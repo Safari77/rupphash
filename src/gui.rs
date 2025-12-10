@@ -241,6 +241,7 @@ impl GuiApp {
                         if let Ok(mut raw) = rsraw::RawImage::open(&data) {
                             // Unpack is fast, Process is slow
                             if raw.unpack().is_ok() {
+                                raw.set_use_camera_wb(true);
                                 // 3. LATE SKIP: Check again before the heavy 'process' call
                                 let still_relevant = {
                                     if let Ok(window) = window_clone.read() {
