@@ -1,5 +1,5 @@
 use eframe::egui;
-use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_counts};
+use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_hardlink_groups};
 use crate::format_relative_time;
 use crate::GroupStatus;
 use crate::db::AppContext;
@@ -1063,7 +1063,7 @@ impl eframe::App for GuiApp {
                         if !self.state.view_mode {
                             let info = &self.state.group_infos[g_idx];
                             let (header_text, header_color) = match info.status {
-                                GroupStatus::AllIdentical => (format!("Group {} - Bit-identical", g_idx + 1), egui::Color32::GREEN),
+                                GroupStatus::AllIdentical => (format!("Group {} - Bit-identical (hardlinks in light blue)", g_idx + 1), egui::Color32::GREEN),
                                 GroupStatus::SomeIdentical => (format!("Group {} - Some Identical", g_idx + 1), egui::Color32::LIGHT_GREEN),
                                 GroupStatus::None => (format!("Group {} (Dist: {})", g_idx + 1, info.max_dist), egui::Color32::YELLOW),
                             };
@@ -1071,24 +1071,27 @@ impl eframe::App for GuiApp {
                         }
 
                         let counts = get_bit_identical_counts(group);
+                        let hardlink_groups = get_hardlink_groups(group);
 
                         for (f_idx, file) in group.iter().enumerate() {
                             let is_selected = g_idx == self.state.current_group_idx && f_idx == self.state.current_file_idx;
                             let is_marked = self.state.marked_for_deletion.contains(&file.path);
                             let exists = file.path.exists();
                             let is_bit_identical = !self.state.view_mode && *counts.get(&file.content_hash).unwrap_or(&0) > 1;
+                            let is_hardlinked = !self.state.view_mode && file.dev_inode
+                                .map(|di| hardlink_groups.contains_key(&di))
+                                .unwrap_or(false);
 
-                            let mut text = format_path_depth(&file.path, self.state.path_display_depth);
-                            if is_marked {
-                                text = format!("→ {}", text);
-                            } else {
-                                text = format!("  {}", text);
-                            }
-
+                            let text = format!("{} {}{}",
+                                if is_marked     { "M" } else { " " },
+                                if is_hardlinked { "L " } else { "  " },
+                                format_path_depth(&file.path, self.state.path_display_depth)
+                            );
                             let mut label_text = egui::RichText::new(text).family(egui::FontFamily::Monospace);
                             if !is_selected {
                                 if !exists { label_text = label_text.color(egui::Color32::RED).strikethrough(); }
                                 else if is_marked { label_text = label_text.color(egui::Color32::RED); }
+                                else if is_hardlinked { label_text = label_text.color(egui::Color32::LIGHT_BLUE); }
                                 else if is_bit_identical { label_text = label_text.color(egui::Color32::GREEN); }
                             }
 

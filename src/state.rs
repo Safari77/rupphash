@@ -578,3 +578,26 @@ impl AppState {
         }
     }
 }
+
+
+/// Check if a file is a hardlink (has other files pointing to same inode)
+pub fn is_hardlinked(file: &FileMetadata, group: &[FileMetadata]) -> bool {
+    if let Some(dev_ino) = file.dev_inode {
+        group.iter().filter(|f| f.dev_inode == Some(dev_ino)).count() > 1
+    } else {
+        false
+    }
+}
+
+/// Returns a map of (dev, ino) -> Vec<&FileMetadata> for files that are hardlinked
+pub fn get_hardlink_groups(group: &[FileMetadata]) -> HashMap<(u64, u64), Vec<usize>> {
+    let mut groups: HashMap<(u64, u64), Vec<usize>> = HashMap::new();
+    for (idx, f) in group.iter().enumerate() {
+        if let Some(dev_ino) = f.dev_inode {
+            groups.entry(dev_ino).or_default().push(idx);
+        }
+    }
+    // Only keep groups with 2+ files (actual hardlinks)
+    groups.retain(|_, v| v.len() > 1);
+    groups
+}
