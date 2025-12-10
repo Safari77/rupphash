@@ -36,7 +36,7 @@ eframe = { version = "0.33", default-features = false, features = ["default_font
 egui = "0.33"
 egui_extras = { version = "0.33", features = ["all_loaders"] }
 font-loader = "0.11.0"
-rsraw = "0.1.0"
+rsraw = { git = "https://github.com/Safari77/rsraw", branch = "process_flags" }
 kamadak-exif = "0.6.1"
 
 [profile.release]
