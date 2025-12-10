@@ -11,28 +11,20 @@ use image::GenericImageView;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{FileMetadata, GroupInfo, GroupStatus};
-use crate::rupphash::DctPhash;
-use crate::mih::{MIHIndex, find_groups_parallel};
-use crate::db::AppContext;
+use crate::phash::DctPhash;
+use crate::hamminghash::{MIHIndex, HammingHash, SparseBitSet};
+use crate::db::{AppContext, HashAlgorithm, HashValue};
 
 pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf"];
 
-// --- Trait Alias Helper ---
-// This allows us to create a Box<dyn BufReadSeek> that satisfies both requirements.
 trait BufReadSeek: std::io::BufRead + std::io::Seek {}
 impl<T: std::io::BufRead + std::io::Seek> BufReadSeek for T {}
 
-/// Helper to get EXIF orientation efficiently (standard + RAW/TIFF)
-/// Reads just the header of the file to find orientation tag using kamadak-exif.
-/// TODO use rsraw to read orientation if kamadak fails
 fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
-    // We use the composite trait object Box<dyn BufReadSeek> so both branches return the same type.
     let mut reader: Box<dyn BufReadSeek> = if let Some(bytes) = preloaded_bytes {
-        // Cursor implements both BufRead and Seek
         Box::new(std::io::Cursor::new(bytes))
     } else {
         match fs::File::open(path) {
-            // BufReader<File> implements both BufRead and Seek
             Ok(f) => Box::new(std::io::BufReader::new(f)),
             Err(_) => return 1,
         }
@@ -40,51 +32,37 @@ fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
 
     match exif::Reader::new().read_from_container(&mut reader) {
         Ok(exif_data) => {
-            if let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY) {
-                 match field.value.get_uint(0) {
-                    Some(v @ 1..=8) => return v as u8,
-                    _ => {}
-                 }
-            }
+            if let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                 && let Some(v @ 1..=8) = field.value.get_uint(0) { return v as u8 }
             1
         },
         Err(_) => 1
     }
 }
 
-/// Get resolution for a file, using rsraw for RAW files
 fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
     if is_raw_ext(path) {
-        // Use rsraw for RAW files
         let data = match bytes {
             Some(b) => b.to_vec(),
             None => fs::read(path).ok()?,
         };
-        if let Ok(mut raw) = rsraw::RawImage::open(&data) {
-            if raw.unpack().is_ok() {
-                // Get dimensions from unpacked raw (before processing)
-                return Some((raw.width() as u32, raw.height() as u32));
-            }
+        if let Ok(mut raw) = rsraw::RawImage::open(&data) && raw.unpack().is_ok() {
+            return Some((raw.width(), raw.height()));
         }
         None
     } else {
-        // Use image crate for regular images
         match bytes {
             Some(b) => {
                 if let Ok(reader) = image::ImageReader::new(std::io::Cursor::new(b)).with_guessed_format()
                     && let Ok(dims) = reader.into_dimensions() {
                     Some(dims)
-                } else {
-                    None
-                }
+                } else { None }
             }
             None => {
                 if let Ok(reader) = image::ImageReader::open(path)
                     && let Ok(dims) = reader.into_dimensions() {
                     Some(dims)
-                } else {
-                    None
-                }
+                } else { None }
             }
         }
     }
@@ -100,66 +78,84 @@ pub struct ScanConfig {
     pub ignore_same_stem: bool,
 }
 
-// Update signature to accept optional progress sender
+#[derive(Clone)]
+struct ScannedFile {
+    pub path: std::path::PathBuf,
+    pub size: u64,
+    pub modified: DateTime<Utc>,
+    pub resolution: Option<(u32, u32)>,
+    pub content_hash: [u8; 32],
+    pub orientation: u8,
+    pub dev_inode: Option<(u64, u64)>,
+    pub phash: Option<u64>,
+    pub pdqhash: Option<[u8; 32]>,
+    pub pdq_features: Option<crate::pdqhash::PdqFeatures>,
+}
+
+impl ScannedFile {
+    fn to_file_metadata(&self) -> FileMetadata {
+        FileMetadata {
+            path: self.path.clone(),
+            size: self.size,
+            modified: self.modified,
+            phash: self.phash.unwrap_or(0),
+            pdqhash: self.pdqhash,
+            resolution: self.resolution,
+            content_hash: self.content_hash,
+            orientation: self.orientation,
+            dev_inode: self.dev_inode,
+        }
+    }
+}
+
 pub fn scan_and_group(
     config: &ScanConfig,
     ctx: &AppContext,
-    progress_tx: Option<Sender<(usize, usize)>> // (current, total)
+    progress_tx: Option<Sender<(usize, usize)>>
 ) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>) {
+    use std::time::Instant;
+
     let ctx_ref = ctx;
     let force_rehash = config.rehash;
+    let use_pdqhash = ctx.hash_algorithm == HashAlgorithm::PdqHash;
 
-    // 1. File Walking
     let mut all_files = Vec::new();
     let mut seen_paths = HashSet::new();
     for path_str in &config.paths {
         let path = Path::new(path_str);
         if path.is_dir() {
             for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
-                if is_image_ext(entry.path()) {
-                    // Canonicalize to handle symlinks and avoid duplicates
-                    if let Ok(canonical) = entry.path().canonicalize() {
-                        if seen_paths.insert(canonical.clone()) {
+                if is_image_ext(entry.path())
+                    && let Ok(canonical) = entry.path().canonicalize()
+                        && seen_paths.insert(canonical.clone()) {
                             all_files.push(canonical);
                         }
-                    }
-                }
             }
-        } else if path.is_file() && is_image_ext(path) {
-            if let Ok(canonical) = path.canonicalize() {
-                if seen_paths.insert(canonical.clone()) {
+        } else if path.is_file() && is_image_ext(path)
+            && let Ok(canonical) = path.canonicalize()
+                && seen_paths.insert(canonical.clone()) {
                     all_files.push(canonical);
                 }
-            }
-        }
     }
 
-    if all_files.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
+    if all_files.is_empty() { return (Vec::new(), Vec::new()); }
 
     let total_files = all_files.len();
-    if let Some(tx) = &progress_tx {
-        let _ = tx.send((0, total_files));
-    }
+    if let Some(tx) = &progress_tx { let _ = tx.send((0, total_files)); }
 
-    // 2. Database Writer & Hashing
+    let hash_start = Instant::now();
     let (tx, rx) = unbounded();
     let db_handle = ctx.start_db_writer(rx);
     let hasher = DctPhash::new();
-
     let processed_count = AtomicUsize::new(0);
 
-    let valid_files: Vec<FileMetadata> = all_files.par_iter().filter_map(|path| {
-        // --- Progress Reporting ---
+    let valid_files: Vec<ScannedFile> = all_files.par_iter().filter_map(|path| {
         if let Some(prog_tx) = &progress_tx {
             let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            // Limit updates to reduce overhead (e.g., every 50 files)
-            if current % 50 == 0 || current == total_files {
+            if current.is_multiple_of(50) || current == total_files {
                 let _ = prog_tx.send((current, total_files));
             }
         }
-        // --------------------------
 
         let metadata = fs::metadata(path).ok()?;
         let size = metadata.len();
@@ -169,87 +165,296 @@ pub fn scan_and_group(
         let inode = metadata.ino();
         let dev_inode = Some((metadata.dev(), metadata.ino()));
 
-        // Meta Key
         let mut mh = blake3::Hasher::new_keyed(&ctx_ref.meta_key);
         mh.update(&mtime_ns.to_le_bytes());
         mh.update(&inode.to_le_bytes());
         mh.update(&size.to_le_bytes());
         let meta_key: [u8; 32] = *mh.finalize().as_bytes();
 
-        let mut phash = 0u64;
+        let mut phash: Option<u64> = None;
+        let mut pdqhash: Option<[u8; 32]> = None;
+        let mut pdq_features: Option<crate::pdqhash::PdqFeatures> = None;
         let mut new_meta = None;
-        let mut new_phash = None;
-        let mut computed = false;
+        let mut new_hash = None;
         let mut resolution = None;
         let mut ck = [0u8; 32];
         let mut orientation = 1;
 
-        // Try reading full file for hashing (needed anyway)
-        let bytes = fs::read(path).ok();
-
+        let mut bytes = fs::read(path).ok();
         if let Some(ref b) = bytes {
-            // Get orientation from bytes (fast header read)
             orientation = get_orientation(path, Some(b));
         }
 
         if !force_rehash
             && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
                  ck = ch;
-                 if let Ok(Some(p)) = ctx_ref.get_phash(&ch) {
-                    phash = p;
-                    computed = true;
-                    // If we didn't read bytes, read orientation from file
-                    if bytes.is_none() {
-                        orientation = get_orientation(path, None);
-                    }
-                    resolution = get_resolution(path, None);
-                }
+                 if use_pdqhash {
+                     if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
+                         pdqhash = Some(h);
+                         if bytes.is_none() { bytes = fs::read(path).ok(); }
+                         if let Some(ref b) = bytes
+                             && let Ok(img) = image::load_from_memory(b) {
+                                 if let Some((f, _)) = crate::pdqhash::generate_pdq_features(&img) {
+                                     pdq_features = Some(f);
+                                 }
+                                 resolution = Some(img.dimensions());
+                             }
+                     }
+                 } else if let Ok(Some(h)) = ctx_ref.get_phash(&ch) {
+                     phash = Some(h);
+                     if bytes.is_none() { orientation = get_orientation(path, None); }
+                     resolution = get_resolution(path, None);
+                 }
             }
 
-        if !computed {
+        let needs_calculation = if use_pdqhash {
+             pdqhash.is_none() || pdq_features.is_none()
+        } else {
+             phash.is_none()
+        };
+
+        if needs_calculation {
              let b = match bytes { Some(v) => v, None => return None };
              let ch = blake3::keyed_hash(&ctx_ref.content_key, &b);
              ck = *ch.as_bytes();
              new_meta = Some((meta_key, ck));
 
-             if let Ok(Some(p)) = ctx_ref.get_phash(&ck) {
-                 phash = p;
+             if use_pdqhash {
+                 if let Ok(img) = image::load_from_memory(&b) {
+                     resolution = Some(img.dimensions());
+                     if let Some((features, _quality)) = crate::pdqhash::generate_pdq_features(&img) {
+                         let hash = features.to_hash();
+                         pdqhash = Some(hash);
+                         pdq_features = Some(features);
+                         new_hash = Some((ck, HashValue::PdqHash(hash)));
+                         eprintln!("[DEBUG-PDQ] Generated fresh hash+features for: {:?}", path);
+                     } else { return None; }
+                 } else { return None; }
+             } else if let Ok(Some(h)) = ctx_ref.get_phash(&ck) {
+                 phash = Some(h);
                  resolution = get_resolution(path, Some(&b));
              } else if let Ok(img) = image::load_from_memory(&b) {
                  resolution = Some(img.dimensions());
-                 phash = hasher.hash_image_invariant(&img);
-                 new_phash = Some((ck, phash));
+                 let hash = hasher.hash_image(&img);
+                 phash = Some(hash);
+                 new_hash = Some((ck, HashValue::PHash(hash)));
              } else { return None; }
         }
 
-        if new_meta.is_some() || new_phash.is_some() { let _ = tx.send((new_meta, new_phash)); }
+        if new_meta.is_some() || new_hash.is_some() { let _ = tx.send((new_meta, new_hash)); }
 
-        Some(FileMetadata {
-            path: path.clone(), size, modified: mtime_utc, phash, resolution,
-            content_hash: ck, orientation, dev_inode, })
+        Some(ScannedFile {
+            path: path.clone(),
+            size,
+            modified: mtime_utc,
+            resolution,
+            content_hash: ck,
+            orientation,
+            dev_inode,
+            phash,
+            pdqhash,
+            pdq_features,
+        })
     }).collect();
 
     drop(tx);
     db_handle.join().expect("DB writer thread panicked");
 
-    // 3. Grouping
-    let hashes: Vec<u64> = valid_files.iter().map(|f| f.phash).collect();
-    if hashes.is_empty() { return (Vec::new(), Vec::new()); }
+    let hash_elapsed = hash_start.elapsed();
+    let hash_count = valid_files.len();
+    eprintln!("[DEBUG] Algorithm: {}", if use_pdqhash { "PDQ hash" } else { "pHash" });
+    eprintln!("[DEBUG] Hashes loaded: {} in {:.2}s", hash_count, hash_elapsed.as_secs_f64());
 
-    let mih = MIHIndex::new(hashes.clone()).expect("Failed to create MIH");
-    let raw_groups = find_groups_parallel(&mih, config.similarity);
+    let group_start = Instant::now();
+    let (processed_groups, processed_infos, comparison_count) = if use_pdqhash {
+        group_with_pdqhash(&valid_files, config)
+    } else {
+        group_with_phash(&valid_files, config)
+    };
+    let group_elapsed = group_start.elapsed();
+
+    eprintln!("[DEBUG] Grouping: {} groups found in {:.2}s ({} comparisons)",
+        processed_groups.len(), group_elapsed.as_secs_f64(), comparison_count);
+
+    let mut combined: Vec<_> = processed_groups.into_iter().zip(processed_infos).collect();
+    combined.sort_by(|(g1, info1), (g2, info2)| {
+        let has_ident1 = info1.status != GroupStatus::None;
+        let has_ident2 = info2.status != GroupStatus::None;
+        if has_ident1 != has_ident2 { return has_ident2.cmp(&has_ident1); }
+        if info1.max_dist != info2.max_dist { return info1.max_dist.cmp(&info2.max_dist); }
+        let s1 = g1.first().map(|f| f.size).unwrap_or(0);
+        let s2 = g2.first().map(|f| f.size).unwrap_or(0);
+        s2.cmp(&s1)
+    });
+
+    combined.into_iter().unzip()
+}
+
+// --- Generic Grouping Implementation ---
+
+fn group_files_generic<H>(
+    valid_files: &[ScannedFile],
+    config: &ScanConfig,
+    extract_hash: impl Fn(&ScannedFile) -> Option<H> + Sync + Send,
+    generate_variants: impl Fn(&ScannedFile, H) -> Vec<H> + Sync + Send,
+) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize)
+where H: HammingHash + std::fmt::Debug
+{
+    let hashes: Vec<H> = valid_files.iter().filter_map(&extract_hash).collect();
+    if hashes.is_empty() { return (Vec::new(), Vec::new(), 0); }
+
+    let mih = MIHIndex::new(hashes.clone());
+    let n = valid_files.len();
+    let comparison_count = AtomicUsize::new(0);
+
+    let chunk_tolerance = config.similarity / (H::NUM_CHUNKS as u32);
+    let bits_per_chunk = H::bit_width_per_chunk();
+
+    eprintln!("[DEBUG-GROUP] Files: {}, Chunk Tolerance: {}, Bits/Chunk: {}", n, chunk_tolerance, bits_per_chunk);
+
+    let adjacency: Vec<Vec<u32>> = valid_files
+        .par_iter()
+        .enumerate()
+        .map_init(
+            || (SparseBitSet::new(n), Vec::new()),
+            |(visited, results), (i, file)| {
+                results.clear();
+
+                if let Some(hash) = extract_hash(file) {
+                    let variants = generate_variants(file, hash);
+
+                    if i < 3 {
+                         eprintln!("[DEBUG-TRACE] File {}: Generated {} variants.", i, variants.len());
+                    }
+
+                    for variant in variants {
+                        visited.clear();
+
+                        for k in 0..H::NUM_CHUNKS {
+                            let q_chunk = variant.get_chunk(k);
+                            let chunk_base = k * H::NUM_BUCKETS;
+
+                            let mut check_bucket = |val: u16| {
+                                let flat_idx = chunk_base + val as usize;
+                                let start = unsafe { *mih.offsets.get_unchecked(flat_idx) } as usize;
+                                let end = unsafe { *mih.offsets.get_unchecked(flat_idx + 1) } as usize;
+                                let bucket = unsafe { mih.values.get_unchecked(start..end) };
+
+                                for &cand_id in bucket {
+                                    let cid = cand_id as usize;
+                                    if cid == i { continue; }
+
+                                    if !visited.set(cid) {
+                                        comparison_count.fetch_add(1, Ordering::Relaxed);
+                                        let cand_hash = unsafe { mih.db_hashes.get_unchecked(cid) };
+
+                                        let dist = variant.hamming_distance(cand_hash);
+                                        if dist <= config.similarity
+                                            && !results.contains(&cand_id) {
+                                                results.push(cand_id);
+                                                if i < 5 {
+                                                    eprintln!("[DEBUG-MATCH] File {} matched {} (Dist: {})", i, cid, dist);
+                                                }
+                                            }
+                                    }
+                                }
+                            };
+
+                            check_bucket(q_chunk);
+                            if chunk_tolerance >= 1 {
+                                for bit in 0..bits_per_chunk {
+                                    check_bucket(q_chunk ^ (1 << bit));
+                                }
+                            }
+                        }
+                    }
+                }
+                results.clone()
+            }
+        )
+        .collect();
+
+    let mut visited_cluster = vec![false; n];
+    let mut groups = Vec::new();
+
+    for i in 0..n {
+        if visited_cluster[i] { continue; }
+        if adjacency[i].is_empty() { continue; }
+
+        let mut group = vec![i as u32];
+        visited_cluster[i] = true;
+        let mut stack = adjacency[i].clone();
+
+        while let Some(neighbor) = stack.pop() {
+            if !visited_cluster[neighbor as usize] {
+                visited_cluster[neighbor as usize] = true;
+                group.push(neighbor);
+                stack.extend_from_slice(&adjacency[neighbor as usize]);
+            }
+        }
+        if group.len() > 1 { groups.push(group); }
+    }
+
+    let is_pdq = std::any::type_name::<H>().contains("u8");
+    let (g, i) = process_raw_groups(groups, valid_files, config, is_pdq);
+    (g, i, comparison_count.load(Ordering::Relaxed))
+}
+
+fn group_with_phash(
+    valid_files: &[ScannedFile],
+    config: &ScanConfig,
+) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
+    use crate::phash::generate_dihedral_hashes;
+    group_files_generic(
+        valid_files,
+        config,
+        |f| f.phash,
+        |_f, h| generate_dihedral_hashes(h)
+    )
+}
+
+fn group_with_pdqhash(
+    valid_files: &[ScannedFile],
+    config: &ScanConfig,
+) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
+    group_files_generic(
+        valid_files,
+        config,
+        |f| f.pdqhash,
+        |f, h| {
+            if let Some(features) = &f.pdq_features {
+                features.generate_dihedral_hashes()
+            } else {
+                eprintln!("[DEBUG-WARN] No PDQ features for file. Using fallback (0 deg only).");
+                vec![h]
+            }
+        }
+    )
+}
+
+fn process_raw_groups(
+    raw_groups: Vec<Vec<u32>>,
+    valid_files: &[ScannedFile],
+    config: &ScanConfig,
+    use_pdqhash: bool,
+) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>) {
+    let ignore_enabled = config.ignore_same_stem;
+    let allowed_exts: HashSet<String> = config.extensions.iter().map(|e| e.to_lowercase()).collect();
+    let ext_priorities: HashMap<String, usize> = config.extensions.iter()
+        .enumerate()
+        .map(|(i, e)| (e.to_lowercase(), i))
+        .collect();
 
     let mut processed_groups = Vec::new();
     let mut processed_infos = Vec::new();
 
-    let ignore_enabled = config.ignore_same_stem;
-    let allowed_exts: HashSet<String> = config.extensions.iter().map(|e| e.to_lowercase()).collect();
-    let ext_priorities: HashMap<String, usize> = config.extensions.iter().enumerate().map(|(i, e)| (e.to_lowercase(), i)).collect();
-
     for group_indices in raw_groups {
-        let mut group_data: Vec<FileMetadata> = group_indices.iter().map(|&idx| valid_files[idx as usize].clone()).collect();
+        let group_indices = group_indices;
 
-        // Filter logic
+        let mut group_data: Vec<FileMetadata> = group_indices.iter()
+            .map(|&idx| valid_files[idx as usize].to_file_metadata())
+            .collect();
+
         if ignore_enabled && group_data.len() >= 2 {
             let first_parent = group_data[0].path.parent();
             let first_stem = group_data[0].path.file_stem();
@@ -270,208 +475,47 @@ pub fn scan_and_group(
             }
         }
 
-        let info = analyze_group(&mut group_data, &config.group_by.to_lowercase(), &ext_priorities);
+        let info = if use_pdqhash {
+             analyze_group_with_features(
+                &mut group_data,
+                &group_indices,
+                valid_files,
+                &config.group_by.to_lowercase(),
+                &ext_priorities
+            )
+        } else {
+            analyze_group(&mut group_data, &config.group_by.to_lowercase(), &ext_priorities, false)
+        };
+
         processed_groups.push(group_data);
         processed_infos.push(info);
     }
-
-    // Sort Groups
-    let mut combined: Vec<_> = processed_groups.into_iter().zip(processed_infos).collect();
-    combined.sort_by(|(g1, info1), (g2, info2)| {
-        let has_ident1 = info1.status != GroupStatus::None;
-        let has_ident2 = info2.status != GroupStatus::None;
-        if has_ident1 != has_ident2 { return has_ident2.cmp(&has_ident1); }
-        if info1.max_dist != info2.max_dist { return info1.max_dist.cmp(&info2.max_dist); }
-        let s1 = g1.first().map(|f| f.size).unwrap_or(0);
-        let s2 = g2.first().map(|f| f.size).unwrap_or(0);
-        s2.cmp(&s1)
-    });
-
-    combined.into_iter().unzip()
+    (processed_groups, processed_infos)
 }
 
-pub fn analyze_group(
-    files: &mut Vec<FileMetadata>,
-    group_by: &str,
-    ext_priorities: &HashMap<String, usize>
-) -> GroupInfo {
-    if files.is_empty() {
-        return GroupInfo { max_dist: 0, status: GroupStatus::None };
-    }
-
-    let mut counts = HashMap::new();
-    for f in files.iter() {
-        *counts.entry(f.content_hash).or_insert(0) += 1;
-    }
-
-    let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) = files.drain(..)
-        .partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
-
-    let sorter = |a: &FileMetadata, b: &FileMetadata| {
-        if group_by == "date" {
-            a.modified.cmp(&b.modified)
-        } else {
-            let ext_a = a.path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-            let ext_b = b.path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-
-            let prio_a = ext_priorities.get(&ext_a).unwrap_or(&usize::MAX);
-            let prio_b = ext_priorities.get(&ext_b).unwrap_or(&usize::MAX);
-
-            match prio_a.cmp(prio_b) {
-                std::cmp::Ordering::Equal => b.size.cmp(&a.size),
-                other => other,
-            }
-        }
-    };
-
-    duplicates.sort_by(sorter);
-    unique.sort_by(sorter);
-
-    files.append(&mut duplicates);
-    files.append(&mut unique);
-
-    let pivot_phash = files[0].phash;
-    let max_d = files.iter().map(|f| (f.phash ^ pivot_phash).count_ones()).max().unwrap_or(0);
-
-    let has_duplicates = !counts.values().all(|&c| c == 1);
-    let all_identical = counts.len() == 1;
-
-    let status = if all_identical {
-        GroupStatus::AllIdentical
-    } else if has_duplicates {
-        GroupStatus::SomeIdentical
-    } else {
-        GroupStatus::None
-    };
-
-    GroupInfo {
-        max_dist: max_d,
-        status,
-    }
-}
-
-pub fn is_raw_ext(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            let e = e.to_lowercase();
-            RAW_EXTS.contains(&e.as_str())
-        })
-        .unwrap_or(false)
-}
-
-fn is_image_ext(path: &Path) -> bool {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .map(|ext| {
-            let e = ext.to_lowercase();
-            // Check standard extensions OR the centralized raw list
-            matches!(
-                e.as_str(),
-                "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "tif" | 
-                "avif" | "tga" | "xbm" | "xpm"
-            ) || RAW_EXTS.contains(&e.as_str())
-        })
-        .unwrap_or(false)
-}
-
-/// Scan files for view mode (no similarity checking)
-/// Returns files in current directory only (non-recursive), sorted according to sort_order
-/// Also returns list of subdirectories
-pub fn scan_for_view(
-    paths: &[String],
-    sort_order: &str,
-    progress_tx: Option<Sender<(usize, usize)>>
-) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, Vec<std::path::PathBuf>) {
+pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
     use rand::seq::SliceRandom;
-
-    // 1. File Walking - NON-RECURSIVE, current directory only
-    let mut all_files = Vec::new();
-    let mut subdirs = Vec::new();
-    let mut seen_paths = HashSet::new();
-
-    for path_str in paths {
-        let path = Path::new(path_str);
-        if path.is_dir() {
-            // Read directory entries directly (non-recursive)
-            if let Ok(entries) = fs::read_dir(path) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let entry_path = entry.path();
-                    if entry_path.is_dir() {
-                        // Collect subdirectories
-                        if let Ok(canonical) = entry_path.canonicalize() {
-                            subdirs.push(canonical);
-                        }
-                    } else if entry_path.is_file() && is_image_ext(&entry_path) {
-                        // Collect image files
-                        if let Ok(canonical) = entry_path.canonicalize() {
-                            if seen_paths.insert(canonical.clone()) {
-                                all_files.push(canonical);
-                            }
-                        }
-                    }
-                }
-            }
-        } else if path.is_file() && is_image_ext(path) {
-            if let Ok(canonical) = path.canonicalize() {
-                if seen_paths.insert(canonical.clone()) {
-                    all_files.push(canonical);
-                }
-            }
-        }
-    }
-
-    // Sort subdirectories by name
-    subdirs.sort_by(|a, b| {
-        a.file_name().cmp(&b.file_name())
-    });
-
-    if all_files.is_empty() {
-        return (Vec::new(), Vec::new(), subdirs);
-    }
-
-    let total_files = all_files.len();
-    if let Some(tx) = &progress_tx {
-        let _ = tx.send((0, total_files));
-    }
-
-    let processed_count = AtomicUsize::new(0);
-
-    // 2. Gather metadata (no hashing needed for view mode)
-    let mut files: Vec<FileMetadata> = all_files.par_iter().filter_map(|path| {
-        if let Some(prog_tx) = &progress_tx {
-            let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if current % 50 == 0 || current == total_files {
-                let _ = prog_tx.send((current, total_files));
-            }
-        }
-
-        let metadata = fs::metadata(path).ok()?;
-        let size = metadata.len();
-        let mtime = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
-        let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
-
-        // We check orientation even in View Mode
-        // This requires opening the file, but it's fast (buffered header only).
-        // get_resolution is skipped for speed.
-        let orientation = get_orientation(path, None);
-
-        Some(FileMetadata {
-            path: path.clone(),
-            size,
-            modified: mtime_utc,
-            phash: 0, // Not needed for view mode
-            resolution: None,
-            content_hash: [0u8; 32], // Not needed for view mode
-            orientation,
-            dev_inode: None,
-        })
-    }).collect();
-
-    // 3. Sort according to sort_order
     match sort_order {
-        "name" => files.sort_by(|a, b| a.path.cmp(&b.path)),
-        "name-desc" => files.sort_by(|a, b| b.path.cmp(&a.path)),
+        "name" => files.sort_by(|a, b| {
+            let name_a = a.path.file_name().map(|s| s.to_string_lossy().to_lowercase());
+            let name_b = b.path.file_name().map(|s| s.to_string_lossy().to_lowercase());
+            name_a.cmp(&name_b)
+        }),
+        "name-desc" => files.sort_by(|a, b| {
+            let name_a = a.path.file_name().map(|s| s.to_string_lossy().to_lowercase());
+            let name_b = b.path.file_name().map(|s| s.to_string_lossy().to_lowercase());
+            name_b.cmp(&name_a)
+        }),
+        "name-natural" => files.sort_by(|a, b| {
+            let name_a = a.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let name_b = b.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+            natord::compare(&name_a, &name_b)
+        }),
+        "name-natural-desc" => files.sort_by(|a, b| {
+            let name_a = a.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let name_b = b.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+            natord::compare(&name_b, &name_a)
+        }),
         "date" => files.sort_by(|a, b| a.modified.cmp(&b.modified)),
         "date-desc" => files.sort_by(|a, b| b.modified.cmp(&a.modified)),
         "size" => files.sort_by(|a, b| a.size.cmp(&b.size)),
@@ -480,18 +524,191 @@ pub fn scan_for_view(
             let mut rng = rand::rng();
             files.shuffle(&mut rng);
         },
-        _ => {} // Keep original order
+        _ => {
+            files.sort_by(|a, b| {
+                let name_a = a.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let name_b = b.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+                natord::compare(&name_a, &name_b)
+            });
+        }
     }
+}
 
-    if files.is_empty() {
-        return (Vec::new(), Vec::new(), subdirs);
+pub fn analyze_group(
+    files: &mut Vec<FileMetadata>,
+    sort_order: &str,
+    #[allow(unused)] ext_priorities: &HashMap<String, usize>,
+    use_pdqhash: bool,
+) -> GroupInfo {
+    if files.is_empty() { return GroupInfo { max_dist: 0, status: GroupStatus::None }; }
+
+    let mut counts = HashMap::new();
+    for f in files.iter() { *counts.entry(f.content_hash).or_insert(0) += 1; }
+
+    let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) = files.drain(..)
+        .partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
+
+    sort_files(&mut duplicates, sort_order);
+    sort_files(&mut unique, sort_order);
+    files.append(&mut duplicates);
+    files.append(&mut unique);
+
+    let max_d = if use_pdqhash {
+         if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
+            files.iter()
+                .filter_map(|f| f.pdqhash)
+                .map(|h| {
+                    let mut dist = 0;
+                    for i in 0..32 { dist += (pivot[i] ^ h[i]).count_ones(); }
+                    dist
+                })
+                .max()
+                .unwrap_or(0)
+        } else { 0 }
+    } else if let Some(first) = files.first() {
+        let pivot = first.phash;
+        files.iter()
+            .map(|f| (f.phash ^ pivot).count_ones())
+            .max()
+            .unwrap_or(0)
+    } else { 0 };
+
+    let has_duplicates = !counts.values().all(|&c| c == 1);
+    let all_identical = counts.len() == 1;
+    let status = if all_identical { GroupStatus::AllIdentical } else if has_duplicates { GroupStatus::SomeIdentical } else { GroupStatus::None };
+
+    GroupInfo { max_dist: max_d, status }
+}
+
+fn analyze_group_with_features(
+    files: &mut Vec<FileMetadata>,
+    original_indices: &[u32],
+    valid_files: &[ScannedFile],
+    sort_order: &str,
+    #[allow(unused)] ext_priorities: &HashMap<String, usize>,
+) -> GroupInfo {
+    if files.is_empty() { return GroupInfo { max_dist: 0, status: GroupStatus::None }; }
+
+    let mut counts = HashMap::new();
+    for f in files.iter() { *counts.entry(f.content_hash).or_insert(0) += 1; }
+
+    let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) = files.drain(..)
+        .partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
+
+    sort_files(&mut duplicates, sort_order);
+    sort_files(&mut unique, sort_order);
+    files.append(&mut duplicates);
+    files.append(&mut unique);
+
+    let pivot_features = valid_files.iter()
+        .find(|vf| vf.path == files[0].path)
+        .and_then(|vf| vf.pdq_features.as_ref());
+
+    let max_d = if let Some(pivot_feats) = pivot_features {
+        let pivot_variants = pivot_feats.generate_dihedral_hashes();
+        files.iter().map(|f| {
+            if let Some(h) = f.pdqhash {
+                pivot_variants.iter()
+                    .map(|v| {
+                        let mut d = 0;
+                        for i in 0..32 { d += (v[i] ^ h[i]).count_ones(); }
+                        d
+                    })
+                    .min()
+                    .unwrap_or(255)
+            } else { 0 }
+        })
+        .max()
+        .unwrap_or(0)
+    } else if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
+        files.iter()
+            .filter_map(|f| f.pdqhash)
+            .map(|h| {
+                let mut dist = 0;
+                for i in 0..32 { dist += (pivot[i] ^ h[i]).count_ones(); }
+                dist
+            })
+            .max()
+            .unwrap_or(0)
+    } else { 0 };
+
+    let has_duplicates = !counts.values().all(|&c| c == 1);
+    let all_identical = counts.len() == 1;
+    let status = if all_identical { GroupStatus::AllIdentical } else if has_duplicates { GroupStatus::SomeIdentical } else { GroupStatus::None };
+
+    GroupInfo { max_dist: max_d, status }
+}
+
+pub fn is_raw_ext(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).map(|e| RAW_EXTS.contains(&e.to_lowercase().as_str())).unwrap_or(false)
+}
+
+fn is_image_ext(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()).map(|ext| {
+        let e = ext.to_lowercase();
+        matches!(e.as_str(), "jpg"|"jpeg"|"png"|"webp"|"bmp"|"tiff"|"tif"|"avif"|"tga"|"xbm"|"xpm") || RAW_EXTS.contains(&e.as_str())
+    }).unwrap_or(false)
+}
+
+pub fn scan_for_view(
+    paths: &[String],
+    sort_order: &str,
+    progress_tx: Option<Sender<(usize, usize)>>
+) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, Vec<std::path::PathBuf>) {
+    let mut all_files = Vec::new();
+    let mut subdirs = Vec::new();
+    let mut seen_paths = HashSet::new();
+
+    for path_str in paths {
+        let path = Path::new(path_str);
+        if path.is_dir() {
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let entry_path = entry.path();
+                    if entry_path.is_dir() {
+                        if let Ok(canonical) = entry_path.canonicalize() { subdirs.push(canonical); }
+                    } else if entry_path.is_file() && is_image_ext(&entry_path)
+                        && let Ok(canonical) = entry_path.canonicalize() && seen_paths.insert(canonical.clone()) {
+                            all_files.push(canonical);
+                        }
+                }
+            }
+        } else if path.is_file() && is_image_ext(path) && let Ok(canonical) = path.canonicalize() && seen_paths.insert(canonical.clone()) {
+            all_files.push(canonical);
+        }
     }
+    subdirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
-    // Return as single group with no duplicates status
-    let info = GroupInfo {
-        max_dist: 0,
-        status: GroupStatus::None,
-    };
+    if all_files.is_empty() { return (Vec::new(), Vec::new(), subdirs); }
 
+    let total_files = all_files.len();
+    if let Some(tx) = &progress_tx { let _ = tx.send((0, total_files)); }
+
+    let processed_count = AtomicUsize::new(0);
+    let mut files: Vec<FileMetadata> = all_files.par_iter().filter_map(|path| {
+        if let Some(prog_tx) = &progress_tx {
+            let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if current.is_multiple_of(50) || current == total_files { let _ = prog_tx.send((current, total_files)); }
+        }
+        let metadata = fs::metadata(path).ok()?;
+        let size = metadata.len();
+        let mtime = DateTime::from(metadata.modified().ok().unwrap_or(UNIX_EPOCH));
+        let orientation = get_orientation(path, None);
+        Some(FileMetadata {
+            path: path.clone(),
+            size,
+            modified: mtime,
+            phash: 0,
+            pdqhash: None,
+            resolution: None,
+            content_hash: [0u8; 32],
+            orientation,
+            dev_inode: None,
+        })
+    }).collect();
+
+    sort_files(&mut files, sort_order);
+    if files.is_empty() { return (Vec::new(), Vec::new(), subdirs); }
+    let info = GroupInfo { max_dist: 0, status: GroupStatus::None };
     (vec![files], vec![info], subdirs)
 }

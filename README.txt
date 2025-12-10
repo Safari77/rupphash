@@ -2,27 +2,27 @@ test performance of Multi-Index Hashing:
 
 $ cargo test --release -- --nocapture
 ...
-running 1 test
+--- PERFORMANCE TEST: 1000000 Images (Generic u64) ---
 
---- PERFORMANCE TEST: 1000000 Images ---
+--- TEST: High Similarity (Distance > 7) ---
+Testing u64 (pHash)...
 Generating 1000000 random hashes...
-Injecting similar hashes at random indices: [442329, 296504, 667276, 257949, 15470]
-Building Index took: 92.43ms
+Querying distance 12 (u64)... Found: [[0, 1]]
+Testing [u8; 32] (PDQ)...
+Querying distance 30 (PDQ)... Found: [[0, 1]]
+test hamminghash::tests::test_high_similarity_support ... ok
+Injecting similar hashes at random indices: [773023, 836470, 728951, 945586, 558794]
+Building Index took: 27.21ms
 Grouping (max_dist=5) with 14 threads...
-Step 1: finding neighbors in parallel...
-Step 2: grouping connected components...
-Grouping took:       976.38ms
-Total Time (Compute): 1.07s
+Grouping took:        12.22s
+Total Time (Compute): 12.25s
 Found 2 groups.
-Found Target Group Size: 5 (Indices: [15470, 667276, 442329, 296504, 257949])
-test mih::tests::test_1_million_images_performance ... ok
+Found Target Group Size: 5 (Indices: [558794, 836470, 945586, 728951, 773023])
+test hamminghash::tests::test_1_million_images_performance ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
-
-     Running unittests src/main.rs (target/release/deps/rupphash-929dfa05e9002018)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.25s
 
 
-(Now supporting 15 bit similarity, it is five times slower.)
 
 test against one other phash implementation:
 

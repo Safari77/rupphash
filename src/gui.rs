@@ -89,19 +89,22 @@ pub struct GuiApp {
 
 impl GuiApp {
     /// Create a new GuiApp for duplicate detection mode
-    pub fn new(ctx: AppContext, scan_config: ScanConfig, show_relative_times: bool, use_trash: bool, group_by: String, ext_priorities: HashMap<String, usize>) -> Self {
+    pub fn new(ctx: AppContext, scan_config: ScanConfig, show_relative_times: bool, use_trash: bool,
+        group_by: String, ext_priorities: HashMap<String, usize>, use_raw_thumbnails: bool,) -> Self {
+        let use_pdqhash = ctx.hash_algorithm == crate::db::HashAlgorithm::PdqHash;
         let mut state = AppState::new(
             Vec::new(),
             Vec::new(),
             show_relative_times,
             use_trash,
             group_by,
-            ext_priorities
+            ext_priorities,
+            use_pdqhash,
         );
         state.is_loading = true;
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
-        let (tx, rx) = Self::spawn_raw_loader_pool(active_window.clone());
+        let (tx, rx) = Self::spawn_raw_loader_pool(active_window.clone(), use_raw_thumbnails);
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
 
         Self {
@@ -142,6 +145,7 @@ impl GuiApp {
         use_trash: bool,
         move_target: Option<std::path::PathBuf>,
         slideshow_interval: Option<f32>,
+        use_raw_thumbnails: bool,
     ) -> Self {
         let mut state = AppState::new(
             Vec::new(),
@@ -149,7 +153,8 @@ impl GuiApp {
             show_relative_times,
             use_trash,
             sort_order.clone(),
-            HashMap::new()
+            HashMap::new(),
+            false, // view mode doesn't use hashing
         );
         state.is_loading = true;
         state.view_mode = true;
@@ -158,7 +163,7 @@ impl GuiApp {
 
         // Determine initial directory from paths
         let current_dir = paths.first()
-            .map(|p| std::path::PathBuf::from(p))
+            .map(std::path::PathBuf::from)
             .and_then(|p| if p.is_dir() { Some(p) } else { p.parent().map(|p| p.to_path_buf()) })
             .and_then(|p| p.canonicalize().ok());
 
@@ -172,7 +177,7 @@ impl GuiApp {
         };
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
-        let (tx, rx) = Self::spawn_raw_loader_pool(active_window.clone());
+        let (tx, rx) = Self::spawn_raw_loader_pool(active_window.clone(), use_raw_thumbnails);
         let ctx = crate::db::AppContext::new().expect("Failed to create context");
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
 
@@ -208,7 +213,7 @@ impl GuiApp {
 
     /// Spawns a pool of background threads that decode raw images.
     /// Workers check `active_window` before processing to skip stale requests.
-    fn spawn_raw_loader_pool(active_window: Arc<RwLock<HashSet<std::path::PathBuf>>>)
+    fn spawn_raw_loader_pool(active_window: Arc<RwLock<HashSet<std::path::PathBuf>>>, use_thumbnails: bool)
         -> (Sender<std::path::PathBuf>, Receiver<(std::path::PathBuf, Option<egui::ColorImage>)>)
     {
         let (tx, rx) = unbounded::<std::path::PathBuf>();
@@ -226,22 +231,20 @@ impl GuiApp {
                 while let Ok(path) = rx_clone.recv() {
                     // 1. FAST SKIP: Check if this file is still relevant
                     {
-                        if let Ok(window) = window_clone.read() {
-                            if !window.contains(&path) {
+                        if let Ok(window) = window_clone.read()
+                            && !window.contains(&path) {
                                 // Inform UI to clear loading state, but return None for image
                                 let _ = tx_clone.send((path, None));
                                 continue;
                             }
-                        }
                     }
 
                     // 2. Decode
                     let mut success = false;
-                    if let Ok(data) = fs::read(&path) {
-                        if let Ok(mut raw) = rsraw::RawImage::open(&data) {
+                    if let Ok(data) = fs::read(&path)
+                        && let Ok(mut raw) = rsraw::RawImage::open(&data) {
                             // Unpack is fast, Process is slow
                             if raw.unpack().is_ok() {
-                                raw.set_use_camera_wb(true);
                                 // 3. LATE SKIP: Check again before the heavy 'process' call
                                 let still_relevant = {
                                     if let Ok(window) = window_clone.read() {
@@ -250,22 +253,29 @@ impl GuiApp {
                                 };
 
                                 if still_relevant {
-                                    if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
-                                        let width = processed.width() as usize;
-                                        let height = processed.height() as usize;
-
-                                        // Safety check: Ensure buffer size matches dimensions (RGB = 3 bytes)
-                                        if processed.len() == width * height * 3 {
-                                            let size = [width, height];
-                                            let image = egui::ColorImage::from_rgb(size, &processed);
+                                    if use_thumbnails
+                                        && let Some(image) = Self::extract_best_thumbnail(&mut raw) {
                                             let _ = tx_clone.send((path.clone(), Some(image)));
                                             success = true;
+                                        }
+                                    if !success {
+                                        raw.set_use_camera_wb(true);
+                                        if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
+                                            let width = processed.width() as usize;
+                                            let height = processed.height() as usize;
+
+                                            // Safety check: Ensure buffer size matches dimensions (RGB = 3 bytes)
+                                            if processed.len() == width * height * 3 {
+                                                let size = [width, height];
+                                                let image = egui::ColorImage::from_rgb(size, &processed);
+                                                let _ = tx_clone.send((path.clone(), Some(image)));
+                                                success = true;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
                     if !success {
                         let _ = tx_clone.send((path, None));
@@ -277,6 +287,25 @@ impl GuiApp {
         (tx, result_rx)
     }
 
+    /// Extract the best (largest) thumbnail from a RAW file
+    fn extract_best_thumbnail(raw: &mut rsraw::RawImage) -> Option<egui::ColorImage> {
+        let thumbs = raw.extract_thumbs().ok()?;
+
+        // Find the largest JPEG thumbnail
+        let best_thumb = thumbs.into_iter()
+            .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
+            .max_by_key(|t| t.width * t.height)?;
+
+        // Decode JPEG thumbnail using image crate
+        let img = image::load_from_memory(&best_thumb.data).ok()?;
+        let rgb = img.to_rgb8();
+        let (width, height) = rgb.dimensions();
+
+        Some(egui::ColorImage::from_rgb(
+                [width as usize, height as usize],
+                rgb.as_raw()
+        ))
+    }
     pub fn with_move_target(mut self, target: Option<std::path::PathBuf>) -> Self {
         self.state.move_target = target;
         self
@@ -313,11 +342,10 @@ impl GuiApp {
         let mut dirs = Vec::new();
 
         // Add parent directory if it exists
-        if let Some(ref current) = self.current_dir {
-            if let Some(parent) = current.parent() {
+        if let Some(ref current) = self.current_dir
+            && let Some(parent) = current.parent() {
                 dirs.push(parent.to_path_buf());
             }
-        }
 
         // Add stored subdirectories
         dirs.extend(self.subdirs.clone());
@@ -334,26 +362,23 @@ impl GuiApp {
 
     /// Go up one directory level
     fn go_up_directory(&mut self) {
-        if let Some(ref current) = self.current_dir.clone() {
-            if let Some(parent) = current.parent() {
+        if let Some(ref current) = self.current_dir.clone()
+            && let Some(parent) = current.parent() {
                 self.change_directory(parent.to_path_buf());
             }
-        }
     }
 
     /// Updates the resolution metadata for a specific file path
     fn update_file_resolution(&mut self, path: &Path, w: u32, h: u32) {
         // Fast path: Check current item first (most common case during view)
-        if let Some(group) = self.state.groups.get_mut(self.state.current_group_idx) {
-            if let Some(file) = group.get_mut(self.state.current_file_idx) {
-                if file.path == path {
+        if let Some(group) = self.state.groups.get_mut(self.state.current_group_idx)
+            && let Some(file) = group.get_mut(self.state.current_file_idx)
+                && file.path == path {
                     if file.resolution.is_none() {
                         file.resolution = Some((w, h));
                     }
                     return;
                 }
-            }
-        }
 
         // Scan to update resolution for preloaded/background items
         for group in &mut self.state.groups {
@@ -427,9 +452,8 @@ impl GuiApp {
         let current_g = self.state.current_group_idx;
         let current_f = self.state.current_file_idx;
 
-        if let Some((lg, lf)) = self.last_preload_pos {
-            if lg == current_g && lf == current_f { return; }
-        }
+        if let Some((lg, lf)) = self.last_preload_pos
+            && lg == current_g && lf == current_f { return; }
         self.last_preload_pos = Some((current_g, current_f));
 
         let preload_limit = self.ctx.gui_config.preload_count.unwrap_or(10);
@@ -514,8 +538,8 @@ impl GuiApp {
             }
         }
 
-        if let Some(rx) = &self.scan_rx {
-            if let Ok((new_groups, new_infos, new_subdirs)) = rx.try_recv() {
+        if let Some(rx) = &self.scan_rx
+            && let Ok((new_groups, new_infos, new_subdirs)) = rx.try_recv() {
                 // Restore state logic
                 let mut target_group_paths: Vec<std::path::PathBuf> = Vec::new();
                 let mut target_selected_path = None;
@@ -564,7 +588,6 @@ impl GuiApp {
 
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.get_title_string()));
             }
-        }
     }
 
     // Helper to render texture with pan/zoom logic
@@ -672,7 +695,7 @@ impl GuiApp {
         // Then rotation spins it to match target_rect (visual).
         egui::Image::from_texture((texture_id, texture_size))
             .rotate(total_angle, egui::Vec2::splat(0.5))
-            .paint_at(&ui, paint_rect);
+            .paint_at(ui, paint_rect);
 
         // --- 7. Interaction ---
         if response.dragged() {
@@ -704,12 +727,11 @@ impl eframe::App for GuiApp {
             self.initial_scale_applied = true;
         }
 
-        if let Some(set_time) = self.status_set_time {
-            if set_time.elapsed() > std::time::Duration::from_secs(3) {
+        if let Some(set_time) = self.status_set_time
+            && set_time.elapsed() > std::time::Duration::from_secs(3) {
                 self.state.status_message = None;
                 self.status_set_time = None;
             }
-        }
 
         // Receive finished raw images from worker thread pool
         while let Ok((path, maybe_image)) = self.raw_preload_rx.try_recv() {
@@ -746,22 +768,19 @@ impl eframe::App for GuiApp {
 
         // Directory picker navigation
         if self.show_dir_picker {
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                if self.dir_picker_selection > 0 {
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                && self.dir_picker_selection > 0 {
                     self.dir_picker_selection -= 1;
                 }
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                if self.dir_picker_selection + 1 < self.dir_list.len() {
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown))
+                && self.dir_picker_selection + 1 < self.dir_list.len() {
                     self.dir_picker_selection += 1;
                 }
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if let Some(selected_dir) = self.dir_list.get(self.dir_picker_selection).cloned() {
+            if ctx.input(|i| i.key_pressed(egui::Key::Enter))
+                && let Some(selected_dir) = self.dir_list.get(self.dir_picker_selection).cloned() {
                     self.show_dir_picker = false;
                     self.change_directory(selected_dir);
                 }
-            }
         } else if !self.state.is_loading && self.state.renaming.is_none() {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) { *intent.borrow_mut() = Some(InputIntent::NextItem); }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) { *intent.borrow_mut() = Some(InputIntent::PrevItem); }
@@ -818,7 +837,13 @@ impl eframe::App for GuiApp {
         }
 
         // Dialogs (Confirmation, Rename, etc.)
+        // Handle Y/N keys for confirmation dialogs
         if self.state.show_confirmation {
+            if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
+                self.state.handle_input(InputIntent::ConfirmDelete);
+            } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
+                self.state.handle_input(InputIntent::Cancel);
+            }
             let marked_count = self.state.marked_for_deletion.len();
             let use_trash = self.state.use_trash;
             egui::Window::new("Confirm Deletion").collapsible(false).show(ctx, |ui| {
@@ -829,6 +854,11 @@ impl eframe::App for GuiApp {
        }
 
        if self.state.show_delete_immediate_confirmation {
+           if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
+               self.state.handle_input(InputIntent::ConfirmDeleteImmediate);
+           } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
+               self.state.handle_input(InputIntent::Cancel);
+           }
            egui::Window::new("Confirm Delete").collapsible(false).show(ctx, |ui| {
                let filename = self.state.get_current_image_path().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_default();
                ui.label(format!("Delete current file?\n{}", filename));
@@ -838,6 +868,11 @@ impl eframe::App for GuiApp {
        }
 
        if self.state.show_move_confirmation {
+           if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
+               self.state.handle_input(InputIntent::ConfirmMoveMarked);
+           } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
+               self.state.handle_input(InputIntent::Cancel);
+           }
            egui::Window::new("Confirm Move").collapsible(false).show(ctx, |ui| {
                let target = self.state.move_target.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                ui.label(format!("Move marked files to:\n{}", target));
@@ -907,8 +942,8 @@ impl eframe::App for GuiApp {
         }
 
         // Slideshow
-        if let Some(interval) = self.state.slideshow_interval {
-            if !self.state.slideshow_paused && !self.state.is_loading && !self.state.groups.is_empty() {
+        if let Some(interval) = self.state.slideshow_interval
+            && !self.state.slideshow_paused && !self.state.is_loading && !self.state.groups.is_empty() {
                 let should_advance = match self.slideshow_last_advance {
                     Some(last) => last.elapsed().as_secs_f32() >= interval,
                     None => true,
@@ -920,7 +955,6 @@ impl eframe::App for GuiApp {
                 }
                 ctx.request_repaint_after(std::time::Duration::from_secs_f32(0.1));
             }
-        }
 
         if let Some(err_text) = self.state.error_popup.clone() {
             egui::Window::new("Error").show(ctx, |ui| { ui.label(err_text); if ui.button("OK").clicked() { self.state.handle_input(InputIntent::Cancel); } });
@@ -952,7 +986,7 @@ impl eframe::App for GuiApp {
 
                      let move_status = if self.state.move_target.is_some() { " | [M]ove" } else { "" };
                      let del_key = if self.state.view_mode { " | [Del]ete" } else { "" };
-                     let rot_str = if self.state.manual_rotation % 4 != 0 { format!(" | [O] Rot: {}°", (self.state.manual_rotation % 4) * 90) } else { "".to_string() };
+                     let rot_str = if !self.state.manual_rotation.is_multiple_of(4) { format!(" | [O] Rot: {}°", (self.state.manual_rotation % 4) * 90) } else { "".to_string() };
 
                      let pos_str = if !self.state.groups.is_empty() {
                          let total: usize = self.state.groups.iter().map(|g| g.len()).sum();
@@ -984,8 +1018,8 @@ impl eframe::App for GuiApp {
             let panel_max_width = window_width * 0.5;
             let panel_response = egui::SidePanel::left("list_panel").resizable(true).default_width(self.panel_width).max_width(panel_max_width).show(ctx, |ui| {
                 // Show current directory header in view mode
-                if self.state.view_mode {
-                    if let Some(ref current_dir) = self.current_dir {
+                if self.state.view_mode
+                    && let Some(ref current_dir) = self.current_dir {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("📁").size(16.0));
                             ui.add(egui::Label::new(
@@ -1000,7 +1034,6 @@ impl eframe::App for GuiApp {
                         });
                         ui.separator();
                     }
-                }
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     // Show progress when loading
@@ -1022,8 +1055,8 @@ impl eframe::App for GuiApp {
                     let mut dir_to_open: Option<std::path::PathBuf> = None;
                     if self.state.view_mode && !self.state.is_loading {
                         // Parent directory entry
-                        if let Some(ref current) = self.current_dir {
-                            if let Some(parent) = current.parent() {
+                        if let Some(ref current) = self.current_dir
+                            && let Some(parent) = current.parent() {
                                 let resp = ui.add(egui::Button::new(
                                     egui::RichText::new("📁 ..")
                                         .color(egui::Color32::YELLOW)
@@ -1032,7 +1065,6 @@ impl eframe::App for GuiApp {
                                     dir_to_open = Some(parent.to_path_buf());
                                 }
                             }
-                        }
 
                         // Subdirectories
                         for subdir in &self.subdirs {
@@ -1055,8 +1087,9 @@ impl eframe::App for GuiApp {
                         }
                     }
 
-                    // We collect actions to perform after the loop
+                            // We collect actions to perform after the loop
                     let mut action_rename = false;
+                    let mut action_delete = false;
                     let mut new_selection = None;
 
                     for (g_idx, group) in self.state.groups.iter().enumerate() {
@@ -1102,8 +1135,17 @@ impl eframe::App for GuiApp {
                                 new_selection = Some((g_idx, f_idx));
                             }
 
-                            // Restore Context Menu
-                            resp.context_menu(|ui| { if ui.button("Rename").clicked() { ui.close(); action_rename = true; } ui.label("Press 'R' to rename selected."); });
+                            // Context Menu with Rename and Delete
+                            resp.context_menu(|ui| {
+                                if ui.button("Rename (R)").clicked() {
+                                    ui.close();
+                                    action_rename = true;
+                                }
+                                if ui.button("Delete (Del)").clicked() {
+                                    ui.close();
+                                    action_delete = true;
+                                }
+                            });
 
                             if is_selected && self.state.selection_changed { resp.scroll_to_me(Some(egui::Align::Center)); }
 
@@ -1132,11 +1174,21 @@ impl eframe::App for GuiApp {
                         self.state.selection_changed = true;
                     }
                     if action_rename {
+                        // Set rename_input before triggering StartRename (same as keyboard handling)
+                        if let Some(path) = self.state.get_current_image_path() {
+                            self.rename_input = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        }
                         self.state.handle_input(InputIntent::StartRename);
+                    }
+                    if action_delete {
+                        self.state.handle_input(InputIntent::DeleteImmediate);
                     }
                     if let Some(dir) = dir_to_open {
                         self.change_directory(dir);
                     }
+
+                    // Reset selection_changed after scroll has been applied
+                    self.state.selection_changed = false;
                 });
             });
             // Track panel width for saving
@@ -1156,13 +1208,11 @@ impl eframe::App for GuiApp {
                      match img_src.load_for_size(ui.ctx(), ui.available_size()) {
                          Ok(egui::load::TexturePoll::Ready { texture }) => {
                              // Update metadata with actual resolution if missing
-                             if let Some(group) = self.state.groups.get_mut(current_group_idx) {
-                                 if let Some(file) = group.get_mut(self.state.current_file_idx) {
-                                     if file.resolution.is_none() {
+                             if let Some(group) = self.state.groups.get_mut(current_group_idx)
+                                 && let Some(file) = group.get_mut(self.state.current_file_idx)
+                                     && file.resolution.is_none() {
                                          file.resolution = Some((texture.size.x as u32, texture.size.y as u32));
                                      }
-                                 }
-                             }
 
                              self.render_image_texture(ui, texture.id, texture.size, available_rect, current_group_idx);
                          },
@@ -1205,11 +1255,10 @@ impl eframe::App for GuiApp {
                 .or(i.viewport().inner_rect)
                 .map(|r| (r.width() as u32, r.height() as u32))
         });
-        if let Some((w, h)) = size {
-            if w > 100 && h > 100 {
+        if let Some((w, h)) = size
+            && w > 100 && h > 100 {
                 self.last_window_size = Some((w, h));
             }
-        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
