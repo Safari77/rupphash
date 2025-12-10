@@ -6,18 +6,18 @@ use clap::Parser;
 use jiff::{Timestamp};
 use std::collections::{HashMap};
 
-use crate::db::AppContext;
+use crate::db::{AppContext, HashAlgorithm};
 use crate::scanner::ScanConfig;
-// Import the shared helper
 use crate::state::get_bit_identical_counts;
 
-mod rupphash;
-mod mih;
+mod phash;
+mod pdqhash;
 mod db;
 mod ui;
 mod gui;
 mod state;
 mod scanner;
+mod hamminghash;
 
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
@@ -25,6 +25,7 @@ pub struct FileMetadata {
     pub size: u64,
     pub modified: DateTime<Utc>,
     pub phash: u64,
+    pub pdqhash: Option<[u8; 32]>,
     pub resolution: Option<(u32, u32)>,
     pub content_hash: [u8; 32],
     pub orientation: u8, // Added: EXIF orientation (1-8)
@@ -84,65 +85,13 @@ pub fn format_relative_time(ts: Timestamp) -> String {
 }
 
 // --- Analysis Logic ---
-// Moved to phdupes.rs if needed, but keeping existing structure
 pub fn analyze_group(
     files: &mut Vec<FileMetadata>,
     group_by: &str,
     ext_priorities: &HashMap<String, usize>
 ) -> GroupInfo {
-    if files.is_empty() {
-        return GroupInfo { max_dist: 0, status: GroupStatus::None };
-    }
-
-    let mut counts = HashMap::new();
-    for f in files.iter() {
-        *counts.entry(f.content_hash).or_insert(0) += 1;
-    }
-
-    let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) = files.drain(..)
-        .partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
-
-    let sorter = |a: &FileMetadata, b: &FileMetadata| {
-        if group_by == "date" {
-            a.modified.cmp(&b.modified)
-        } else {
-            let ext_a = a.path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-            let ext_b = b.path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-
-            let prio_a = ext_priorities.get(&ext_a).unwrap_or(&usize::MAX);
-            let prio_b = ext_priorities.get(&ext_b).unwrap_or(&usize::MAX);
-
-            match prio_a.cmp(prio_b) {
-                std::cmp::Ordering::Equal => b.size.cmp(&a.size),
-                other => other,
-            }
-        }
-    };
-
-    duplicates.sort_by(sorter);
-    unique.sort_by(sorter);
-
-    files.append(&mut duplicates);
-    files.append(&mut unique);
-
-    let pivot_phash = files[0].phash;
-    let max_d = files.iter().map(|f| (f.phash ^ pivot_phash).count_ones()).max().unwrap_or(0);
-
-    let has_duplicates = !counts.values().all(|&c| c == 1);
-    let all_identical = counts.len() == 1;
-
-    let status = if all_identical {
-        GroupStatus::AllIdentical
-    } else if has_duplicates {
-        GroupStatus::SomeIdentical
-    } else {
-        GroupStatus::None
-    };
-
-    GroupInfo {
-        max_dist: max_d,
-        status,
-    }
+    // Delegate to scanner's analyze_group with phash mode
+    scanner::analyze_group(files, group_by, ext_priorities, false)
 }
 
 // --- CLI Definition ---
@@ -157,16 +106,13 @@ struct Cli {
     rehash: bool,
     #[arg(long)]
     rehash_only: bool,
-    #[arg(long, default_value_t = 5)]
-    similarity: u32,
+    /// Similarity threshold (default: 5 for pHash, 40 for PDQ hash)
+    #[arg(long)]
+    similarity: Option<u32>,
 
-    /// Sort order: name, date, date-desc, size, size-desc, random
+    /// Sort order with --view: name, name-desc, name-natural, name-natural-desc, date, date-desc, size, size-desc, random
     #[arg(long, default_value = "name")]
     sort: String,
-
-    // Legacy alias for --sort
-    #[arg(long, default_value = "size", hide = true)]
-    group_by: String,
 
     #[arg(long)]
     use_tui: bool,
@@ -198,15 +144,36 @@ struct Cli {
     /// Directory to move marked files to
     #[arg(long, value_name = "DIR")]
     move_marked: Option<PathBuf>,
+
+    /// Use embedded thumbnails from RAW files instead of processing
+    #[arg(long)]
+    raw_thumbnails: bool,
+
+    /// Use PDQ hash instead of pHash for duplicate detection
+    #[arg(long)]
+    pdqhash: bool,
 }
 
 impl Cli {
     fn validate(&self) -> Result<(), String> {
-        if self.similarity > crate::mih::MAX_SIMILARITY {
-            return Err(format!("Similarity must be 0-{}. Got {}.", crate::mih::MAX_SIMILARITY, self.similarity));
+        // Validate similarity based on hash algorithm
+        let max_similarity = if self.pdqhash {
+            crate::hamminghash::MAX_SIMILARITY_256
+        } else {
+            crate::hamminghash::MAX_SIMILARITY_64
+        };
+
+        let similarity = self.get_similarity();
+        if similarity > max_similarity {
+            return Err(format!(
+                "Similarity must be 0-{} for {}. Got {}.",
+                max_similarity,
+                if self.pdqhash { "PDQ hash" } else { "pHash" },
+                similarity
+            ));
         }
 
-        let valid_sorts = ["name", "date", "date-desc", "size", "size-desc", "random"];
+        let valid_sorts = ["name", "name-desc", "name-natural", "name-natural-desc", "date", "date-desc", "size", "size-desc", "random"];
         let sort_lower = self.sort.to_lowercase();
         if !valid_sorts.contains(&sort_lower.as_str()) {
             return Err(format!("Invalid sort '{}'. Use one of: {}", self.sort, valid_sorts.join(", ")));
@@ -225,41 +192,35 @@ impl Cli {
             }
         }
 
-        if let Some(secs) = self.slideshow {
-            if secs <= 0.0 {
+        if let Some(secs) = self.slideshow
+            && secs <= 0.0 {
                 return Err("Slideshow interval must be positive".to_string());
             }
-        }
 
         Ok(())
-    }
-
-    /// Get effective sort mode (handles legacy group_by)
-    fn effective_sort(&self) -> String {
-        // If --sort was explicitly set to something other than default, use it
-        // Otherwise fall back to group_by for backwards compatibility
-        if self.sort != "size" {
-            self.sort.to_lowercase()
-        } else if self.group_by != "size" {
-            // Legacy: map old group_by values
-            match self.group_by.to_lowercase().as_str() {
-                "date" => "date".to_string(),
-                _ => "size".to_string(),
-            }
-        } else {
-            "size".to_string()
-        }
     }
 
     /// Check if we're in view mode (explicit or implied)
     fn is_view_mode(&self) -> bool {
         self.view || self.shuffle || self.slideshow.is_some()
     }
+
+    /// Get the hash algorithm based on CLI flags
+    fn hash_algorithm(&self) -> HashAlgorithm {
+        if self.pdqhash {
+            HashAlgorithm::PdqHash
+        } else {
+            HashAlgorithm::PHash
+        }
+    }
+
+    /// Get similarity threshold with algorithm-specific defaults
+    fn get_similarity(&self) -> u32 {
+        self.similarity.unwrap_or(if self.pdqhash { 40 } else { 5 })
+    }
 }
 
 // --- CLI Helpers ---
-// Removed local `get_bit_identical_counts` in favor of state::get_bit_identical_counts
-
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 { return format!("{} B", bytes); }
     let kb = bytes as f64 / 1024.0;
@@ -292,7 +253,6 @@ fn run_interactive_cli_delete(
         }
         println!("========================================================");
 
-        // REFACTORED: Use shared helper
         let counts = get_bit_identical_counts(group);
 
         for (i, file) in group.iter().enumerate() {
@@ -350,8 +310,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     image_extras::register();
 
-    let sort_order = args.effective_sort();
+    let sort_order = args.sort.to_lowercase();
     let is_view_mode = args.is_view_mode();
+    let hash_algorithm = args.hash_algorithm();
 
     // View mode uses GUI by default unless --use-tui specified
     let use_gui = args.use_gui || (is_view_mode && !args.use_tui);
@@ -366,6 +327,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.use_trash,
             args.move_marked.clone(),
             args.slideshow,
+            args.raw_thumbnails,
         );
         if let Err(e) = app.run() {
             eprintln!("GUI Error: {}", e);
@@ -373,13 +335,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Duplicate detection modes require AppContext
-    let ctx = AppContext::new()?;
+    // Duplicate detection modes require AppContext with selected algorithm
+    let ctx = AppContext::with_algorithm(hash_algorithm)?;
 
+    let similarity = args.get_similarity();
     let scan_config = ScanConfig {
         paths: args.paths.clone(),
         rehash: args.rehash,
-        similarity: args.similarity,
+        similarity,
         group_by: sort_order.clone(),
         extensions: ctx.grouping_config.extensions.clone(),
         ignore_same_stem: ctx.grouping_config.ignore_same_stem,
@@ -397,14 +360,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|(i, e)| (e.to_lowercase(), i))
             .collect();
 
-        println!("Launching GUI...");
+        println!("Launching GUI with {} algorithm (similarity: {})...",
+            if args.pdqhash { "PDQ hash" } else { "pHash" },
+            similarity);
         let app = gui::GuiApp::new(
             ctx,
             scan_config,
             args.relative_times,
             args.use_trash,
             sort_order,
-            ext_priorities
+            ext_priorities,
+            args.raw_thumbnails,
         ).with_move_target(args.move_marked.clone());
 
         if let Err(e) = app.run() {
@@ -415,7 +381,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // For non-GUI modes, scan first then display results
     let (final_groups, final_infos) = scanner::scan_and_group(&scan_config, &ctx, None);
-    println!("Found {} duplicate groups.", final_groups.len());
+    println!("Found {} duplicate groups using {}.",
+        final_groups.len(),
+        if args.pdqhash { "PDQ hash" } else { "pHash" });
 
     if args.use_tui {
         let ext_priorities: HashMap<String, usize> = ctx.grouping_config.extensions.iter()
@@ -429,7 +397,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.relative_times,
             args.use_trash,
             sort_order,
-            ext_priorities
+            ext_priorities,
+            args.pdqhash,
         );
         state.move_target = args.move_marked.clone();
 
@@ -450,7 +419,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  GroupStatus::None => println!("\n--- Group {} (Max Dist: {}) ---", i + 1, info.max_dist),
             }
 
-            // REFACTORED: Use shared helper
             let counts = get_bit_identical_counts(group);
 
             for file in group {

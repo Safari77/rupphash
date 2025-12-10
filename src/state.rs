@@ -53,7 +53,7 @@ pub fn format_path_depth(path: &Path, depth: usize) -> String {
     let take = depth + 1;
     let len = components.len();
 
-    let start = if len > take { len - take } else { 0 };
+    let start = len.saturating_sub(take);
 
     let mut out = PathBuf::new();
     for c in &components[start..] {
@@ -104,6 +104,7 @@ pub struct AppState {
     pub slideshow_paused: bool,
     pub is_fullscreen: bool,
     pub manual_rotation: u8, // Added: 0=0, 1=90, 2=180, 3=270
+    pub use_pdqhash: bool,
 }
 
 impl AppState {
@@ -113,7 +114,8 @@ impl AppState {
         show_relative_times: bool,
         use_trash: bool,
         group_by: String,
-        ext_priorities: HashMap<String, usize>
+        ext_priorities: HashMap<String, usize>,
+        use_pdqhash: bool,
     ) -> Self {
         let count = groups.iter().map(|g| g.len()).sum();
         Self {
@@ -144,6 +146,7 @@ impl AppState {
             slideshow_paused: false,
             is_fullscreen: false,
             manual_rotation: 0, // Init
+            use_pdqhash,
         }
     }
 
@@ -223,8 +226,11 @@ impl AppState {
             InputIntent::ExecuteDelete => {
                 if !self.marked_for_deletion.is_empty() {
                     self.show_confirmation = true;
+                } else if self.get_current_image_path().is_some() {
+                    // If nothing marked, delete current file
+                    self.show_delete_immediate_confirmation = true;
                 } else {
-                    self.set_status("No files marked.".to_string(), false);
+                    self.set_status("No files to delete.".to_string(), false);
                 }
             },
             InputIntent::DeleteImmediate => {
@@ -412,7 +418,7 @@ impl AppState {
             let mut i = 0;
             while i < self.groups.len() {
                 if self.groups[i].is_empty() { self.groups.remove(i); self.group_infos.remove(i); if self.current_group_idx >= i && self.current_group_idx > 0 { self.current_group_idx -= 1; } }
-                else { self.group_infos[i] = analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities); i += 1; }
+                else { self.group_infos[i] = analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities, self.use_pdqhash); i += 1; }
             }
             if self.groups.is_empty() { self.current_group_idx = 0; self.current_file_idx = 0; }
             else {
@@ -544,7 +550,7 @@ impl AppState {
                         self.current_group_idx -= 1;
                     }
                 } else {
-                    self.group_infos[i] = analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities);
+                    self.group_infos[i] = analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities, self.use_pdqhash);
                     i += 1;
                 }
             }

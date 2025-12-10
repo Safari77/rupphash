@@ -95,7 +95,7 @@ impl DctPhash {
     }
 
     /// Calculates a rotation-invariant 64-bit perceptual hash.
-    /// It computes the standard hash and then finds the minimum hash 
+    /// It computes the standard hash and then finds the minimum hash
     /// among all 90-degree rotations (0, 90, 180, 270).
     #[allow(dead_code)]
     pub fn hash_image_invariant(&self, img: &DynamicImage) -> u64 {
@@ -221,4 +221,61 @@ pub fn rotate_hash_270(hash: u64) -> u64 {
         }
     }
     result
+}
+
+// =========================================================================
+//  Flip Operations (Bitwise Operations on u64)
+// =========================================================================
+
+/// Flips a DCT pHash horizontally.
+/// Logic: Horizontal flip changes sign of odd horizontal frequencies.
+pub fn flip_hash_horizontal(hash: u64) -> u64 {
+    let mut result = 0u64;
+    for i in 0..64 {
+        let x = i % 8;
+        let flip = x % 2 != 0;
+        let bit = (hash >> (63 - i)) & 1;
+        let final_bit = if flip { bit ^ 1 } else { bit };
+        result |= final_bit << (63 - i);
+    }
+    result
+}
+
+/// Flips a DCT pHash vertically.
+/// Logic: Vertical flip changes sign of odd vertical frequencies.
+pub fn flip_hash_vertical(hash: u64) -> u64 {
+    let mut result = 0u64;
+    for i in 0..64 {
+        let y = i / 8;
+        let flip = y % 2 != 0;
+        let bit = (hash >> (63 - i)) & 1;
+        let final_bit = if flip { bit ^ 1 } else { bit };
+        result |= final_bit << (63 - i);
+    }
+    result
+}
+
+// =========================================================================
+//  All 8 Dihedral Variants (Store 1 / Query 8 Strategy)
+// =========================================================================
+
+/// Generates all 8 dihedral variants of a pHash.
+/// Returns: [original, rot90, rot180, rot270, flip_h, flip_h+rot90, flip_h+rot180, flip_h+rot270]
+///
+/// This is used for the "Store 1 / Query 8" strategy:
+/// - Store: Only the original pHash (Rotation 0°)
+/// - Query: Generate all 8 variants and check if any match stored hashes
+pub fn generate_dihedral_hashes(hash: u64) -> Vec<u64> {
+    let h0 = hash;
+    let h90 = rotate_hash_90(hash);
+    let h180 = rotate_hash_180(hash);
+    let h270 = rotate_hash_270(hash);
+
+    // Flipped variants
+    let h_flip = flip_hash_horizontal(hash);
+    let h_flip_90 = rotate_hash_90(h_flip);
+    let h_flip_180 = rotate_hash_180(h_flip);
+    let h_flip_270 = rotate_hash_270(h_flip);
+
+    vec![h0, h90, h180, h270, h_flip, h_flip_90, h_flip_180, h_flip_270]
 }

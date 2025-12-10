@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::{env, process};
 
-use crate::rupphash::*;
+use crate::phash::*;
 
-mod rupphash;
+mod phash;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
