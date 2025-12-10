@@ -28,6 +28,7 @@ pub struct FileMetadata {
     pub resolution: Option<(u32, u32)>,
     pub content_hash: [u8; 32],
     pub orientation: u8, // Added: EXIF orientation (1-8)
+    pub dev_inode: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -15,7 +15,7 @@ use jiff::Timestamp;
 // Removed unused import: crate::FileMetadata
 use crate::GroupStatus;
 use crate::format_relative_time;
-use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_counts};
+use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_hardlink_groups};
 
 pub struct TuiApp {
     state: AppState,
@@ -174,7 +174,7 @@ impl TuiApp {
 
             let (header_text, header_color) = match info.status {
                 GroupStatus::AllIdentical => (
-                    format!("--- Group {} - Bit-identical ---", g_idx + 1),
+                    format!("--- Group {} - Bit-identical (hardlinks in magenta) ---", g_idx + 1),
                     Color::Green
                 ),
                 GroupStatus::SomeIdentical => (
@@ -193,18 +193,24 @@ impl TuiApp {
             ])));
 
             let counts = get_bit_identical_counts(group);
+            let hardlink_groups = get_hardlink_groups(group);
 
             for (f_idx, file) in group.iter().enumerate() {
                 let is_marked = self.state.marked_for_deletion.contains(&file.path);
                 let is_selected = g_idx == self.state.current_group_idx && f_idx == self.state.current_file_idx;
                 let is_bit_identical = *counts.get(&file.content_hash).unwrap_or(&0) > 1;
+                let is_hardlinked = file.dev_inode
+                    .map(|di| hardlink_groups.contains_key(&di))
+                    .unwrap_or(false);
 
                 let style = if is_selected {
-                     Style::default().fg(Color::Blue)
+                    Style::default().fg(Color::Blue)
                 } else if is_marked {
-                     Style::default().fg(Color::Red)
+                    Style::default().fg(Color::Red)
+                } else if is_hardlinked {
+                   Style::default().fg(Color::Magenta)
                 } else if is_bit_identical {
-                     Style::default().fg(Color::Green)
+                    Style::default().fg(Color::Green)
                 } else {
                      Style::default()
                 };

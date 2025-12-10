@@ -167,6 +167,7 @@ pub fn scan_and_group(
         let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
         let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
         let inode = metadata.ino();
+        let dev_inode = Some((metadata.dev(), metadata.ino()));
 
         // Meta Key
         let mut mh = blake3::Hasher::new_keyed(&ctx_ref.meta_key);
@@ -223,7 +224,9 @@ pub fn scan_and_group(
 
         if new_meta.is_some() || new_phash.is_some() { let _ = tx.send((new_meta, new_phash)); }
 
-        Some(FileMetadata { path: path.clone(), size, modified: mtime_utc, phash, resolution, content_hash: ck, orientation })
+        Some(FileMetadata {
+            path: path.clone(), size, modified: mtime_utc, phash, resolution,
+            content_hash: ck, orientation, dev_inode, })
     }).collect();
 
     drop(tx);
@@ -461,6 +464,7 @@ pub fn scan_for_view(
             resolution: None,
             content_hash: [0u8; 32], // Not needed for view mode
             orientation,
+            dev_inode: None,
         })
     }).collect();
 
