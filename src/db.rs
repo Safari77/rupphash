@@ -7,8 +7,17 @@ use serde::{Deserialize, Serialize};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 const CONFIG_FILE_NAME: &str = "phdupes.conf";
-const DB_FILE_NAME: &str = "phdupes";
+const DB_FILE_NAME_PHASH: &str = "phdupes_phash";
+const DB_FILE_NAME_PDQHASH: &str = "phdupes_pdqhash";
 use crate::scanner::RAW_EXTS;
+
+/// Hash algorithm selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashAlgorithm {
+    #[default]
+    PHash,
+    PdqHash,
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GroupingConfig {
@@ -68,18 +77,29 @@ struct Config {
 
 pub struct AppContext {
     pub env: Arc<Environment>,
-    pub phash_db: Database,
+    pub hash_db: Database,
     pub meta_db: Database,
     pub content_key: [u8; 32],
     pub meta_key: [u8; 32],
     pub grouping_config: GroupingConfig,
     pub gui_config: GuiConfig,
+    pub hash_algorithm: HashAlgorithm,
 }
 
-pub type DbUpdate = (Option<([u8; 32], [u8; 32])>, Option<([u8; 32], u64)>);
+/// Database update type - supports both pHash (u64) and PDQ hash ([u8; 32])
+pub enum HashValue {
+    PHash(u64),
+    PdqHash([u8; 32]),
+}
+
+pub type DbUpdate = (Option<([u8; 32], [u8; 32])>, Option<([u8; 32], HashValue)>);
 
 impl AppContext {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_algorithm(HashAlgorithm::PHash)
+    }
+
+    pub fn with_algorithm(algorithm: HashAlgorithm) -> Result<Self, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("No config dir found")?;
         let cache_dir = dirs::cache_dir().ok_or("No cache dir found")?;
 
@@ -87,7 +107,13 @@ impl AppContext {
         fs::create_dir_all(&cache_dir)?;
 
         let config_path = config_dir.join(CONFIG_FILE_NAME);
-        let db_path = cache_dir.join(DB_FILE_NAME);
+
+        // Select database path based on algorithm
+        let db_file_name = match algorithm {
+            HashAlgorithm::PHash => DB_FILE_NAME_PHASH,
+            HashAlgorithm::PdqHash => DB_FILE_NAME_PDQHASH,
+        };
+        let db_path = cache_dir.join(db_file_name);
 
         let config = if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
@@ -139,26 +165,41 @@ impl AppContext {
             .set_max_dbs(5)
             .open(&db_path)?;
 
-        let phash_db = env.open_db(None)?;
+        let hash_db = env.open_db(None)?;
         let meta_db = env.create_db(Some("file_metadata"), DatabaseFlags::empty())?;
 
         Ok(Self {
             env: Arc::new(env),
-            phash_db,
+            hash_db,
             meta_db,
             content_key,
             meta_key,
             grouping_config: config.grouping,
             gui_config: config.gui,
+            hash_algorithm: algorithm,
         })
     }
 
+    /// Get pHash (64-bit) from database
     pub fn get_phash(&self, content_hash: &[u8; 32]) -> Result<Option<u64>, lmdb::Error> {
         let txn = self.env.begin_ro_txn()?;
-        match txn.get(self.phash_db, content_hash) {
+        match txn.get(self.hash_db, content_hash) {
             Ok(bytes) => {
                 let arr: [u8; 8] = bytes.try_into().map_err(|_| lmdb::Error::Corrupted)?;
                 Ok(Some(u64::from_le_bytes(arr)))
+            },
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Get PDQ hash (256-bit) from database
+    pub fn get_pdqhash(&self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, lmdb::Error> {
+        let txn = self.env.begin_ro_txn()?;
+        match txn.get(self.hash_db, content_hash) {
+            Ok(bytes) => {
+                let arr: [u8; 32] = bytes.try_into().map_err(|_| lmdb::Error::Corrupted)?;
+                Ok(Some(arr))
             },
             Err(lmdb::Error::NotFound) => Ok(None),
             Err(e) => Err(e),
@@ -180,11 +221,11 @@ impl AppContext {
     pub fn start_db_writer(&self, rx: Receiver<DbUpdate>) -> thread::JoinHandle<()> {
         let env = self.env.clone();
         let meta_db = self.meta_db;
-        let phash_db = self.phash_db;
+        let hash_db = self.hash_db;
 
         thread::spawn(move || {
             let mut meta_updates = Vec::new();
-            let mut phash_updates = Vec::new();
+            let mut hash_updates: Vec<([u8; 32], HashValue)> = Vec::new();
             let mut last_flush = Instant::now();
             let flush_interval = Duration::from_secs(1);
             let max_buffer = 1000;
@@ -193,22 +234,22 @@ impl AppContext {
                 let msg = rx.recv_timeout(Duration::from_millis(100));
 
                 match msg {
-                    Ok((meta_op, phash_op)) => {
+                    Ok((meta_op, hash_op)) => {
                         if let Some(m) = meta_op { meta_updates.push(m); }
-                        if let Some(p) = phash_op { phash_updates.push(p); }
+                        if let Some(h) = hash_op { hash_updates.push(h); }
                     },
                     Err(RecvTimeoutError::Timeout) => {},
                     Err(RecvTimeoutError::Disconnected) => {
-                        let _ = Self::write_batch(&env, meta_db, phash_db, &meta_updates, &phash_updates);
+                        let _ = Self::write_batch(&env, meta_db, hash_db, &meta_updates, &hash_updates);
                         break;
                     }
                 }
 
-                if (last_flush.elapsed() >= flush_interval || meta_updates.len() >= max_buffer || phash_updates.len() >= max_buffer)
-                    && (!meta_updates.is_empty() || !phash_updates.is_empty()) {
-                        if Self::write_batch(&env, meta_db, phash_db, &meta_updates, &phash_updates).is_ok() {
+                if (last_flush.elapsed() >= flush_interval || meta_updates.len() >= max_buffer || hash_updates.len() >= max_buffer)
+                    && (!meta_updates.is_empty() || !hash_updates.is_empty()) {
+                        if Self::write_batch(&env, meta_db, hash_db, &meta_updates, &hash_updates).is_ok() {
                             meta_updates.clear();
-                            phash_updates.clear();
+                            hash_updates.clear();
                         }
                         last_flush = Instant::now();
                     }
@@ -219,17 +260,24 @@ impl AppContext {
     fn write_batch(
         env: &Environment,
         meta_db: Database,
-        phash_db: Database,
+        hash_db: Database,
         meta_updates: &Vec<([u8; 32], [u8; 32])>,
-        phash_updates: &Vec<([u8; 32], u64)>
+        hash_updates: &Vec<([u8; 32], HashValue)>
     ) -> Result<(), lmdb::Error> {
         let mut txn = env.begin_rw_txn()?;
         for (key, val) in meta_updates {
             txn.put(meta_db, key, val, WriteFlags::empty())?;
         }
-        for (key, val) in phash_updates {
-            let val_bytes = val.to_le_bytes();
-            txn.put(phash_db, key, &val_bytes, WriteFlags::empty())?;
+        for (key, val) in hash_updates {
+            match val {
+                HashValue::PHash(phash) => {
+                    let val_bytes = phash.to_le_bytes();
+                    txn.put(hash_db, key, &val_bytes, WriteFlags::empty())?;
+                },
+                HashValue::PdqHash(pdqhash) => {
+                    txn.put(hash_db, key, pdqhash, WriteFlags::empty())?;
+                },
+            }
         }
         txn.commit()
     }
