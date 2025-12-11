@@ -117,8 +117,12 @@ impl AppContext {
 
         let config = if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
+            eprintln!("[DEBUG-DB] Loading config from {:?}", config_path);
             let cfg: Config = toml::from_str(&content)
                 .map_err(|_| "Failed to parse config. Format might have changed.")?;
+            
+            eprintln!("[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}",
+                cfg.gui.width, cfg.gui.height, cfg.gui.panel_width);
 
             // Write back defaults if new sections missing
             let raw_value: toml::Value = toml::from_str(&content).unwrap_or(toml::Value::Integer(0));
@@ -126,11 +130,14 @@ impl AppContext {
             let missing_gui = raw_value.get("gui").is_none();
 
             if missing_grouping || missing_gui {
+                eprintln!("[DEBUG-DB] Writing back defaults (missing_grouping={}, missing_gui={})", 
+                    missing_grouping, missing_gui);
                  let toml_str = toml::to_string_pretty(&cfg)?;
                  fs::write(&config_path, toml_str)?;
             }
             cfg
         } else {
+            eprintln!("[DEBUG-DB] Config file does not exist, creating new one at {:?}", config_path);
             let mut random_bytes = [0u8; 32];
             getrandom::fill(&mut random_bytes)?;
 
@@ -287,12 +294,24 @@ impl AppContext {
         let config_dir = dirs::config_dir().ok_or("No config dir found")?;
         let config_path = config_dir.join(CONFIG_FILE_NAME);
 
+        eprintln!("[DEBUG-DB] save_gui_config called");
+        eprintln!("[DEBUG-DB] config_path = {:?}", config_path);
+        eprintln!("[DEBUG-DB] gui_config to save: width={:?}, height={:?}, panel_width={:?}",
+            gui_config.width, gui_config.height, gui_config.panel_width);
+
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
+            eprintln!("[DEBUG-DB] Read existing config, length = {} bytes", content.len());
             let mut cfg: Config = toml::from_str(&content)?;
+            eprintln!("[DEBUG-DB] Parsed config, old gui: width={:?}, height={:?}, panel_width={:?}",
+                cfg.gui.width, cfg.gui.height, cfg.gui.panel_width);
             cfg.gui = gui_config.clone();
             let toml_str = toml::to_string_pretty(&cfg)?;
+            eprintln!("[DEBUG-DB] Writing new config:\n{}", toml_str);
             fs::write(&config_path, toml_str)?;
+            eprintln!("[DEBUG-DB] Config saved successfully");
+        } else {
+            eprintln!("[DEBUG-DB] Config file does not exist at {:?}", config_path);
         }
         Ok(())
     }
