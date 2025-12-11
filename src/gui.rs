@@ -78,6 +78,7 @@ pub struct GuiApp {
     // Track window size and panel width for saving on exit
     last_window_size: Option<(u32, u32)>,
     panel_width: f32,
+    saved_panel_width: f32,  // Original loaded value, preserved until applied
 
     // Directory browsing (view mode only)
     current_dir: Option<std::path::PathBuf>,
@@ -105,7 +106,21 @@ impl GuiApp {
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
         let (tx, rx) = Self::spawn_raw_loader_pool(active_window.clone(), use_raw_thumbnails);
+        // panel_width is saved in logical points (after font_scale applied)
+        // Load it as-is - we'll use it directly once ppp stabilizes
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
+        // Initialize with configured size so we have a fallback if window size isn't captured
+        let initial_window_size = Some((
+            ctx.gui_config.width.unwrap_or(1280),
+            ctx.gui_config.height.unwrap_or(720)
+        ));
+
+        eprintln!("[DEBUG-CONFIG] new() - Loaded from config: window={}x{}, panel_width={}",
+            ctx.gui_config.width.unwrap_or(1280),
+            ctx.gui_config.height.unwrap_or(720),
+            panel_width);
+        eprintln!("[DEBUG-CONFIG] new() - Raw config values: width={:?}, height={:?}, panel_width={:?}",
+            ctx.gui_config.width, ctx.gui_config.height, ctx.gui_config.panel_width);
 
         Self {
             state,
@@ -127,8 +142,9 @@ impl GuiApp {
             raw_preload_tx: tx,
             raw_preload_rx: rx,
             active_window,
-            last_window_size: None,
+            last_window_size: initial_window_size,
             panel_width,
+            saved_panel_width: panel_width,  // Preserve original value
             current_dir: None,
             show_dir_picker: false,
             dir_list: Vec::new(),
@@ -179,7 +195,21 @@ impl GuiApp {
         let active_window = Arc::new(RwLock::new(HashSet::new()));
         let (tx, rx) = Self::spawn_raw_loader_pool(active_window.clone(), use_raw_thumbnails);
         let ctx = crate::db::AppContext::new().expect("Failed to create context");
+        // panel_width is saved in logical points (after font_scale applied)
+        // Load it as-is - we'll use it directly once ppp stabilizes
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
+        // Initialize with configured size so we have a fallback if window size isn't captured
+        let initial_window_size = Some((
+            ctx.gui_config.width.unwrap_or(1280),
+            ctx.gui_config.height.unwrap_or(720)
+        ));
+
+        eprintln!("[DEBUG-CONFIG] new_view_mode() - Loaded from config: window={}x{}, panel_width={}",
+            ctx.gui_config.width.unwrap_or(1280),
+            ctx.gui_config.height.unwrap_or(720),
+            panel_width);
+        eprintln!("[DEBUG-CONFIG] new_view_mode() - Raw config values: width={:?}, height={:?}, panel_width={:?}",
+            ctx.gui_config.width, ctx.gui_config.height, ctx.gui_config.panel_width);
 
         Self {
             state,
@@ -201,8 +231,9 @@ impl GuiApp {
             raw_preload_tx: tx,
             raw_preload_rx: rx,
             active_window,
-            last_window_size: None,
+            last_window_size: initial_window_size,
             panel_width,
+            saved_panel_width: panel_width,  // Preserve original value
             current_dir,
             show_dir_picker: false,
             dir_list: Vec::new(),
@@ -400,8 +431,14 @@ impl GuiApp {
             self.get_title_string()
         };
 
+        // Config stores physical pixels (screen_rect * ppp after font_scale applied)
+        // with_inner_size is called BEFORE font_scale, when ppp=1.0
+        // So physical pixels = logical points at that moment
         let width = self.ctx.gui_config.width.unwrap_or(1280) as f32;
         let height = self.ctx.gui_config.height.unwrap_or(720) as f32;
+
+        eprintln!("[DEBUG-RUN] Setting window size to {}x{} (physical pixels = logical points at ppp=1)", width, height);
+        eprintln!("[DEBUG-RUN] self.panel_width at run() = {}", self.panel_width);
 
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
@@ -758,7 +795,9 @@ impl eframe::App for GuiApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.show_dir_picker {
                 self.show_dir_picker = false;
-            } else if self.state.show_confirmation || self.state.error_popup.is_some() || self.state.renaming.is_none() { *intent.borrow_mut() = Some(InputIntent::Cancel); }
+            } else if self.state.show_confirmation || self.state.error_popup.is_some() || self.state.renaming.is_some() {
+                *intent.borrow_mut() = Some(InputIntent::Cancel);
+            }
             else { *intent.borrow_mut() = Some(InputIntent::Quit); }
         }
         // Ctrl+Q to quit (triggers on_exit to save window size)
@@ -1007,16 +1046,54 @@ impl eframe::App for GuiApp {
             });
 
             // Restore Detailed File List
-            // On first frame, reset egui's cached panel width to use our saved value
-            if !self.initial_panel_width_applied {
-                ctx.memory_mut(|mem| {
-                    mem.data.remove::<egui::panel::PanelState>(egui::Id::new("list_panel"));
-                });
+            // Get actual window width - try viewport rect first, fall back to used_rect
+            // Note: window_width is in logical points (not physical pixels)
+            let window_width = ctx.input(|i| {
+                i.viewport().inner_rect
+                    .or(i.viewport().outer_rect)
+                    .map(|r| r.width())
+            }).unwrap_or_else(|| ctx.used_rect().width());
+            let panel_max_width = window_width * 0.5;
+
+            // Only print debug every 60 frames to reduce spam
+            use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+            static FRAME_COUNT: AtomicU32 = AtomicU32::new(0);
+            let frame = FRAME_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            if frame.is_multiple_of(60) {
+                let ppp = ctx.pixels_per_point();
+                eprintln!("[DEBUG-PANEL] frame={}, window={}x{}px ({}x{} logical), panel_width={}",
+                    frame,
+                    (window_width * ppp) as u32, (ctx.used_rect().height() * ppp) as u32,
+                    window_width as u32, ctx.used_rect().height() as u32,
+                    self.panel_width);
+            }
+
+            // Delay panel width restoration until after font_scale is applied
+            // On first frames (ppp=1), use a default. Once ppp stabilizes (>1), apply saved width.
+            let ppp = ctx.pixels_per_point();
+            let should_apply_saved_width = !self.initial_panel_width_applied && ppp > 1.5;
+
+            if should_apply_saved_width {
+                eprintln!("[DEBUG-PANEL] Applying saved panel width {} (ppp={})", self.saved_panel_width, ppp);
                 self.initial_panel_width_applied = true;
             }
-            let window_width = ctx.input(|i| i.viewport().inner_rect.map(|r| r.width()).unwrap_or(1280.0));
-            let panel_max_width = window_width * 0.5;
-            let panel_response = egui::SidePanel::left("list_panel").resizable(true).default_width(self.panel_width).max_width(panel_max_width).show(ctx, |ui| {
+
+            let panel = egui::SidePanel::left("list_panel")
+                .resizable(true)
+                .min_width(96.0);
+
+            let panel = if should_apply_saved_width {
+                // Force the saved width on the frame when ppp stabilizes
+                panel.exact_width(self.saved_panel_width.min(panel_max_width))
+            } else if self.initial_panel_width_applied {
+                // After initial application, use default_width and let user resize
+                panel.default_width(self.panel_width).max_width(panel_max_width)
+            } else {
+                // Before ppp stabilizes, use a reasonable default
+                panel.default_width(200.0).max_width(panel_max_width)
+            };
+
+            let panel_response = panel.show(ctx, |ui| {
                 // Show current directory header in view mode
                 if self.state.view_mode
                     && let Some(ref current_dir) = self.current_dir {
@@ -1192,7 +1269,11 @@ impl eframe::App for GuiApp {
                 });
             });
             // Track panel width for saving
-            self.panel_width = panel_response.response.rect.width();
+            let rendered_width = panel_response.response.rect.width();
+            if (rendered_width - self.panel_width).abs() > 1.0 {
+                eprintln!("[DEBUG-PANEL] Width changed: {} -> {}", self.panel_width, rendered_width);
+            }
+            self.panel_width = rendered_width;
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1248,20 +1329,62 @@ impl eframe::App for GuiApp {
             } else { ui.centered_and_justified(|ui| ui.label("No image selected")); }
         });
 
-        // Track window size for saving on exit (in logical points, matching with_inner_size)
-        let size = ctx.input(|i| {
-            // Try outer_rect first (full window), fall back to inner_rect
-            i.viewport().outer_rect
-                .or(i.viewport().inner_rect)
-                .map(|r| (r.width() as u32, r.height() as u32))
+        // Track window size for saving on exit
+        // Use viewport inner_rect or outer_rect for the full window size
+        // available_rect excludes panels so it's not what we want
+        let ppp = ctx.pixels_per_point();
+
+        // Try to get the actual window size from viewport
+        let viewport_size = ctx.input(|i| {
+            i.viewport().inner_rect
+                .or(i.viewport().outer_rect)
+                .map(|r| ((r.width() * ppp) as u32, (r.height() * ppp) as u32))
         });
-        if let Some((w, h)) = size
-            && w > 100 && h > 100 {
-                self.last_window_size = Some((w, h));
+
+        // Debug every 60 frames
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+        static FRAME: AtomicU32 = AtomicU32::new(0);
+        let f = FRAME.fetch_add(1, AtomicOrdering::Relaxed);
+
+        if let Some(size) = viewport_size {
+            // Detect if window was maximized by comparing to full screen size
+            // Your screen is 3840x2160, so if size is close to that, window was maximized
+            let is_maximized = size.0 >= 3800 || size.1 >= 2100;
+
+            if f.is_multiple_of(60) {
+                eprintln!("[DEBUG-WINSIZE] viewport_size={:?}, ppp={}, is_maximized={}",
+                    size, ppp, is_maximized);
             }
+
+            // Only save if:
+            // - font_scale has been applied (ppp > 1)
+            // - window is not maximized (we want to preserve the user's chosen size)
+            // - size is reasonable
+            if size.0 > 100 && size.1 > 100 && ppp > 1.0 && !is_maximized {
+                self.last_window_size = Some(size);
+            }
+        } else {
+            // Fallback: use ctx.used_rect() which should include everything drawn
+            let used = ctx.used_rect();
+            let size = ((used.width() * ppp) as u32, (used.height() * ppp) as u32);
+            let is_maximized = size.0 >= 3800 || size.1 >= 2100;
+
+            if f.is_multiple_of(60) {
+                eprintln!("[DEBUG-WINSIZE] used_rect={:?}, ppp={}, size_physical={:?}, is_maximized={}",
+                    used, ppp, size, is_maximized);
+            }
+
+            if size.0 > 100 && size.1 > 100 && ppp > 1.0 && !is_maximized {
+                self.last_window_size = Some(size);
+            }
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        eprintln!("[DEBUG-EXIT] on_exit called");
+        eprintln!("[DEBUG-EXIT] last_window_size = {:?}", self.last_window_size);
+        eprintln!("[DEBUG-EXIT] panel_width = {}", self.panel_width);
+
         // Save window size and panel width to config
         let mut gui_config = self.ctx.gui_config.clone();
         if let Some((w, h)) = self.last_window_size {
@@ -1271,10 +1394,16 @@ impl eframe::App for GuiApp {
         } else {
             eprintln!("Warning: No window size captured");
         }
+        // panel_width is in current logical points (after font_scale)
+        // Save it directly - we'll scale when loading
         gui_config.panel_width = Some(self.panel_width);
         eprintln!("Saving panel width: {}", self.panel_width);
+        eprintln!("[DEBUG-EXIT] Calling save_gui_config with width={:?}, height={:?}, panel_width={:?}",
+            gui_config.width, gui_config.height, gui_config.panel_width);
         if let Err(e) = self.ctx.save_gui_config(&gui_config) {
             eprintln!("Error saving config: {}", e);
+        } else {
+            eprintln!("[DEBUG-EXIT] save_gui_config succeeded");
         }
     }
 }
