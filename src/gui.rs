@@ -96,6 +96,10 @@ pub struct GuiApp {
 
     // EXIF info display
     show_exif: bool,
+
+    // Cache for current image's histogram and EXIF data (to avoid reloading on toggle)
+    cached_histogram: Option<(std::path::PathBuf, [u32; 256])>,
+    cached_exif: Option<(std::path::PathBuf, Vec<(String, String)>)>,
 }
 
 impl GuiApp {
@@ -164,6 +168,8 @@ impl GuiApp {
             completion_index: 0,
             show_histogram: false,
             show_exif: false,
+            cached_histogram: None,
+            cached_exif: None,
         }
     }
 
@@ -258,6 +264,8 @@ impl GuiApp {
             completion_index: 0,
             show_histogram: false,
             show_exif: false,
+            cached_histogram: None,
+            cached_exif: None,
         }
     }
 
@@ -804,8 +812,8 @@ impl GuiApp {
         }
     }
 
-    /// Compute greyscale histogram from image data and render it
-    fn render_histogram(&self, ui: &mut egui::Ui, available_rect: egui::Rect, path: &std::path::Path) {
+    /// Render greyscale histogram, using cached data if available
+    fn render_histogram(&mut self, ui: &mut egui::Ui, available_rect: egui::Rect, path: &std::path::Path) {
         // Get window width for histogram sizing (10% of window width)
         let window_width = ui.ctx().input(|i| {
             i.viewport().inner_rect
@@ -823,64 +831,91 @@ impl GuiApp {
             egui::vec2(hist_width, hist_height),
         );
 
-        // Compute histogram based on file type
-        let histogram = if is_raw_ext(path) {
-            // For RAW files, use rsraw to decode and compute histogram
-            Self::compute_histogram_from_raw(path)
-        } else {
-            // For standard image files, use the image crate
-            if let Ok(img) = image::open(path) {
-                let grey = img.to_luma8();
-                let mut hist = [0u32; 256];
-                for pixel in grey.pixels() {
-                    hist[pixel.0[0] as usize] += 1;
-                }
-                Some(hist)
+        // Check cache first
+        let histogram = if let Some((cached_path, cached_hist)) = &self.cached_histogram {
+            if cached_path == path {
+                Some(*cached_hist)
             } else {
                 None
             }
+        } else {
+            None
         };
 
-        if let Some(hist) = histogram {
-            // Find max value for normalization (skip extremes which might be clipped)
-            let max_val = hist[1..255].iter().copied().max().unwrap_or(1).max(1);
-
-            let painter = ui.painter();
-
-            // Draw background
-            painter.rect_filled(hist_rect, 0.0, egui::Color32::from_black_alpha(180));
-
-            // Draw histogram bars
-            let bar_width = hist_width / 256.0;
-            let usable_height = hist_height - 4.0; // Small padding
-
-            for (i, &count) in hist.iter().enumerate() {
-                if count == 0 { continue; }
-
-                let normalized = (count as f32 / max_val as f32).min(1.0);
-                let bar_height = normalized * usable_height;
-
-                let x = hist_rect.min.x + (i as f32) * bar_width;
-                let y_bottom = hist_rect.max.y - 2.0;
-                let y_top = y_bottom - bar_height;
-
-                // Color based on luminance value (darker values = darker bars)
-                let grey = (i as u8).saturating_add(40).min(220);
-                let color = egui::Color32::from_gray(grey);
-
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(x, y_top),
-                        egui::pos2(x + bar_width.max(1.0), y_bottom),
-                    ),
-                    0.0,
-                    color,
-                );
+        // Compute if not cached
+        let histogram = histogram.or_else(|| {
+            let hist = if is_raw_ext(path) {
+                Self::compute_histogram_from_raw(path)
+            } else {
+                Self::compute_histogram_from_image(path)
+            };
+            // Cache the result
+            if let Some(h) = hist {
+                self.cached_histogram = Some((path.to_path_buf(), h));
+                Some(h)
+            } else {
+                None
             }
+        });
 
-            // Draw border
-            painter.rect_stroke(hist_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Outside);
+        if let Some(hist) = histogram {
+            Self::draw_histogram(ui, hist_rect, &hist);
         }
+    }
+
+    /// Draw histogram bars (pure rendering, no I/O)
+    fn draw_histogram(ui: &mut egui::Ui, hist_rect: egui::Rect, hist: &[u32; 256]) {
+        // Find max value for normalization (skip extremes which might be clipped)
+        let max_val = hist[1..255].iter().copied().max().unwrap_or(1).max(1);
+
+        let painter = ui.painter();
+        let hist_width = hist_rect.width();
+        let hist_height = hist_rect.height();
+
+        // Draw background
+        painter.rect_filled(hist_rect, 0.0, egui::Color32::from_black_alpha(180));
+
+        // Draw histogram bars
+        let bar_width = hist_width / 256.0;
+        let usable_height = hist_height - 4.0; // Small padding
+
+        for (i, &count) in hist.iter().enumerate() {
+            if count == 0 { continue; }
+
+            let normalized = (count as f32 / max_val as f32).min(1.0);
+            let bar_height = normalized * usable_height;
+
+            let x = hist_rect.min.x + (i as f32) * bar_width;
+            let y_bottom = hist_rect.max.y - 2.0;
+            let y_top = y_bottom - bar_height;
+
+            // Color based on luminance value (darker values = darker bars)
+            let grey = (i as u8).saturating_add(40).min(220);
+            let color = egui::Color32::from_gray(grey);
+
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x, y_top),
+                    egui::pos2(x + bar_width.max(1.0), y_bottom),
+                ),
+                0.0,
+                color,
+            );
+        }
+
+        // Draw border
+        painter.rect_stroke(hist_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Outside);
+    }
+
+    /// Compute histogram from a standard image file
+    fn compute_histogram_from_image(path: &std::path::Path) -> Option<[u32; 256]> {
+        let img = image::open(path).ok()?;
+        let grey = img.to_luma8();
+        let mut hist = [0u32; 256];
+        for pixel in grey.pixels() {
+            hist[pixel.0[0] as usize] += 1;
+        }
+        Some(hist)
     }
 
     /// Compute histogram from a RAW file using rsraw
@@ -925,15 +960,29 @@ impl GuiApp {
         None
     }
 
-    /// Render EXIF information overlay
+    /// Render EXIF information overlay, using cached data if available
     /// Position: to the right of histogram if shown, otherwise bottom-left corner
-    fn render_exif(&self, ui: &mut egui::Ui, available_rect: egui::Rect, path: &std::path::Path) {
+    fn render_exif(&mut self, ui: &mut egui::Ui, available_rect: egui::Rect, path: &std::path::Path) {
         let exif_tags = &self.ctx.gui_config.exif_tags;
         if exif_tags.is_empty() {
             return;
         }
 
-        let tags = crate::scanner::get_exif_tags(path, exif_tags);
+        // Check cache first
+        let tags = if let Some((cached_path, cached_tags)) = &self.cached_exif {
+            if cached_path == path {
+                cached_tags.clone()
+            } else {
+                let new_tags = crate::scanner::get_exif_tags(path, exif_tags);
+                self.cached_exif = Some((path.to_path_buf(), new_tags.clone()));
+                new_tags
+            }
+        } else {
+            let new_tags = crate::scanner::get_exif_tags(path, exif_tags);
+            self.cached_exif = Some((path.to_path_buf(), new_tags.clone()));
+            new_tags
+        };
+
         if tags.is_empty() {
             return;
         }
