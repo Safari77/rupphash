@@ -1,6 +1,9 @@
 ///! Compute PDQ hash of an image.
 pub use image;
 use std::f32::consts::PI;
+use fast_image_resize as fr;
+use fast_image_resize::images::Image;
+use fast_image_resize::ResizeOptions;
 
 const LUMA_FROM_R_COEFF: f32 = 0.299;
 const LUMA_FROM_G_COEFF: f32 = 0.587;
@@ -105,21 +108,96 @@ pub fn generate_pdq_features(image: &image::DynamicImage) -> Option<(PdqFeatures
         return None;
     }
 
-    // Standard PDQ implementation usually resizes to exact dimensions if not full size
-    // We use thumbnail_exact to match the reference behavior closer
-    let out = if image.width() > DOWNSAMPLE_DIMS || image.height() > DOWNSAMPLE_DIMS {
-        generate_pdq_full_size_internal(&image.thumbnail_exact(
-            DOWNSAMPLE_DIMS.min(image.width()),
-            DOWNSAMPLE_DIMS.min(image.height()),
-        ))
+    // Optimization: Convert to Luma ONCE before resizing.
+    // Resizing 1 channel is 3x faster than resizing 3 channels (RGB).
+    let luma_image = if let image::DynamicImage::ImageLuma8(x) = image {
+        x.clone()
     } else {
-        generate_pdq_full_size_internal(image)
+        image.to_luma8()
     };
-    Some(out)
+
+    let w = luma_image.width();
+    let h = luma_image.height();
+
+    // Resize if larger than 512x512
+    let processed_image = if w > DOWNSAMPLE_DIMS || h > DOWNSAMPLE_DIMS {
+        // Calculate new dimensions maintaining aspect ratio (thumbnail behavior)
+        let (new_w, new_h) = calculate_target_dimensions(w, h, DOWNSAMPLE_DIMS);
+        resize_luma_fast(&luma_image, new_w, new_h)
+    } else {
+        luma_image
+    };
+
+    // We can pass the Luma8 directly to a specialized internal function
+    // to avoid re-converting it in the next step.
+    Some(generate_pdq_from_luma(&processed_image))
 }
 
 pub fn generate_pdq(image: &image::DynamicImage) -> Option<([u8; HASH_LENGTH], f32)> {
     generate_pdq_features(image).map(|(feats, quality)| (feats.to_hash(), quality))
+}
+
+fn resize_luma_fast(img: &image::GrayImage, w: u32, h: u32) -> image::GrayImage {
+    let src_width = img.width();
+    let src_height = img.height();
+    let dst_width = w;
+    let dst_height = h;
+
+    // Create container for source image
+    let src_view = Image::from_vec_u8(
+        src_width,
+        src_height,
+        img.as_raw().clone(),
+        fr::PixelType::U8,
+    ).unwrap();
+
+    // Create container for destination
+    let mut dst_view = Image::new(
+        dst_width,
+        dst_height,
+        fr::PixelType::U8
+    );
+
+    let mut resizer = fr::Resizer::new();
+    let options = ResizeOptions::default(); 
+    resizer.resize(&src_view, &mut dst_view, &options).unwrap();
+    // Convert back to image::GrayImage
+    image::GrayImage::from_raw(w, h, dst_view.into_vec()).unwrap()
+}
+
+fn calculate_target_dimensions(w: u32, h: u32, max_dim: u32) -> (u32, u32) {
+    let ratio = w as f32 / h as f32;
+    if w > h {
+        (max_dim, (max_dim as f32 / ratio) as u32)
+    } else {
+        ((max_dim as f32 * ratio) as u32, max_dim)
+    }
+}
+
+// Slightly modified internal helper that accepts GrayImage directly
+fn generate_pdq_from_luma(img: &image::GrayImage) -> (PdqFeatures, f32) {
+    let num_cols = img.width() as usize;
+    let num_rows = img.height() as usize;
+    
+    // Convert u8 pixels to f32 for processing
+    let mut luma_buffer: Vec<f32> = img.pixels().map(|p| p.0[0] as f32).collect();
+
+    let window_size_along_rows = num_cols.div_ceil(2 * BUFFER_W_H);
+    let window_size_along_cols = num_rows.div_ceil(2 * BUFFER_W_H);
+
+    jarosz_filter_float(
+        &mut luma_buffer,
+        num_rows,
+        num_cols,
+        window_size_along_rows,
+        window_size_along_cols,
+        PDQ_NUM_JAROSZ_XY_PASSES,
+    );
+
+    let buffer64x64 = decimate_float::<BUFFER_W_H, BUFFER_W_H>(&luma_buffer, num_rows, num_cols);
+    let quality = pdq_image_domain_quality_metric(&buffer64x64);
+    let features = PdqFeatures::new(&buffer64x64);
+    (features, quality)
 }
 
 // --- INTERNAL HELPERS ---
@@ -272,4 +350,64 @@ fn pdq_image_domain_quality_metric<const R: usize, const C: usize>(buf: &[[f32; 
     for i in 0..R { for j in 0..(C - 1) { sum += ((buf[i][j] - buf[i][j+1])/255.0).abs(); } }
     let q = sum / 90.0;
     if q > 1.0 { 1.0 } else { q }
+}
+
+// --- BENCHMARK TESTS ---
+
+#[cfg(test)]
+mod benchmarks {
+    use super::*;
+    use std::path::Path;
+    use std::time::Instant;
+
+    #[test]
+    fn bench_pdq_performance() {
+        let path = Path::new("./tests/bench.jpg");
+        let img = image::open(path)
+            .expect("Failed to open './tests/bench.jpg'. Please ensure the test image exists.");
+
+        // Number of iterations for the benchmark
+        let iterations_feats = 100;
+        let iterations_dihed = 30000;
+
+        // ---------------------------------------------------------
+        // Benchmark 1: generate_pdq_features
+        // Measures full pipeline: resize -> luma -> filter -> DCT
+        // ---------------------------------------------------------
+
+        // Warmup (ensure code is loaded/caches warm)
+        let _ = generate_pdq_features(&img);
+
+        let start = Instant::now();
+        for _ in 0..iterations_feats {
+            // Use black_box to prevent compiler from optimizing away the loop
+            std::hint::black_box(generate_pdq_features(&img));
+        }
+        let duration = start.elapsed();
+        let avg_time = duration / iterations_feats;
+
+        println!("\n=== Benchmark Results ===");
+        println!("generate_pdq_features ({} iterations):", iterations_feats);
+        println!("  Total time: {:?}", duration);
+        println!("  Avg time:   {:?}", avg_time);
+
+        // ---------------------------------------------------------
+        // Benchmark 2: generate_dihedral_hashes
+        // Measures hashing and bit manipulations on existing features
+        // ---------------------------------------------------------
+
+        let (features, _) = generate_pdq_features(&img).expect("Failed to generate features");
+
+        let start = Instant::now();
+        for _ in 0..iterations_dihed {
+            std::hint::black_box(features.generate_dihedral_hashes());
+        }
+        let duration = start.elapsed();
+        let avg_time = duration / iterations_dihed;
+
+        println!("generate_dihedral_hashes ({} iterations):", iterations_dihed);
+        println!("  Total time: {:?}", duration);
+        println!("  Avg time:   {:?}", avg_time);
+        println!("=========================\n");
+    }
 }
