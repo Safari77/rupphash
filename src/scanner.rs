@@ -84,7 +84,7 @@ pub fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
 /// Get multiple EXIF tags as a vector of (tag_name, value) pairs
 /// Only returns tags that exist in the image
 /// Supports derived values like DerivedCountry
-pub fn get_exif_tags(path: &Path, tag_names: &[String]) -> Vec<(String, String)> {
+pub fn get_exif_tags(path: &Path, tag_names: &[String], decimal_coords: bool) -> Vec<(String, String)> {
     let Some(exif_data) = read_exif_data(path, None) else {
         return Vec::new();
     };
@@ -104,7 +104,7 @@ pub fn get_exif_tags(path: &Path, tag_names: &[String]) -> Vec<(String, String)>
             results.push((format_derived_tag_display_name(tag_name), value));
         } else if let Some((tag, in_value)) = parse_exif_tag_name(tag_name) {
             if let Some(field) = exif_data.get_field(tag, in_value) {
-                let value_str = format_exif_value(&field.value, tag);
+                let value_str = format_exif_value(&field.value, tag, decimal_coords);
                 results.push((tag_name.clone(), value_str));
             }
         }
@@ -320,8 +320,18 @@ pub fn get_supported_exif_tags() -> Vec<(&'static str, &'static str)> {
 }
 
 /// Format an EXIF value for display
-fn format_exif_value(value: &exif::Value, tag: exif::Tag) -> String {
+fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) -> String {
     match tag {
+        exif::Tag::GPSLatitude | exif::Tag::GPSLongitude => {
+            if decimal_coords {
+                // Parse rational D/M/S to decimal degrees
+                if let Some(val) = parse_gps_coordinate(value) {
+                    return format!("{:.6}", val);
+                }
+            }
+            // Fallback to default Minutes/Seconds display
+            clean_exif_string(&value.display_as(tag).to_string())
+        },
         exif::Tag::ExposureTime => {
             if let Some(r) = value.get_uint(0) {
                 if let exif::Value::Rational(rats) = value {
