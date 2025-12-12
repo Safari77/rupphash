@@ -9,6 +9,7 @@ use std::collections::{HashMap};
 use crate::db::{AppContext, HashAlgorithm};
 use crate::scanner::ScanConfig;
 use crate::state::get_bit_identical_counts;
+use libheif_rs::integration::image::register_all_decoding_hooks;
 
 mod phash;
 mod pdqhash;
@@ -311,6 +312,7 @@ fn run_interactive_cli_delete(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    register_all_decoding_hooks();
     let args = Cli::parse();
 
     // Handle --show-exif-tags early, before validation
