@@ -68,8 +68,8 @@ pub struct GuiApp {
     // Channel to send paths to the worker
     raw_preload_tx: Sender<std::path::PathBuf>,
     // Channel to receive decoded images from the worker.
-    // Format: (Path, Option<Image>) - None indicates failure/skip so we can clear loading state
-    raw_preload_rx: Receiver<(std::path::PathBuf, Option<egui::ColorImage>)>,
+    // Format: (Path, Option<(Image, actual_resolution)>) - None indicates failure/skip
+    raw_preload_rx: Receiver<(std::path::PathBuf, Option<(egui::ColorImage, (u32, u32))>)>,
 
     // Shared state to tell workers which files are still relevant.
     // If a file is not in this set, workers will skip decoding it.
@@ -272,7 +272,7 @@ impl GuiApp {
     /// Spawns a pool of background threads that decode raw images.
     /// Workers check `active_window` before processing to skip stale requests.
     fn spawn_raw_loader_pool(active_window: Arc<RwLock<HashSet<std::path::PathBuf>>>, use_thumbnails: bool)
-        -> (Sender<std::path::PathBuf>, Receiver<(std::path::PathBuf, Option<egui::ColorImage>)>)
+        -> (Sender<std::path::PathBuf>, Receiver<(std::path::PathBuf, Option<(egui::ColorImage, (u32, u32))>)>)
     {
         let (tx, rx) = unbounded::<std::path::PathBuf>();
         let (result_tx, result_rx) = unbounded();
@@ -303,6 +303,9 @@ impl GuiApp {
                         && let Ok(mut raw) = rsraw::RawImage::open(&data) {
                             // Unpack is fast, Process is slow
                             if raw.unpack().is_ok() {
+                                // Get actual RAW dimensions (before any thumbnail extraction)
+                                let actual_resolution = (raw.width(), raw.height());
+
                                 // 3. LATE SKIP: Check again before the heavy 'process' call
                                 let still_relevant = {
                                     if let Ok(window) = window_clone.read() {
@@ -313,7 +316,8 @@ impl GuiApp {
                                 if still_relevant {
                                     if use_thumbnails
                                         && let Some(image) = Self::extract_best_thumbnail(&mut raw) {
-                                            let _ = tx_clone.send((path.clone(), Some(image)));
+                                            // Send thumbnail image but with actual RAW resolution
+                                            let _ = tx_clone.send((path.clone(), Some((image, actual_resolution))));
                                             success = true;
                                         }
                                     if !success {
@@ -326,7 +330,7 @@ impl GuiApp {
                                             if processed.len() == width * height * 3 {
                                                 let size = [width, height];
                                                 let image = egui::ColorImage::from_rgb(size, &processed);
-                                                let _ = tx_clone.send((path.clone(), Some(image)));
+                                                let _ = tx_clone.send((path.clone(), Some((image, actual_resolution))));
                                                 success = true;
                                             }
                                         }
@@ -1071,11 +1075,10 @@ impl eframe::App for GuiApp {
             }
 
         // Receive finished raw images from worker thread pool
-        while let Ok((path, maybe_image)) = self.raw_preload_rx.try_recv() {
-            if let Some(color_image) = maybe_image {
-                // Update resolution in metadata now that we have loaded the image
-                let size = color_image.size;
-                self.update_file_resolution(&path, size[0] as u32, size[1] as u32);
+        while let Ok((path, maybe_result)) = self.raw_preload_rx.try_recv() {
+            if let Some((color_image, actual_resolution)) = maybe_result {
+                // Update resolution in metadata with actual RAW dimensions (not thumbnail size)
+                self.update_file_resolution(&path, actual_resolution.0, actual_resolution.1);
 
                 let name = format!("raw_{}", path.display());
                 let texture = ctx.load_texture(name, color_image, Default::default());
