@@ -50,6 +50,22 @@ pub struct GuiConfig {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub panel_width: Option<f32>,
+    #[serde(default = "default_exif_tags")]
+    pub exif_tags: Vec<String>,
+}
+
+fn default_exif_tags() -> Vec<String> {
+    vec![
+        "Make".to_string(),
+        "Model".to_string(),
+        "LensModel".to_string(),
+        "DateTimeOriginal".to_string(),
+        "ExposureTime".to_string(),
+        "FNumber".to_string(),
+        "ISO".to_string(),
+        "FocalLength".to_string(),
+        "ExposureBias".to_string(),
+    ]
 }
 
 impl Default for GuiConfig {
@@ -62,6 +78,7 @@ impl Default for GuiConfig {
             width: Some(1280),
             height: Some(720),
             panel_width: Some(450.0),
+            exif_tags: default_exif_tags(),
         }
     }
 }
@@ -120,7 +137,7 @@ impl AppContext {
             eprintln!("[DEBUG-DB] Loading config from {:?}", config_path);
             let cfg: Config = toml::from_str(&content)
                 .map_err(|_| "Failed to parse config. Format might have changed.")?;
-            
+
             eprintln!("[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}",
                 cfg.gui.width, cfg.gui.height, cfg.gui.panel_width);
 
@@ -130,7 +147,7 @@ impl AppContext {
             let missing_gui = raw_value.get("gui").is_none();
 
             if missing_grouping || missing_gui {
-                eprintln!("[DEBUG-DB] Writing back defaults (missing_grouping={}, missing_gui={})", 
+                eprintln!("[DEBUG-DB] Writing back defaults (missing_grouping={}, missing_gui={})",
                     missing_grouping, missing_gui);
                  let toml_str = toml::to_string_pretty(&cfg)?;
                  fs::write(&config_path, toml_str)?;

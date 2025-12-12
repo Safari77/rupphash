@@ -52,24 +52,223 @@ fn get_file_identifiers(metadata: &fs::Metadata, ignore_dev_id: bool) -> (u64, O
     }
 }
 
-fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
+/// Read EXIF data from a file and return the exif::Exif structure
+/// This is the shared function used by both get_orientation and get_exif_tags
+pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exif::Exif> {
     let mut reader: Box<dyn BufReadSeek> = if let Some(bytes) = preloaded_bytes {
         Box::new(std::io::Cursor::new(bytes))
     } else {
         match fs::File::open(path) {
             Ok(f) => Box::new(std::io::BufReader::new(f)),
-            Err(_) => return 1,
+            Err(_) => return None,
         }
     };
 
-    match exif::Reader::new().read_from_container(&mut reader) {
-        Ok(exif_data) => {
-            if let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-                 && let Some(v @ 1..=8) = field.value.get_uint(0) { return v as u8 }
-            1
-        },
-        Err(_) => 1
+    exif::Reader::new().read_from_container(&mut reader).ok()
+}
+
+/// Get orientation from EXIF data (1-8, defaults to 1)
+pub fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
+    if let Some(exif_data) = read_exif_data(path, preloaded_bytes) {
+        if let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            && let Some(v @ 1..=8) = field.value.get_uint(0) {
+                return v as u8;
+            }
     }
+    1
+}
+
+/// Get multiple EXIF tags as a vector of (tag_name, value) pairs
+/// Only returns tags that exist in the image
+pub fn get_exif_tags(path: &Path, tag_names: &[String]) -> Vec<(String, String)> {
+    let Some(exif_data) = read_exif_data(path, None) else {
+        return Vec::new();
+    };
+
+    let mut results = Vec::new();
+
+    for tag_name in tag_names {
+        if let Some((tag, in_value)) = parse_exif_tag_name(tag_name) {
+            if let Some(field) = exif_data.get_field(tag, in_value) {
+                let value_str = format_exif_value(&field.value, tag);
+                results.push((tag_name.clone(), value_str));
+            }
+        }
+    }
+
+    results
+}
+
+/// Parse a tag name string into an exif::Tag and exif::In
+fn parse_exif_tag_name(name: &str) -> Option<(exif::Tag, exif::In)> {
+    // Common EXIF tags - add more as needed
+    let tag = match name.to_lowercase().as_str() {
+        "make" => exif::Tag::Make,
+        "model" => exif::Tag::Model,
+        "orientation" => exif::Tag::Orientation,
+        "datetime" | "datetimeoriginal" => exif::Tag::DateTimeOriginal,
+        "datetimedigitized" => exif::Tag::DateTimeDigitized,
+        "exposuretime" | "exposure" => exif::Tag::ExposureTime,
+        "fnumber" | "aperture" => exif::Tag::FNumber,
+        "iso" | "isospeedratings" | "photographicsensitivity" => exif::Tag::PhotographicSensitivity,
+        "focallength" => exif::Tag::FocalLength,
+        "focallengthin35mmfilm" | "focallength35mm" => exif::Tag::FocalLengthIn35mmFilm,
+        "exposureprogram" => exif::Tag::ExposureProgram,
+        "meteringmode" => exif::Tag::MeteringMode,
+        "flash" => exif::Tag::Flash,
+        "whitebalance" => exif::Tag::WhiteBalance,
+        "lensmodel" | "lens" => exif::Tag::LensModel,
+        "lensmake" => exif::Tag::LensMake,
+        "software" => exif::Tag::Software,
+        "artist" => exif::Tag::Artist,
+        "copyright" => exif::Tag::Copyright,
+        "imagewidth" | "pixelxdimension" => exif::Tag::PixelXDimension,
+        "imageheight" | "pixelydimension" => exif::Tag::PixelYDimension,
+        "gpslatitude" => exif::Tag::GPSLatitude,
+        "gpslongitude" => exif::Tag::GPSLongitude,
+        "gpsaltitude" => exif::Tag::GPSAltitude,
+        "exposurebias" | "exposurebiasvalue" => exif::Tag::ExposureBiasValue,
+        "colorspace" => exif::Tag::ColorSpace,
+        "scenetype" => exif::Tag::SceneType,
+        "subjectdistance" => exif::Tag::SubjectDistance,
+        "digitalzoomratio" => exif::Tag::DigitalZoomRatio,
+        "contrast" => exif::Tag::Contrast,
+        "saturation" => exif::Tag::Saturation,
+        "sharpness" => exif::Tag::Sharpness,
+        _ => return None,
+    };
+
+    Some((tag, exif::In::PRIMARY))
+}
+
+/// Returns a list of all supported EXIF tag names that can be used in configuration
+pub fn get_supported_exif_tags() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("Make", "Camera manufacturer"),
+        ("Model", "Camera model"),
+        ("LensModel", "Lens model name"),
+        ("LensMake", "Lens manufacturer"),
+        ("DateTime", "Date/time original (alias for DateTimeOriginal)"),
+        ("DateTimeOriginal", "Date/time when photo was taken"),
+        ("DateTimeDigitized", "Date/time when photo was digitized"),
+        ("ExposureTime", "Exposure time (shutter speed)"),
+        ("Exposure", "Exposure time (alias)"),
+        ("FNumber", "F-number (aperture)"),
+        ("Aperture", "F-number (alias)"),
+        ("ISO", "ISO sensitivity"),
+        ("ISOSpeedRatings", "ISO sensitivity (alias)"),
+        ("PhotographicSensitivity", "ISO sensitivity (alias)"),
+        ("FocalLength", "Focal length in mm"),
+        ("FocalLengthIn35mmFilm", "Focal length equivalent in 35mm"),
+        ("FocalLength35mm", "Focal length equivalent in 35mm (alias)"),
+        ("ExposureProgram", "Exposure program mode"),
+        ("MeteringMode", "Metering mode"),
+        ("Flash", "Flash status"),
+        ("WhiteBalance", "White balance mode"),
+        ("ExposureBias", "Exposure bias/compensation"),
+        ("ExposureBiasValue", "Exposure bias/compensation (alias)"),
+        ("Software", "Software used"),
+        ("Artist", "Artist/creator"),
+        ("Copyright", "Copyright information"),
+        ("Orientation", "Image orientation (1-8)"),
+        ("ImageWidth", "Image width in pixels"),
+        ("PixelXDimension", "Image width in pixels (alias)"),
+        ("ImageHeight", "Image height in pixels"),
+        ("PixelYDimension", "Image height in pixels (alias)"),
+        ("ColorSpace", "Color space"),
+        ("SceneType", "Scene type"),
+        ("SubjectDistance", "Subject distance"),
+        ("DigitalZoomRatio", "Digital zoom ratio"),
+        ("Contrast", "Contrast setting"),
+        ("Saturation", "Saturation setting"),
+        ("Sharpness", "Sharpness setting"),
+        ("GPSLatitude", "GPS latitude"),
+        ("GPSLongitude", "GPS longitude"),
+        ("GPSAltitude", "GPS altitude"),
+    ]
+}
+
+/// Format an EXIF value for display
+fn format_exif_value(value: &exif::Value, tag: exif::Tag) -> String {
+    match tag {
+        exif::Tag::ExposureTime => {
+            if let Some(r) = value.get_uint(0) {
+                if let exif::Value::Rational(rats) = value {
+                    if !rats.is_empty() {
+                        let num = rats[0].num;
+                        let denom = rats[0].denom;
+                        if denom > num && num > 0 {
+                            return format!("1/{}s", denom / num);
+                        } else if denom > 0 {
+                            return format!("{:.1}s", num as f64 / denom as f64);
+                        }
+                    }
+                }
+                format!("{}s", r)
+            } else {
+                clean_exif_string(&value.display_as(tag).to_string())
+            }
+        },
+        exif::Tag::FNumber => {
+            if let exif::Value::Rational(rats) = value {
+                if !rats.is_empty() && rats[0].denom > 0 {
+                    return format!("f/{:.1}", rats[0].num as f64 / rats[0].denom as f64);
+                }
+            }
+            clean_exif_string(&value.display_as(tag).to_string())
+        },
+        exif::Tag::FocalLength => {
+            if let exif::Value::Rational(rats) = value {
+                if !rats.is_empty() && rats[0].denom > 0 {
+                    return format!("{}mm", rats[0].num / rats[0].denom);
+                }
+            }
+            clean_exif_string(&value.display_as(tag).to_string())
+        },
+        exif::Tag::PhotographicSensitivity => {
+            if let Some(iso) = value.get_uint(0) {
+                format!("ISO {}", iso)
+            } else {
+                clean_exif_string(&value.display_as(tag).to_string())
+            }
+        },
+        exif::Tag::FocalLengthIn35mmFilm => {
+            if let Some(fl) = value.get_uint(0) {
+                format!("{}mm (35mm equiv)", fl)
+            } else {
+                clean_exif_string(&value.display_as(tag).to_string())
+            }
+        },
+        _ => {
+            // Default: use the library's display formatting, then clean it
+            clean_exif_string(&value.display_as(tag).to_string())
+        }
+    }
+}
+
+/// Clean up EXIF string values that may contain garbage or repeated empty entries
+fn clean_exif_string(s: &str) -> String {
+    // Remove surrounding quotes if present
+    let s = s.trim().trim_matches('"');
+
+    // If the string contains comma-separated values (common in some EXIF fields),
+    // take only the first non-empty meaningful value
+    if s.contains("\", \"") || s.contains(", ") {
+        // Split by common separators and find first non-empty value
+        let parts: Vec<&str> = s.split(|c| c == ',' || c == '"')
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty() && *p != "'" && p.len() > 1)
+            .collect();
+
+        if let Some(first) = parts.first() {
+            return first.to_string();
+        }
+    }
+
+    // Remove any trailing garbage (null bytes represented as empty quotes, etc.)
+    let cleaned = s.trim_end_matches(|c: char| c == '"' || c == '\'' || c == ',' || c.is_whitespace() || c == '\0');
+
+    cleaned.to_string()
 }
 
 fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
