@@ -564,7 +564,12 @@ pub fn scan_and_group(
                                  if let Some((f, _)) = crate::pdqhash::generate_pdq_features(&img) {
                                      pdq_features = Some(f);
                                  }
-                                 resolution = Some(img.dimensions());
+                                 // For RAW files, use rsraw to get actual resolution, not thumbnail
+                                 resolution = if is_raw_ext(path) {
+                                     get_resolution(path, Some(b))
+                                 } else {
+                                     Some(img.dimensions())
+                                 };
                              }
                      }
                  } else if let Ok(Some(h)) = ctx_ref.get_phash(&ch) {
@@ -588,7 +593,12 @@ pub fn scan_and_group(
 
              if use_pdqhash {
                  if let Ok(img) = image::load_from_memory(&b) {
-                     resolution = Some(img.dimensions());
+                     // For RAW files, use rsraw to get actual resolution, not thumbnail
+                     resolution = if is_raw_ext(path) {
+                         get_resolution(path, Some(&b))
+                     } else {
+                         Some(img.dimensions())
+                     };
                      if let Some((features, _quality)) = crate::pdqhash::generate_pdq_features(&img) {
                          let hash = features.to_hash();
                          pdqhash = Some(hash);
