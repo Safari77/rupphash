@@ -691,7 +691,8 @@ where H: HammingHash + std::fmt::Debug
                     let variants = generate_variants(file, hash);
 
                     if i < 3 {
-                         eprintln!("[DEBUG-TRACE] File {}: Generated {} variants.", i, variants.len());
+                        eprintln!("[DEBUG-TRACE] File {}: {:?} - Generated {} variants.",
+                            i, file.path.file_name().unwrap_or_default(), variants.len());
                     }
 
                     for variant in variants {
@@ -720,7 +721,9 @@ where H: HammingHash + std::fmt::Debug
                                             && !results.contains(&cand_id) {
                                                 results.push(cand_id);
                                                 if i < 5 {
-                                                    eprintln!("[DEBUG-MATCH] File {} matched {} (Dist: {})", i, cid, dist);
+                                                    let cand_name = valid_files[cid].path.file_name().unwrap_or_default();
+                                                    eprintln!("[DEBUG-MATCH] {:?} matched {:?} (Dist: {})",
+                                                        file.path.file_name().unwrap_or_default(), cand_name, dist);
                                                 }
                                             }
                                     }
@@ -762,9 +765,80 @@ where H: HammingHash + std::fmt::Debug
         if group.len() > 1 { groups.push(group); }
     }
 
+    // Merge groups that share same-stem files (e.g., jpg and nef of same photo)
+    let groups = merge_groups_by_stem(groups, valid_files);
+
     let is_pdq = std::any::type_name::<H>().contains("u8");
     let (g, i) = process_raw_groups(groups, valid_files, config, is_pdq);
     (g, i, comparison_count.load(Ordering::Relaxed))
+}
+
+/// Merge groups that contain files with the same stem (e.g., dsc_1335.jpg and dsc_1335.nef).
+/// This handles the case where RAW and JPEG have different hashes but should be in the same group.
+fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> Vec<Vec<u32>> {
+    let original_count = groups.len();
+    if groups.len() < 2 { return groups; }
+
+    // Build stem key -> group indices mapping
+    // Key: (parent_dir, stem) -> set of group indices containing files with this stem
+    let mut stem_to_groups: HashMap<(std::path::PathBuf, std::ffi::OsString), Vec<usize>> = HashMap::new();
+
+    for (group_idx, group) in groups.iter().enumerate() {
+        for &file_idx in group {
+            let path = &valid_files[file_idx as usize].path;
+            if let (Some(parent), Some(stem)) = (path.parent(), path.file_stem()) {
+                let key = (parent.to_path_buf(), stem.to_os_string());
+                stem_to_groups.entry(key).or_default().push(group_idx);
+            }
+        }
+    }
+
+    // Union-Find to merge groups
+    let mut parent: Vec<usize> = (0..groups.len()).collect();
+
+    fn find(parent: &mut [usize], i: usize) -> usize {
+        if parent[i] != i {
+            parent[i] = find(parent, parent[i]);
+        }
+        parent[i]
+    }
+
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb { parent[ra] = rb; }
+    }
+
+    // Merge groups that share a stem
+    for (key, group_indices) in &stem_to_groups {
+        if group_indices.len() > 1 {
+            eprintln!("[DEBUG-MERGE] Merging {} groups via stem {:?}", group_indices.len(), key.1);
+            let first = group_indices[0];
+            for &other in &group_indices[1..] {
+                union(&mut parent, first, other);
+            }
+        }
+    }
+
+    // Collect merged groups
+    let mut merged: HashMap<usize, Vec<u32>> = HashMap::new();
+    for (group_idx, group) in groups.into_iter().enumerate() {
+        let root = find(&mut parent, group_idx);
+        merged.entry(root).or_default().extend(group);
+    }
+
+    // Deduplicate indices within each merged group
+    let result: Vec<Vec<u32>> = merged.into_values().map(|mut g| {
+        g.sort_unstable();
+        g.dedup();
+        g
+    }).collect();
+
+    if result.len() != original_count {
+        eprintln!("[DEBUG-MERGE] Merged {} groups into {}", original_count, result.len());
+    }
+
+    result
 }
 
 fn group_with_phash(
@@ -805,8 +879,6 @@ fn process_raw_groups(
     config: &ScanConfig,
     use_pdqhash: bool,
 ) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>) {
-    let ignore_enabled = config.ignore_same_stem;
-    let allowed_exts: HashSet<String> = config.extensions.iter().map(|e| e.to_lowercase()).collect();
     let ext_priorities: HashMap<String, usize> = config.extensions.iter()
         .enumerate()
         .map(|(i, e)| (e.to_lowercase(), i))
@@ -816,36 +888,13 @@ fn process_raw_groups(
     let mut processed_infos = Vec::new();
 
     for group_indices in raw_groups {
-        let group_indices = group_indices;
-
         let mut group_data: Vec<FileMetadata> = group_indices.iter()
             .map(|&idx| valid_files[idx as usize].to_file_metadata())
             .collect();
 
-        if ignore_enabled && group_data.len() >= 2 {
-            let first_parent = group_data[0].path.parent();
-            let first_stem = group_data[0].path.file_stem();
-            let all_same_base = group_data.iter().all(|f| f.path.parent() == first_parent && f.path.file_stem() == first_stem);
-
-            if all_same_base {
-                let mut valid_exts = true;
-                let mut unique_norm_exts = HashSet::new();
-                for f in &group_data {
-                    if let Some(ext) = f.path.extension().and_then(|e| e.to_str()) {
-                        let lower = ext.to_lowercase();
-                        if !allowed_exts.contains(&lower) { valid_exts = false; break; }
-                        let norm = if lower == "jpeg" { "jpg" } else { &lower };
-                        unique_norm_exts.insert(norm.to_string());
-                    } else { valid_exts = false; break; }
-                }
-                if valid_exts && unique_norm_exts.len() >= 2 { continue; }
-            }
-        }
-
         let info = if use_pdqhash {
-             analyze_group_with_features(
+            analyze_group_with_features(
                 &mut group_data,
-                &group_indices,
                 valid_files,
                 &config.group_by.to_lowercase(),
                 &ext_priorities
@@ -921,21 +970,17 @@ pub fn analyze_group(
     files.append(&mut unique);
 
     let max_d = if use_pdqhash {
-         if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
+        if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
             files.iter()
                 .filter_map(|f| f.pdqhash)
-                .map(|h| {
-                    let mut dist = 0;
-                    for i in 0..32 { dist += (pivot[i] ^ h[i]).count_ones(); }
-                    dist
-                })
+                .map(|h| pivot.hamming_distance(&h))
                 .max()
                 .unwrap_or(0)
         } else { 0 }
     } else if let Some(first) = files.first() {
         let pivot = first.phash;
         files.iter()
-            .map(|f| (f.phash ^ pivot).count_ones())
+            .map(|f| pivot.hamming_distance(&f.phash))
             .max()
             .unwrap_or(0)
     } else { 0 };
@@ -949,7 +994,6 @@ pub fn analyze_group(
 
 fn analyze_group_with_features(
     files: &mut Vec<FileMetadata>,
-    original_indices: &[u32],
     valid_files: &[ScannedFile],
     sort_order: &str,
     #[allow(unused)] ext_priorities: &HashMap<String, usize>,
@@ -967,8 +1011,12 @@ fn analyze_group_with_features(
     files.append(&mut duplicates);
     files.append(&mut unique);
 
-    let pivot_features = valid_files.iter()
-        .find(|vf| vf.path == files[0].path)
+    // Sort so same-stem files are adjacent, with non-raw (jpg) before raw (nef)
+    sort_by_stem_then_ext(files);
+
+    // Find pivot features by path lookup (after sorting, first file is the pivot)
+    let pivot_features = files.first()
+        .and_then(|pivot| valid_files.iter().find(|vf| vf.path == pivot.path))
         .and_then(|vf| vf.pdq_features.as_ref());
 
     let max_d = if let Some(pivot_feats) = pivot_features {
@@ -976,11 +1024,7 @@ fn analyze_group_with_features(
         files.iter().map(|f| {
             if let Some(h) = f.pdqhash {
                 pivot_variants.iter()
-                    .map(|v| {
-                        let mut d = 0;
-                        for i in 0..32 { d += (v[i] ^ h[i]).count_ones(); }
-                        d
-                    })
+                    .map(|v| v.hamming_distance(&h))
                     .min()
                     .unwrap_or(255)
             } else { 0 }
@@ -990,11 +1034,7 @@ fn analyze_group_with_features(
     } else if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
         files.iter()
             .filter_map(|f| f.pdqhash)
-            .map(|h| {
-                let mut dist = 0;
-                for i in 0..32 { dist += (pivot[i] ^ h[i]).count_ones(); }
-                dist
-            })
+            .map(|h| pivot.hamming_distance(&h))
             .max()
             .unwrap_or(0)
     } else { 0 };
@@ -1004,6 +1044,23 @@ fn analyze_group_with_features(
     let status = if all_identical { GroupStatus::AllIdentical } else if has_duplicates { GroupStatus::SomeIdentical } else { GroupStatus::None };
 
     GroupInfo { max_dist: max_d, status }
+}
+
+/// Sort files so same-stem files are adjacent, with non-raw before raw.
+/// e.g., dsc_1335.jpg, dsc_1335.nef, dsc_1336.jpg, dsc_1336.nef
+fn sort_by_stem_then_ext(files: &mut [FileMetadata]) {
+    files.sort_by(|a, b| {
+        let stem_a = a.path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let stem_b = b.path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+
+        match natord::compare(&stem_a, &stem_b) {
+            std::cmp::Ordering::Equal => {
+                // Same stem: non-raw first (false < true)
+                is_raw_ext(&a.path).cmp(&is_raw_ext(&b.path))
+            }
+            other => other,
+        }
+    });
 }
 
 pub fn is_raw_ext(path: &Path) -> bool {
