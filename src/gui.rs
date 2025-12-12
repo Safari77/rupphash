@@ -86,6 +86,10 @@ pub struct GuiApp {
     dir_list: Vec<std::path::PathBuf>,
     dir_picker_selection: usize,
     subdirs: Vec<std::path::PathBuf>,  // Subdirectories in current directory
+
+    // Tab Completion State
+    completion_candidates: Vec<String>,
+    completion_index: usize,
 }
 
 impl GuiApp {
@@ -150,6 +154,8 @@ impl GuiApp {
             dir_list: Vec::new(),
             dir_picker_selection: 0,
             subdirs: Vec::new(),
+            completion_candidates: Vec::new(),
+            completion_index: 0,
         }
     }
 
@@ -240,6 +246,8 @@ impl GuiApp {
             dir_list: Vec::new(),
             dir_picker_selection: 0,
             subdirs: Vec::new(),
+            completion_candidates: Vec::new(),
+            completion_index: 0,
         }
     }
 
@@ -949,11 +957,77 @@ impl eframe::App for GuiApp {
        }
 
        if self.state.renaming.is_some() {
+            let mut submit = false;
+            let mut cancel = false;
+            let mut request_focus_back = false;
+
             egui::Window::new("Rename").collapsible(false).show(ctx, |ui| {
-               ui.text_edit_singleline(&mut self.rename_input);
-               if ui.button("Rename").clicked() { self.state.handle_input(InputIntent::SubmitRename(self.rename_input.clone())); }
-               if ui.button("Cancel").clicked() { self.state.handle_input(InputIntent::Cancel); }
+               let res = ui.text_edit_singleline(&mut self.rename_input);
+               if !self.state.show_sort_selection && !self.state.show_confirmation {
+                   res.request_focus();
+               }
+
+               if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                   submit = true;
+               }
+
+               if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                   request_focus_back = true;
+                   let parent = if let Some(state) = &self.state.renaming {
+                       state.original_path.parent().map(|p| p.to_path_buf())
+                   } else { None };
+
+                   if let Some(parent_dir) = parent {
+                       // Calculate previous index to check if input matches what we last auto-completed
+                       let prev_idx = if !self.completion_candidates.is_empty() {
+                           (self.completion_index + self.completion_candidates.len() - 1) % self.completion_candidates.len()
+                       } else { 0 };
+
+                       // Check if the current input matches the candidate we just showed.
+                       // This confirms the user hasn't typed something new manually.
+                       let input_matches_candidate = !self.completion_candidates.is_empty()
+                           && self.completion_candidates[prev_idx] == self.rename_input;
+
+                       // If empty or user typed something new, scan for new candidates
+                       if self.completion_candidates.is_empty() || !input_matches_candidate {
+                           self.completion_candidates.clear();
+                           self.completion_index = 0;
+                           if let Ok(entries) = fs::read_dir(&parent_dir) {
+                               let prefix = self.rename_input.clone();
+                               for entry in entries.flatten() {
+                                   let name = entry.file_name().to_string_lossy().to_string();
+                                   if name.starts_with(&prefix) {
+                                       self.completion_candidates.push(name);
+                                   }
+                               }
+                               self.completion_candidates.sort();
+                           }
+                       }
+
+                       // Apply the next completion
+                       if !self.completion_candidates.is_empty() {
+                           self.rename_input = self.completion_candidates[self.completion_index].clone();
+                           self.completion_index = (self.completion_index + 1) % self.completion_candidates.len();
+                       }
+                   }
+               }
+
+               if request_focus_back {
+                   res.request_focus();
+               }
+
+               if ui.button("Rename").clicked() { submit = true; }
+               if ui.button("Cancel").clicked() { cancel = true; }
            });
+
+           if submit {
+               self.state.handle_input(InputIntent::SubmitRename(self.rename_input.clone()));
+               self.completion_candidates.clear();
+           }
+           if cancel {
+               self.state.handle_input(InputIntent::Cancel);
+               self.completion_candidates.clear();
+           }
        }
 
        // Sort Selection Dialog
