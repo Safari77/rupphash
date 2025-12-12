@@ -41,6 +41,8 @@ kamadak-exif = "0.6.1"
 natord = "1.0.9"
 chacha20poly1305 = "0.10.1"
 fast_image_resize = "5.4"
+country-boundaries = "1.2.0"
+codes-iso-3166 = { version = "0.1", features = ["part_2"] }
 
 [profile.release]
 opt-level = 3

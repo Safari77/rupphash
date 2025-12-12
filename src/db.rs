@@ -65,6 +65,7 @@ fn default_exif_tags() -> Vec<String> {
         "ISO".to_string(),
         "FocalLength".to_string(),
         "ExposureBias".to_string(),
+        "DerivedCountry".to_string(),
     ]
 }
 
