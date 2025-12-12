@@ -2,7 +2,7 @@ use std::path::{PathBuf, Path};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use crate::{FileMetadata, GroupInfo};
-use crate::scanner::analyze_group;
+use crate::scanner::{analyze_group, sort_files};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputIntent {
@@ -33,7 +33,9 @@ pub enum InputIntent {
     TogglePathVisibility,
     ToggleSlideshow,      // Pause/resume slideshow
     ToggleFullscreen,
-    RotateCW,             // Added: Rotate image clockwise
+    RotateCW,
+    ShowSortSelection,
+    ChangeSortOrder(String),
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +92,7 @@ pub struct AppState {
     pub show_confirmation: bool,
     pub show_move_confirmation: bool,
     pub show_delete_immediate_confirmation: bool,
+    pub show_sort_selection: bool,
     pub error_popup: Option<String>,
     pub exit_requested: bool,
     pub selection_changed: bool,
@@ -97,13 +100,14 @@ pub struct AppState {
     pub last_file_count: usize,
     pub zoom_relative: bool,
     pub path_display_depth: usize,
+
     // View mode features
     pub view_mode: bool,
     pub move_target: Option<PathBuf>,
     pub slideshow_interval: Option<f32>,
     pub slideshow_paused: bool,
     pub is_fullscreen: bool,
-    pub manual_rotation: u8, // Added: 0=0, 1=90, 2=180, 3=270
+    pub manual_rotation: u8,
     pub use_pdqhash: bool,
 }
 
@@ -133,6 +137,7 @@ impl AppState {
             show_confirmation: false,
             show_move_confirmation: false,
             show_delete_immediate_confirmation: false,
+            show_sort_selection: false,
             error_popup: None,
             exit_requested: false,
             selection_changed: true,
@@ -145,7 +150,7 @@ impl AppState {
             slideshow_interval: None,
             slideshow_paused: false,
             is_fullscreen: false,
-            manual_rotation: 0, // Init
+            manual_rotation: 0,
             use_pdqhash,
         }
     }
@@ -155,6 +160,20 @@ impl AppState {
 
         if self.error_popup.is_some() {
             self.error_popup = None;
+            return;
+        }
+        // Handle sort selection modal
+        if self.show_sort_selection {
+            match intent {
+                InputIntent::ChangeSortOrder(sort) => {
+                    self.show_sort_selection = false;
+                    self.perform_sort(sort);
+                },
+                InputIntent::Cancel | InputIntent::Quit => {
+                    self.show_sort_selection = false;
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -293,6 +312,10 @@ impl AppState {
             InputIntent::RotateCW => {
                 self.manual_rotation = (self.manual_rotation + 1) % 4;
             },
+            InputIntent::ShowSortSelection => {
+                self.show_sort_selection = true;
+            },
+            InputIntent::ChangeSortOrder(_) => {},
         }
     }
 
@@ -334,6 +357,32 @@ impl AppState {
                 }
             }
         }
+    }
+
+    fn perform_sort(&mut self, sort_order: String) {
+        // Capture current file path to preserve selection
+        let current_path = self.get_current_image_path().cloned();
+
+        for group in &mut self.groups {
+            sort_files(group, &sort_order);
+        }
+
+        // Restore selection
+        if let Some(path) = current_path {
+            if let Some(group) = self.groups.get(self.current_group_idx) {
+                if let Some(new_idx) = group.iter().position(|f| f.path == path) {
+                    self.current_file_idx = new_idx;
+                } else {
+                     // Fallback if file not found (unlikely unless list changed concurrently)
+                     self.current_file_idx = 0;
+                }
+            }
+        } else {
+            self.current_file_idx = 0;
+        }
+
+        self.set_status(format!("Sorted by: {}", sort_order), false);
+        self.selection_changed = true;
     }
 
     pub fn next_item(&mut self) {

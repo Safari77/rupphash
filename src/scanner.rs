@@ -581,7 +581,7 @@ pub fn analyze_group(
     let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) = files.drain(..)
         .partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
 
-    sort_files(&mut duplicates, sort_order);
+    sort_files(&mut duplicates, "name-natural");
     sort_files(&mut unique, sort_order);
     files.append(&mut duplicates);
     files.append(&mut unique);
