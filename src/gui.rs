@@ -544,6 +544,7 @@ impl GuiApp {
     }
 
     fn check_reload(&mut self, ctx: &egui::Context) {
+        // 1. Start scanning if needed
         if self.state.is_loading && self.scan_rx.is_none() {
             let cfg = self.scan_config.clone();
             let ctx_clone = self.ctx.clone();
@@ -564,27 +565,33 @@ impl GuiApp {
             } else {
                 thread::spawn(move || {
                     let (groups, infos) = scanner::scan_and_group(&cfg, &ctx_clone, Some(prog_tx));
-                    let _ = tx.send((groups, infos, Vec::new())); // No subdirs for duplicate mode
+                    let _ = tx.send((groups, infos, Vec::new()));
                 });
             }
         }
 
+        // 2. Process Progress Updates
         if let Some(prog_rx) = &self.scan_progress_rx {
             while let Ok(progress) = prog_rx.try_recv() {
                 self.scan_progress = progress;
-                ctx.request_repaint();
+                ctx.request_repaint(); // Wake up to show progress bar changes
             }
         }
 
-        if let Some(rx) = &self.scan_rx
-            && let Ok((new_groups, new_infos, new_subdirs)) = rx.try_recv() {
+        // 3. Process Final Result
+        if let Some(rx) = &self.scan_rx {
+            if let Ok((new_groups, new_infos, new_subdirs)) = rx.try_recv() {
                 // Restore state logic
                 let mut target_group_paths: Vec<std::path::PathBuf> = Vec::new();
                 let mut target_selected_path = None;
+
+                // Preserve selection if possible
                 if self.state.current_group_idx < self.state.groups.len() {
                     let group = &self.state.groups[self.state.current_group_idx];
                     target_group_paths = group.iter().map(|f| f.path.clone()).collect();
-                    if self.state.current_file_idx < group.len() { target_selected_path = Some(group[self.state.current_file_idx].path.clone()); }
+                    if self.state.current_file_idx < group.len() {
+                        target_selected_path = Some(group[self.state.current_file_idx].path.clone());
+                    }
                 }
 
                 let new_total = new_groups.iter().map(|g| g.len()).sum::<usize>();
@@ -593,23 +600,39 @@ impl GuiApp {
                 self.state.groups = new_groups;
                 self.state.group_infos = new_infos;
                 self.state.last_file_count = new_total;
-                self.subdirs = new_subdirs;  // Store subdirectories
+                self.subdirs = new_subdirs;
 
-                // Restore selection
+                // Restore selection logic...
                 let mut found_group_idx = None;
                 let mut found_file_idx = 0;
                 if let Some(selected_path) = &target_selected_path {
                     for (g_idx, group) in self.state.groups.iter().enumerate() {
-                        if let Some(f_idx) = group.iter().position(|f| &f.path == selected_path) { found_group_idx = Some(g_idx); found_file_idx = f_idx; break; }
+                        if let Some(f_idx) = group.iter().position(|f| &f.path == selected_path) {
+                            found_group_idx = Some(g_idx);
+                            found_file_idx = f_idx;
+                            break;
+                        }
                     }
                 }
                 if found_group_idx.is_none() && !target_group_paths.is_empty() {
                     'outer: for (g_idx, group) in self.state.groups.iter().enumerate() {
-                        for file in group { if target_group_paths.contains(&file.path) { found_group_idx = Some(g_idx); found_file_idx = 0; break 'outer; } }
+                        for file in group {
+                            if target_group_paths.contains(&file.path) {
+                                found_group_idx = Some(g_idx);
+                                found_file_idx = 0;
+                                break 'outer;
+                            }
+                        }
                     }
                 }
-                if let Some(g) = found_group_idx { self.state.current_group_idx = g; self.state.current_file_idx = found_file_idx; }
-                else { self.state.current_group_idx = 0; self.state.current_file_idx = 0; }
+
+                if let Some(g) = found_group_idx {
+                    self.state.current_group_idx = g;
+                    self.state.current_file_idx = found_file_idx;
+                } else {
+                    self.state.current_group_idx = 0;
+                    self.state.current_file_idx = 0;
+                }
 
                 self.state.status_message = Some((msg, false));
                 self.status_set_time = Some(std::time::Instant::now());
@@ -619,13 +642,20 @@ impl GuiApp {
                 self.state.selection_changed = true;
                 self.last_preload_pos = None;
 
-                // Clear raw caches on reload
                 self.raw_cache.clear();
                 self.raw_loading.clear();
                 if let Ok(mut w) = self.active_window.write() { w.clear(); }
 
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.get_title_string()));
+
+                // IMPORTANT: Force repaint immediately to show results
+                ctx.request_repaint();
+            } else {
+                // IMPORTANT: If we are still waiting for data, poll again soon.
+                // This prevents the UI from sleeping if the thread finishes between frames.
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
+        }
     }
 
     // Helper to render texture with pan/zoom logic
