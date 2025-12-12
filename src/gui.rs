@@ -968,17 +968,18 @@ impl GuiApp {
             return;
         }
 
+        let decimal_mode = &self.ctx.gui_config.decimal_coords.unwrap_or(false);
         // Check cache first
         let tags = if let Some((cached_path, cached_tags)) = &self.cached_exif {
             if cached_path == path {
                 cached_tags.clone()
             } else {
-                let new_tags = crate::scanner::get_exif_tags(path, exif_tags);
+                let new_tags = crate::scanner::get_exif_tags(path, exif_tags, *decimal_mode);
                 self.cached_exif = Some((path.to_path_buf(), new_tags.clone()));
                 new_tags
             }
         } else {
-            let new_tags = crate::scanner::get_exif_tags(path, exif_tags);
+            let new_tags = crate::scanner::get_exif_tags(path, exif_tags, *decimal_mode);
             self.cached_exif = Some((path.to_path_buf(), new_tags.clone()));
             new_tags
         };

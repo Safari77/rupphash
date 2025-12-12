@@ -50,6 +50,7 @@ pub struct GuiConfig {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub panel_width: Option<f32>,
+    pub decimal_coords: Option<bool>,
     #[serde(default = "default_exif_tags")]
     pub exif_tags: Vec<String>,
 }
@@ -79,6 +80,7 @@ impl Default for GuiConfig {
             width: Some(1280),
             height: Some(720),
             panel_width: Some(450.0),
+            decimal_coords: Some(true),
             exif_tags: default_exif_tags(),
         }
     }
@@ -314,8 +316,8 @@ impl AppContext {
 
         eprintln!("[DEBUG-DB] save_gui_config called");
         eprintln!("[DEBUG-DB] config_path = {:?}", config_path);
-        eprintln!("[DEBUG-DB] gui_config to save: width={:?}, height={:?}, panel_width={:?}",
-            gui_config.width, gui_config.height, gui_config.panel_width);
+        eprintln!("[DEBUG-DB] gui_config to save: width={:?}, height={:?}, panel_width={:?}, decimal_coords={:?}",
+            gui_config.width, gui_config.height, gui_config.panel_width, gui_config.decimal_coords);
 
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
