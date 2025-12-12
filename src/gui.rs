@@ -14,6 +14,8 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
 use std::f32::consts::PI;
+use fast_image_resize::images::Image as FastImage;
+use fast_image_resize::{Resizer, ResizeOptions, PixelType};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[derive(Default)]
@@ -66,10 +68,10 @@ pub struct GuiApp {
     // Set of paths currently being processed by the worker to avoid dupes
     raw_loading: HashSet<std::path::PathBuf>,
     // Channel to send paths to the worker
-    raw_preload_tx: Sender<std::path::PathBuf>,
+    image_preload_tx: Sender<std::path::PathBuf>,
     // Channel to receive decoded images from the worker.
-    // Format: (Path, Option<(Image, actual_resolution)>) - None indicates failure/skip
-    raw_preload_rx: Receiver<(std::path::PathBuf, Option<(egui::ColorImage, (u32, u32))>)>,
+    image_preload_rx: Receiver<(std::path::PathBuf, Option<(egui::ColorImage, (u32, u32), u8)>)>,
+    scan_batch_rx: Option<Receiver<Vec<FileMetadata>>>,
 
     // Shared state to tell workers which files are still relevant.
     // If a file is not in this set, workers will skip decoding it.
@@ -119,7 +121,7 @@ impl GuiApp {
         state.is_loading = true;
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
-        let (tx, rx) = Self::spawn_raw_loader_pool(active_window.clone(), use_raw_thumbnails);
+        let (tx, rx) = Self::spawn_image_loader_pool(active_window.clone(), use_raw_thumbnails);
         // panel_width is saved in logical points (after font_scale applied)
         // Load it as-is - we'll use it directly once ppp stabilizes
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
@@ -153,8 +155,9 @@ impl GuiApp {
             view_mode_sort: None,
             raw_cache: HashMap::new(),
             raw_loading: HashSet::new(),
-            raw_preload_tx: tx,
-            raw_preload_rx: rx,
+            scan_batch_rx: None,
+            image_preload_tx: tx,
+            image_preload_rx: rx,
             active_window,
             last_window_size: initial_window_size,
             panel_width,
@@ -214,7 +217,7 @@ impl GuiApp {
         };
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
-        let (tx, rx) = Self::spawn_raw_loader_pool(active_window.clone(), use_raw_thumbnails);
+        let (tx, rx) = Self::spawn_image_loader_pool(active_window.clone(), use_raw_thumbnails);
         let ctx = crate::db::AppContext::new().expect("Failed to create context");
         // panel_width is saved in logical points (after font_scale applied)
         // Load it as-is - we'll use it directly once ppp stabilizes
@@ -249,8 +252,9 @@ impl GuiApp {
             view_mode_sort: Some(sort_order),
             raw_cache: HashMap::new(),
             raw_loading: HashSet::new(),
-            raw_preload_tx: tx,
-            raw_preload_rx: rx,
+            scan_batch_rx: None,
+            image_preload_tx: tx,
+            image_preload_rx: rx,
             active_window,
             last_window_size: initial_window_size,
             panel_width,
@@ -269,15 +273,12 @@ impl GuiApp {
         }
     }
 
-    /// Spawns a pool of background threads that decode raw images.
-    /// Workers check `active_window` before processing to skip stale requests.
-    fn spawn_raw_loader_pool(active_window: Arc<RwLock<HashSet<std::path::PathBuf>>>, use_thumbnails: bool)
-        -> (Sender<std::path::PathBuf>, Receiver<(std::path::PathBuf, Option<(egui::ColorImage, (u32, u32))>)>)
+    fn spawn_image_loader_pool(active_window: Arc<RwLock<HashSet<std::path::PathBuf>>>, use_thumbnails: bool)
+        -> (Sender<std::path::PathBuf>, Receiver<(std::path::PathBuf, Option<(egui::ColorImage, (u32, u32), u8)>)>)
     {
         let (tx, rx) = unbounded::<std::path::PathBuf>();
         let (result_tx, result_rx) = unbounded();
 
-        // Spawn threads equal to logical cores (capped reasonably to avoid choking GUI thread)
         let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
 
         for _ in 0..num_threads {
@@ -287,66 +288,266 @@ impl GuiApp {
 
             thread::spawn(move || {
                 while let Ok(path) = rx_clone.recv() {
-                    // 1. FAST SKIP: Check if this file is still relevant
+                    // 1. Skip if no longer in active window
                     {
-                        if let Ok(window) = window_clone.read()
-                            && !window.contains(&path) {
-                                // Inform UI to clear loading state, but return None for image
-                                let _ = tx_clone.send((path, None));
-                                continue;
-                            }
-                    }
-
-                    // 2. Decode
-                    let mut success = false;
-                    if let Ok(data) = fs::read(&path)
-                        && let Ok(mut raw) = rsraw::RawImage::open(&data) {
-                            // Unpack is fast, Process is slow
-                            if raw.unpack().is_ok() {
-                                // Get actual RAW dimensions (before any thumbnail extraction)
-                                let actual_resolution = (raw.width(), raw.height());
-
-                                // 3. LATE SKIP: Check again before the heavy 'process' call
-                                let still_relevant = {
-                                    if let Ok(window) = window_clone.read() {
-                                        window.contains(&path)
-                                    } else { true }
-                                };
-
-                                if still_relevant {
-                                    if use_thumbnails
-                                        && let Some(image) = Self::extract_best_thumbnail(&mut raw) {
-                                            // Send thumbnail image but with actual RAW resolution
-                                            let _ = tx_clone.send((path.clone(), Some((image, actual_resolution))));
-                                            success = true;
-                                        }
-                                    if !success {
-                                        raw.set_use_camera_wb(true);
-                                        if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
-                                            let width = processed.width() as usize;
-                                            let height = processed.height() as usize;
-
-                                            // Safety check: Ensure buffer size matches dimensions (RGB = 3 bytes)
-                                            if processed.len() == width * height * 3 {
-                                                let size = [width, height];
-                                                let image = egui::ColorImage::from_rgb(size, &processed);
-                                                let _ = tx_clone.send((path.clone(), Some((image, actual_resolution))));
-                                                success = true;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                        if let Ok(window) = window_clone.read() && !window.contains(&path) {
+                            let _ = tx_clone.send((path, None));
+                            continue;
                         }
-
-                    if !success {
-                        let _ = tx_clone.send((path, None));
                     }
+
+                    // 2. Load & Process (Resize + Orientation)
+                    let result = Self::load_and_process_image(&path, use_thumbnails);
+                    let _ = tx_clone.send((path, result));
                 }
             });
         }
 
         (tx, result_rx)
+    }
+
+    fn load_and_process_image(path: &std::path::Path, use_thumbnails: bool) -> Option<(egui::ColorImage, (u32, u32), u8)> {
+        let (mut color_image, real_dims, orientation) = if is_raw_ext(path) {
+            // A. RAW FILES
+            // We must read bytes first to safely get orientation from them
+            if let Ok(data) = fs::read(path) {
+                let exif_orientation = crate::scanner::get_orientation(path, Some(&data));
+                eprintln!("[DEBUG] load_and_process_image RAW exif_orientation={}", exif_orientation);
+
+                if let Ok(mut raw) = rsraw::RawImage::open(&data)
+                    && raw.unpack().is_ok() {
+                        let dims = (raw.width() as u32, raw.height() as u32);
+
+                        // Try Thumbnail
+                        if use_thumbnails && let Some(thumb) = Self::extract_best_thumbnail(&mut raw) {
+                             // Thumbnails are extracted as-is (not rotated by rsraw),
+                             // so we need to apply EXIF orientation during rendering
+                             eprintln!("[DEBUG] load_and_process_image RAW using thumbnail, applying exif_orientation={}", exif_orientation);
+                             (thumb, dims, exif_orientation)
+                        } else {
+                            // Full Decode - rsraw applies rotation automatically,
+                            // so we return orientation=1 (no additional rotation needed)
+                            raw.set_use_camera_wb(true);
+                            if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
+                                let w = processed.width() as usize;
+                                let h = processed.height() as usize;
+                                if processed.len() == w * h * 3 {
+                                    eprintln!("[DEBUG] load_and_process_image RAW full decode, orientation=1 (rsraw rotates)");
+                                    (egui::ColorImage::from_rgb([w, h], &processed), dims, 1)
+                                } else { return None; }
+                            } else { return None; }
+                        }
+                } else { return None; }
+            } else { return None; }
+        } else {
+            // B. STANDARD FILES (JPG, PNG, HEIC)
+            // Read orientation lazily
+            let orientation = crate::scanner::get_orientation(path, None);
+            eprintln!("[DEBUG] load_and_process_image OTHER get_orientation={}", orientation);
+            if let Ok(reader) = image::ImageReader::open(path).and_then(|r| r.with_guessed_format()) {
+                if let Ok(dyn_img) = reader.decode() {
+                    let dims = (dyn_img.width(), dyn_img.height());
+                    let buf = dyn_img.to_rgba8();
+                    let pixels = buf.as_flat_samples();
+                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                        [dims.0 as usize, dims.1 as usize],
+                        pixels.as_slice()
+                    );
+                    (img, dims, orientation)
+                } else { return None; }
+            } else { return None; }
+        };
+
+        // --- STEP 2: FAST RESIZING (AVX2/SIMD) ---
+        const MAX_TEXTURE_SIDE: usize = 8192;
+        let w = color_image.width();
+        let h = color_image.height();
+
+        if w > MAX_TEXTURE_SIDE || h > MAX_TEXTURE_SIDE {
+            let scale = (MAX_TEXTURE_SIDE as f32) / (w.max(h) as f32);
+            let new_w = (w as f32 * scale).round() as usize;
+            let new_h = (h as f32 * scale).round() as usize;
+
+            // Convert egui::ColorImage -> fast_image_resize::Image
+            // egui uses RGBA or RGB. standard load above is RGBA (4 bytes).
+            // RAW load above is RGB (3 bytes). We must handle both.
+
+            let pixel_type = if color_image.pixels.len() * 4 == color_image.as_raw().len() {
+                PixelType::U8x4 // Standard/Thumbnail (RGBA)
+            } else {
+                PixelType::U8x3 // Raw Decode (RGB)
+            };
+
+            if let Ok(src_image) = FastImage::from_vec_u8(
+                w as u32,
+                h as u32,
+                color_image.as_raw().to_vec(),
+                pixel_type
+            ) {
+                 let mut dst_image = FastImage::new(
+                     new_w as u32,
+                     new_h as u32,
+                     pixel_type
+                 );
+
+                 // Resize using Lanczos3 for quality or Bilinear for speed
+                 // FilterType::Bilinear is usually safe and very fast for downscaling
+                 let mut resizer = Resizer::new();
+                 if resizer.resize(&src_image, &mut dst_image, &ResizeOptions::default()).is_ok() {
+                     println!("[DEBUG] Fast-Resized {:?} from {}x{} to {}x{}", path, w, h, new_w, new_h);
+
+                     // Convert back to egui
+                     match pixel_type {
+                         PixelType::U8x4 => {
+                             color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                 [new_w, new_h],
+                                 dst_image.buffer()
+                             );
+                         },
+                         PixelType::U8x3 => {
+                             color_image = egui::ColorImage::from_rgb(
+                                 [new_w, new_h],
+                                 dst_image.buffer()
+                             );
+                         },
+                         _ => {}
+                     }
+                 }
+            }
+        }
+
+        Some((color_image, real_dims, orientation))
+    }
+
+    // Handles streaming batches for instant feedback
+    fn check_reload(&mut self, ctx: &egui::Context) {
+        // 1. Start Scan if needed
+        if self.state.is_loading && self.scan_rx.is_none() {
+            let cfg = self.scan_config.clone();
+            let (tx, rx) = unbounded();
+            let (prog_tx, prog_rx) = unbounded();
+
+            // Channel for streaming batch results (view mode)
+            let (batch_tx, batch_rx) = unbounded();
+            self.scan_rx = Some(rx);
+            self.scan_progress_rx = Some(prog_rx);
+            self.scan_batch_rx = Some(batch_rx);
+            self.scan_progress = (0, 0);
+
+            if let Some(ref sort_order) = self.view_mode_sort {
+                let sort = sort_order.clone();
+                let paths = cfg.paths.clone();
+                thread::spawn(move || {
+                    let res = scanner::scan_for_view(&paths, &sort, Some(prog_tx), Some(batch_tx));
+                    let _ = tx.send(res);
+                });
+            } else {
+                // Duplicate Finder Mode
+                let ctx_clone = self.ctx.clone();
+                thread::spawn(move || {
+                    // Note: scan_and_group doesn't use batch_tx yet, but progress will work
+                    let (groups, infos) = scanner::scan_and_group(&cfg, &ctx_clone, Some(prog_tx));
+                    let _ = tx.send((groups, infos, Vec::new()));
+                });
+            }
+        }
+
+        let mut needs_repaint = false;
+
+        // 2. Process Partial Batches (Streaming View)
+        if let Some(batch_rx) = &self.scan_batch_rx {
+             while let Ok(new_files) = batch_rx.try_recv() {
+                 if self.state.groups.is_empty() {
+                     self.state.groups.push(Vec::new());
+                     self.state.group_infos.push(GroupInfo { max_dist:0, status: GroupStatus::None });
+                 }
+                 self.state.groups[0].extend(new_files);
+                 needs_repaint = true;
+             }
+             if needs_repaint {
+                 self.state.last_file_count = self.state.groups[0].len();
+             }
+        }
+
+        // 3. Process Progress Updates
+        if let Some(prog_rx) = &self.scan_progress_rx {
+            while let Ok(progress) = prog_rx.try_recv() {
+                self.scan_progress = progress;
+                needs_repaint = true;
+            }
+        }
+
+        // 4. Process Final Result
+        if let Some(rx) = &self.scan_rx {
+            if let Ok((new_groups, new_infos, new_subdirs)) = rx.try_recv() {
+                eprintln!("[DEBUG-RELOAD] Replacing groups! Old groups count: {}, New groups count: {}",
+                    self.state.groups.len(), new_groups.len());
+                if let Some(first_group) = new_groups.first() {
+                    for (i, file) in first_group.iter().enumerate().take(5) {
+                        eprintln!("[DEBUG-RELOAD]   new_groups[0][{}]: {:?}, orientation={}",
+                            i, file.path.file_name().unwrap_or_default(), file.orientation);
+                    }
+                }
+
+                // Only replace if we have results (duplicate mode) or finished view mode
+                self.state.groups = new_groups;
+                self.state.group_infos = new_infos;
+                self.subdirs = new_subdirs;
+                self.state.last_file_count = self.state.groups.iter().map(|g| g.len()).sum();
+
+                self.state.is_loading = false;
+                self.scan_rx = None;
+                self.scan_progress_rx = None;
+                self.scan_batch_rx = None;
+
+                needs_repaint = true;
+            }
+        }
+
+        // FORCE UI WAKE-UP
+        if needs_repaint {
+            ctx.request_repaint();
+        }
+        // Crucial: If we are still loading, request another frame soon
+        // to keep polling the channels even if the user isn't moving the mouse.
+        if self.state.is_loading {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    fn update_file_metadata(&mut self, path: &Path, w: u32, h: u32, orientation: u8) {
+         eprintln!("[DEBUG-UPDATE] update_file_metadata called: path={:?}, orientation={}", path.file_name().unwrap_or_default(), orientation);
+
+         // Helper to find and update the file in the group list
+         let update_file = |file: &mut FileMetadata| {
+             if file.path == path {
+                 eprintln!("[DEBUG-UPDATE]   Found file! current orientation={}, new orientation={}", file.orientation, orientation);
+                 if file.resolution.is_none() { file.resolution = Some((w, h)); }
+                 // Always update orientation from loader - it knows the correct value
+                 // (e.g., for RAW full decode it's 1, for RAW thumbnails it's EXIF value)
+                 if file.orientation != orientation {
+                     eprintln!("[DEBUG-UPDATE]   Updated orientation {} -> {}", file.orientation, orientation);
+                     file.orientation = orientation;
+                 }
+                 return true;
+             }
+             false
+         };
+
+         // Check current file first (fast path)
+         if let Some(group) = self.state.groups.get_mut(self.state.current_group_idx) {
+             if let Some(file) = group.get_mut(self.state.current_file_idx) {
+                 if update_file(file) { return; }
+             }
+         }
+
+         // Fallback search
+         for group in &mut self.state.groups {
+             for file in group {
+                 if update_file(file) { return; }
+             }
+         }
+         eprintln!("[DEBUG-UPDATE]   FILE NOT FOUND in any group!");
     }
 
     /// Extract the best (largest) thumbnail from a RAW file
@@ -430,31 +631,6 @@ impl GuiApp {
             }
     }
 
-    /// Updates the resolution metadata for a specific file path
-    fn update_file_resolution(&mut self, path: &Path, w: u32, h: u32) {
-        // Fast path: Check current item first (most common case during view)
-        if let Some(group) = self.state.groups.get_mut(self.state.current_group_idx)
-            && let Some(file) = group.get_mut(self.state.current_file_idx)
-                && file.path == path {
-                    if file.resolution.is_none() {
-                        file.resolution = Some((w, h));
-                    }
-                    return;
-                }
-
-        // Scan to update resolution for preloaded/background items
-        for group in &mut self.state.groups {
-            for file in group {
-                if file.path == path {
-                    if file.resolution.is_none() {
-                        file.resolution = Some((w, h));
-                    }
-                    return;
-                }
-            }
-        }
-    }
-
     pub fn run(self) -> Result<(), eframe::Error> {
         let initial_title = if self.state.is_loading {
             format!("{} v{} | Scanning...", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
@@ -515,7 +691,7 @@ impl GuiApp {
 
     /// Handles both standard image preloading (via egui) and Raw preloading (via worker pool)
     /// In duplicate mode (multiple groups), preloads files from current and nearby groups.
-    fn perform_preload(&mut self, ctx: &egui::Context) {
+    fn perform_preload(&mut self, _ctx: &egui::Context) {
         if self.state.groups.is_empty() { return; }
 
         let current_g = self.state.current_group_idx;
@@ -598,14 +774,12 @@ impl GuiApp {
             *w = active_window_paths.clone();
         }
 
-        // Trigger loads - current file first
         for (path, is_current) in &paths_to_preload {
             if *is_current {
-                if is_raw_ext(path) {
-                    if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
-                        self.raw_loading.insert(path.clone());
-                        let _ = self.raw_preload_tx.send(path.clone());
-                    }
+                // Load EVERYTHING via the pool, not just RAW
+                if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
+                    self.raw_loading.insert(path.clone());
+                    let _ = self.image_preload_tx.send(path.clone());
                 }
                 break;
             }
@@ -614,135 +788,15 @@ impl GuiApp {
         // Then other files
         for (path, is_current) in &paths_to_preload {
             if *is_current { continue; }
-
-            if is_raw_ext(path) {
-                if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
-                    self.raw_loading.insert(path.clone());
-                    let _ = self.raw_preload_tx.send(path.clone());
-                }
-            } else {
-                let _ = egui::Image::new(format!("file://{}", path.display())).load_for_size(ctx, egui::Vec2::new(2048.0, 2048.0));
+            if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
+                self.raw_loading.insert(path.clone());
+                let _ = self.image_preload_tx.send(path.clone());
             }
         }
 
         // Cache Eviction
         self.raw_cache.retain(|k, _| active_window_paths.contains(k));
         self.raw_loading.retain(|k| active_window_paths.contains(k));
-    }
-
-    fn check_reload(&mut self, ctx: &egui::Context) {
-        // 1. Start scanning if needed
-        if self.state.is_loading && self.scan_rx.is_none() {
-            let cfg = self.scan_config.clone();
-            let ctx_clone = self.ctx.clone();
-            let (tx, rx) = unbounded();
-            let (prog_tx, prog_rx) = unbounded();
-
-            self.scan_rx = Some(rx);
-            self.scan_progress_rx = Some(prog_rx);
-            self.scan_progress = (0, 0);
-
-            if let Some(ref sort_order) = self.view_mode_sort {
-                let sort = sort_order.clone();
-                let paths = cfg.paths.clone();
-                thread::spawn(move || {
-                    let res = scanner::scan_for_view(&paths, &sort, Some(prog_tx));
-                    let _ = tx.send(res);
-                });
-            } else {
-                thread::spawn(move || {
-                    let (groups, infos) = scanner::scan_and_group(&cfg, &ctx_clone, Some(prog_tx));
-                    let _ = tx.send((groups, infos, Vec::new()));
-                });
-            }
-        }
-
-        // 2. Process Progress Updates
-        if let Some(prog_rx) = &self.scan_progress_rx {
-            while let Ok(progress) = prog_rx.try_recv() {
-                self.scan_progress = progress;
-                ctx.request_repaint(); // Wake up to show progress bar changes
-            }
-        }
-
-        // 3. Process Final Result
-        if let Some(rx) = &self.scan_rx {
-            if let Ok((new_groups, new_infos, new_subdirs)) = rx.try_recv() {
-                // Restore state logic
-                let mut target_group_paths: Vec<std::path::PathBuf> = Vec::new();
-                let mut target_selected_path = None;
-
-                // Preserve selection if possible
-                if self.state.current_group_idx < self.state.groups.len() {
-                    let group = &self.state.groups[self.state.current_group_idx];
-                    target_group_paths = group.iter().map(|f| f.path.clone()).collect();
-                    if self.state.current_file_idx < group.len() {
-                        target_selected_path = Some(group[self.state.current_file_idx].path.clone());
-                    }
-                }
-
-                let new_total = new_groups.iter().map(|g| g.len()).sum::<usize>();
-                let msg = format!("Loaded {} files.", new_total);
-
-                self.state.groups = new_groups;
-                self.state.group_infos = new_infos;
-                self.state.last_file_count = new_total;
-                self.subdirs = new_subdirs;
-
-                // Restore selection logic...
-                let mut found_group_idx = None;
-                let mut found_file_idx = 0;
-                if let Some(selected_path) = &target_selected_path {
-                    for (g_idx, group) in self.state.groups.iter().enumerate() {
-                        if let Some(f_idx) = group.iter().position(|f| &f.path == selected_path) {
-                            found_group_idx = Some(g_idx);
-                            found_file_idx = f_idx;
-                            break;
-                        }
-                    }
-                }
-                if found_group_idx.is_none() && !target_group_paths.is_empty() {
-                    'outer: for (g_idx, group) in self.state.groups.iter().enumerate() {
-                        for file in group {
-                            if target_group_paths.contains(&file.path) {
-                                found_group_idx = Some(g_idx);
-                                found_file_idx = 0;
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(g) = found_group_idx {
-                    self.state.current_group_idx = g;
-                    self.state.current_file_idx = found_file_idx;
-                } else {
-                    self.state.current_group_idx = 0;
-                    self.state.current_file_idx = 0;
-                }
-
-                self.state.status_message = Some((msg, false));
-                self.status_set_time = Some(std::time::Instant::now());
-                self.state.is_loading = false;
-                self.scan_rx = None;
-                self.scan_progress_rx = None;
-                self.state.selection_changed = true;
-                self.last_preload_pos = None;
-
-                self.raw_cache.clear();
-                self.raw_loading.clear();
-                if let Ok(mut w) = self.active_window.write() { w.clear(); }
-
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.get_title_string()));
-
-                // IMPORTANT: Force repaint immediately to show results
-                ctx.request_repaint();
-            } else {
-                // IMPORTANT: If we are still waiting for data, poll again soon.
-                // This prevents the UI from sleeping if the thread finishes between frames.
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
-            }
-        }
     }
 
     // Helper to render texture with pan/zoom logic
@@ -754,6 +808,21 @@ impl GuiApp {
             } else { 1 }
         } else { 1 };
 
+        // DEBUG: Trace orientation lookup
+        if let Some(group) = self.state.groups.get(self.state.current_group_idx) {
+            if let Some(file) = group.get(self.state.current_file_idx) {
+                eprintln!("[DEBUG-RENDER] group_idx={}, file_idx={}, path={:?}, file.orientation={}, used_orientation={}",
+                    self.state.current_group_idx, self.state.current_file_idx,
+                    file.path.file_name().unwrap_or_default(), file.orientation, orientation);
+            } else {
+                eprintln!("[DEBUG-RENDER] group_idx={}, file_idx={} - FILE NOT FOUND, defaulting to 1",
+                    self.state.current_group_idx, self.state.current_file_idx);
+            }
+        } else {
+            eprintln!("[DEBUG-RENDER] group_idx={} - GROUP NOT FOUND, defaulting to 1",
+                self.state.current_group_idx);
+        }
+
         let manual_rot = self.state.manual_rotation % 4;
 
         let exif_angle = match orientation {
@@ -764,6 +833,14 @@ impl GuiApp {
         };
         let manual_angle = manual_rot as f32 * (PI / 2.0);
         let total_angle = exif_angle + manual_angle;
+
+        // DEBUG: Log rotation calculation (only occasionally to avoid spam)
+        static DEBUG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let count = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count % 60 == 0 {
+            eprintln!("[DEBUG-ROTATION] orientation={}, exif_angle={:.4} rad ({:.1}°), manual_rot={}, total_angle={:.4} rad ({:.1}°)",
+                orientation, exif_angle, exif_angle.to_degrees(), manual_rot, total_angle, total_angle.to_degrees());
+        }
 
         let exif_steps = match orientation { 3 => 2, 6 => 1, 8 => 3, _ => 0 };
         let total_steps = (exif_steps + manual_rot) % 4;
@@ -1132,16 +1209,17 @@ impl eframe::App for GuiApp {
             }
 
         // Receive finished raw images from worker thread pool
-        while let Ok((path, maybe_result)) = self.raw_preload_rx.try_recv() {
-            if let Some((color_image, actual_resolution)) = maybe_result {
-                // Update resolution in metadata with actual RAW dimensions (not thumbnail size)
-                self.update_file_resolution(&path, actual_resolution.0, actual_resolution.1);
+        while let Ok((path, maybe_result)) = self.image_preload_rx.try_recv() {
+            if let Some((color_image, actual_resolution, orientation)) = maybe_result {
 
-                let name = format!("raw_{}", path.display());
+                // Now 'orientation' is defined and passed correctly
+                self.update_file_metadata(&path, actual_resolution.0, actual_resolution.1, orientation);
+
+                let name = format!("img_{}", path.display());
                 let texture = ctx.load_texture(name, color_image, Default::default());
                 self.raw_cache.insert(path.clone(), texture);
             }
-            // Always remove from loading set (even on failure/skip) so it can be retried if needed
+            // Always remove from loading set
             self.raw_loading.remove(&path);
             ctx.request_repaint();
         }
@@ -1429,6 +1507,7 @@ impl eframe::App for GuiApp {
                             }
                             if is_selected {
                                 resp.scroll_to_me(Some(egui::Align::Center));
+                                resp.request_focus();
                             }
                         }
 
@@ -1755,35 +1834,16 @@ impl eframe::App for GuiApp {
                  if let Some(texture) = self.raw_cache.get(&path) {
                      self.render_image_texture(ui, texture.id(), texture.size_vec2(), available_rect, current_group_idx);
                  } else {
-                     // 2. Fallback / Standard Egui Load
-                     let uri = format!("file://{}", path.display());
-                     let img_src = egui::Image::new(&uri);
-                     match img_src.load_for_size(ui.ctx(), ui.available_size()) {
-                         Ok(egui::load::TexturePoll::Ready { texture }) => {
-                             // Update metadata with actual resolution if missing
-                             if let Some(group) = self.state.groups.get_mut(current_group_idx)
-                                 && let Some(file) = group.get_mut(self.state.current_file_idx)
-                                     && file.resolution.is_none() {
-                                         file.resolution = Some((texture.size.x as u32, texture.size.y as u32));
-                                     }
+                     // 2. Not in cache? It's loading.
+                     ui.centered_and_justified(|ui| {
+                         ui.spinner();
+                         ui.label("Loading...");
+                     });
 
-                             self.render_image_texture(ui, texture.id, texture.size, available_rect, current_group_idx);
-                         },
-                         Ok(egui::load::TexturePoll::Pending { .. }) => { ui.spinner(); },
-                         Err(_) => {
-                             // If egui fails and it's raw, it might still be loading in background
-                             if is_raw_ext(&path) {
-                                 ui.spinner();
-                                 ui.label("Loading raw...");
-                                 // Trigger load if not already (failsafe)
-                                 if !self.raw_loading.contains(&path) {
-                                     self.raw_loading.insert(path.clone());
-                                     let _ = self.raw_preload_tx.send(path.clone());
-                                 }
-                             } else {
-                                 ui.label("Failed to load.");
-                             }
-                         }
+                     // Trigger load if missed (failsafe)
+                     if !self.raw_loading.contains(&path) {
+                         self.raw_loading.insert(path.clone());
+                         let _ = self.image_preload_tx.send(path.clone());
                      }
                  }
 
