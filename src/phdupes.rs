@@ -99,7 +99,7 @@ pub fn analyze_group(
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Finds visually similar images.", long_about = None)]
 struct Cli {
-    #[arg(required = true)]
+    #[arg(required_unless_present = "show_exif_tags")]
     paths: Vec<String>,
 
     #[arg(long)]
@@ -157,6 +157,10 @@ struct Cli {
     /// Useful for ZFS snapshots where dev ID changes but inodes stay the same.
     #[arg(long)]
     ignore_dev_id: bool,
+
+    /// Show all supported EXIF tag names for use in exif_tags configuration
+    #[arg(long)]
+    show_exif_tags: bool,
 }
 
 impl Cli {
@@ -308,6 +312,21 @@ fn run_interactive_cli_delete(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
+
+    // Handle --show-exif-tags early, before validation
+    if args.show_exif_tags {
+        println!("Supported EXIF tags for use in [gui] exif_tags configuration:\n");
+        println!("{:<25} {}", "Tag Name", "Description");
+        println!("{}", "-".repeat(70));
+        for (name, desc) in scanner::get_supported_exif_tags() {
+            println!("{:<25} {}", name, desc);
+        }
+        println!("\nExample configuration in phdupes.conf:");
+        println!("[gui]");
+        println!("exif_tags = [\"Make\", \"Model\", \"LensModel\", \"ExposureTime\", \"FNumber\", \"ISO\"]");
+        return Ok(());
+    }
+
     if let Err(e) = args.validate() {
         eprintln!("Error: {}", e);
         std::process::exit(1);

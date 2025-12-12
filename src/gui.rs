@@ -93,6 +93,9 @@ pub struct GuiApp {
 
     // Histogram display
     show_histogram: bool,
+
+    // EXIF info display
+    show_exif: bool,
 }
 
 impl GuiApp {
@@ -160,6 +163,7 @@ impl GuiApp {
             completion_candidates: Vec::new(),
             completion_index: 0,
             show_histogram: false,
+            show_exif: false,
         }
     }
 
@@ -253,6 +257,7 @@ impl GuiApp {
             completion_candidates: Vec::new(),
             completion_index: 0,
             show_histogram: false,
+            show_exif: false,
         }
     }
 
@@ -871,6 +876,89 @@ impl GuiApp {
             painter.rect_stroke(hist_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Outside);
         }
     }
+
+    /// Render EXIF information overlay
+    /// Position: to the right of histogram if shown, otherwise bottom-left corner
+    fn render_exif(&self, ui: &mut egui::Ui, available_rect: egui::Rect, path: &std::path::Path) {
+        let exif_tags = &self.ctx.gui_config.exif_tags;
+        if exif_tags.is_empty() {
+            return;
+        }
+
+        let tags = crate::scanner::get_exif_tags(path, exif_tags);
+        if tags.is_empty() {
+            return;
+        }
+
+        // Get window width for positioning
+        let window_width = ui.ctx().input(|i| {
+            i.viewport().inner_rect
+                .or(i.viewport().outer_rect)
+                .map(|r| r.width())
+                .unwrap_or(available_rect.width())
+        });
+
+        let padding = 10.0;
+        let line_height = 14.0;
+        let exif_height = (tags.len() as f32) * line_height + 8.0;
+
+        // Calculate position: to the right of histogram if shown, else bottom-left
+        let exif_x = if self.show_histogram {
+            let hist_width = window_width * 0.10;
+            available_rect.min.x + padding + hist_width + padding
+        } else {
+            available_rect.min.x + padding
+        };
+
+        // Estimate width based on content
+        let max_label_width = tags.iter()
+            .map(|(name, value)| name.len() + value.len() + 2)
+            .max()
+            .unwrap_or(20) as f32 * 7.0;
+        let exif_width = max_label_width.min(300.0).max(150.0);
+
+        let exif_rect = egui::Rect::from_min_size(
+            egui::pos2(exif_x, available_rect.max.y - exif_height - padding),
+            egui::vec2(exif_width, exif_height),
+        );
+
+        let painter = ui.painter();
+
+        // Draw background
+        painter.rect_filled(exif_rect, 4.0, egui::Color32::from_black_alpha(200));
+
+        // Draw EXIF tags
+        let text_x = exif_rect.min.x + 6.0;
+        let mut text_y = exif_rect.min.y + 4.0;
+
+        for (name, value) in &tags {
+            // Draw tag name in gray
+            painter.text(
+                egui::pos2(text_x, text_y),
+                egui::Align2::LEFT_TOP,
+                format!("{}: ", name),
+                egui::FontId::new(11.0, egui::FontFamily::Monospace),
+                egui::Color32::GRAY,
+            );
+
+            // Calculate offset for value (approximate)
+            let name_width = (name.len() + 2) as f32 * 6.5;
+
+            // Draw value in white
+            painter.text(
+                egui::pos2(text_x + name_width, text_y),
+                egui::Align2::LEFT_TOP,
+                value,
+                egui::FontId::new(11.0, egui::FontFamily::Monospace),
+                egui::Color32::WHITE,
+            );
+
+            text_y += line_height;
+        }
+
+        // Draw border
+        painter.rect_stroke(exif_rect, 4.0, egui::Stroke::new(1.0, egui::Color32::DARK_GRAY), egui::StrokeKind::Outside);
+    }
 }
 
 impl eframe::App for GuiApp {
@@ -963,6 +1051,7 @@ impl eframe::App for GuiApp {
             if ctx.input(|i| i.key_pressed(egui::Key::F)) { *intent.borrow_mut() = Some(InputIntent::ToggleFullscreen); }
             if ctx.input(|i| i.key_pressed(egui::Key::O)) { *intent.borrow_mut() = Some(InputIntent::RotateCW); }
             if ctx.input(|i| i.key_pressed(egui::Key::I)) { self.show_histogram = !self.show_histogram; }
+            if ctx.input(|i| i.key_pressed(egui::Key::E)) { self.show_exif = !self.show_exif; }
 
             // View Mode Only
             if self.state.view_mode {
@@ -1253,7 +1342,8 @@ impl eframe::App for GuiApp {
                      let del_key = if self.state.view_mode { " | [Del]ete" } else { "" };
                      let rot_str = if !self.state.manual_rotation.is_multiple_of(4) { format!(" | [O] Rot: {}°", (self.state.manual_rotation % 4) * 90) } else { "".to_string() };
                      let sort_str = if self.state.view_mode { " | [T] Sort" } else { "" };
-                     let hist_str = if self.show_histogram { " | [I] Hist: ON" } else { "" };
+                     let hist_str = if self.show_histogram { " | [I] Hist" } else { "" };
+                     let exif_str = if self.show_exif { " | [E] EXIF" } else { "" };
                      let pos_str = if !self.state.groups.is_empty() {
                          let total: usize = self.state.groups.iter().map(|g| g.len()).sum();
                          let current: usize = self.state.groups.iter().take(self.state.current_group_idx).map(|g| g.len()).sum::<usize>() + self.state.current_file_idx + 1;
@@ -1261,7 +1351,7 @@ impl eframe::App for GuiApp {
                      } else { "".to_string() };
 
                      ui.horizontal(|ui| {
-                         ui.label(format!("W: {}{} | Z: Zoom{}{}{}{}{}{}{}", mode_str, extra, rel_tag, slideshow_status, move_status, del_key, sort_str, rot_str, hist_str));
+                         ui.label(format!("W: {}{} | Z: Zoom{}{}{}{}{}{}{}{}", mode_str, extra, rel_tag, slideshow_status, move_status, del_key, sort_str, rot_str, hist_str, exif_str));
                          ui.separator();
                          ui.label(pos_str);
                          if !filename.is_empty() {
@@ -1557,6 +1647,11 @@ impl eframe::App for GuiApp {
                  // Histogram Overlay (toggle with 'I' key)
                  if self.show_histogram {
                      self.render_histogram(ui, available_rect, &path);
+                 }
+
+                 // EXIF Info Overlay (toggle with 'E' key)
+                 if self.show_exif {
+                     self.render_exif(ui, available_rect, &path);
                  }
             } else { ui.centered_and_justified(|ui| ui.label("No image selected")); }
         });
