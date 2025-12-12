@@ -90,6 +90,9 @@ pub struct GuiApp {
     // Tab Completion State
     completion_candidates: Vec<String>,
     completion_index: usize,
+
+    // Histogram display
+    show_histogram: bool,
 }
 
 impl GuiApp {
@@ -156,6 +159,7 @@ impl GuiApp {
             subdirs: Vec::new(),
             completion_candidates: Vec::new(),
             completion_index: 0,
+            show_histogram: false,
         }
     }
 
@@ -248,6 +252,7 @@ impl GuiApp {
             subdirs: Vec::new(),
             completion_candidates: Vec::new(),
             completion_index: 0,
+            show_histogram: false,
         }
     }
 
@@ -793,6 +798,79 @@ impl GuiApp {
              // Nothing
         }
     }
+
+    /// Compute greyscale histogram from image data and render it
+    fn render_histogram(&self, ui: &mut egui::Ui, available_rect: egui::Rect, path: &std::path::Path) {
+        // Get window width for histogram sizing (10% of window width)
+        let window_width = ui.ctx().input(|i| {
+            i.viewport().inner_rect
+                .or(i.viewport().outer_rect)
+                .map(|r| r.width())
+                .unwrap_or(available_rect.width())
+        });
+        let hist_width = window_width * 0.10;
+        let hist_height = hist_width * 0.75; // 4:3 aspect ratio for histogram
+
+        // Position in bottom-left corner with some padding
+        let padding = 10.0;
+        let hist_rect = egui::Rect::from_min_size(
+            egui::pos2(available_rect.min.x + padding, available_rect.max.y - hist_height - padding),
+            egui::vec2(hist_width, hist_height),
+        );
+
+        // Load image using the image crate for histogram computation
+        let histogram = if let Ok(img) = image::open(path) {
+            let grey = img.to_luma8();
+            let mut hist = [0u32; 256];
+            for pixel in grey.pixels() {
+                hist[pixel.0[0] as usize] += 1;
+            }
+            Some(hist)
+        } else {
+            None
+        };
+
+        if let Some(hist) = histogram {
+            // Find max value for normalization (skip extremes which might be clipped)
+            let max_val = hist[1..255].iter().copied().max().unwrap_or(1).max(1);
+
+            let painter = ui.painter();
+
+            // Draw background
+            painter.rect_filled(hist_rect, 0.0, egui::Color32::from_black_alpha(180));
+
+            // Draw histogram bars
+            let bar_width = hist_width / 256.0;
+            let usable_height = hist_height - 4.0; // Small padding
+
+            for (i, &count) in hist.iter().enumerate() {
+                if count == 0 { continue; }
+
+                let normalized = (count as f32 / max_val as f32).min(1.0);
+                let bar_height = normalized * usable_height;
+
+                let x = hist_rect.min.x + (i as f32) * bar_width;
+                let y_bottom = hist_rect.max.y - 2.0;
+                let y_top = y_bottom - bar_height;
+
+                // Color based on luminance value (darker values = darker bars)
+                let grey = (i as u8).saturating_add(40).min(220);
+                let color = egui::Color32::from_gray(grey);
+
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x, y_top),
+                        egui::pos2(x + bar_width.max(1.0), y_bottom),
+                    ),
+                    0.0,
+                    color,
+                );
+            }
+
+            // Draw border
+            painter.rect_stroke(hist_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Outside);
+        }
+    }
 }
 
 impl eframe::App for GuiApp {
@@ -884,6 +962,7 @@ impl eframe::App for GuiApp {
             if ctx.input(|i| i.key_pressed(egui::Key::S)) { *intent.borrow_mut() = Some(InputIntent::ToggleSlideshow); }
             if ctx.input(|i| i.key_pressed(egui::Key::F)) { *intent.borrow_mut() = Some(InputIntent::ToggleFullscreen); }
             if ctx.input(|i| i.key_pressed(egui::Key::O)) { *intent.borrow_mut() = Some(InputIntent::RotateCW); }
+            if ctx.input(|i| i.key_pressed(egui::Key::I)) { self.show_histogram = !self.show_histogram; }
 
             // View Mode Only
             if self.state.view_mode {
@@ -1174,6 +1253,7 @@ impl eframe::App for GuiApp {
                      let del_key = if self.state.view_mode { " | [Del]ete" } else { "" };
                      let rot_str = if !self.state.manual_rotation.is_multiple_of(4) { format!(" | [O] Rot: {}°", (self.state.manual_rotation % 4) * 90) } else { "".to_string() };
                      let sort_str = if self.state.view_mode { " | [T] Sort" } else { "" };
+                     let hist_str = if self.show_histogram { " | [I] Hist: ON" } else { "" };
                      let pos_str = if !self.state.groups.is_empty() {
                          let total: usize = self.state.groups.iter().map(|g| g.len()).sum();
                          let current: usize = self.state.groups.iter().take(self.state.current_group_idx).map(|g| g.len()).sum::<usize>() + self.state.current_file_idx + 1;
@@ -1181,7 +1261,7 @@ impl eframe::App for GuiApp {
                      } else { "".to_string() };
 
                      ui.horizontal(|ui| {
-                         ui.label(format!("W: {}{} | Z: Zoom{}{}{}{}{}{}", mode_str, extra, rel_tag, slideshow_status, move_status, del_key, sort_str, rot_str));
+                         ui.label(format!("W: {}{} | Z: Zoom{}{}{}{}{}{}{}", mode_str, extra, rel_tag, slideshow_status, move_status, del_key, sort_str, rot_str, hist_str));
                          ui.separator();
                          ui.label(pos_str);
                          if !filename.is_empty() {
@@ -1472,6 +1552,11 @@ impl eframe::App for GuiApp {
                      ui.put(overlay_rect, egui::Label::new(
                          egui::RichText::new(name).size(12.0).color(egui::Color32::WHITE).background_color(egui::Color32::from_black_alpha(150))
                      ));
+                 }
+
+                 // Histogram Overlay (toggle with 'I' key)
+                 if self.show_histogram {
+                     self.render_histogram(ui, available_rect, &path);
                  }
             } else { ui.centered_and_justified(|ui| ui.label("No image selected")); }
         });
