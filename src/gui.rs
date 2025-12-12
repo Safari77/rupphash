@@ -796,7 +796,7 @@ impl eframe::App for GuiApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.show_dir_picker {
                 self.show_dir_picker = false;
-            } else if self.state.show_confirmation || self.state.error_popup.is_some() || self.state.renaming.is_some() {
+            } else if self.state.show_confirmation || self.state.error_popup.is_some() || self.state.renaming.is_some() || self.state.show_sort_selection {
                 *intent.borrow_mut() = Some(InputIntent::Cancel);
             }
             else { *intent.borrow_mut() = Some(InputIntent::Quit); }
@@ -821,7 +821,7 @@ impl eframe::App for GuiApp {
                     self.show_dir_picker = false;
                     self.change_directory(selected_dir);
                 }
-        } else if !self.state.is_loading && self.state.renaming.is_none() {
+        } else if !self.state.is_loading && self.state.renaming.is_none() && !self.state.show_sort_selection {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) { *intent.borrow_mut() = Some(InputIntent::NextItem); }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) { *intent.borrow_mut() = Some(InputIntent::PrevItem); }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) { *intent.borrow_mut() = Some(InputIntent::NextItem); }
@@ -845,16 +845,13 @@ impl eframe::App for GuiApp {
             if ctx.input(|i| i.key_pressed(egui::Key::M)) { *intent.borrow_mut() = Some(InputIntent::MoveMarked); }
             if ctx.input(|i| i.key_pressed(egui::Key::S)) { *intent.borrow_mut() = Some(InputIntent::ToggleSlideshow); }
             if ctx.input(|i| i.key_pressed(egui::Key::F)) { *intent.borrow_mut() = Some(InputIntent::ToggleFullscreen); }
-            if ctx.input(|i| i.key_pressed(egui::Key::O)) { *intent.borrow_mut() = Some(InputIntent::RotateCW); } // Added 'O' key
+            if ctx.input(|i| i.key_pressed(egui::Key::O)) { *intent.borrow_mut() = Some(InputIntent::RotateCW); }
 
-            // Directory navigation (view mode only)
+            // View Mode Only
             if self.state.view_mode {
-                if ctx.input(|i| i.key_pressed(egui::Key::C)) {
-                    self.open_dir_picker();
-                }
-                if ctx.input(|i| i.key_pressed(egui::Key::Period)) {
-                    self.go_up_directory();
-                }
+                if ctx.input(|i| i.key_pressed(egui::Key::C)) { self.open_dir_picker(); }
+                if ctx.input(|i| i.key_pressed(egui::Key::Period)) { self.go_up_directory(); }
+                if ctx.input(|i| i.key_pressed(egui::Key::T)) { *intent.borrow_mut() = Some(InputIntent::ShowSortSelection); }
             }
         }
 
@@ -884,9 +881,9 @@ impl eframe::App for GuiApp {
             } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
                 self.state.handle_input(InputIntent::Cancel);
             }
-            let marked_count = self.state.marked_for_deletion.len();
-            let use_trash = self.state.use_trash;
             egui::Window::new("Confirm Deletion").collapsible(false).show(ctx, |ui| {
+               let marked_count = self.state.marked_for_deletion.len();
+               let use_trash = self.state.use_trash;
                ui.label(format!("Are you sure you want to {} {} files?", if use_trash { "trash" } else { "permanently delete" }, marked_count));
                if ui.button("Yes (y)").clicked() { self.state.handle_input(InputIntent::ConfirmDelete); }
                if ui.button("No (n)").clicked() { self.state.handle_input(InputIntent::Cancel); }
@@ -928,6 +925,51 @@ impl eframe::App for GuiApp {
                if ui.button("Cancel").clicked() { self.state.handle_input(InputIntent::Cancel); }
            });
        }
+
+       // Sort Selection Dialog
+       if self.state.show_sort_selection {
+            let mut selected_sort = None;
+
+            egui::Window::new("Sort Order")
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label("Select sort order (or press 1-9):");
+                    ui.separator();
+
+                    let options = [
+                        ("1. Name (A-Z)", "name", egui::Key::Num1),
+                        ("2. Name (Z-A)", "name-desc", egui::Key::Num2),
+                        ("3. Name Natural (A-Z)", "name-natural", egui::Key::Num3),
+                        ("4. Name Natural (Z-A)", "name-natural-desc", egui::Key::Num4),
+                        ("5. Date (Oldest First)", "date", egui::Key::Num5),
+                        ("6. Date (Newest First)", "date-desc", egui::Key::Num6),
+                        ("7. Size (Smallest First)", "size", egui::Key::Num7),
+                        ("8. Size (Largest First)", "size-desc", egui::Key::Num8),
+                        ("9. Random", "random", egui::Key::Num9),
+                    ];
+
+                    for (label, value, key) in options {
+                        // Check if button clicked OR corresponding number key pressed
+                        if ui.button(label).clicked() || ctx.input(|i| i.key_pressed(key)) {
+                            selected_sort = Some(value.to_string());
+                        }
+                    }
+
+                    ui.separator();
+                    if ui.button("Cancel (Esc)").clicked() {
+                        selected_sort = Some("CANCEL".to_string());
+                    }
+                });
+
+            // Handle the selection after the UI closure to avoid borrow conflicts
+            if let Some(sort) = selected_sort {
+                if sort == "CANCEL" {
+                    self.state.handle_input(InputIntent::Cancel);
+                } else {
+                    self.state.handle_input(InputIntent::ChangeSortOrder(sort));
+                }
+            }
+        }
 
         // Directory picker dialog (view mode)
         if self.show_dir_picker {
@@ -1027,7 +1069,7 @@ impl eframe::App for GuiApp {
                      let move_status = if self.state.move_target.is_some() { " | [M]ove" } else { "" };
                      let del_key = if self.state.view_mode { " | [Del]ete" } else { "" };
                      let rot_str = if !self.state.manual_rotation.is_multiple_of(4) { format!(" | [O] Rot: {}°", (self.state.manual_rotation % 4) * 90) } else { "".to_string() };
-
+                     let sort_str = if self.state.view_mode { " | [T] Sort" } else { "" };
                      let pos_str = if !self.state.groups.is_empty() {
                          let total: usize = self.state.groups.iter().map(|g| g.len()).sum();
                          let current: usize = self.state.groups.iter().take(self.state.current_group_idx).map(|g| g.len()).sum::<usize>() + self.state.current_file_idx + 1;
@@ -1035,7 +1077,7 @@ impl eframe::App for GuiApp {
                      } else { "".to_string() };
 
                      ui.horizontal(|ui| {
-                         ui.label(format!("W: {}{} | Z: Zoom{}{}{}{}{}", mode_str, extra, rel_tag, slideshow_status, move_status, del_key, rot_str));
+                         ui.label(format!("W: {}{} | Z: Zoom{}{}{}{}{}{}", mode_str, extra, rel_tag, slideshow_status, move_status, del_key, sort_str, rot_str));
                          ui.separator();
                          ui.label(pos_str);
                          if !filename.is_empty() {
