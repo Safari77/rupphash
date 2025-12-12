@@ -823,16 +823,22 @@ impl GuiApp {
             egui::vec2(hist_width, hist_height),
         );
 
-        // Load image using the image crate for histogram computation
-        let histogram = if let Ok(img) = image::open(path) {
-            let grey = img.to_luma8();
-            let mut hist = [0u32; 256];
-            for pixel in grey.pixels() {
-                hist[pixel.0[0] as usize] += 1;
-            }
-            Some(hist)
+        // Compute histogram based on file type
+        let histogram = if is_raw_ext(path) {
+            // For RAW files, use rsraw to decode and compute histogram
+            Self::compute_histogram_from_raw(path)
         } else {
-            None
+            // For standard image files, use the image crate
+            if let Ok(img) = image::open(path) {
+                let grey = img.to_luma8();
+                let mut hist = [0u32; 256];
+                for pixel in grey.pixels() {
+                    hist[pixel.0[0] as usize] += 1;
+                }
+                Some(hist)
+            } else {
+                None
+            }
         };
 
         if let Some(hist) = histogram {
@@ -875,6 +881,48 @@ impl GuiApp {
             // Draw border
             painter.rect_stroke(hist_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Outside);
         }
+    }
+
+    /// Compute histogram from a RAW file using rsraw
+    fn compute_histogram_from_raw(path: &std::path::Path) -> Option<[u32; 256]> {
+        let data = fs::read(path).ok()?;
+        let mut raw = rsraw::RawImage::open(&data).ok()?;
+        raw.unpack().ok()?;
+
+        // Try to extract thumbnail first (faster)
+        if let Ok(thumbs) = raw.extract_thumbs() {
+            if let Some(best_thumb) = thumbs.into_iter()
+                .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
+                .max_by_key(|t| t.width * t.height)
+            {
+                if let Ok(img) = image::load_from_memory(&best_thumb.data) {
+                    let grey = img.to_luma8();
+                    let mut hist = [0u32; 256];
+                    for pixel in grey.pixels() {
+                        hist[pixel.0[0] as usize] += 1;
+                    }
+                    return Some(hist);
+                }
+            }
+        }
+
+        // Fallback: process the full RAW (slower)
+        raw.set_use_camera_wb(true);
+        if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
+            let mut hist = [0u32; 256];
+            // RGB data - convert to greyscale using luminance formula
+            // Y = 0.299*R + 0.587*G + 0.114*B
+            for chunk in processed.chunks_exact(3) {
+                let r = chunk[0] as u32;
+                let g = chunk[1] as u32;
+                let b = chunk[2] as u32;
+                let grey = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
+                hist[grey as usize] += 1;
+            }
+            return Some(hist);
+        }
+
+        None
     }
 
     /// Render EXIF information overlay
