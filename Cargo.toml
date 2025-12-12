@@ -40,6 +40,7 @@ rsraw = { git = "https://github.com/Safari77/rsraw", branch = "process_flags" }
 kamadak-exif = "0.6.1"
 natord = "1.0.9"
 chacha20poly1305 = "0.10.1"
+fast_image_resize = "5.4"
 
 [profile.release]
 opt-level = 3
