@@ -190,6 +190,7 @@ impl GuiApp {
             group_by: sort_order.clone(),
             extensions: Vec::new(),
             ignore_same_stem: false,
+            ignore_dev_id: false,
         };
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));

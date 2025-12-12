@@ -2,13 +2,18 @@ use std::path::{Path};
 use std::fs;
 use std::collections::{HashMap, HashSet};
 use std::time::UNIX_EPOCH;
-use std::os::unix::fs::MetadataExt;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 use chrono::{DateTime, Utc};
 use crossbeam_channel::{unbounded, Sender};
 use image::GenericImageView;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+// Platform-specific imports for Metadata
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 use crate::{FileMetadata, GroupInfo, GroupStatus};
 use crate::phash::DctPhash;
@@ -19,6 +24,33 @@ pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2",
 
 trait BufReadSeek: std::io::BufRead + std::io::Seek {}
 impl<T: std::io::BufRead + std::io::Seek> BufReadSeek for T {}
+
+// --- Helper: Cross-Platform ID Extraction ---
+// Returns: (id_for_hashing, Option<(dev_id, file_id)>)
+fn get_file_identifiers(metadata: &fs::Metadata, ignore_dev_id: bool) -> (u64, Option<(u64, u64)>) {
+    #[cfg(unix)]
+    {
+        let inode = metadata.ino();
+        let dev = if ignore_dev_id { 0 } else { metadata.dev() };
+        (inode, Some((dev, inode)))
+    }
+    #[cfg(windows)]
+    {
+        // On Windows: volume_serial_number ~ dev, file_index ~ inode
+        let idx = metadata.file_index().unwrap_or(0);
+        let vol = if ignore_dev_id { 0 } else { metadata.volume_serial_number().unwrap_or(0) as u64 };
+
+        if idx == 0 && vol == 0 {
+            (0, None)
+        } else {
+            (idx, Some((vol, idx)))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        (0, None)
+    }
+}
 
 fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
     let mut reader: Box<dyn BufReadSeek> = if let Some(bytes) = preloaded_bytes {
@@ -76,6 +108,7 @@ pub struct ScanConfig {
     pub group_by: String,
     pub extensions: Vec<String>,
     pub ignore_same_stem: bool,
+    pub ignore_dev_id: bool,
 }
 
 #[derive(Clone)]
@@ -162,12 +195,12 @@ pub fn scan_and_group(
         let mtime = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
         let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
         let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-        let inode = metadata.ino();
-        let dev_inode = Some((metadata.dev(), metadata.ino()));
+
+        let (id_hash, dev_inode) = get_file_identifiers(&metadata, config.ignore_dev_id);
 
         let mut mh = blake3::Hasher::new_keyed(&ctx_ref.meta_key);
         mh.update(&mtime_ns.to_le_bytes());
-        mh.update(&inode.to_le_bytes());
+        mh.update(&id_hash.to_le_bytes()); // Updates with inode only if dev is ignored
         mh.update(&size.to_le_bytes());
         let meta_key: [u8; 32] = *mh.finalize().as_bytes();
 
@@ -694,6 +727,9 @@ pub fn scan_for_view(
         let size = metadata.len();
         let mtime = DateTime::from(metadata.modified().ok().unwrap_or(UNIX_EPOCH));
         let orientation = get_orientation(path, None);
+        // Also apply ignore_dev_id here for consistency in view mode
+        let (_, dev_inode) = get_file_identifiers(&metadata, false);
+
         Some(FileMetadata {
             path: path.clone(),
             size,
@@ -703,7 +739,7 @@ pub fn scan_for_view(
             resolution: None,
             content_hash: [0u8; 32],
             orientation,
-            dev_inode: None,
+            dev_inode,
         })
     }).collect();
 
