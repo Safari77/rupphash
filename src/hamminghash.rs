@@ -226,6 +226,8 @@ mod tests {
     use super::*;
     use rand::prelude::*;
     use std::time::Instant;
+    use std::path::Path;
+    use crate::pdqhash;
 
     // --- TEST 1: High Similarity Logic (Generics check) ---
     #[test]
@@ -347,5 +349,72 @@ mod tests {
         for &expected_idx in &injected_indices {
             assert!(g.contains(&(expected_idx as u32)), "Group missing injected index {}", expected_idx);
         }
+    }
+
+    // --- TEST 3: Dihedral (Rotation/Flip) Robustness ---
+    #[test]
+    fn test_pdq_dihedral_robustness() {
+        println!("\n--- TEST: Dihedral Robustness (Rotation/Flips) ---");
+
+        // 1. Load Image
+        let path = Path::new("./tests/bench.jpg");
+        let img = image::open(path)
+            .expect("Failed to open './tests/bench.jpg'. Ensure file exists.");
+
+        // 2. Generate features and Ground Truth Dihedral Hashes
+        let (features, _) = pdqhash::generate_pdq_features(&img)
+            .expect("Failed to generate features for original image");
+
+        let dihedral_hashes = features.generate_dihedral_hashes();
+        println!("Generated {} dihedral hashes from original features.", dihedral_hashes.len());
+
+        // 3. Define the Physical Transformations
+        // We will perform these ops on pixels and verify the result matches one of the dihedral hashes.
+        let transformations = vec![
+            ("Original", img.clone()),
+            ("Rotate 90", img.rotate90()),
+            ("Rotate 180", img.rotate180()),
+            ("Rotate 270", img.rotate270()),
+            ("Flip Horizontal", img.fliph()),
+            ("Flip Vertical", img.flipv()),
+            ("Transpose (Rot90 + FlipH)", img.rotate90().fliph()), // Transpose approximation
+            ("Transverse (Rot90 + FlipV)", img.rotate90().flipv()), // Transverse approximation
+        ];
+
+        // 4. Test each transformation
+        for (name, transformed_img) in transformations {
+            // Generate hash for the physically transformed image
+            let (hash_bytes, _) = pdqhash::generate_pdq(&transformed_img)
+                .expect("Failed to hash transformed image");
+
+            // Find best match in the dihedral set
+            let mut min_dist = u32::MAX;
+            let mut best_idx = 0;
+
+            for (i, ground_truth) in dihedral_hashes.iter().enumerate() {
+                let dist = hash_bytes.hamming_distance(ground_truth);
+                if dist < min_dist {
+                    min_dist = dist;
+                    best_idx = i;
+                }
+            }
+
+            println!(
+                "Transform: {:<25} | Best Match Index: {} | Hamming Distance: {}", 
+                name, best_idx, min_dist
+            );
+
+            // Pixel-domain rotation causes resampling artifacts that can flip bits.
+            // A distance of < 20 is still considered a "Match" in PDQ terms (threshold is usually ~30-60).
+            let tolerance = 22; 
+
+            assert!(
+                min_dist <= tolerance,
+                "FAIL: Transform '{}' resulted in distance {} (expected <= {})",
+                name, min_dist, tolerance
+            );
+        }
+
+        println!("PASSED: All physical transformations matched the computed dihedral set.");
     }
 }

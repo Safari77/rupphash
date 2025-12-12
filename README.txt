@@ -2,25 +2,59 @@ test performance of Multi-Index Hashing:
 
 $ cargo test --release -- --nocapture
 ...
+
+running 3 tests
+
 --- PERFORMANCE TEST: 1000000 Images (Generic u64) ---
+Generating 1000000 random hashes...
 
 --- TEST: High Similarity (Distance > 7) ---
 Testing u64 (pHash)...
-Generating 1000000 random hashes...
 Querying distance 12 (u64)... Found: [[0, 1]]
 Testing [u8; 32] (PDQ)...
 Querying distance 30 (PDQ)... Found: [[0, 1]]
 test hamminghash::tests::test_high_similarity_support ... ok
-Injecting similar hashes at random indices: [773023, 836470, 728951, 945586, 558794]
-Building Index took: 27.21ms
+Injecting similar hashes at random indices: [518780, 241878, 542465, 318989, 850151]
+Building Index took: 26.95ms
 Grouping (max_dist=5) with 14 threads...
-Grouping took:        12.22s
-Total Time (Compute): 12.25s
-Found 2 groups.
-Found Target Group Size: 5 (Indices: [558794, 836470, 945586, 728951, 773023])
+
+--- TEST: Dihedral Robustness (Rotation/Flips) ---
+Querying distance 12 (u64)... Found: [[0, 1]]
+Testing [u8; 32] (PDQ)...
+Querying distance 30 (PDQ)... Found: [[0, 1]]
+test hamminghash::tests::test_high_similarity_support ... ok
+Injecting similar hashes at random indices: [506066, 304664, 531336, 222969, 513496]
+Generated 8 dihedral hashes from original features.
+Building Index took: 25.99ms
+Grouping (max_dist=5) with 14 threads...
+Transform: Original                  | Best Match Index: 0 | Hamming Distance: 0
+Transform: Rotate 90                 | Best Match Index: 1 | Hamming Distance: 2
+Transform: Rotate 180                | Best Match Index: 2 | Hamming Distance: 18
+Transform: Rotate 270                | Best Match Index: 3 | Hamming Distance: 20
+Transform: Flip Horizontal           | Best Match Index: 4 | Hamming Distance: 20
+Transform: Flip Vertical             | Best Match Index: 5 | Hamming Distance: 0
+Transform: Transpose (Rot90 + FlipH) | Best Match Index: 6 | Hamming Distance: 0
+Transform: Transverse (Rot90 + FlipV) | Best Match Index: 7 | Hamming Distance: 18
+PASSED: All physical transformations matched the computed dihedral set.
+test hamminghash::tests::test_pdq_dihedral_robustness ... ok
+
+=== Benchmark Results ===
+generate_pdq_features (100 iterations):
+  Total time: 428.563759ms
+  Avg time:   4.285637ms
+generate_dihedral_hashes (30000 iterations):
+  Total time: 295.707917ms
+  Avg time:   9.856µs
+=========================
+
+test pdqhash::benchmarks::bench_pdq_performance ... ok
+Grouping took:        12.27s
+Total Time (Compute): 12.30s
+Found 1 groups.
+Found Target Group Size: 5 (Indices: [241878, 850151, 518780, 542465, 318989])
 test hamminghash::tests::test_1_million_images_performance ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.25s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.31s
 
 
 
