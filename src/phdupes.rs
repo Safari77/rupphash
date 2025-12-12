@@ -316,7 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle --show-exif-tags early, before validation
     if args.show_exif_tags {
         println!("Supported EXIF tags for use in [gui] exif_tags configuration:\n");
-        println!("{:<25} {}", "Tag Name", "Description");
+        println!("{:<25} Description", "Tag Name");
         println!("{}", "-".repeat(70));
         for (name, desc) in scanner::get_supported_exif_tags() {
             println!("{:<25} {}", name, desc);

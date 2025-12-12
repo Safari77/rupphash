@@ -5,10 +5,6 @@ use fast_image_resize as fr;
 use fast_image_resize::images::Image;
 use fast_image_resize::ResizeOptions;
 
-const LUMA_FROM_R_COEFF: f32 = 0.299;
-const LUMA_FROM_G_COEFF: f32 = 0.587;
-const LUMA_FROM_B_COEFF: f32 = 0.114;
-
 const MIN_HASHABLE_DIM: u32 = 5;
 const PDQ_NUM_JAROSZ_XY_PASSES: usize = 2;
 const DOWNSAMPLE_DIMS: u32 = 512;
@@ -133,6 +129,7 @@ pub fn generate_pdq_features(image: &image::DynamicImage) -> Option<(PdqFeatures
     Some(generate_pdq_from_luma(&processed_image))
 }
 
+#[allow(unused)]
 pub fn generate_pdq(image: &image::DynamicImage) -> Option<([u8; HASH_LENGTH], f32)> {
     generate_pdq_features(image).map(|(feats, quality)| (feats.to_hash(), quality))
 }
@@ -159,7 +156,7 @@ fn resize_luma_fast(img: &image::GrayImage, w: u32, h: u32) -> image::GrayImage 
     );
 
     let mut resizer = fr::Resizer::new();
-    let options = ResizeOptions::default(); 
+    let options = ResizeOptions::default();
     resizer.resize(&src_view, &mut dst_view, &options).unwrap();
     // Convert back to image::GrayImage
     image::GrayImage::from_raw(w, h, dst_view.into_vec()).unwrap()
@@ -178,7 +175,7 @@ fn calculate_target_dimensions(w: u32, h: u32, max_dim: u32) -> (u32, u32) {
 fn generate_pdq_from_luma(img: &image::GrayImage) -> (PdqFeatures, f32) {
     let num_cols = img.width() as usize;
     let num_rows = img.height() as usize;
-    
+
     // Convert u8 pixels to f32 for processing
     let mut luma_buffer: Vec<f32> = img.pixels().map(|p| p.0[0] as f32).collect();
 
@@ -201,47 +198,6 @@ fn generate_pdq_from_luma(img: &image::GrayImage) -> (PdqFeatures, f32) {
 }
 
 // --- INTERNAL HELPERS ---
-
-fn generate_pdq_full_size_internal(image: &image::DynamicImage) -> (PdqFeatures, f32) {
-    let (num_cols, num_rows, mut luma_buffer) = to_luma_image(image);
-    let window_size_along_rows = num_cols.div_ceil(2 * BUFFER_W_H);
-    let window_size_along_cols = num_rows.div_ceil(2 * BUFFER_W_H);
-
-    jarosz_filter_float(
-        &mut luma_buffer,
-        num_rows,
-        num_cols,
-        window_size_along_rows,
-        window_size_along_cols,
-        PDQ_NUM_JAROSZ_XY_PASSES,
-    );
-
-    let buffer64x64 = decimate_float::<BUFFER_W_H, BUFFER_W_H>(&luma_buffer, num_rows, num_cols);
-    let quality = pdq_image_domain_quality_metric(&buffer64x64);
-    let features = PdqFeatures::new(&buffer64x64);
-    (features, quality)
-}
-
-fn to_luma_image(image: &image::DynamicImage) -> (usize, usize, Vec<f32>) {
-    match image {
-        image::DynamicImage::ImageLuma8(img) => (
-            img.width() as usize,
-            img.height() as usize,
-            img.pixels().map(|p| p.0[0] as f32).collect()
-        ),
-        _ => {
-            let rgb = image.to_rgb8();
-            let width = rgb.width() as usize;
-            let height = rgb.height() as usize;
-            let data: Vec<f32> = rgb.pixels().map(|p| {
-                p.0[0] as f32 * LUMA_FROM_R_COEFF +
-                p.0[1] as f32 * LUMA_FROM_G_COEFF +
-                p.0[2] as f32 * LUMA_FROM_B_COEFF
-            }).collect();
-            (width, height, data)
-        }
-    }
-}
 
 // Compute DCT matrix on the fly to ensure mathematical correctness
 fn get_dct_matrix() -> [[f32; 64]; 16] {

@@ -72,12 +72,11 @@ pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exi
 
 /// Get orientation from EXIF data (1-8, defaults to 1)
 pub fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
-    if let Some(exif_data) = read_exif_data(path, preloaded_bytes) {
-        if let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+    if let Some(exif_data) = read_exif_data(path, preloaded_bytes)
+        && let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
             && let Some(v @ 1..=8) = field.value.get_uint(0) {
                 return v as u8;
             }
-    }
     1
 }
 
@@ -102,12 +101,11 @@ pub fn get_exif_tags(path: &Path, tag_names: &[String], decimal_coords: bool) ->
         // Check for derived tags first
         if let Some(value) = get_derived_value(tag_name, gps_coords) {
             results.push((format_derived_tag_display_name(tag_name), value));
-        } else if let Some((tag, in_value)) = parse_exif_tag_name(tag_name) {
-            if let Some(field) = exif_data.get_field(tag, in_value) {
+        } else if let Some((tag, in_value)) = parse_exif_tag_name(tag_name)
+            && let Some(field) = exif_data.get_field(tag, in_value) {
                 let value_str = format_exif_value(&field.value, tag, decimal_coords);
                 results.push((tag_name.clone(), value_str));
             }
-        }
     }
 
     results
@@ -152,14 +150,13 @@ fn extract_gps_coordinates(exif_data: &exif::Exif) -> Option<(f64, f64)> {
 
 /// Parse GPS coordinate from EXIF rational values (degrees, minutes, seconds)
 fn parse_gps_coordinate(value: &exif::Value) -> Option<f64> {
-    if let exif::Value::Rational(rats) = value {
-        if rats.len() >= 3 {
+    if let exif::Value::Rational(rats) = value
+        && rats.len() >= 3 {
             let degrees = rats[0].num as f64 / rats[0].denom as f64;
             let minutes = rats[1].num as f64 / rats[1].denom as f64;
             let seconds = rats[2].num as f64 / rats[2].denom as f64;
             return Some(degrees + minutes / 60.0 + seconds / 3600.0);
         }
-    }
     None
 }
 
@@ -334,8 +331,8 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
         },
         exif::Tag::ExposureTime => {
             if let Some(r) = value.get_uint(0) {
-                if let exif::Value::Rational(rats) = value {
-                    if !rats.is_empty() {
+                if let exif::Value::Rational(rats) = value
+                    && !rats.is_empty() {
                         let num = rats[0].num;
                         let denom = rats[0].denom;
                         if denom > num && num > 0 {
@@ -344,26 +341,23 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
                             return format!("{:.1}s", num as f64 / denom as f64);
                         }
                     }
-                }
                 format!("{}s", r)
             } else {
                 clean_exif_string(&value.display_as(tag).to_string())
             }
         },
         exif::Tag::FNumber => {
-            if let exif::Value::Rational(rats) = value {
-                if !rats.is_empty() && rats[0].denom > 0 {
+            if let exif::Value::Rational(rats) = value
+                && !rats.is_empty() && rats[0].denom > 0 {
                     return format!("f/{:.1}", rats[0].num as f64 / rats[0].denom as f64);
                 }
-            }
             clean_exif_string(&value.display_as(tag).to_string())
         },
         exif::Tag::FocalLength => {
-            if let exif::Value::Rational(rats) = value {
-                if !rats.is_empty() && rats[0].denom > 0 {
+            if let exif::Value::Rational(rats) = value
+                && !rats.is_empty() && rats[0].denom > 0 {
                     return format!("{}mm", rats[0].num / rats[0].denom);
                 }
-            }
             clean_exif_string(&value.display_as(tag).to_string())
         },
         exif::Tag::PhotographicSensitivity => {
@@ -396,7 +390,7 @@ fn clean_exif_string(s: &str) -> String {
     // take only the first non-empty meaningful value
     if s.contains("\", \"") || s.contains(", ") {
         // Split by common separators and find first non-empty value
-        let parts: Vec<&str> = s.split(|c| c == ',' || c == '"')
+        let parts: Vec<&str> = s.split([',', '"'])
             .map(|p| p.trim())
             .filter(|p| !p.is_empty() && *p != "'" && p.len() > 1)
             .collect();
