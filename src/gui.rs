@@ -925,12 +925,11 @@ impl GuiApp {
         raw.unpack().ok()?;
 
         // Try to extract thumbnail first (faster)
-        if let Ok(thumbs) = raw.extract_thumbs() {
-            if let Some(best_thumb) = thumbs.into_iter()
+        if let Ok(thumbs) = raw.extract_thumbs()
+            && let Some(best_thumb) = thumbs.into_iter()
                 .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
                 .max_by_key(|t| t.width * t.height)
-            {
-                if let Ok(img) = image::load_from_memory(&best_thumb.data) {
+                && let Ok(img) = image::load_from_memory(&best_thumb.data) {
                     let grey = img.to_luma8();
                     let mut hist = [0u32; 256];
                     for pixel in grey.pixels() {
@@ -938,8 +937,6 @@ impl GuiApp {
                     }
                     return Some(hist);
                 }
-            }
-        }
 
         // Fallback: process the full RAW (slower)
         raw.set_use_camera_wb(true);

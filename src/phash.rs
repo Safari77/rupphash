@@ -241,20 +241,6 @@ pub fn flip_hash_horizontal(hash: u64) -> u64 {
     result
 }
 
-/// Flips a DCT pHash vertically.
-/// Logic: Vertical flip changes sign of odd vertical frequencies.
-pub fn flip_hash_vertical(hash: u64) -> u64 {
-    let mut result = 0u64;
-    for i in 0..64 {
-        let y = i / 8;
-        let flip = y % 2 != 0;
-        let bit = (hash >> (63 - i)) & 1;
-        let final_bit = if flip { bit ^ 1 } else { bit };
-        result |= final_bit << (63 - i);
-    }
-    result
-}
-
 // =========================================================================
 //  All 8 Dihedral Variants (Store 1 / Query 8 Strategy)
 // =========================================================================
