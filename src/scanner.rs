@@ -11,6 +11,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
+use libheif_rs::HeifContext;
 
 // Platform-specific imports for Metadata
 #[cfg(unix)]
@@ -55,22 +56,18 @@ fn get_file_identifiers(metadata: &fs::Metadata, ignore_dev_id: bool) -> (u64, O
     }
 }
 
-/// Read EXIF data from a file and return the exif::Exif structure
-/// This is the shared function used by both get_orientation and get_exif_tags
 pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exif::Exif> {
-    let mut reader: Box<dyn BufReadSeek> = if let Some(bytes) = preloaded_bytes {
-        Box::new(std::io::Cursor::new(bytes))
-    } else {
-        match fs::File::open(path) {
-            Ok(f) => Box::new(std::io::BufReader::new(f)),
-            Err(_) => return None,
+    let mut reader: Box<dyn BufReadSeek> = match preloaded_bytes {
+        Some(bytes) => Box::new(std::io::Cursor::new(bytes)),
+        None => {
+            let file = fs::File::open(path).ok()?;
+            Box::new(std::io::BufReader::new(file))
         }
     };
 
     exif::Reader::new().read_from_container(&mut reader).ok()
 }
 
-/// Get orientation from EXIF data (1-8, defaults to 1)
 pub fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
     if let Some(exif_data) = read_exif_data(path, preloaded_bytes)
         && let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
@@ -407,31 +404,58 @@ fn clean_exif_string(s: &str) -> String {
 }
 
 fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
+    // 1. Handle RAW images
     if is_raw_ext(path) {
-        let data = match bytes {
-            Some(b) => b.to_vec(),
-            None => fs::read(path).ok()?,
-        };
-        if let Ok(mut raw) = rsraw::RawImage::open(&data) && raw.unpack().is_ok() {
-            return Some((raw.width(), raw.height()));
-        }
-        None
-    } else {
-        match bytes {
-            Some(b) => {
-                if let Ok(reader) = image::ImageReader::new(std::io::Cursor::new(b)).with_guessed_format()
-                    && let Ok(dims) = reader.into_dimensions() {
-                    Some(dims)
-                } else { None }
-            }
+        let data_cow;
+        let data_slice = match bytes {
+            Some(b) => b,
             None => {
-                if let Ok(reader) = image::ImageReader::open(path)
-                    && let Ok(dims) = reader.into_dimensions() {
-                    Some(dims)
-                } else { None }
+                data_cow = fs::read(path).ok()?;
+                &data_cow
+            }
+        };
+
+        if let Ok(mut raw) = rsraw::RawImage::open(data_slice) {
+             if raw.unpack().is_ok() {
+                 return Some((raw.width() as u32, raw.height() as u32));
+             }
+        }
+        return None;
+    }
+
+    // 2. Handle HEIC/HEIF specifically
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        let ext = ext.to_lowercase();
+        if ext == "heic" || ext == "heif" {
+            let ctx = match bytes {
+                Some(b) => HeifContext::read_from_bytes(b).ok()?,
+                None => HeifContext::read_from_file(path.to_str()?).ok()?,
+            };
+
+            if let Ok(handle) = ctx.primary_image_handle() {
+                return Some((handle.width(), handle.height()));
             }
         }
     }
+
+    // 3. Handle Standard Formats
+    let reader_obj: Box<dyn BufReadSeek> = match bytes {
+        Some(b) => Box::new(std::io::Cursor::new(b)),
+        None => {
+            // Manually open the file so we can wrap it in BufReader + Box
+            let file = fs::File::open(path).ok()?;
+            Box::new(std::io::BufReader::new(file))
+        }
+    };
+
+    // Now we create the ImageReader using the unified Box type
+    if let Ok(reader) = image::ImageReader::new(reader_obj).with_guessed_format() {
+        if let Ok(dims) = reader.into_dimensions() {
+            return Some(dims);
+        }
+    }
+
+    None
 }
 
 #[derive(Clone)]
@@ -519,7 +543,7 @@ pub fn scan_and_group(
     let valid_files: Vec<ScannedFile> = all_files.par_iter().filter_map(|path| {
         if let Some(prog_tx) = &progress_tx {
             let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if current.is_multiple_of(50) || current == total_files {
+            if current.is_multiple_of(10) || current == total_files {
                 let _ = prog_tx.send((current, total_files));
             }
         }
@@ -1080,19 +1104,21 @@ pub fn is_raw_ext(path: &Path) -> bool {
 fn is_image_ext(path: &Path) -> bool {
     path.extension().and_then(|s| s.to_str()).map(|ext| {
         let e = ext.to_lowercase();
-        matches!(e.as_str(), "jpg"|"jpeg"|"png"|"webp"|"bmp"|"tiff"|"tif"|"avif"|"tga"|"xbm"|"xpm") || RAW_EXTS.contains(&e.as_str())
+        matches!(e.as_str(), "jpg"|"jpeg"|"png"|"webp"|"bmp"|"tiff"|"tif"|"avif"|"heic"|"heif"|"tga"|"xbm"|"xpm") || RAW_EXTS.contains(&e.as_str())
     }).unwrap_or(false)
 }
 
 pub fn scan_for_view(
     paths: &[String],
     sort_order: &str,
-    progress_tx: Option<Sender<(usize, usize)>>
+    progress_tx: Option<Sender<(usize, usize)>>,
+    batch_tx: Option<Sender<Vec<FileMetadata>>>,
 ) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, Vec<std::path::PathBuf>) {
-    let mut all_files = Vec::new();
     let mut subdirs = Vec::new();
     let mut seen_paths = HashSet::new();
+    let mut raw_paths = Vec::new();
 
+    // 1. Fast Directory Walk (Collect paths only)
     for path_str in paths {
         let path = Path::new(path_str);
         if path.is_dir() {
@@ -1101,53 +1127,87 @@ pub fn scan_for_view(
                     let entry_path = entry.path();
                     if entry_path.is_dir() {
                         if let Ok(canonical) = entry_path.canonicalize() { subdirs.push(canonical); }
-                    } else if entry_path.is_file() && is_image_ext(&entry_path)
-                        && let Ok(canonical) = entry_path.canonicalize() && seen_paths.insert(canonical.clone()) {
-                            all_files.push(canonical);
+                    } else if entry_path.is_file() && is_image_ext(&entry_path) {
+                        if let Ok(canonical) = entry_path.canonicalize() {
+                            if seen_paths.insert(canonical.clone()) {
+                                raw_paths.push(canonical);
+                            }
                         }
+                    }
                 }
             }
-        } else if path.is_file() && is_image_ext(path) && let Ok(canonical) = path.canonicalize() && seen_paths.insert(canonical.clone()) {
-            all_files.push(canonical);
+        } else if path.is_file() && is_image_ext(path) {
+             if let Ok(canonical) = path.canonicalize() {
+                 if seen_paths.insert(canonical.clone()) {
+                     raw_paths.push(canonical);
+                 }
+             }
         }
     }
     subdirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
-    if all_files.is_empty() { return (Vec::new(), Vec::new(), subdirs); }
-
-    let total_files = all_files.len();
+    let total_files = raw_paths.len();
     if let Some(tx) = &progress_tx { let _ = tx.send((0, total_files)); }
 
+    if raw_paths.is_empty() { return (Vec::new(), Vec::new(), subdirs); }
+
+    // 2. Parallel Processing with Streaming
+    let chunk_size = 100;
     let processed_count = AtomicUsize::new(0);
-    let mut files: Vec<FileMetadata> = all_files.par_iter().filter_map(|path| {
-        if let Some(prog_tx) = &progress_tx {
-            let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if current.is_multiple_of(50) || current == total_files { let _ = prog_tx.send((current, total_files)); }
+
+    // Split into chunks to stream results to UI
+    let chunks: Vec<Vec<std::path::PathBuf>> = raw_paths.chunks(chunk_size).map(|c| c.to_vec()).collect();
+    let mut all_files = Vec::new();
+
+    for chunk in chunks {
+        let batch_results: Vec<FileMetadata> = chunk.par_iter().filter_map(|path| {
+            if let Some(prog_tx) = &progress_tx {
+                let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if current % 50 == 0 || current == total_files {
+                    let _ = prog_tx.send((current, total_files));
+                }
+            }
+
+            let metadata = fs::metadata(path).ok()?;
+            let size = metadata.len();
+            let modified = DateTime::from(metadata.modified().ok().unwrap_or(UNIX_EPOCH));
+
+            // Required for RAWs to look correct immediately.
+            // Streaming (batch_tx) ensures the UI is still responsive.
+            // Note: For RAW files, the actual orientation used depends on whether thumbnails
+            // or full decode is used. The image loader will return the correct value.
+            let orientation = get_orientation(path, None);
+            eprintln!("[DEBUG-SCAN] scan_for_view get_orientation={} for {:?}", orientation, path.file_name().unwrap_or_default());
+
+            let (_, dev_inode) = get_file_identifiers(&metadata, false);
+
+            Some(FileMetadata {
+                path: path.clone(),
+                size,
+                modified,
+                phash: 0,
+                pdqhash: None,
+                resolution: None,
+                content_hash: [0u8; 32],
+                orientation,
+                dev_inode,
+            })
+        }).collect();
+
+        // Stream this batch to the GUI immediately
+        if !batch_results.is_empty() {
+             if let Some(tx) = &batch_tx {
+                 let _ = tx.send(batch_results.clone());
+             }
+             all_files.extend(batch_results);
         }
-        let metadata = fs::metadata(path).ok()?;
-        let size = metadata.len();
-        let mtime = DateTime::from(metadata.modified().ok().unwrap_or(UNIX_EPOCH));
-        let orientation = get_orientation(path, None);
-        // Also apply ignore_dev_id here for consistency in view mode
-        let (_, dev_inode) = get_file_identifiers(&metadata, false);
+    }
 
-        Some(FileMetadata {
-            path: path.clone(),
-            size,
-            modified: mtime,
-            phash: 0,
-            pdqhash: None,
-            resolution: None,
-            content_hash: [0u8; 32],
-            orientation,
-            dev_inode,
-        })
-    }).collect();
+    // 3. Final Sort
+    sort_files(&mut all_files, sort_order);
 
-    sort_files(&mut files, sort_order);
-    if files.is_empty() { return (Vec::new(), Vec::new(), subdirs); }
     let info = GroupInfo { max_dist: 0, status: GroupStatus::None };
-    (vec![files], vec![info], subdirs)
+    (vec![all_files], vec![info], subdirs)
 }
 
 #[cfg(test)]
