@@ -1,13 +1,16 @@
-use std::path::{Path};
-use std::fs;
-use std::collections::{HashMap, HashSet};
-use std::time::UNIX_EPOCH;
-use rayon::prelude::*;
-use walkdir::WalkDir;
 use chrono::{DateTime, Utc};
+use codes_iso_3166::part_1::CountryCode;
+use codes_iso_3166::part_2::SubdivisionCode;
 use crossbeam_channel::{unbounded, Sender};
 use image::GenericImageView;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::UNIX_EPOCH;
+use walkdir::WalkDir;
 
 // Platform-specific imports for Metadata
 #[cfg(unix)]
@@ -80,6 +83,7 @@ pub fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
 
 /// Get multiple EXIF tags as a vector of (tag_name, value) pairs
 /// Only returns tags that exist in the image
+/// Supports derived values like DerivedCountry
 pub fn get_exif_tags(path: &Path, tag_names: &[String]) -> Vec<(String, String)> {
     let Some(exif_data) = read_exif_data(path, None) else {
         return Vec::new();
@@ -87,8 +91,18 @@ pub fn get_exif_tags(path: &Path, tag_names: &[String]) -> Vec<(String, String)>
 
     let mut results = Vec::new();
 
+    // Pre-extract GPS coordinates for derived values (only if needed)
+    let gps_coords = if tag_names.iter().any(|t| is_derived_tag(t)) {
+        extract_gps_coordinates(&exif_data)
+    } else {
+        None
+    };
+
     for tag_name in tag_names {
-        if let Some((tag, in_value)) = parse_exif_tag_name(tag_name) {
+        // Check for derived tags first
+        if let Some(value) = get_derived_value(tag_name, gps_coords) {
+            results.push((format_derived_tag_display_name(tag_name), value));
+        } else if let Some((tag, in_value)) = parse_exif_tag_name(tag_name) {
             if let Some(field) = exif_data.get_field(tag, in_value) {
                 let value_str = format_exif_value(&field.value, tag);
                 results.push((tag_name.clone(), value_str));
@@ -97,6 +111,121 @@ pub fn get_exif_tags(path: &Path, tag_names: &[String]) -> Vec<(String, String)>
     }
 
     results
+}
+
+/// Check if a tag name is a derived value (not a real EXIF tag)
+fn is_derived_tag(name: &str) -> bool {
+    matches!(name.to_lowercase().as_str(), "derivedcountry" | "country")
+}
+
+/// Get the display name for a derived tag
+fn format_derived_tag_display_name(name: &str) -> String {
+    match name.to_lowercase().as_str() {
+        "derivedcountry" => "Country".to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Extract GPS coordinates from EXIF data as (latitude, longitude)
+fn extract_gps_coordinates(exif_data: &exif::Exif) -> Option<(f64, f64)> {
+    let lat_field = exif_data.get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY)?;
+    let lon_field = exif_data.get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY)?;
+    let lat_ref = exif_data.get_field(exif::Tag::GPSLatitudeRef, exif::In::PRIMARY);
+    let lon_ref = exif_data.get_field(exif::Tag::GPSLongitudeRef, exif::In::PRIMARY);
+
+    let lat = parse_gps_coordinate(&lat_field.value)?;
+    let lon = parse_gps_coordinate(&lon_field.value)?;
+
+    // Apply reference (N/S for latitude, E/W for longitude)
+    let lat = if let Some(ref_field) = lat_ref {
+        let ref_str = ref_field.value.display_as(exif::Tag::GPSLatitudeRef).to_string();
+        if ref_str.trim().eq_ignore_ascii_case("S") { -lat } else { lat }
+    } else { lat };
+
+    let lon = if let Some(ref_field) = lon_ref {
+        let ref_str = ref_field.value.display_as(exif::Tag::GPSLongitudeRef).to_string();
+        if ref_str.trim().eq_ignore_ascii_case("W") { -lon } else { lon }
+    } else { lon };
+
+    Some((lat, lon))
+}
+
+/// Parse GPS coordinate from EXIF rational values (degrees, minutes, seconds)
+fn parse_gps_coordinate(value: &exif::Value) -> Option<f64> {
+    if let exif::Value::Rational(rats) = value {
+        if rats.len() >= 3 {
+            let degrees = rats[0].num as f64 / rats[0].denom as f64;
+            let minutes = rats[1].num as f64 / rats[1].denom as f64;
+            let seconds = rats[2].num as f64 / rats[2].denom as f64;
+            return Some(degrees + minutes / 60.0 + seconds / 3600.0);
+        }
+    }
+    None
+}
+
+/// Get a derived value based on tag name and available data
+fn get_derived_value(tag_name: &str, gps_coords: Option<(f64, f64)>) -> Option<String> {
+    match tag_name.to_lowercase().as_str() {
+        "derivedcountry" => {
+            let (lat, lon) = gps_coords?;
+            derive_country(lat, lon)
+        },
+        _ => None,
+    }
+}
+
+/// Derive country name from GPS coordinates using country-boundaries
+fn derive_country(lat: f64, lon: f64) -> Option<String> {
+    use country_boundaries::{CountryBoundaries, LatLon, BOUNDARIES_ODBL_360X180};
+
+    // Create boundaries instance (this is fast after first load as data is static)
+    let boundaries = CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).ok()?;
+
+    // Get the position
+    let pos = LatLon::new(lat, lon).ok()?;
+
+    // Get country IDs for this position
+    let ids = boundaries.ids(pos);
+
+    if ids.is_empty() {
+        return None;
+    }
+
+    // Find subdivision (like "US-FL") and country code (like "US")
+    let subdivision_id = ids.iter().find(|id| id.contains('-')).map(|s| s.as_ref());
+    let country_id = ids.iter().find(|id| id.len() == 2).map(|s| s.as_ref());
+
+    // Build the location string
+    format_location(country_id, subdivision_id)
+}
+
+/// Format location string from country and subdivision codes
+fn format_location(country_code: Option<&str>, subdivision_code: Option<&str>) -> Option<String> {
+    // 1. Get subdivision name (e.g., "US-FL" -> "Florida")
+    let subdivision_name = subdivision_code.and_then(|code| {
+        // The crate expects underscores (US_FL) not hyphens (US-FL)
+        let formatted_code = code.replace('-', "_");
+        SubdivisionCode::from_str(&formatted_code)
+            .ok()
+            .map(|s| s.name().to_string())
+    });
+
+    // 2. Get country name (e.g., "FI" -> "Finland")
+    let country_name = country_code.and_then(|code| {
+        CountryCode::from_str(code)
+            .ok()
+            .map(|c| c.short_name().to_string())
+    });
+
+    match (country_name, subdivision_name) {
+        (Some(country), Some(subdivision)) => Some(format!("{}, {}", subdivision, country)),
+        (Some(country), None) => Some(country),
+        (None, Some(subdivision)) => Some(subdivision),
+        (None, None) => {
+            // Fallback: return the raw code if we have one
+            country_code.or(subdivision_code).map(|s| s.to_string())
+        }
+    }
 }
 
 /// Parse a tag name string into an exif::Tag and exif::In
@@ -185,6 +314,8 @@ pub fn get_supported_exif_tags() -> Vec<(&'static str, &'static str)> {
         ("GPSLatitude", "GPS latitude"),
         ("GPSLongitude", "GPS longitude"),
         ("GPSAltitude", "GPS altitude"),
+        // Derived values (computed from other EXIF data)
+        ("DerivedCountry", "Country name derived from GPS coordinates"),
     ]
 }
 
@@ -946,4 +1077,21 @@ pub fn scan_for_view(
     if files.is_empty() { return (Vec::new(), Vec::new(), subdirs); }
     let info = GroupInfo { max_dist: 0, status: GroupStatus::None };
     (vec![files], vec![info], subdirs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_country_florida() {
+        // Simulate the GPS coordinates provided
+        let lat = 28.68;
+        let lon = -81.31;
+        let result = derive_country(lat, lon);
+        assert_eq!(
+            result,
+            Some("Florida, United States of America (the)".to_string())
+        );
+    }
 }
