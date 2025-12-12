@@ -322,14 +322,9 @@ impl AppContext {
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
             eprintln!("[DEBUG-DB] Read existing config, length = {} bytes", content.len());
-            let mut cfg: Config = toml::from_str(&content)?;
+            let cfg: Config = toml::from_str(&content)?;
             eprintln!("[DEBUG-DB] Parsed config, old gui: width={:?}, height={:?}, panel_width={:?}",
                 cfg.gui.width, cfg.gui.height, cfg.gui.panel_width);
-            cfg.gui = gui_config.clone();
-            let toml_str = toml::to_string_pretty(&cfg)?;
-            eprintln!("[DEBUG-DB] Writing new config:\n{}", toml_str);
-            fs::write(&config_path, toml_str)?;
-            eprintln!("[DEBUG-DB] Config saved successfully");
         } else {
             eprintln!("[DEBUG-DB] Config file does not exist at {:?}", config_path);
         }
