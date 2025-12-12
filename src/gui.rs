@@ -514,6 +514,7 @@ impl GuiApp {
     }
 
     /// Handles both standard image preloading (via egui) and Raw preloading (via worker pool)
+    /// In duplicate mode (multiple groups), preloads files from current and nearby groups.
     fn perform_preload(&mut self, ctx: &egui::Context) {
         if self.state.groups.is_empty() { return; }
 
@@ -525,46 +526,102 @@ impl GuiApp {
         self.last_preload_pos = Some((current_g, current_f));
 
         let preload_limit = self.ctx.gui_config.preload_count.unwrap_or(10);
-
-        let group = &self.state.groups[current_g];
-
-        // Calculate the range of files to preload
-        let half = preload_limit / 2;
-        let start = current_f.saturating_sub(half);
-        let end = (start + preload_limit).min(group.len());
-        let start = if end - start < preload_limit { end.saturating_sub(preload_limit) } else { start };
-
-        // 1. Update the Active Window (Shared with Workers)
         let mut active_window_paths = HashSet::new();
-        for i in start..end {
-            active_window_paths.insert(group[i].path.clone());
+
+        // Collect paths to preload, respecting preload_limit across all groups
+        let mut paths_to_preload: Vec<(std::path::PathBuf, bool)> = Vec::new(); // (path, is_current)
+
+        // Single group mode (--view) or multiple groups mode (duplicate finder)
+        if self.state.groups.len() == 1 {
+            // Original behavior: preload within the single group
+            let group = &self.state.groups[0];
+            let half = preload_limit / 2;
+            let start = current_f.saturating_sub(half);
+            let end = (start + preload_limit).min(group.len());
+            let start = if end - start < preload_limit { end.saturating_sub(preload_limit) } else { start };
+
+            for i in start..end {
+                paths_to_preload.push((group[i].path.clone(), i == current_f));
+            }
+        } else {
+            // Multiple groups: preload current group + files from nearby groups
+            let current_group = &self.state.groups[current_g];
+
+            // Add all files from current group (these are most important)
+            for (i, file) in current_group.iter().enumerate() {
+                paths_to_preload.push((file.path.clone(), i == current_f));
+            }
+
+            // Calculate remaining preload slots after current group
+            let remaining = preload_limit.saturating_sub(current_group.len());
+
+            if remaining > 0 {
+                // Preload from adjacent groups (next group first, then previous)
+                let mut extra_paths = Vec::new();
+
+                // Next group(s)
+                let mut next_g = current_g + 1;
+                let mut slots_left = remaining / 2 + remaining % 2; // Give slightly more to next
+                while next_g < self.state.groups.len() && slots_left > 0 {
+                    let group = &self.state.groups[next_g];
+                    for file in group.iter().take(slots_left) {
+                        extra_paths.push((file.path.clone(), false));
+                        slots_left -= 1;
+                    }
+                    next_g += 1;
+                }
+
+                // Previous group(s)
+                slots_left = remaining / 2;
+                let mut prev_g = current_g.saturating_sub(1);
+                while prev_g < current_g && slots_left > 0 {
+                    let group = &self.state.groups[prev_g];
+                    for file in group.iter().take(slots_left) {
+                        extra_paths.push((file.path.clone(), false));
+                        slots_left -= 1;
+                    }
+                    if prev_g == 0 { break; }
+                    prev_g -= 1;
+                }
+
+                paths_to_preload.extend(extra_paths);
+            }
         }
+
+        // Build active window set
+        for (path, _) in &paths_to_preload {
+            active_window_paths.insert(path.clone());
+        }
+
+        // Update shared active window
         if let Ok(mut w) = self.active_window.write() {
             *w = active_window_paths.clone();
         }
 
-        // Helper to trigger load
-        let mut trigger_load = |file_idx: usize| {
-            if file_idx >= group.len() { return; }
-            let path = &group[file_idx].path;
+        // Trigger loads - current file first
+        for (path, is_current) in &paths_to_preload {
+            if *is_current {
+                if is_raw_ext(path) {
+                    if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
+                        self.raw_loading.insert(path.clone());
+                        let _ = self.raw_preload_tx.send(path.clone());
+                    }
+                }
+                break;
+            }
+        }
+
+        // Then other files
+        for (path, is_current) in &paths_to_preload {
+            if *is_current { continue; }
 
             if is_raw_ext(path) {
                 if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
                     self.raw_loading.insert(path.clone());
                     let _ = self.raw_preload_tx.send(path.clone());
                 }
-            } else if file_idx != current_f {
-                 let _ = egui::Image::new(format!("file://{}", path.display())).load_for_size(ctx, egui::Vec2::new(2048.0, 2048.0));
-            }
-        };
-
-        // 2. Prioritize Current Image
-        trigger_load(current_f);
-
-        // 3. Queue Neighbors
-        if preload_limit > 0 {
-            for i in start..end {
-                if i != current_f { trigger_load(i); }
+            } else {
+                let _ = egui::Image::new(format!("file://{}", path.display())).load_for_size(ctx, egui::Vec2::new(2048.0, 2048.0));
             }
         }
 
