@@ -15,6 +15,7 @@ const CONFIG_FILE_NAME: &str = "phdupes.conf";
 const DB_FILE_NAME_PHASH: &str = "phdupes_phash";
 const DB_FILE_NAME_PDQHASH: &str = "phdupes_pdqhash";
 const DB_FILE_NAME_FEATURES: &str = "phdupes_features";
+const DB_FILE_NAME_PIXELHASH: &str = "phdupes_pixelhash";
 
 // Encryption overhead: 24-byte nonce + 16-byte Poly1305 tag
 const ENCRYPTION_OVERHEAD: usize = 24 + 16;
@@ -160,6 +161,7 @@ pub struct AppContext {
     pub hash_db: Database,
     pub meta_db: Database,
     pub feature_db: Database,
+    pub pixel_db: Database,
     pub content_key: [u8; 32],
     pub meta_key: [u8; 32],
     pub grouping_config: GroupingConfig,
@@ -176,9 +178,10 @@ pub enum HashValue {
 
 // (Meta Update, Hash Update, Feature Update)
 pub type DbUpdate = (
-    Option<([u8; 32], [u8; 32])>,
-    Option<([u8; 32], HashValue)>,
-    Option<([u8; 32], CachedFeatures)>
+    Option<([u8; 32], [u8; 32])>,         // Meta
+    Option<([u8; 32], HashValue)>,        // Hash
+    Option<([u8; 32], CachedFeatures)>,   // Features
+    Option<([u8; 32], [u8; 32])>          // Pixel Hash
 );
 
 impl AppContext {
@@ -317,12 +320,14 @@ impl AppContext {
         let hash_db = env.open_db(None)?;
         let meta_db = env.create_db(Some("file_metadata"), DatabaseFlags::empty())?;
         let feature_db = env.create_db(Some(DB_FILE_NAME_FEATURES), DatabaseFlags::empty())?;
+        let pixel_db = env.create_db(Some(DB_FILE_NAME_PIXELHASH), DatabaseFlags::empty())?;
 
         Ok(Self {
             env: Arc::new(env),
             hash_db,
             meta_db,
             feature_db,
+            pixel_db,
             content_key,
             meta_key,
             grouping_config: config.grouping,
@@ -463,6 +468,22 @@ impl AppContext {
         }
     }
 
+    pub fn get_pixel_hash(&self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, lmdb::Error> {
+        let txn = self.env.begin_ro_txn()?;
+        match txn.get(self.pixel_db, content_hash) {
+            Ok(encrypted_bytes) => {
+                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
+                    let arr: [u8; 32] = decrypted.try_into().map_err(|_| lmdb::Error::Corrupted)?;
+                    Ok(Some(arr))
+                } else {
+                    Err(lmdb::Error::Corrupted)
+                }
+            },
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Prune entries older than `max_age_seconds`.
     /// 1. Iterates MetaDB: Removes entries where timestamp < cutoff.
     /// 2. Collects active ContentHashes.
@@ -545,6 +566,21 @@ impl AppContext {
             }
         }
 
+        // 4. Sweep PixelDB
+        if txn.stat(self.pixel_db)?.entries() > 0 {
+            let mut cursor = txn.open_rw_cursor(self.pixel_db)?;
+            for iter in cursor.iter_start() {
+                if let Ok((key, _)) = iter {
+                     if key.len() == 32 {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(key);
+                        if !valid_content_hashes.contains(&k) {
+                            cursor.del(WriteFlags::empty())?;
+                        }
+                    }
+                }
+            }
+        }
         txn.commit()?;
         Ok((meta_remove_count, hash_remove_count))
     }
@@ -554,12 +590,15 @@ impl AppContext {
         let meta_db = self.meta_db;
         let hash_db = self.hash_db;
         let feature_db = self.feature_db;
+        let pixel_db = self.pixel_db;
         let cipher = self.cipher.clone();
 
         thread::spawn(move || {
             let mut meta_updates = Vec::new();
             let mut hash_updates = Vec::new();
             let mut feature_updates = Vec::new();
+            let mut pixel_updates = Vec::new();
+
             let mut last_flush = Instant::now();
             let flush_interval = Duration::from_secs(1);
             let max_buffer = 1000;
@@ -567,24 +606,27 @@ impl AppContext {
             loop {
                 let msg = rx.recv_timeout(Duration::from_millis(100));
                 match msg {
-                    Ok((m, h, f)) => {
+                    Ok((m, h, f, p)) => {
                         if let Some(up) = m { meta_updates.push(up); }
                         if let Some(up) = h { hash_updates.push(up); }
                         if let Some(up) = f { feature_updates.push(up); }
+                        if let Some(up) = p { pixel_updates.push(up); }
                     },
                     Err(RecvTimeoutError::Disconnected) => {
-                        let _ = Self::write_batch(&cipher, &env, meta_db, hash_db, feature_db, &meta_updates, &hash_updates, &feature_updates);
+                        let _ = Self::write_batch(&cipher, &env, meta_db, hash_db, feature_db, pixel_db, &meta_updates, &hash_updates, &feature_updates, &pixel_updates);
                         break;
                     },
                     _ => {}
                 }
 
-                if (last_flush.elapsed() >= flush_interval || meta_updates.len() >= max_buffer || hash_updates.len() >= max_buffer || feature_updates.len() >= max_buffer)
-                    && (!meta_updates.is_empty() || !hash_updates.is_empty() || !feature_updates.is_empty()) {
-                        if Self::write_batch(&cipher, &env, meta_db, hash_db, feature_db, &meta_updates, &hash_updates, &feature_updates).is_ok() {
+                if (last_flush.elapsed() >= flush_interval || meta_updates.len() >= max_buffer || hash_updates.len() >= max_buffer || feature_updates.len() >= max_buffer || pixel_updates.len() >= max_buffer)
+                    && (!meta_updates.is_empty() || !hash_updates.is_empty()
+                        || !feature_updates.is_empty()) || !pixel_updates.is_empty() {
+                        if Self::write_batch(&cipher, &env, meta_db, hash_db, feature_db, pixel_db, &meta_updates, &hash_updates, &feature_updates, &pixel_updates).is_ok() {
                             meta_updates.clear();
                             hash_updates.clear();
                             feature_updates.clear();
+                            pixel_updates.clear();
                         }
                         last_flush = Instant::now();
                     }
@@ -598,9 +640,11 @@ impl AppContext {
         meta_db: Database,
         hash_db: Database,
         feature_db: Database,
+        pixel_db: Database,
         meta_updates: &Vec<([u8; 32], [u8; 32])>,
         hash_updates: &Vec<([u8; 32], HashValue)>,
-        feature_updates: &Vec<([u8; 32], CachedFeatures)>
+        feature_updates: &Vec<([u8; 32], CachedFeatures)>,
+        pixel_updates: &Vec<([u8; 32], [u8; 32])>,
     ) -> Result<(), lmdb::Error> {
         let mut txn = env.begin_rw_txn()?;
 
@@ -637,6 +681,12 @@ impl AppContext {
             let bytes = features.to_bytes();
             let encrypted = Self::encrypt_value(cipher, key, &bytes);
             txn.put(feature_db, key, &encrypted, WriteFlags::empty())?;
+        }
+
+        // 4. Pixel Updates
+        for (key, val) in pixel_updates {
+            let encrypted = Self::encrypt_value(cipher, key, val);
+            txn.put(pixel_db, key, &encrypted, WriteFlags::empty())?;
         }
 
         txn.commit()
