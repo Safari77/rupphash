@@ -102,6 +102,8 @@ pub struct GuiApp {
     // Cache for current image's histogram and EXIF data (to avoid reloading on toggle)
     cached_histogram: Option<(std::path::PathBuf, [u32; 256])>,
     cached_exif: Option<(std::path::PathBuf, Vec<(String, String)>)>,
+    search_input: String,
+    search_focus_requested: bool,
 }
 
 impl GuiApp {
@@ -173,6 +175,8 @@ impl GuiApp {
             show_exif: false,
             cached_histogram: None,
             cached_exif: None,
+            search_input: String::new(),
+            search_focus_requested: false,
         }
     }
 
@@ -271,6 +275,8 @@ impl GuiApp {
             show_exif: false,
             cached_histogram: None,
             cached_exif: None,
+            search_input: String::new(),
+            search_focus_requested: false,
         }
     }
 
@@ -1242,6 +1248,8 @@ impl eframe::App for GuiApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.show_dir_picker {
                 self.show_dir_picker = false;
+            } else if self.state.show_search {
+                 *intent.borrow_mut() = Some(InputIntent::CancelSearch);
             } else if self.state.show_confirmation || self.state.error_popup.is_some() || self.state.renaming.is_some() || self.state.show_sort_selection {
                 *intent.borrow_mut() = Some(InputIntent::Cancel);
             }
@@ -1267,7 +1275,7 @@ impl eframe::App for GuiApp {
                     self.show_dir_picker = false;
                     self.change_directory(selected_dir);
                 }
-        } else if !self.state.is_loading && self.state.renaming.is_none() && !self.state.show_sort_selection {
+        } else if !self.state.is_loading && self.state.renaming.is_none() && !self.state.show_sort_selection && !self.state.show_search {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) { *intent.borrow_mut() = Some(InputIntent::NextItem); }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) { *intent.borrow_mut() = Some(InputIntent::PrevItem); }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) { *intent.borrow_mut() = Some(InputIntent::NextItem); }
@@ -1323,6 +1331,19 @@ impl eframe::App for GuiApp {
                 self.panel_width = (self.panel_width + delta).min(window_width * 0.8);
                 force_panel_resize = true;
             }
+            // Search
+            if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
+                *intent.borrow_mut() = Some(InputIntent::StartSearch);
+                self.search_input.clear();
+                self.search_focus_requested = false;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
+                if ctx.input(|i| i.modifiers.shift) {
+                    *intent.borrow_mut() = Some(InputIntent::PrevSearchResult);
+                } else {
+                    *intent.borrow_mut() = Some(InputIntent::NextSearchResult);
+                }
+            }
         }
 
         let pending = intent.borrow().clone();
@@ -1357,112 +1378,149 @@ impl eframe::App for GuiApp {
                if ui.button("Yes (y)").clicked() { self.state.handle_input(InputIntent::ConfirmDelete); }
                if ui.button("No (n)").clicked() { self.state.handle_input(InputIntent::Cancel); }
            });
-       }
+        }
 
-       if self.state.show_delete_immediate_confirmation {
-           if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
-               self.state.handle_input(InputIntent::ConfirmDeleteImmediate);
-           } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
-               self.state.handle_input(InputIntent::Cancel);
-           }
-           egui::Window::new("Confirm Delete").collapsible(false).show(ctx, |ui| {
-               let filename = self.state.get_current_image_path().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_default();
-               ui.label(format!("Delete current file?\n{}", filename));
-               if ui.button("Yes (y)").clicked() { self.state.handle_input(InputIntent::ConfirmDeleteImmediate); }
-               if ui.button("No (n)").clicked() { self.state.handle_input(InputIntent::Cancel); }
-           });
-       }
+        if self.state.show_delete_immediate_confirmation {
+            if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
+                self.state.handle_input(InputIntent::ConfirmDeleteImmediate);
+            } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
+                self.state.handle_input(InputIntent::Cancel);
+            }
+            egui::Window::new("Confirm Delete").collapsible(false).show(ctx, |ui| {
+                let filename = self.state.get_current_image_path().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_default();
+                ui.label(format!("Delete current file?\n{}", filename));
+                if ui.button("Yes (y)").clicked() { self.state.handle_input(InputIntent::ConfirmDeleteImmediate); }
+                if ui.button("No (n)").clicked() { self.state.handle_input(InputIntent::Cancel); }
+            });
+        }
 
-       if self.state.show_move_confirmation {
-           if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
-               self.state.handle_input(InputIntent::ConfirmMoveMarked);
-           } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
-               self.state.handle_input(InputIntent::Cancel);
-           }
-           egui::Window::new("Confirm Move").collapsible(false).show(ctx, |ui| {
-               let target = self.state.move_target.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-               ui.label(format!("Move marked files to:\n{}", target));
-               if ui.button("Yes (y)").clicked() { self.state.handle_input(InputIntent::ConfirmMoveMarked); }
-               if ui.button("No (n)").clicked() { self.state.handle_input(InputIntent::Cancel); }
-           });
-       }
+        if self.state.show_move_confirmation {
+            if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
+                self.state.handle_input(InputIntent::ConfirmMoveMarked);
+            } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
+                self.state.handle_input(InputIntent::Cancel);
+            }
+            egui::Window::new("Confirm Move").collapsible(false).show(ctx, |ui| {
+                let target = self.state.move_target.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                ui.label(format!("Move marked files to:\n{}", target));
+                if ui.button("Yes (y)").clicked() { self.state.handle_input(InputIntent::ConfirmMoveMarked); }
+                if ui.button("No (n)").clicked() { self.state.handle_input(InputIntent::Cancel); }
+            });
+        }
 
-       if self.state.renaming.is_some() {
+        // Search Dialog with Fixes
+        if self.state.show_search {
+            let mut submit = false;
+            let mut cancel = false;
+
+            egui::Window::new("Find File (Regex)")
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label("Case-insensitive regex search:");
+
+                    let res = ui.text_edit_singleline(&mut self.search_input);
+
+                    if !self.search_focus_requested {
+                        res.request_focus();
+                        self.search_focus_requested = true;
+                    }
+
+                    // Check both has_focus (typing) and lost_focus (committed via Enter)
+                    let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if enter_pressed && (res.has_focus() || res.lost_focus()) {
+                        submit = true;
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Find").clicked() { submit = true; }
+                        if ui.button("Cancel").clicked() { cancel = true; }
+                    });
+                });
+
+            if submit {
+                self.state.handle_input(InputIntent::SubmitSearch(self.search_input.clone()));
+            }
+            if cancel {
+                self.state.handle_input(InputIntent::CancelSearch);
+            }
+        }
+
+        if self.state.renaming.is_some() {
             let mut submit = false;
             let mut cancel = false;
             let mut request_focus_back = false;
 
             egui::Window::new("Rename").collapsible(false).show(ctx, |ui| {
-               let res = ui.text_edit_singleline(&mut self.rename_input);
-               if !self.state.show_sort_selection && !self.state.show_confirmation {
-                   res.request_focus();
-               }
+                let res = ui.text_edit_singleline(&mut self.rename_input);
+                if !self.state.show_sort_selection && !self.state.show_confirmation {
+                    res.request_focus();
+                }
 
-               if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                   submit = true;
-               }
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
 
-               if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
-                   request_focus_back = true;
-                   let parent = if let Some(state) = &self.state.renaming {
-                       state.original_path.parent().map(|p| p.to_path_buf())
-                   } else { None };
+                if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                    request_focus_back = true;
+                    let parent = if let Some(state) = &self.state.renaming {
+                        state.original_path.parent().map(|p| p.to_path_buf())
+                    } else { None };
 
-                   if let Some(parent_dir) = parent {
-                       // Calculate previous index to check if input matches what we last auto-completed
-                       let prev_idx = if !self.completion_candidates.is_empty() {
-                           (self.completion_index + self.completion_candidates.len() - 1) % self.completion_candidates.len()
-                       } else { 0 };
+                    if let Some(parent_dir) = parent {
+                        // Calculate previous index to check if input matches what we last auto-completed
+                        let prev_idx = if !self.completion_candidates.is_empty() {
+                            (self.completion_index + self.completion_candidates.len() - 1) % self.completion_candidates.len()
+                        } else { 0 };
 
-                       // Check if the current input matches the candidate we just showed.
-                       // This confirms the user hasn't typed something new manually.
-                       let input_matches_candidate = !self.completion_candidates.is_empty()
-                           && self.completion_candidates[prev_idx] == self.rename_input;
+                        // Check if the current input matches the candidate we just showed.
+                        // This confirms the user hasn't typed something new manually.
+                        let input_matches_candidate = !self.completion_candidates.is_empty()
+                            && self.completion_candidates[prev_idx] == self.rename_input;
 
-                       // If empty or user typed something new, scan for new candidates
-                       if self.completion_candidates.is_empty() || !input_matches_candidate {
-                           self.completion_candidates.clear();
-                           self.completion_index = 0;
-                           if let Ok(entries) = fs::read_dir(&parent_dir) {
-                               let prefix = self.rename_input.clone();
-                               for entry in entries.flatten() {
-                                   let name = entry.file_name().to_string_lossy().to_string();
-                                   if name.starts_with(&prefix) {
-                                       self.completion_candidates.push(name);
-                                   }
-                               }
-                               self.completion_candidates.sort();
-                           }
-                       }
+                        // If empty or user typed something new, scan for new candidates
+                        if self.completion_candidates.is_empty() || !input_matches_candidate {
+                            self.completion_candidates.clear();
+                            self.completion_index = 0;
+                            if let Ok(entries) = fs::read_dir(&parent_dir) {
+                                let prefix = self.rename_input.clone();
+                                for entry in entries.flatten() {
+                                    let name = entry.file_name().to_string_lossy().to_string();
+                                    if name.starts_with(&prefix) {
+                                        self.completion_candidates.push(name);
+                                    }
+                                }
+                                self.completion_candidates.sort();
+                            }
+                        }
 
-                       // Apply the next completion
-                       if !self.completion_candidates.is_empty() {
-                           self.rename_input = self.completion_candidates[self.completion_index].clone();
-                           self.completion_index = (self.completion_index + 1) % self.completion_candidates.len();
-                       }
-                   }
-               }
+                        // Apply the next completion
+                        if !self.completion_candidates.is_empty() {
+                            self.rename_input = self.completion_candidates[self.completion_index].clone();
+                            self.completion_index = (self.completion_index + 1) % self.completion_candidates.len();
+                        }
+                    }
+                }
 
-               if request_focus_back {
-                   res.request_focus();
-               }
+                if request_focus_back {
+                    res.request_focus();
+                }
 
-               if ui.button("Rename").clicked() { submit = true; }
-               if ui.button("Cancel").clicked() { cancel = true; }
-           });
+                if ui.button("Rename").clicked() { submit = true; }
+                if ui.button("Cancel").clicked() { cancel = true; }
+            });
 
-           if submit {
-               self.state.handle_input(InputIntent::SubmitRename(self.rename_input.clone()));
-               self.completion_candidates.clear();
-           }
-           if cancel {
-               self.state.handle_input(InputIntent::Cancel);
-               self.completion_candidates.clear();
-           }
-       }
+            if submit {
+                self.state.handle_input(InputIntent::SubmitRename(self.rename_input.clone()));
+                self.completion_candidates.clear();
+            }
+            if cancel {
+                self.state.handle_input(InputIntent::Cancel);
+                self.completion_candidates.clear();
+            }
+        }
 
-       // Sort Selection Dialog
-       if self.state.show_sort_selection {
+        // Sort Selection Dialog
+        if self.state.show_sort_selection {
             let mut selected_sort = None;
 
             egui::Window::new("Sort Order")
@@ -1812,7 +1870,7 @@ impl eframe::App for GuiApp {
                             resp.context_menu(|ui| {
                                 if ui.button("Rename (R)").clicked() { ui.close(); action_rename = true; }
                                 if ui.button("Copy full path").clicked() { // Copy to clipboard
-                                    ui.ctx().copy_text(file.path.to_string_lossy().to_string()); 
+                                    ui.ctx().copy_text(file.path.to_string_lossy().to_string());
                                     ui.close();
                                 }
                                 if ui.button("Delete (Del)").clicked() { ui.close(); action_delete = true; }
@@ -1848,8 +1906,8 @@ impl eframe::App for GuiApp {
                 });
             });
             let rendered_width = panel_response.response.rect.width();
-            if !force_panel_resize && (rendered_width - self.panel_width).abs() > 1.0 { 
-                self.panel_width = rendered_width; 
+            if !force_panel_resize && (rendered_width - self.panel_width).abs() > 1.0 {
+                self.panel_width = rendered_width;
             }
         }
 
