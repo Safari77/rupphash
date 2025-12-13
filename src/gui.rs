@@ -1202,6 +1202,9 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Local flag to force egui to respect our manual resize this frame
+        let mut force_panel_resize = false;
+
         if !self.initial_scale_applied {
             let user_scale = self.ctx.gui_config.font_scale.unwrap_or(1.0);
             ctx.set_pixels_per_point(ctx.pixels_per_point() * user_scale);
@@ -1270,6 +1273,7 @@ impl eframe::App for GuiApp {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) { *intent.borrow_mut() = Some(InputIntent::NextItem); }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) { *intent.borrow_mut() = Some(InputIntent::PrevItem); }
             if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) { *intent.borrow_mut() = Some(InputIntent::PageDown); }
+            if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::PageDown)) { *intent.borrow_mut() = Some(InputIntent::NextGroupByDist); }
             if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) { *intent.borrow_mut() = Some(InputIntent::PageUp); }
             if ctx.input(|i| i.key_pressed(egui::Key::Home)) { *intent.borrow_mut() = Some(InputIntent::Home); }
             if ctx.input(|i| i.key_pressed(egui::Key::End)) { *intent.borrow_mut() = Some(InputIntent::End); }
@@ -1296,7 +1300,23 @@ impl eframe::App for GuiApp {
             if self.state.view_mode {
                 if ctx.input(|i| i.key_pressed(egui::Key::C)) { self.open_dir_picker(); }
                 if ctx.input(|i| i.key_pressed(egui::Key::Period)) { self.go_up_directory(); }
-                if ctx.input(|i| i.key_pressed(egui::Key::T)) { *intent.borrow_mut() = Some(InputIntent::ShowSortSelection); }
+                if ctx.input(|i| i.key_pressed(egui::Key::T)) {
+                    *intent.borrow_mut() = Some(InputIntent::ShowSortSelection);
+                }
+            }
+
+            let window_width = ctx.input(|i| i.viewport().inner_rect.map(|r| r.width()).unwrap_or(1000.0));
+            let delta = window_width * 0.02;
+
+            // V to Shrink panel
+            if ctx.input(|i| i.key_pressed(egui::Key::V)) {
+                self.panel_width = (self.panel_width - delta).max(96.0);
+                force_panel_resize = true;
+            }
+            // B to Expand
+            if ctx.input(|i| i.key_pressed(egui::Key::B)) {
+                self.panel_width = (self.panel_width + delta).min(window_width * 0.8);
+                force_panel_resize = true;
             }
         }
 
@@ -1304,7 +1324,6 @@ impl eframe::App for GuiApp {
         if let Some(i) = pending {
             match i {
                 InputIntent::CycleViewMode => { self.update_view_state(|v| { v.mode = match v.mode { ViewMode::FitWindow => ViewMode::FitWidth, ViewMode::FitWidth => ViewMode::FitHeight, _ => ViewMode::FitWindow, }; }); },
-                // UPDATED: Fit -> 1:1 -> 2x -> 4x -> 8x -> Fit
                 InputIntent::CycleZoom => { self.update_view_state(|v| { v.mode = match v.mode {
                     ViewMode::FitWindow => ViewMode::ManualZoom(1.0),  // 1:1 native pixels
                     ViewMode::ManualZoom(z) if (z - 1.0).abs() < 0.1 => ViewMode::ManualZoom(2.0),
@@ -1612,6 +1631,9 @@ impl eframe::App for GuiApp {
             }).unwrap_or_else(|| ctx.used_rect().width());
             let panel_max_width = window_width * 0.5;
 
+            // Delay panel width restoration until after font_scale is applied
+            let ppp = ctx.pixels_per_point();
+
             // Only print debug every 60 frames to reduce spam
             use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
             static FRAME_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -1627,7 +1649,6 @@ impl eframe::App for GuiApp {
 
             // Delay panel width restoration until after font_scale is applied
             // On first frames (ppp=1), use a default. Once ppp stabilizes (>1), apply saved width.
-            let ppp = ctx.pixels_per_point();
             let should_apply_saved_width = !self.initial_panel_width_applied && ppp > 1.5;
 
             if should_apply_saved_width {
@@ -1635,19 +1656,19 @@ impl eframe::App for GuiApp {
                 self.initial_panel_width_applied = true;
             }
 
-            let panel = egui::SidePanel::left("list_panel")
+            let panel_builder = egui::SidePanel::left("list_panel")
                 .resizable(true)
                 .min_width(96.0);
 
-            let panel = if should_apply_saved_width {
-                // Force the saved width on the frame when ppp stabilizes
-                panel.exact_width(self.saved_panel_width.min(panel_max_width))
+            // Apply width logic to the builder
+            let panel = if force_panel_resize {
+                panel_builder.exact_width(self.panel_width)
+            } else if should_apply_saved_width {
+                panel_builder.exact_width(self.saved_panel_width.min(panel_max_width))
             } else if self.initial_panel_width_applied {
-                // After initial application, use default_width and let user resize
-                panel.default_width(self.panel_width).max_width(panel_max_width)
+                panel_builder.default_width(self.panel_width).max_width(panel_max_width)
             } else {
-                // Before ppp stabilizes, use a reasonable default
-                panel.default_width(200.0).max_width(panel_max_width)
+                panel_builder.default_width(200.0).max_width(panel_max_width)
             };
 
             let panel_response = panel.show(ctx, |ui| {
@@ -1785,7 +1806,7 @@ impl eframe::App for GuiApp {
 
                             resp.context_menu(|ui| {
                                 if ui.button("Rename (R)").clicked() { ui.close(); action_rename = true; }
-                                if ui.button("Copy full path").clicked() { /// Copy to clipboard
+                                if ui.button("Copy full path").clicked() { // Copy to clipboard
                                     ui.ctx().copy_text(file.path.to_string_lossy().to_string()); 
                                     ui.close();
                                 }
@@ -1822,7 +1843,9 @@ impl eframe::App for GuiApp {
                 });
             });
             let rendered_width = panel_response.response.rect.width();
-            if (rendered_width - self.panel_width).abs() > 1.0 { self.panel_width = rendered_width; }
+            if !force_panel_resize && (rendered_width - self.panel_width).abs() > 1.0 { 
+                self.panel_width = rendered_width; 
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {

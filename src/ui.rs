@@ -2,7 +2,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -12,7 +12,6 @@ use ratatui::{
 };
 use jiff::Timestamp;
 
-// Removed unused import: crate::FileMetadata
 use crate::GroupStatus;
 use crate::format_relative_time;
 use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_hardlink_groups};
@@ -21,6 +20,7 @@ pub struct TuiApp {
     state: AppState,
     list_state: ListState,
     view_height: usize,
+    rename_buffer: String,
 }
 
 impl TuiApp {
@@ -33,6 +33,7 @@ impl TuiApp {
             state,
             list_state,
             view_height: 0,
+            rename_buffer: String::new(),
         }
     }
 
@@ -54,11 +55,13 @@ impl TuiApp {
         while !self.state.exit_requested {
             tui.draw(|frame| self.render(frame))?;
 
-            if event::poll(Duration::from_millis(100))?
-                && let Event::Key(key) = event::read()?
-                    && key.kind == KeyEventKind::Press {
-                        self.handle_key(key.code);
+            if event::poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        self.handle_key(key.code, key.modifiers);
                     }
+                }
+            }
 
             // Sync list state with app state
             self.sync_list_state();
@@ -71,27 +74,46 @@ impl TuiApp {
              self.list_state.select(None);
              return;
         }
-        // Calculate absolute index for Ratatui list
-        // Each group has: 1 header item + N file items
-        // Note: Each file item is 1 ListItem (even though it has 2 lines internally)
         let mut abs_idx = 0;
         for i in 0..self.state.current_group_idx {
-            abs_idx += 1 + self.state.groups[i].len(); // 1 header + file count
+            abs_idx += 1 + self.state.groups[i].len();
         }
-        abs_idx += 1 + self.state.current_file_idx; // 1 for current group header + file index
+        abs_idx += 1 + self.state.current_file_idx;
         self.list_state.select(Some(abs_idx));
     }
 
-    fn handle_key(&mut self, key: KeyCode) {
-        // Error popup - dismiss on any key
+    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        // 1. Error Popup
         if self.state.error_popup.is_some() {
             self.state.handle_input(InputIntent::Cancel);
             return;
         }
 
-        // Modal / Confirmation Override
+        // 2. Renaming Input
+        if self.state.renaming.is_some() {
+            match code {
+                KeyCode::Esc => {
+                    self.state.handle_input(InputIntent::Cancel);
+                    self.rename_buffer.clear();
+                }
+                KeyCode::Enter => {
+                    self.state.handle_input(InputIntent::SubmitRename(self.rename_buffer.clone()));
+                    self.rename_buffer.clear();
+                }
+                KeyCode::Backspace => {
+                    self.rename_buffer.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.rename_buffer.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // 3. Delete Confirmation
         if self.state.show_confirmation {
-             match key {
+             match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.state.handle_input(InputIntent::ConfirmDelete),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.state.handle_input(InputIntent::Cancel),
                 _ => {}
@@ -99,35 +121,83 @@ impl TuiApp {
              return;
         }
 
-        // Renaming state - cancel only (TUI doesn't support rename UI)
-        if self.state.renaming.is_some() {
-            if matches!(key, KeyCode::Esc) {
-                self.state.handle_input(InputIntent::Cancel);
+        // 4. Move Confirmation
+        if self.state.show_move_confirmation {
+             match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.state.handle_input(InputIntent::ConfirmMoveMarked),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.state.handle_input(InputIntent::Cancel),
+                _ => {}
+             }
+             return;
+        }
+
+        // 5. Delete Immediate Confirmation
+        if self.state.show_delete_immediate_confirmation {
+             match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.state.handle_input(InputIntent::ConfirmDeleteImmediate),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.state.handle_input(InputIntent::Cancel),
+                _ => {}
+             }
+             return;
+        }
+
+        // 6. Sort Selection Menu
+        if self.state.show_sort_selection {
+            match code {
+                KeyCode::Char('1') => self.state.handle_input(InputIntent::ChangeSortOrder("name".to_string())),
+                KeyCode::Char('2') => self.state.handle_input(InputIntent::ChangeSortOrder("name-desc".to_string())),
+                KeyCode::Char('3') => self.state.handle_input(InputIntent::ChangeSortOrder("name-natural".to_string())),
+                KeyCode::Char('4') => self.state.handle_input(InputIntent::ChangeSortOrder("name-natural-desc".to_string())),
+                KeyCode::Char('5') => self.state.handle_input(InputIntent::ChangeSortOrder("date".to_string())),
+                KeyCode::Char('6') => self.state.handle_input(InputIntent::ChangeSortOrder("date-desc".to_string())),
+                KeyCode::Char('7') => self.state.handle_input(InputIntent::ChangeSortOrder("size".to_string())),
+                KeyCode::Char('8') => self.state.handle_input(InputIntent::ChangeSortOrder("size-desc".to_string())),
+                KeyCode::Char('9') => self.state.handle_input(InputIntent::ChangeSortOrder("random".to_string())),
+                KeyCode::Esc | KeyCode::Char('n') => self.state.handle_input(InputIntent::Cancel),
+                _ => {}
             }
             return;
         }
 
-        // Standard Mapping
-        let intent = match key {
+        // 7. Standard Navigation & Actions
+        let intent = match code {
             KeyCode::Char('q') | KeyCode::Esc => Some(InputIntent::Quit),
             KeyCode::Down => Some(InputIntent::NextItem),
             KeyCode::Up => Some(InputIntent::PrevItem),
-            KeyCode::PageDown => Some(InputIntent::PageDown),
+
+            // Handle Shift+PageDown for NextGroupByDist
+            KeyCode::PageDown => {
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    Some(InputIntent::NextGroupByDist)
+                } else {
+                    Some(InputIntent::PageDown)
+                }
+            },
             KeyCode::PageUp => Some(InputIntent::PageUp),
+
             KeyCode::Tab => Some(InputIntent::NextGroup),
             KeyCode::BackTab => Some(InputIntent::PrevGroup),
             KeyCode::Home => Some(InputIntent::Home),
             KeyCode::End => Some(InputIntent::End),
+
             KeyCode::Char(' ') => Some(InputIntent::ToggleMark),
-            KeyCode::Char('d') => Some(InputIntent::ExecuteDelete),
+            KeyCode::Char('d') | KeyCode::Delete => Some(InputIntent::ExecuteDelete),
+            KeyCode::Char('m') => Some(InputIntent::MoveMarked),
+            KeyCode::Char('r') => {
+                // Pre-fill buffer with current filename
+                if let Some(path) = self.state.get_current_image_path() {
+                    self.rename_buffer = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                }
+                Some(InputIntent::StartRename)
+            },
+            KeyCode::Char('s') => Some(InputIntent::ShowSortSelection),
             KeyCode::Char('h') => Some(InputIntent::ToggleRelativeTime),
             KeyCode::Char('p') => Some(InputIntent::TogglePathVisibility),
-            KeyCode::Char('x') => Some(InputIntent::ToggleZoomRelative), // Added for consistency (affects state even if TUI doesn't show images)
+            KeyCode::Char('x') => Some(InputIntent::ToggleZoomRelative),
             _ => None,
         };
 
         if let Some(i) = intent {
-            // Special handling for paging which needs view dimension from renderer
             if matches!(i, InputIntent::PageDown | InputIntent::PageUp) {
                 self.state.move_page(i == InputIntent::PageDown, self.view_height);
                 self.state.selection_changed = true;
@@ -148,10 +218,6 @@ impl TuiApp {
             ])
             .split(area);
 
-        // Update view height for paging
-        // Each file item takes 2 lines, headers take 1 line, plus 2 for borders
-        // For accurate paging, we estimate visible items: (height - 2 borders) / 2 lines per item
-        // This is approximate since headers only take 1 line
         self.view_height = (main_layout[0].height.saturating_sub(2) / 2) as usize;
 
         // --- Status Bar ---
@@ -161,7 +227,7 @@ impl TuiApp {
         } else {
              let mode = if self.state.use_trash { "Trash" } else { "Perm" };
              let time_mode = if self.state.show_relative_times { "Rel" } else { "Abs" };
-             Paragraph::new(Span::raw(format!("Mode: {} | Time: {} | [Space]: Mark | [d]: Delete | [h]: Time | [p]: Path | [Tab]: Groups | [q]: Quit", mode, time_mode)))
+             Paragraph::new(Span::raw(format!("Mode: {} | Time: {} | [Space]: Mark | [d]: Delete | [m]: Move | [r]: Rename | [s]: Sort | [q]: Quit", mode, time_mode)))
         };
 
         frame.render_widget(status_widget, main_layout[1]);
@@ -256,25 +322,58 @@ impl TuiApp {
 
         frame.render_stateful_widget(list, main_layout[0], &mut self.list_state);
 
-        // --- Popups ---
+        // --- Modals / Popups ---
+
+        // 1. Confirmation Popups
         if self.state.show_confirmation {
-            let block = Block::default().title("Confirmation").borders(Borders::ALL).style(Style::default().bg(Color::DarkGray));
             let action = if self.state.use_trash { "trash" } else { "delete" };
             let text = format!("Are you sure you want to {} {} files?\n\n(y) Yes / (n) No", action, self.state.marked_for_deletion.len());
-            let paragraph = Paragraph::new(text).block(block).alignment(Alignment::Center);
-            let area = centered_rect(60, 20, area);
+            render_popup(frame, "Confirm Deletion", &text, 60, 20, Color::Red);
+        }
+
+        if self.state.show_delete_immediate_confirmation {
+            let path = self.state.get_current_image_path();
+            let name = path.map(|p| p.file_name().unwrap_or_default().to_string_lossy()).unwrap_or_default();
+            let action = if self.state.use_trash { "trash" } else { "delete" };
+            let text = format!("{} current file?\n{}\n\n(y) Yes / (n) No", action, name);
+            render_popup(frame, "Confirm Delete", &text, 60, 20, Color::Red);
+        }
+
+        if self.state.show_move_confirmation {
+            let target = self.state.move_target.as_ref().map(|p| p.display().to_string()).unwrap_or("???".into());
+            let text = format!("Move {} files to:\n{}\n\n(y) Yes / (n) No", self.state.marked_for_deletion.len(), target);
+            render_popup(frame, "Confirm Move", &text, 60, 20, Color::Cyan);
+        }
+
+        // 2. Sort Menu
+        if self.state.show_sort_selection {
+            let text = "Select Sort Order:\n\n1. Name (A-Z)\n2. Name (Z-A)\n3. Name Natural (A-Z)\n4. Name Natural (Z-A)\n5. Date (Oldest)\n6. Date (Newest)\n7. Size (Smallest)\n8. Size (Largest)\n9. Random\n\n(Esc) Cancel";
+            render_popup(frame, "Sort Order", text, 40, 40, Color::Yellow);
+        }
+
+        // 3. Rename Input
+        if self.state.renaming.is_some() {
+            let block = Block::default().title("Rename File").borders(Borders::ALL).style(Style::default().bg(Color::Blue).fg(Color::White));
+            let paragraph = Paragraph::new(self.rename_buffer.clone()).block(block);
+            let area = centered_rect(60, 10, area);
             frame.render_widget(Clear, area);
             frame.render_widget(paragraph, area);
         }
 
+        // 4. Error Popup
         if let Some(err_text) = &self.state.error_popup {
-            let block = Block::default().title("ERROR").borders(Borders::ALL).style(Style::default().bg(Color::Red).fg(Color::White));
-            let paragraph = Paragraph::new(err_text.clone()).block(block).wrap(Wrap { trim: true }).alignment(Alignment::Left);
-            let area = centered_rect(80, 40, area);
-            frame.render_widget(Clear, area);
-            frame.render_widget(paragraph, area);
+            render_popup(frame, "ERROR", err_text, 80, 40, Color::Red);
         }
     }
+}
+
+// Helper for generic text popups
+fn render_popup(frame: &mut Frame, title: &str, text: &str, percent_x: u16, percent_y: u16, border_color: Color) {
+    let block = Block::default().title(title).borders(Borders::ALL).style(Style::default().bg(Color::DarkGray).fg(border_color));
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: true }).alignment(Alignment::Center);
+    let area = centered_rect(percent_x, percent_y, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
