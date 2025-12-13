@@ -11,6 +11,9 @@ image = { version = "0.25", features = ["avif-native"] }
 #image-extras = "0.1"
 image-extras = { git = "https://github.com/image-rs/image-extras", branch = "main" }
 libheif-rs = { version = "2.5", features = ["image"] }
+zune-jpeg = "0.4"
+flate2 = { version = "1.1", features = ["zlib-ng"], default-features = false }
+jpeg-decoder = "0.3.2"
 rustdct = "0.7"
 transpose = "0.2"
 walkdir = "2.5.0"

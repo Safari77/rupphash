@@ -1,5 +1,5 @@
 use eframe::egui;
-use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_hardlink_groups};
+use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_content_identical_counts, get_hardlink_groups};
 use crate::format_relative_time;
 use crate::GroupStatus;
 use crate::db::AppContext;
@@ -214,6 +214,7 @@ impl GuiApp {
             extensions: Vec::new(),
             ignore_same_stem: false,
             ignore_dev_id: false,
+            calc_pixel_hash: false,
         };
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
@@ -1739,19 +1740,26 @@ impl eframe::App for GuiApp {
 
                         let counts = get_bit_identical_counts(group);
                         let hardlink_groups = get_hardlink_groups(group);
+                        let pixel_counts = get_content_identical_counts(group);
 
                         for (f_idx, file) in group.iter().enumerate() {
                             let is_selected = g_idx == self.state.current_group_idx && f_idx == self.state.current_file_idx;
                             let is_marked = self.state.marked_for_deletion.contains(&file.path);
                             let exists = file.path.exists();
                             let is_bit_identical = !self.state.view_mode && *counts.get(&file.content_hash).unwrap_or(&0) > 1;
+                            let is_content_identical = file.pixel_hash
+                                .map(|ph| *pixel_counts.get(&ph).unwrap_or(&0) > 1)
+                                .unwrap_or(false);
+                            // Logic: Bit Identical implies Content Identical, so only show "C" if NOT Bit Identical
+                            let show_c_flag = is_content_identical && !is_bit_identical;
                             let is_hardlinked = !self.state.view_mode && file.dev_inode
                                 .map(|di| hardlink_groups.contains_key(&di))
                                 .unwrap_or(false);
 
-                            let text = format!("{} {}{}",
+                            let text = format!("{} {}{}{}",
                                 if is_marked     { "M" } else { " " },
                                 if is_hardlinked { "L " } else { "  " },
+                                if show_c_flag { "C" } else { " " },
                                 format_path_depth(&file.path, self.state.path_display_depth)
                             );
                             let mut label_text = egui::RichText::new(text).family(egui::FontFamily::Monospace);
@@ -1760,6 +1768,7 @@ impl eframe::App for GuiApp {
                                 else if is_marked { label_text = label_text.color(egui::Color32::RED); }
                                 else if is_hardlinked { label_text = label_text.color(egui::Color32::LIGHT_BLUE); }
                                 else if is_bit_identical { label_text = label_text.color(egui::Color32::GREEN); }
+                                else if show_c_flag { label_text = label_text.color(egui::Color32::GOLD); }
                             }
 
                             // Use Button with selected and wrap_mode to prevent word wrap
