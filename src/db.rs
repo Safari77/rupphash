@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use std::fs;
 use std::thread;
-use std::time::{Duration, Instant};
-use lmdb::{Environment, Database, Transaction, WriteFlags, DatabaseFlags};
+use std::time::{Duration, Instant, UNIX_EPOCH, SystemTime};
+use std::collections::HashSet;
+use lmdb::{Environment, Database, Transaction, WriteFlags, DatabaseFlags, Cursor};
 use serde::{Deserialize, Serialize};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use chacha20poly1305::{
@@ -443,13 +444,22 @@ impl AppContext {
         }
     }
 
+    /// Retrieve content hash from metadata key.
+    /// STRICTLY expects [ContentHash (32) || Timestamp (8)].
+    /// Returns ONLY the ContentHash.
     pub fn get_content_hash(&self, meta_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, lmdb::Error> {
         let txn = self.env.begin_ro_txn()?;
         match txn.get(self.meta_db, meta_hash) {
-            Ok(encrypted_bytes) => {
-                if let Some(decrypted) = self.decrypt_value(meta_hash, encrypted_bytes) {
-                    let arr: [u8; 32] = decrypted.try_into().map_err(|_| lmdb::Error::Corrupted)?;
-                    Ok(Some(arr))
+            Ok(encrypted) => {
+                if let Some(decrypted) = self.decrypt_value(meta_hash, encrypted) {
+                    if decrypted.len() == 40 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&decrypted[0..32]);
+                        Ok(Some(arr))
+                    } else {
+                        // Strict check: if size is wrong, it's corrupted or old format
+                        Err(lmdb::Error::Corrupted)
+                    }
                 } else {
                     Err(lmdb::Error::Corrupted)
                 }
@@ -459,12 +469,94 @@ impl AppContext {
         }
     }
 
+    /// Prune entries older than `max_age_seconds`.
+    /// 1. Iterates MetaDB: Removes entries where timestamp < cutoff.
+    /// 2. Collects active ContentHashes.
+    /// 3. Sweeps HashDB/FeatureDB: Removes entries not in active set.
+    pub fn prune(&self, max_age_seconds: u64) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let cutoff = now.saturating_sub(max_age_seconds);
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let mut valid_content_hashes = HashSet::new();
+        let mut meta_remove_count = 0;
+        let mut hash_remove_count = 0;
+
+        // 1. Scan MetaDB
+        {
+            let mut cursor = txn.open_rw_cursor(self.meta_db)?;
+            for iter in cursor.iter_start() {
+                let (key, val_bytes) = iter;
+
+                let should_delete = if let Some(decrypted) = self.decrypt_value(key, val_bytes) {
+                    if decrypted.len() == 40 {
+                        let ts_bytes: [u8; 8] = decrypted[32..40].try_into().unwrap();
+                        let last_seen = u64::from_le_bytes(ts_bytes);
+
+                        if last_seen < cutoff {
+                            true // Expired
+                        } else {
+                            let mut ch = [0u8; 32];
+                            ch.copy_from_slice(&decrypted[0..32]);
+                            valid_content_hashes.insert(ch);
+                            false // Keep
+                        }
+                    } else {
+                        true // Corrupted/Old format -> Delete
+                    }
+                } else {
+                    true // Decrypt fail -> Delete
+                };
+
+                if should_delete {
+                    cursor.del(WriteFlags::empty())?;
+                    meta_remove_count += 1;
+                }
+            }
+        }
+
+        // 2. Sweep HashDB
+        {
+            let mut cursor = txn.open_rw_cursor(self.hash_db)?;
+            for iter in cursor.iter_start() {
+                let (key, _) = iter;
+
+                if key.len() == 32 {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(key);
+                    if !valid_content_hashes.contains(&k) {
+                        cursor.del(WriteFlags::empty())?;
+                        hash_remove_count += 1;
+                    }
+                }
+            }
+        }
+
+        // 3. Sweep FeatureDB
+        {
+            let mut cursor = txn.open_rw_cursor(self.feature_db)?;
+            for iter in cursor.iter_start() {
+                let (key, _) = iter;
+
+                if key.len() == 32 {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(key);
+                    if !valid_content_hashes.contains(&k) {
+                        cursor.del(WriteFlags::empty())?;
+                    }
+                }
+            }
+        }
+
+        txn.commit()?;
+        Ok((meta_remove_count, hash_remove_count))
+    }
+
     pub fn start_db_writer(&self, rx: Receiver<DbUpdate>) -> thread::JoinHandle<()> {
         let env = self.env.clone();
         let meta_db = self.meta_db;
         let hash_db = self.hash_db;
         let feature_db = self.feature_db;
-        // Clone cipher to move into thread
         let cipher = self.cipher.clone();
 
         thread::spawn(move || {
@@ -477,7 +569,6 @@ impl AppContext {
 
             loop {
                 let msg = rx.recv_timeout(Duration::from_millis(100));
-
                 match msg {
                     Ok((m, h, f)) => {
                         if let Some(up) = m { meta_updates.push(up); }
@@ -516,13 +607,20 @@ impl AppContext {
     ) -> Result<(), lmdb::Error> {
         let mut txn = env.begin_rw_txn()?;
 
-        // Encrypt Meta Map (db_key is meta_hash, value is content_hash)
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now_bytes = now.to_le_bytes();
+
+        // 1. Meta Updates: Append Timestamp (8 bytes) to ContentHash (32 bytes)
         for (key, val) in meta_updates {
-            let encrypted = Self::encrypt_value(cipher, key, val);
+            let mut data = Vec::with_capacity(32 + 8);
+            data.extend_from_slice(val);      // Content Hash
+            data.extend_from_slice(&now_bytes); // Timestamp
+
+            let encrypted = Self::encrypt_value(cipher, key, &data);
             txn.put(meta_db, key, &encrypted, WriteFlags::empty())?;
         }
 
-        // Encrypt Hash Map (db_key is content_hash, value is phash/pdqhash)
+        // 2. Hash Updates
         for (key, val) in hash_updates {
             match val {
                 HashValue::PHash(phash) => {
@@ -537,7 +635,7 @@ impl AppContext {
             }
         }
 
-        // Encrypt Features (db_key is content_hash, value is features)
+        // 3. Feature Updates
         for (key, features) in feature_updates {
             let bytes = features.to_bytes();
             let encrypted = Self::encrypt_value(cipher, key, &bytes);
