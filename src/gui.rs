@@ -1318,7 +1318,7 @@ impl eframe::App for GuiApp {
             if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::L)) { *intent.borrow_mut() = Some(InputIntent::ReloadList); }
             if ctx.input(|i| i.key_pressed(egui::Key::X)) { *intent.borrow_mut() = Some(InputIntent::ToggleZoomRelative); }
             if ctx.input(|i| i.key_pressed(egui::Key::P)) { *intent.borrow_mut() = Some(InputIntent::TogglePathVisibility); }
-            if ctx.input(|i| i.key_pressed(egui::Key::Delete)) || ctx.input(|i| i.key_pressed(egui::Key::Backspace)) { *intent.borrow_mut() = Some(InputIntent::DeleteImmediate); }
+            if ctx.input(|i| i.key_pressed(egui::Key::Delete)) { *intent.borrow_mut() = Some(InputIntent::DeleteImmediate); }
             if ctx.input(|i| i.key_pressed(egui::Key::M)) { *intent.borrow_mut() = Some(InputIntent::MoveMarked); }
             if ctx.input(|i| i.key_pressed(egui::Key::S)) { *intent.borrow_mut() = Some(InputIntent::ToggleSlideshow); }
             if ctx.input(|i| i.key_pressed(egui::Key::F)) { *intent.borrow_mut() = Some(InputIntent::ToggleFullscreen); }
