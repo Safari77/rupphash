@@ -505,6 +505,22 @@ impl GuiApp {
                 self.subdirs = new_subdirs;
                 self.state.last_file_count = self.state.groups.iter().map(|g| g.len()).sum();
 
+                // Clamp or reset indices to prevent panic if new list is smaller
+                if self.state.groups.is_empty() {
+                    self.state.current_group_idx = 0;
+                    self.state.current_file_idx = 0;
+                } else {
+                    if self.state.current_group_idx >= self.state.groups.len() {
+                        self.state.current_group_idx = self.state.groups.len() - 1;
+                        self.state.current_file_idx = 0; // Reset file index if we jumped groups
+                    }
+                    // Also check file index bounds for the current group
+                    let group_len = self.state.groups[self.state.current_group_idx].len();
+                    if self.state.current_file_idx >= group_len {
+                        self.state.current_file_idx = group_len.saturating_sub(1);
+                    }
+                }
+
                 self.state.is_loading = false;
                 self.scan_rx = None;
                 self.scan_progress_rx = None;
