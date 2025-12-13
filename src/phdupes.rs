@@ -29,6 +29,7 @@ pub struct FileMetadata {
     pub pdqhash: Option<[u8; 32]>,
     pub resolution: Option<(u32, u32)>,
     pub content_hash: [u8; 32],
+    pub pixel_hash: Option<[u8; 32]>,
     pub orientation: u8, // Added: EXIF orientation (1-8)
     pub dev_inode: Option<(u64, u64)>,
 }
@@ -111,6 +112,9 @@ struct Cli {
     /// Similarity threshold (default: 5 for pHash, 40 for PDQ hash)
     #[arg(long)]
     similarity: Option<u32>,
+    /// Calculate hash of raw pixel data to find content-identical files (e.g. PNG vs JPG)
+    #[arg(long)]
+    pixel_hash: bool,
 
     /// Sort order with --view: name, name-desc, name-natural, name-natural-desc, date, date-desc, size, size-desc, random
     #[arg(long, default_value = "name")]
@@ -397,6 +401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         extensions: ctx.grouping_config.extensions.clone(),
         ignore_same_stem: ctx.grouping_config.ignore_same_stem,
         ignore_dev_id: args.ignore_dev_id,
+        calc_pixel_hash: args.pixel_hash,
     };
 
     if args.rehash_only {

@@ -12,6 +12,8 @@ use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 use libheif_rs::HeifContext;
 use image::GenericImageView;
+use zune_jpeg::JpegDecoder as ZuneDecoder;
+use jpeg_decoder::Decoder as Tier2Decoder;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -117,6 +119,79 @@ fn format_derived_tag_display_name(name: &str) -> String {
         "derivedcountry" => "Country".to_string(),
         _ => name.to_string(),
     }
+}
+
+fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
+    let ext = path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+
+    // Explicitly reject RAWs here so they are handled by the RAW-specific logic
+    if crate::scanner::RAW_EXTS.contains(&ext.as_str()) {
+        return None;
+    }
+
+    match ext.as_str() {
+        "jpg" | "jpeg" => {
+            // TIER 1: Zune-JPEG
+            let mut zune = ZuneDecoder::new(bytes);
+            if let Ok(pixels) = zune.decode() {
+                if let Some(info) = zune.info() {
+                    let w = info.width as u32;
+                    let h = info.height as u32;
+                    let len = pixels.len();
+
+                    // Robustly handle Grayscale vs RGB based on buffer size
+                    if len == (w * h) as usize {
+                        // Grayscale
+                        if let Some(buf) = image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels) {
+                            eprintln!("[DEBUG-LOAD] {:?} -> Zune-JPEG (Grayscale)", path.file_name().unwrap_or_default());
+                            return Some(image::DynamicImage::ImageLuma8(buf));
+                        }
+                    } else if len == (w * h * 3) as usize {
+                        // RGB
+                        if let Some(buf) = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels) {
+                            eprintln!("[DEBUG-LOAD] {:?} -> Zune-JPEG (RGB)", path.file_name().unwrap_or_default());
+                            return Some(image::DynamicImage::ImageRgb8(buf));
+                        }
+                    } else if len == (w * h * 4) as usize {
+                        // CMYK or RGBA (Zune might output RGBA for CMYK)
+                        if let Some(buf) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, pixels) {
+                            eprintln!("[DEBUG-LOAD] {:?} -> Zune-JPEG (RGBA/CMYK)", path.file_name().unwrap_or_default());
+                            return Some(image::DynamicImage::ImageRgba8(buf));
+                        }
+                    }
+                }
+            }
+
+            // TIER 2: jpeg-decoder (Fallback)
+            let mut decoder = Tier2Decoder::new(std::io::Cursor::new(bytes));
+            if let Ok(pixels) = decoder.decode() {
+                 let info = decoder.info();
+                 let w = info.unwrap().width as u32;
+                 let h = info.unwrap().height as u32;
+                 let len = pixels.len();
+
+                 if len == (w * h) as usize {
+                     if let Some(buf) = image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels) {
+                         eprintln!("[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback Grayscale)", path.file_name().unwrap_or_default());
+                         return Some(image::DynamicImage::ImageLuma8(buf));
+                     }
+                 } else if len == (w * h * 3) as usize {
+                     if let Some(buf) = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels) {
+                         eprintln!("[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback RGB)", path.file_name().unwrap_or_default());
+                         return Some(image::DynamicImage::ImageRgb8(buf));
+                     }
+                 }
+            }
+        },
+        _ => {}
+    }
+
+    // This handles AVIF, WebP, and corrupted files.
+    eprintln!("[DEBUG-LOAD] {:?} -> Fallback (image crate)", path.file_name().unwrap_or_default());
+    image::load_from_memory(bytes).ok()
 }
 
 /// Extract GPS coordinates from EXIF data as (latitude, longitude)
@@ -463,6 +538,7 @@ pub struct ScanConfig {
     pub extensions: Vec<String>,
     pub ignore_same_stem: bool,
     pub ignore_dev_id: bool,
+    pub calc_pixel_hash: bool,
 }
 
 #[derive(Clone)]
@@ -477,6 +553,7 @@ struct ScannedFile {
     pub phash: Option<u64>,
     pub pdqhash: Option<[u8; 32]>,
     pub pdq_features: Option<crate::pdqhash::PdqFeatures>,
+    pub pixel_hash: Option<[u8; 32]>,
 }
 
 impl ScannedFile {
@@ -491,6 +568,7 @@ impl ScannedFile {
             content_hash: self.content_hash,
             orientation: self.orientation,
             dev_inode: self.dev_inode,
+            pixel_hash: self.pixel_hash,
         }
     }
 }
@@ -577,44 +655,118 @@ pub fn scan_and_group(
         let mut ck = [0u8; 32];
         let mut orientation = 1;
         let mut cache_hit_full = false;
+        let mut pixel_hash: Option<[u8; 32]> = None; // Init
+        let mut new_pixel = None; // For DB update
 
-        if !force_rehash
-            && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
-                 ck = ch;
-                 // Refresh timestamp
-                 new_meta = Some((meta_key, ck));
-                 if use_pdqhash {
-                     if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
-                         pdqhash = Some(h);
-                         if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
-                             // Ensure cached features are valid length (256)
-                             if feats.coefficients.len() == 256 {
-                                 resolution = Some((feats.width, feats.height));
-                                 orientation = feats.orientation;
-                                 let mut coeffs = [0.0; 256];
-                                 coeffs.copy_from_slice(&feats.coefficients);
-                                 pdq_features = Some(crate::pdqhash::PdqFeatures { coefficients: coeffs });
-                                 cache_hit_full = true;
-                             }
-                         }
-                     }
-                 } else if let Ok(Some(h)) = ctx_ref.get_phash(&ch) {
-                     phash = Some(h);
-                 }
+        if !force_rehash && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
+            ck = ch;
+            // Refresh timestamp
+            new_meta = Some((meta_key, ck));
+            if use_pdqhash {
+                if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
+                    pdqhash = Some(h);
+                    if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
+                        // Ensure cached features are valid length (256)
+                        if feats.coefficients.len() == 256 {
+                            resolution = Some((feats.width, feats.height));
+                            orientation = feats.orientation;
+                            let mut coeffs = [0.0; 256];
+                            coeffs.copy_from_slice(&feats.coefficients);
+                            pdq_features = Some(crate::pdqhash::PdqFeatures { coefficients: coeffs });
+                            cache_hit_full = true;
+                        }
+                    }
+                }
+            } else if let Ok(Some(h)) = ctx_ref.get_phash(&ch) {
+                phash = Some(h);
             }
+            // If user wants pixel hash, try to fetch it from DB.
+            if config.calc_pixel_hash {
+                if let Ok(Some(ph)) = ctx_ref.get_pixel_hash(&ch) {
+                    pixel_hash = Some(ph);
+                } else {
+                    // Missing in DB! Force load below to calculate it.
+                    cache_hit_full = false;
+                }
+            }
+        }
 
         if !cache_hit_full {
-             let bytes = fs::read(path).ok();
-             if let Some(ref b) = bytes {
-                 orientation = get_orientation(path, Some(b));
-             }
+            let bytes = fs::read(path).ok();
 
-             if use_pdqhash {
-                 if let Some(ref b) = bytes
-                    && let Ok(img) = image::load_from_memory(b) {
-                        resolution = if is_raw_ext(path) { get_resolution(path, Some(b)) } else { Some(img.dimensions()) };
+            if let Some(ref b) = bytes {
+                // 1. Orientation (Must be done on fresh read)
+                orientation = get_orientation(path, Some(b));
 
-                        if let Some((features, _)) = crate::pdqhash::generate_pdq_features(&img) {
+                // 2. Calculate file hash if needed
+                if ck == [0u8; 32] {
+                    let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
+                    ck = *ch.as_bytes();
+                    new_meta = Some((meta_key, ck));
+                }
+
+                // 3. Load Image ONCE using the FAST loader
+                let mut img_for_hashing: Option<image::DynamicImage> = None;
+
+                if is_raw_ext(path) {
+                    // RAW FILE: Extract Largest JPEG Thumbnail
+                    if config.calc_pixel_hash {
+                        if let Ok(mut raw) = rsraw::RawImage::open(b) {
+                            if let Ok(thumbs) = raw.extract_thumbs() {
+                                // Find largest JPEG thumbnail
+                                if let Some(thumb) = thumbs.into_iter()
+                                    .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
+                                        .max_by_key(|t| t.width * t.height)
+                                {
+                                    // Decode using our robust fast loader.
+                                    // We pass a dummy path to force it to treat bytes as JPEG.
+                                    img_for_hashing = load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data);
+
+                                    // If we got a valid image, we can also use its resolution
+                                    // if we didn't have one already (often faster than parsing headers twice)
+                                    if let Some(img) = &img_for_hashing {
+                                        if resolution.is_none() {
+                                            resolution = Some(img.dimensions());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Fallback for resolution if thumbnail extraction failed or we didn't calculate hash
+                    if resolution.is_none() { resolution = get_resolution(path, Some(b)); }
+                } else {
+                    // STANDARD IMAGE: Use fast loader directly
+                    img_for_hashing = load_image_fast(path, b);
+                }
+
+                if let Some(img) = &img_for_hashing {
+                    // Get resolution from the loaded image
+                    if resolution.is_none() {
+                        resolution = Some(img.dimensions());
+                    }
+
+                    // 4. Calculate Pixel Hash of 16bit RGBA (Content Identical Check)
+                    if config.calc_pixel_hash && pixel_hash.is_none() {
+                        // This ensures 16-bit PNGs != 8-bit PNGs unless the extra bits are purely padding.
+                        let rgba16 = img.to_rgba16();
+                        let raw_u16 = rgba16.as_raw();
+                        let raw_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                raw_u16.as_ptr() as *const u8,
+                                raw_u16.len() * 2 // 2 bytes per u16
+                            )
+                        };
+                        let ph = *blake3::hash(raw_bytes).as_bytes();
+                        eprintln!("[DEBUG-PIXEL_HASH 16BIT] {:?} : {}", path.file_name().unwrap_or_default(), hex::encode(ph));
+                        pixel_hash = Some(ph);
+                        new_pixel = Some((ck, ph));
+                    }
+
+                    // 5. Calculate Visual Hash (PDQ or pHash)
+                    if use_pdqhash {
+                        // Use 'img' directly - do NOT call load_from_memory again
+                        if let Some((features, _)) = crate::pdqhash::generate_pdq_features(img) {
                             let hash = features.to_hash();
                             pdqhash = Some(hash);
                             pdq_features = Some(features.clone());
@@ -626,38 +778,33 @@ pub fn scan_and_group(
                                 coefficients: features.coefficients.to_vec(),
                             };
 
-                            if ck == [0u8; 32] {
-                                let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
-                                ck = *ch.as_bytes();
-                                new_meta = Some((meta_key, ck));
+                            if new_hash.is_none() { // Don't overwrite if already set (rare)
                                 new_hash = Some((ck, HashValue::PdqHash(hash)));
                             }
                             new_features = Some((ck, cached_feats));
                         }
-                    } else { return None; }
-             } else {
-                 if phash.is_none() {
-                      if let Some(ref b) = bytes {
-                          let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
-                          ck = *ch.as_bytes();
-                          new_meta = Some((meta_key, ck));
-
-                          if let Ok(img) = image::load_from_memory(b) {
-                              resolution = Some(img.dimensions());
-                              let hasher = DctPhash::new();
-                              let hash = hasher.hash_image(&img);
-                              phash = Some(hash);
-                              new_hash = Some((ck, HashValue::PHash(hash)));
-                          }
-                      }
-                 } else if resolution.is_none() {
-                      resolution = get_resolution(path, bytes.as_deref());
-                 }
-             }
+                    } else {
+                        // pHash Mode
+                        if phash.is_none() {
+                            let hasher = DctPhash::new();
+                            // Use 'img' directly
+                            let hash = hasher.hash_image(img);
+                            phash = Some(hash);
+                            new_hash = Some((ck, HashValue::PHash(hash)));
+                        }
+                    }
+                } else {
+                    // Fallback: If image failed to decode (e.g. corrupt),
+                    // but we might still get resolution from headers for RAWs
+                    if resolution.is_none() {
+                        resolution = get_resolution(path, Some(b));
+                    }
+                }
+            }
         }
 
-        if new_meta.is_some() || new_hash.is_some() || new_features.is_some() {
-            let _ = tx.send((new_meta, new_hash, new_features));
+        if new_meta.is_some() || new_hash.is_some() || new_features.is_some() || new_pixel.is_some() {
+            let _ = tx.send((new_meta, new_hash, new_features, new_pixel));
         }
 
         Some(ScannedFile {
@@ -671,6 +818,7 @@ pub fn scan_and_group(
             phash,
             pdqhash,
             pdq_features,
+            pixel_hash,
         })
     }).collect();
 
@@ -1179,6 +1327,7 @@ pub fn scan_for_view(
                 pdqhash: None,
                 resolution: None,
                 content_hash: [0u8; 32],
+                pixel_hash: None,
                 orientation,
                 dev_inode,
             })

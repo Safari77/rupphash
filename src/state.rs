@@ -75,6 +75,16 @@ pub fn get_bit_identical_counts(group: &[FileMetadata]) -> HashMap<[u8; 32], usi
     counts
 }
 
+pub fn get_content_identical_counts(files: &[FileMetadata]) -> HashMap<[u8; 32], usize> {
+    let mut counts = HashMap::new();
+    for f in files {
+        if let Some(ph) = f.pixel_hash {
+            *counts.entry(ph).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
 // --- AppState ---
 
 pub struct AppState {
