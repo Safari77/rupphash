@@ -16,8 +16,6 @@ transpose = "0.2"
 walkdir = "2.5.0"
 zerocopy = "0.8.31"
 rayon = "1.11.0"
-lmdb = "0.8"
-lmdb-sys = "0.8.0"
 blake3 = "1.5"
 dirs = "6"
 serde = { version = "1.0", features = ["derive"] }
@@ -39,6 +37,7 @@ codes-iso-3166 = { version = "0.1", features = ["part_2"] }
 rsraw = { git = "https://github.com/Safari77/rsraw", branch = "process_flags" }
 kamadak-exif = "0.6.1"
 natord = "1.0.9"
+lmdb-rkv = "0.14.0"
 
 # GUI
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }

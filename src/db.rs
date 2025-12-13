@@ -285,20 +285,14 @@ impl AppContext {
             .set_max_dbs(10)
             .open(&db_path)?;
 
-        // Check if configured size differs from actual environment size
-        // LMDB stores the map size in the environment metadata (MDB_envinfo.me_mapsize)
-        // We use the raw FFI since not all lmdb crate versions expose info()
-        let actual_map_size = {
-            use std::mem::MaybeUninit;
-            let mut info = MaybeUninit::<lmdb_sys::MDB_envinfo>::uninit();
-            let rc = unsafe { lmdb_sys::mdb_env_info(env.env(), info.as_mut_ptr()) };
-            if rc == 0 {
-                unsafe { info.assume_init() }.me_mapsize
-            } else {
-                eprintln!("[WARN-DB] Could not get LMDB env info (rc={}), skipping map size check", rc);
-                map_size // Assume configured size if we can't check
+        let actual_map_size = match env.info() {
+            Ok(info) => info.map_size(),
+            Err(e) => {
+                eprintln!("[WARN-DB] Could not get LMDB env info: {}, skipping map size check", e);
+                map_size
             }
         };
+
         let configured_map_size = map_size;
 
         if actual_map_size != configured_map_size {
@@ -483,66 +477,69 @@ impl AppContext {
         let mut hash_remove_count = 0;
 
         // 1. Scan MetaDB
-        {
+        if txn.stat(self.meta_db)?.entries() > 0 {
             let mut cursor = txn.open_rw_cursor(self.meta_db)?;
             for iter in cursor.iter_start() {
-                let (key, val_bytes) = iter;
+                if let Ok((key, val_bytes)) = iter {
+                    let should_delete = if let Some(decrypted) = self.decrypt_value(key, val_bytes) {
+                        if decrypted.len() == 40 {
+                            let ts_bytes: [u8; 8] = decrypted[32..40].try_into().unwrap();
+                            let last_seen = u64::from_le_bytes(ts_bytes);
 
-                let should_delete = if let Some(decrypted) = self.decrypt_value(key, val_bytes) {
-                    if decrypted.len() == 40 {
-                        let ts_bytes: [u8; 8] = decrypted[32..40].try_into().unwrap();
-                        let last_seen = u64::from_le_bytes(ts_bytes);
-
-                        if last_seen < cutoff {
-                            true // Expired
+                            if last_seen < cutoff {
+                                true // Expired
+                            } else {
+                                let mut ch = [0u8; 32];
+                                ch.copy_from_slice(&decrypted[0..32]);
+                                valid_content_hashes.insert(ch);
+                                false // Keep
+                            }
                         } else {
-                            let mut ch = [0u8; 32];
-                            ch.copy_from_slice(&decrypted[0..32]);
-                            valid_content_hashes.insert(ch);
-                            false // Keep
+                            true // Corrupted/Old format -> Delete
                         }
                     } else {
-                        true // Corrupted/Old format -> Delete
-                    }
-                } else {
-                    true // Decrypt fail -> Delete
-                };
+                        true // Decrypt fail -> Delete
+                    };
 
-                if should_delete {
-                    cursor.del(WriteFlags::empty())?;
-                    meta_remove_count += 1;
+                    if should_delete {
+                        cursor.del(WriteFlags::empty())?;
+                        meta_remove_count += 1;
+                    }
                 }
             }
         }
 
         // 2. Sweep HashDB
-        {
+        if txn.stat(self.hash_db)?.entries() > 0 {
             let mut cursor = txn.open_rw_cursor(self.hash_db)?;
             for iter in cursor.iter_start() {
-                let (key, _) = iter;
+                // Fix: Handle Result
+                if let Ok((key, _)) = iter {
+                    if key.len() == 32 {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(key);
 
-                if key.len() == 32 {
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(key);
-                    if !valid_content_hashes.contains(&k) {
-                        cursor.del(WriteFlags::empty())?;
-                        hash_remove_count += 1;
+                        if !valid_content_hashes.contains(&k) {
+                            cursor.del(WriteFlags::empty())?;
+                            hash_remove_count += 1;
+                        }
                     }
                 }
             }
         }
 
         // 3. Sweep FeatureDB
-        {
+        if txn.stat(self.feature_db)?.entries() > 0 {
             let mut cursor = txn.open_rw_cursor(self.feature_db)?;
             for iter in cursor.iter_start() {
-                let (key, _) = iter;
-
-                if key.len() == 32 {
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(key);
-                    if !valid_content_hashes.contains(&k) {
-                        cursor.del(WriteFlags::empty())?;
+                // Fix: Handle Result
+                if let Ok((key, _)) = iter {
+                    if key.len() == 32 {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(key);
+                        if !valid_content_hashes.contains(&k) {
+                            cursor.del(WriteFlags::empty())?;
+                        }
                     }
                 }
             }
