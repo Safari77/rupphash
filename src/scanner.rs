@@ -569,7 +569,10 @@ pub fn scan_and_group(
         let mut phash: Option<u64> = None;
         let mut pdqhash: Option<[u8; 32]> = None;
         let mut pdq_features: Option<crate::pdqhash::PdqFeatures> = None;
+        // IMPORTANT: new_meta tracks updates to the file_metadata DB.
+        // Even if we hit the cache, we MUST set this to refresh the timestamp.
         let mut new_meta = None;
+
         let mut new_hash = None;
         let mut new_features = None;
         let mut resolution = None;
@@ -580,6 +583,8 @@ pub fn scan_and_group(
         if !force_rehash
             && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
                  ck = ch;
+                 // Refresh timestamp
+                 new_meta = Some((meta_key, ck));
                  if use_pdqhash {
                      if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
                          pdqhash = Some(h);
