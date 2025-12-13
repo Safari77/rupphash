@@ -413,10 +413,8 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
             }
         };
 
-        if let Ok(mut raw) = rsraw::RawImage::open(data_slice) {
-             if raw.unpack().is_ok() {
-                 return Some((raw.width() as u32, raw.height() as u32));
-             }
+        if let Ok(raw) = rsraw::RawImage::open(data_slice) {
+            return Some((raw.width() as u32, raw.height() as u32));
         }
         return None;
     }
