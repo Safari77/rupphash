@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use crate::{FileMetadata, GroupInfo};
 use crate::scanner::{analyze_group, sort_files};
+use regex::RegexBuilder;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputIntent {
@@ -38,6 +39,11 @@ pub enum InputIntent {
     ChangeSortOrder(String),
     NextGroupByDist,
     PreviousGroupByDist,
+    StartSearch,
+    SubmitSearch(String),
+    NextSearchResult,
+    PrevSearchResult,
+    CancelSearch,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +153,9 @@ pub struct AppState {
     pub is_fullscreen: bool,
     pub manual_rotation: u8,
     pub use_pdqhash: bool,
+    pub show_search: bool,
+    pub search_results: Vec<(usize, usize)>, // (group_idx, file_idx)
+    pub current_search_match: usize,
 }
 
 impl AppState {
@@ -190,6 +199,9 @@ impl AppState {
             is_fullscreen: false,
             manual_rotation: 0,
             use_pdqhash,
+            show_search: false,
+            search_results: Vec::new(),
+            current_search_match: 0,
         }
     }
 
@@ -391,6 +403,21 @@ impl AppState {
                 } else {
                     self.set_status("No groups with smaller distance found.".to_string(), false);
                 }
+            },
+            InputIntent::StartSearch => {
+                self.show_search = true;
+            },
+            InputIntent::SubmitSearch(query) => {
+                self.perform_search(query);
+            },
+            InputIntent::CancelSearch => {
+                self.show_search = false;
+            },
+            InputIntent::NextSearchResult => {
+                self.jump_search(true);
+            },
+            InputIntent::PrevSearchResult => {
+                self.jump_search(false);
             },
             InputIntent::ChangeSortOrder(_) => {},
         }
@@ -613,6 +640,63 @@ impl AppState {
                 self.error_popup = Some(format!("Failed to delete:\n{}", e));
             }
         }
+    }
+
+    fn perform_search(&mut self, query: String) {
+        self.search_results.clear();
+        if query.is_empty() { 
+            self.show_search = false;
+            return; 
+        }
+
+        let re = match RegexBuilder::new(&query).case_insensitive(true).build() {
+            Ok(r) => r,
+            Err(e) => {
+                self.error_popup = Some(format!("Invalid Regex:\n{}", e));
+                return;
+            }
+        };
+
+        for (g_idx, group) in self.groups.iter().enumerate() {
+            for (f_idx, file) in group.iter().enumerate() {
+                let name = file.path.file_name().unwrap_or_default().to_string_lossy();
+                if re.is_match(&name) {
+                    self.search_results.push((g_idx, f_idx));
+                }
+            }
+        }
+
+        if !self.search_results.is_empty() {
+            self.show_search = false;
+            self.current_search_match = 0;
+            let (g, f) = self.search_results[0];
+            self.current_group_idx = g;
+            self.current_file_idx = f;
+            self.selection_changed = true;
+            self.set_status(format!("Found {} matches. (F3/Shift+F3 to nav)", self.search_results.len()), false);
+        } else {
+            self.error_popup = Some(format!("No matches found for:\n'{}'", query));
+        }
+    }
+
+    fn jump_search(&mut self, next: bool) {
+        if self.search_results.is_empty() { return; }
+
+        if next {
+            self.current_search_match = (self.current_search_match + 1) % self.search_results.len();
+        } else {
+            if self.current_search_match == 0 {
+                self.current_search_match = self.search_results.len() - 1;
+            } else {
+                self.current_search_match -= 1;
+            }
+        }
+
+        let (g, f) = self.search_results[self.current_search_match];
+        self.current_group_idx = g;
+        self.current_file_idx = f;
+        self.selection_changed = true;
+        self.set_status(format!("Match {}/{}", self.current_search_match + 1, self.search_results.len()), false);
     }
 
     fn perform_move_marked(&mut self) {
