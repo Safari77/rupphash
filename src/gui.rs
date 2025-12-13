@@ -1711,10 +1711,11 @@ impl eframe::App for GuiApp {
                         let current_header_height = if header_visible { header_height } else { 0.0 };
                         let group_content_height = (group.len() as f32 * file_row_height) + if header_visible { separator_height } else { 0.0 };
                         let group_total_height = current_header_height + group_content_height;
-
+                        // Check if the SELECTED item is in this group before clipping the whole group
+                        let contains_selection = g_idx == self.state.current_group_idx;
                         let is_group_visible = (current_y + group_total_height > clip_rect.min.y) && (current_y < clip_rect.max.y);
-
-                        if !is_group_visible {
+                        // If group is not visible AND doesn't contain the selection we need to jump to, skip it.
+                        if !is_group_visible && !(contains_selection && self.state.selection_changed) {
                             ui.add_space(group_total_height);
                             current_y += group_total_height;
                             continue;
@@ -1733,19 +1734,22 @@ impl eframe::App for GuiApp {
 
                         let counts = get_bit_identical_counts(group);
                         let hardlink_groups = get_hardlink_groups(group);
-                        // NEW: Subgroups
                         let content_subgroups = get_content_subgroups(group);
 
                         for (f_idx, file) in group.iter().enumerate() {
+                            let is_selected = g_idx == self.state.current_group_idx && f_idx == self.state.current_file_idx;
+                            // Define visibility
                             let is_file_visible = (current_y + file_row_height > clip_rect.min.y) && (current_y < clip_rect.max.y);
+                            // If this is the selected file and selection changed,
+                            // we MUST render it even if off-screen so scroll_to_me works.
+                            let force_render = is_selected && self.state.selection_changed;
 
-                            if !is_file_visible {
+                            if !is_file_visible && !force_render {
                                 ui.add_space(file_row_height);
                                 current_y += file_row_height;
                                 continue;
                             }
 
-                            let is_selected = g_idx == self.state.current_group_idx && f_idx == self.state.current_file_idx;
                             let is_marked = self.state.marked_for_deletion.contains(&file.path);
                             let exists = file.path.exists();
                             let is_bit_identical = !self.state.view_mode && *counts.get(&file.content_hash).unwrap_or(&0) > 1;
@@ -1778,11 +1782,19 @@ impl eframe::App for GuiApp {
 
                             let resp = ui.add(egui::Button::new(label_text).selected(is_selected).wrap_mode(egui::TextWrapMode::Truncate));
                             if resp.clicked() { new_selection = Some((g_idx, f_idx)); }
+
                             resp.context_menu(|ui| {
                                 if ui.button("Rename (R)").clicked() { ui.close(); action_rename = true; }
+                                if ui.button("Copy full path").clicked() { /// Copy to clipboard
+                                    ui.ctx().copy_text(file.path.to_string_lossy().to_string()); 
+                                    ui.close();
+                                }
                                 if ui.button("Delete (Del)").clicked() { ui.close(); action_delete = true; }
                             });
-                            if is_selected && self.state.selection_changed { resp.scroll_to_me(Some(egui::Align::Center)); }
+
+                            if is_selected && self.state.selection_changed {
+                                resp.scroll_to_me(Some(egui::Align::Center));
+                            }
 
                             let size_kb = file.size / 1024;
                             let time_str = if self.state.show_relative_times {
@@ -1801,7 +1813,8 @@ impl eframe::App for GuiApp {
                         }
                     }
 
-                    if let Some((g, f)) = new_selection { self.state.current_group_idx = g; self.state.current_file_idx = f; self.state.selection_changed = true; }
+                    if let Some((g, f)) = new_selection { self.state.current_group_idx = g;
+                        self.state.current_file_idx = f; self.state.selection_changed = true; }
                     if action_rename { if let Some(path) = self.state.get_current_image_path() { self.rename_input = path.file_name().unwrap_or_default().to_string_lossy().to_string(); } self.state.handle_input(InputIntent::StartRename); }
                     if action_delete { self.state.handle_input(InputIntent::DeleteImmediate); }
                     if let Some(dir) = dir_to_open { self.change_directory(dir); }
