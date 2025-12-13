@@ -101,6 +101,7 @@ pub fn analyze_group(
 #[command(author, version, about = "Finds visually similar images.", long_about = None)]
 struct Cli {
     #[arg(required_unless_present = "show_exif_tags")]
+    #[arg(required_unless_present = "prune")]
     paths: Vec<String>,
 
     #[arg(long)]
@@ -162,6 +163,10 @@ struct Cli {
     /// Show all supported EXIF tag names for use in exif_tags configuration
     #[arg(long)]
     show_exif_tags: bool,
+
+    /// Prune database entries older than SECONDS (removes stale cache)
+    #[arg(long, value_name = "SECONDS")]
+    prune: Option<u64>,
 }
 
 impl Cli {
@@ -339,6 +344,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sort_order = args.sort.to_lowercase();
     let is_view_mode = args.is_view_mode();
     let hash_algorithm = args.hash_algorithm();
+
+    // --- PRUNE MODE ---
+    if let Some(seconds) = args.prune {
+        let ctx = AppContext::with_algorithm(hash_algorithm)?;
+
+        println!("Pruning entries older than {} seconds) from {} database...",
+            seconds, if args.pdqhash { "PDQ hash" } else { "pHash" });
+
+        match ctx.prune(seconds) {
+            Ok((meta_count, hash_count)) => {
+                println!("Success.");
+                println!("  - Removed {} expired file entries.", meta_count);
+                println!("  - Removed {} orphaned hash entries.", hash_count);
+            },
+            Err(e) => eprintln!("Pruning failed: {}", e),
+        }
+        // Exit immediately after pruning
+        return Ok(());
+    }
 
     // View mode uses GUI by default unless --use-tui specified
     let use_gui = args.use_gui || (is_view_mode && !args.use_tui);
