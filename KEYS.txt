@@ -1,0 +1,59 @@
+PHDUPES GUI KEY COMMANDS
+==============================================================================
+
+NAVIGATION
+------------------------------------------------------------------------------
+Arrow Up / Left      : Select previous file
+Arrow Down / Right   : Select next file
+Page Up              : Scroll up one page
+Page Down            : Scroll down one page
+Shift + Page Down    : Jump to the next duplicate group with a larger 
+                       Hamming distance (e.g., Dist 0 -> Dist 2)
+Home                 : Jump to the first file
+End                  : Jump to the last file
+Tab                  : Jump to the next duplicate group
+Shift + Tab          : Jump to the previous duplicate group
+
+FILE OPERATIONS
+------------------------------------------------------------------------------
+Space                : Toggle "Mark" status (for bulk deletion/moving)
+D                    : Execute deletion of ALL marked files (with confirm)
+M                    : Move ALL marked files to target dir (with confirm)
+Delete / Backspace   : Delete the currently selected file immediately
+R                    : Rename the currently selected file
+Ctrl + L             : Reload/Rescan the file list
+
+Right-Click (List)   : Open context menu (Rename, Copy full path, Delete)
+
+IMAGE VIEWING & ZOOM
+------------------------------------------------------------------------------
+W                    : Cycle View Mode (Fit Window -> Fit Width -> Fit Height)
+Z                    : Cycle Zoom Level (1:1 -> 2x -> 4x -> 8x -> Fit)
+X                    : Toggle Zoom Type (Absolute vs Relative to window)
+O                    : Rotate image 90° Clockwise (Visual only)
+F                    : Toggle Fullscreen mode
+S                    : Toggle Slideshow (Pause/Resume)
+Mouse Drag           : Pan image (when zoomed in)
+
+INFO OVERLAYS & DISPLAY
+------------------------------------------------------------------------------
+I                    : Toggle Histogram overlay
+E                    : Toggle EXIF Info overlay
+H                    : Toggle Relative Times (e.g., "2m ago" vs absolute date)
+P                    : Toggle Path Visibility depth in the sidebar
+T                    : Open Sort Order menu (Name, Date, Size, Random)
+
+INTERFACE LAYOUT
+------------------------------------------------------------------------------
+V                    : Shrink the sidebar panel width
+B                    : Expand the sidebar panel width
+
+VIEW MODE SPECIFIC (Browser Mode)
+------------------------------------------------------------------------------
+C                    : Open Directory Picker to change folders
+. (Period)           : Go up one directory level
+
+SYSTEM
+------------------------------------------------------------------------------
+Esc                  : Cancel current action / Close dialogs / Quit app
+Ctrl + Q             : Force Quit application
