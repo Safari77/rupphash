@@ -2,7 +2,6 @@ use chrono::{DateTime, Utc};
 use codes_iso_3166::part_1::CountryCode;
 use codes_iso_3166::part_2::SubdivisionCode;
 use crossbeam_channel::{unbounded, Sender};
-use image::GenericImageView;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -12,8 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 use libheif_rs::HeifContext;
+use image::GenericImageView;
 
-// Platform-specific imports for Metadata
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
@@ -29,8 +28,7 @@ pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2",
 trait BufReadSeek: std::io::BufRead + std::io::Seek {}
 impl<T: std::io::BufRead + std::io::Seek> BufReadSeek for T {}
 
-// --- Helper: Cross-Platform ID Extraction ---
-// Returns: (id_for_hashing, Option<(dev_id, file_id)>)
+// --- Identifier Helpers ---
 fn get_file_identifiers(metadata: &fs::Metadata, ignore_dev_id: bool) -> (u64, Option<(u64, u64)>) {
     #[cfg(unix)]
     {
@@ -537,7 +535,6 @@ pub fn scan_and_group(
     let hash_start = Instant::now();
     let (tx, rx) = unbounded();
     let db_handle = ctx.start_db_writer(rx);
-    let hasher = DctPhash::new();
     let processed_count = AtomicUsize::new(0);
 
     let valid_files: Vec<ScannedFile> = all_files.par_iter().filter_map(|path| {
@@ -553,12 +550,11 @@ pub fn scan_and_group(
         let mtime = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
         let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
         let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-
         let (id_hash, dev_inode) = get_file_identifiers(&metadata, config.ignore_dev_id);
 
         let mut mh = blake3::Hasher::new_keyed(&ctx_ref.meta_key);
         mh.update(&mtime_ns.to_le_bytes());
-        mh.update(&id_hash.to_le_bytes()); // Updates with inode only if dev is ignored
+        mh.update(&id_hash.to_le_bytes());
         mh.update(&size.to_le_bytes());
         let meta_key: [u8; 32] = *mh.finalize().as_bytes();
 
@@ -567,14 +563,11 @@ pub fn scan_and_group(
         let mut pdq_features: Option<crate::pdqhash::PdqFeatures> = None;
         let mut new_meta = None;
         let mut new_hash = None;
+        let mut new_features = None;
         let mut resolution = None;
         let mut ck = [0u8; 32];
         let mut orientation = 1;
-
-        let mut bytes = fs::read(path).ok();
-        if let Some(ref b) = bytes {
-            orientation = get_orientation(path, Some(b));
-        }
+        let mut cache_hit_full = false;
 
         if !force_rehash
             && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
@@ -582,67 +575,79 @@ pub fn scan_and_group(
                  if use_pdqhash {
                      if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
                          pdqhash = Some(h);
-                         if bytes.is_none() { bytes = fs::read(path).ok(); }
-                         if let Some(ref b) = bytes
-                             && let Ok(img) = image::load_from_memory(b) {
-                                 if let Some((f, _)) = crate::pdqhash::generate_pdq_features(&img) {
-                                     pdq_features = Some(f);
-                                 }
-                                 // For RAW files, use rsraw to get actual resolution, not thumbnail
-                                 resolution = if is_raw_ext(path) {
-                                     get_resolution(path, Some(b))
-                                 } else {
-                                     Some(img.dimensions())
-                                 };
+                         if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
+                             // Ensure cached features are valid length (256)
+                             if feats.coefficients.len() == 256 {
+                                 resolution = Some((feats.width, feats.height));
+                                 orientation = feats.orientation;
+                                 let mut coeffs = [0.0; 256];
+                                 coeffs.copy_from_slice(&feats.coefficients);
+                                 pdq_features = Some(crate::pdqhash::PdqFeatures { coefficients: coeffs });
+                                 cache_hit_full = true;
                              }
+                         }
                      }
                  } else if let Ok(Some(h)) = ctx_ref.get_phash(&ch) {
                      phash = Some(h);
-                     if bytes.is_none() { orientation = get_orientation(path, None); }
-                     resolution = get_resolution(path, None);
                  }
             }
 
-        let needs_calculation = if use_pdqhash {
-             pdqhash.is_none() || pdq_features.is_none()
-        } else {
-             phash.is_none()
-        };
-
-        if needs_calculation {
-             let b = match bytes { Some(v) => v, None => return None };
-             let ch = blake3::keyed_hash(&ctx_ref.content_key, &b);
-             ck = *ch.as_bytes();
-             new_meta = Some((meta_key, ck));
+        if !cache_hit_full {
+             let bytes = fs::read(path).ok();
+             if let Some(ref b) = bytes {
+                 orientation = get_orientation(path, Some(b));
+             }
 
              if use_pdqhash {
-                 if let Ok(img) = image::load_from_memory(&b) {
-                     // For RAW files, use rsraw to get actual resolution, not thumbnail
-                     resolution = if is_raw_ext(path) {
-                         get_resolution(path, Some(&b))
-                     } else {
-                         Some(img.dimensions())
-                     };
-                     if let Some((features, _quality)) = crate::pdqhash::generate_pdq_features(&img) {
-                         let hash = features.to_hash();
-                         pdqhash = Some(hash);
-                         pdq_features = Some(features);
-                         new_hash = Some((ck, HashValue::PdqHash(hash)));
-                         eprintln!("[DEBUG-PDQ] Generated fresh hash+features for: {:?}", path);
-                     } else { return None; }
-                 } else { return None; }
-             } else if let Ok(Some(h)) = ctx_ref.get_phash(&ck) {
-                 phash = Some(h);
-                 resolution = get_resolution(path, Some(&b));
-             } else if let Ok(img) = image::load_from_memory(&b) {
-                 resolution = Some(img.dimensions());
-                 let hash = hasher.hash_image(&img);
-                 phash = Some(hash);
-                 new_hash = Some((ck, HashValue::PHash(hash)));
-             } else { return None; }
+                 if let Some(ref b) = bytes
+                    && let Ok(img) = image::load_from_memory(b) {
+                        resolution = if is_raw_ext(path) { get_resolution(path, Some(b)) } else { Some(img.dimensions()) };
+
+                        if let Some((features, _)) = crate::pdqhash::generate_pdq_features(&img) {
+                            let hash = features.to_hash();
+                            pdqhash = Some(hash);
+                            pdq_features = Some(features.clone());
+
+                            let cached_feats = crate::db::CachedFeatures {
+                                width: resolution.unwrap_or((0,0)).0,
+                                height: resolution.unwrap_or((0,0)).1,
+                                orientation,
+                                coefficients: features.coefficients.to_vec(),
+                            };
+
+                            if ck == [0u8; 32] {
+                                let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
+                                ck = *ch.as_bytes();
+                                new_meta = Some((meta_key, ck));
+                                new_hash = Some((ck, HashValue::PdqHash(hash)));
+                            }
+                            new_features = Some((ck, cached_feats));
+                        }
+                    } else { return None; }
+             } else {
+                 if phash.is_none() {
+                      if let Some(ref b) = bytes {
+                          let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
+                          ck = *ch.as_bytes();
+                          new_meta = Some((meta_key, ck));
+
+                          if let Ok(img) = image::load_from_memory(b) {
+                              resolution = Some(img.dimensions());
+                              let hasher = DctPhash::new();
+                              let hash = hasher.hash_image(&img);
+                              phash = Some(hash);
+                              new_hash = Some((ck, HashValue::PHash(hash)));
+                          }
+                      }
+                 } else if resolution.is_none() {
+                      resolution = get_resolution(path, bytes.as_deref());
+                 }
+             }
         }
 
-        if new_meta.is_some() || new_hash.is_some() { let _ = tx.send((new_meta, new_hash)); }
+        if new_meta.is_some() || new_hash.is_some() || new_features.is_some() {
+            let _ = tx.send((new_meta, new_hash, new_features));
+        }
 
         Some(ScannedFile {
             path: path.clone(),
@@ -662,9 +667,8 @@ pub fn scan_and_group(
     db_handle.join().expect("DB writer thread panicked");
 
     let hash_elapsed = hash_start.elapsed();
-    let hash_count = valid_files.len();
     eprintln!("[DEBUG] Algorithm: {}", if use_pdqhash { "PDQ hash" } else { "pHash" });
-    eprintln!("[DEBUG] Hashes loaded: {} in {:.2}s", hash_count, hash_elapsed.as_secs_f64());
+    eprintln!("[DEBUG] Hashes loaded: {} in {:.2}s", valid_files.len(), hash_elapsed.as_secs_f64());
 
     let group_start = Instant::now();
     let (processed_groups, processed_infos, comparison_count) = if use_pdqhash {
@@ -692,7 +696,6 @@ pub fn scan_and_group(
 }
 
 // --- Generic Grouping Implementation ---
-
 fn group_files_generic<H>(
     valid_files: &[ScannedFile],
     config: &ScanConfig,
@@ -708,11 +711,6 @@ where H: HammingHash + std::fmt::Debug
     let n = valid_files.len();
     let comparison_count = AtomicUsize::new(0);
 
-    let chunk_tolerance = config.similarity / (H::NUM_CHUNKS as u32);
-    let bits_per_chunk = H::bit_width_per_chunk();
-
-    eprintln!("[DEBUG-GROUP] Files: {}, Chunk Tolerance: {}, Bits/Chunk: {}", n, chunk_tolerance, bits_per_chunk);
-
     let adjacency: Vec<Vec<u32>> = valid_files
         .par_iter()
         .enumerate()
@@ -724,12 +722,10 @@ where H: HammingHash + std::fmt::Debug
                 if let Some(hash) = extract_hash(file) {
                     let variants = generate_variants(file, hash);
 
-                    if i < 3 {
-                        eprintln!("[DEBUG-TRACE] File {}: {:?} - Generated {} variants.",
-                            i, file.path.file_name().unwrap_or_default(), variants.len());
-                    }
-
                     for variant in variants {
+                        // Clear visited FOR EACH VARIANT.
+                        // We must re-check candidates against this new rotation
+                        // because the distance will be different.
                         visited.clear();
 
                         for k in 0..H::NUM_CHUNKS {
@@ -738,35 +734,38 @@ where H: HammingHash + std::fmt::Debug
 
                             let mut check_bucket = |val: u16| {
                                 let flat_idx = chunk_base + val as usize;
+                                // Unsafe get for speed (MIHIndex is guaranteed valid size)
                                 let start = unsafe { *mih.offsets.get_unchecked(flat_idx) } as usize;
                                 let end = unsafe { *mih.offsets.get_unchecked(flat_idx + 1) } as usize;
                                 let bucket = unsafe { mih.values.get_unchecked(start..end) };
 
                                 for &cand_id in bucket {
                                     let cid = cand_id as usize;
-                                    if cid == i { continue; }
+                                    if cid == i { continue; } // Don't match self
 
-                                    if !visited.set(cid) {
-                                        comparison_count.fetch_add(1, Ordering::Relaxed);
-                                        let cand_hash = unsafe { mih.db_hashes.get_unchecked(cid) };
+                                    // OPTIMIZATION 1: If we already matched this file
+                                    // (via a previous variant), skip it.
+                                    if results.contains(&cand_id) { continue; }
 
-                                        let dist = variant.hamming_distance(cand_hash);
-                                        if dist <= config.similarity
-                                            && !results.contains(&cand_id) {
-                                                results.push(cand_id);
-                                                if i < 5 {
-                                                    let cand_name = valid_files[cid].path.file_name().unwrap_or_default();
-                                                    eprintln!("[DEBUG-MATCH] {:?} matched {:?} (Dist: {})",
-                                                        file.path.file_name().unwrap_or_default(), cand_name, dist);
-                                                }
-                                            }
+                                    // OPTIMIZATION 2: If we already checked this file
+                                    // *for this specific variant* (e.g. in another chunk), skip.
+                                    // 'visited.set' returns true if already present.
+                                    if visited.set(cid) { continue; }
+
+                                    comparison_count.fetch_add(1, Ordering::Relaxed);
+                                    let cand_hash = unsafe { mih.db_hashes.get_unchecked(cid) };
+
+                                    if variant.hamming_distance(cand_hash) <= config.similarity {
+                                        results.push(cand_id);
                                     }
                                 }
                             };
 
+                            // Standard MIH Multi-Probe Logic
                             check_bucket(q_chunk);
-                            if chunk_tolerance >= 1 {
-                                for bit in 0..bits_per_chunk {
+                            if config.similarity / (H::NUM_CHUNKS as u32) >= 1 {
+                                let bits = H::bit_width_per_chunk();
+                                for bit in 0..bits {
                                     check_bucket(q_chunk ^ (1 << bit));
                                 }
                             }
@@ -799,35 +798,80 @@ where H: HammingHash + std::fmt::Debug
         if group.len() > 1 { groups.push(group); }
     }
 
-    // Merge groups that share same-stem files (e.g., jpg and nef of same photo)
+    // Merge RAW+JPG logic
     let groups = merge_groups_by_stem(groups, valid_files);
 
+    // Process Metadata
     let is_pdq = std::any::type_name::<H>().contains("u8");
     let (g, i) = process_raw_groups(groups, valid_files, config, is_pdq);
     (g, i, comparison_count.load(Ordering::Relaxed))
 }
 
+pub fn analyze_group(
+    files: &mut Vec<FileMetadata>,
+    sort_order: &str,
+    #[allow(unused)] ext_priorities: &HashMap<String, usize>,
+    use_pdqhash: bool,
+) -> GroupInfo {
+    if files.is_empty() { return GroupInfo { max_dist: 0, status: GroupStatus::None }; }
+
+    // Explicitly deduplicate files by path
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.dedup_by(|a, b| a.path == b.path);
+
+    let mut counts = HashMap::new();
+    for f in files.iter() { *counts.entry(f.content_hash).or_insert(0) += 1; }
+
+    let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) = files.drain(..)
+        .partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
+
+    sort_files(&mut duplicates, "name-natural");
+    sort_files(&mut unique, sort_order);
+    files.append(&mut duplicates);
+    files.append(&mut unique);
+
+    let max_d = if use_pdqhash {
+        if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
+            files.iter().filter_map(|f| f.pdqhash).map(|h| pivot.hamming_distance(&h)).max().unwrap_or(0)
+        } else { 0 }
+    } else if let Some(first) = files.first() {
+        let pivot = first.phash;
+        files.iter().map(|f| pivot.hamming_distance(&f.phash)).max().unwrap_or(0)
+    } else { 0 };
+
+    let has_duplicates = !counts.values().all(|&c| c == 1);
+    let all_identical = counts.len() == 1;
+    let status = if all_identical { GroupStatus::AllIdentical } else if has_duplicates { GroupStatus::SomeIdentical } else { GroupStatus::None };
+
+    GroupInfo { max_dist: max_d, status }
+}
+
 /// Merge groups that contain files with the same stem (e.g., dsc_1335.jpg and dsc_1335.nef).
-/// This handles the case where RAW and JPEG have different hashes but should be in the same group.
+/// This handles the case where RAW and JPEG have different hashes but should be considered the same "shot".
 fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> Vec<Vec<u32>> {
     let original_count = groups.len();
+
+    // Optimization: Don't do work if there's nothing to merge
     if groups.len() < 2 { return groups; }
 
-    // Build stem key -> group indices mapping
-    // Key: (parent_dir, stem) -> set of group indices containing files with this stem
+    // Build map: (Parent Dir, Stem) -> List of Group Indices containing this stem
+    // e.g. (" /photos", "IMG_001") -> [Group 5, Group 12]
     let mut stem_to_groups: HashMap<(std::path::PathBuf, std::ffi::OsString), Vec<usize>> = HashMap::new();
 
     for (group_idx, group) in groups.iter().enumerate() {
         for &file_idx in group {
-            let path = &valid_files[file_idx as usize].path;
-            if let (Some(parent), Some(stem)) = (path.parent(), path.file_stem()) {
-                let key = (parent.to_path_buf(), stem.to_os_string());
-                stem_to_groups.entry(key).or_default().push(group_idx);
+            // Safety check for index
+            if let Some(file) = valid_files.get(file_idx as usize) {
+                let path = &file.path;
+                if let (Some(parent), Some(stem)) = (path.parent(), path.file_stem()) {
+                    let key = (parent.to_path_buf(), stem.to_os_string());
+                    stem_to_groups.entry(key).or_default().push(group_idx);
+                }
             }
         }
     }
 
-    // Union-Find to merge groups
+    // Union-Find Data Structure
     let mut parent: Vec<usize> = (0..groups.len()).collect();
 
     fn find(parent: &mut [usize], i: usize) -> usize {
@@ -840,13 +884,14 @@ fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> V
     fn union(parent: &mut [usize], a: usize, b: usize) {
         let ra = find(parent, a);
         let rb = find(parent, b);
-        if ra != rb { parent[ra] = rb; }
+        if ra != rb {
+            parent[ra] = rb;
+        }
     }
 
     // Merge groups that share a stem
-    for (key, group_indices) in &stem_to_groups {
+    for group_indices in stem_to_groups.values() {
         if group_indices.len() > 1 {
-            eprintln!("[DEBUG-MERGE] Merging {} groups via stem {:?}", group_indices.len(), key.1);
             let first = group_indices[0];
             for &other in &group_indices[1..] {
                 union(&mut parent, first, other);
@@ -854,14 +899,14 @@ fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> V
         }
     }
 
-    // Collect merged groups
+    // Collect the merged results
     let mut merged: HashMap<usize, Vec<u32>> = HashMap::new();
     for (group_idx, group) in groups.into_iter().enumerate() {
         let root = find(&mut parent, group_idx);
         merged.entry(root).or_default().extend(group);
     }
 
-    // Deduplicate indices within each merged group
+    // Format output: Deduplicate indices within the new merged groups
     let result: Vec<Vec<u32>> = merged.into_values().map(|mut g| {
         g.sort_unstable();
         g.dedup();
@@ -869,42 +914,11 @@ fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> V
     }).collect();
 
     if result.len() != original_count {
-        eprintln!("[DEBUG-MERGE] Merged {} groups into {}", original_count, result.len());
+        eprintln!("[DEBUG-MERGE] Collapsed {} hash groups into {} actual photo groups (matched RAW+JPG).",
+            original_count, result.len());
     }
 
     result
-}
-
-fn group_with_phash(
-    valid_files: &[ScannedFile],
-    config: &ScanConfig,
-) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
-    use crate::phash::generate_dihedral_hashes;
-    group_files_generic(
-        valid_files,
-        config,
-        |f| f.phash,
-        |_f, h| generate_dihedral_hashes(h)
-    )
-}
-
-fn group_with_pdqhash(
-    valid_files: &[ScannedFile],
-    config: &ScanConfig,
-) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
-    group_files_generic(
-        valid_files,
-        config,
-        |f| f.pdqhash,
-        |f, h| {
-            if let Some(features) = &f.pdq_features {
-                features.generate_dihedral_hashes()
-            } else {
-                eprintln!("[DEBUG-WARN] No PDQ features for file. Using fallback (0 deg only).");
-                vec![h]
-            }
-        }
-    )
 }
 
 fn process_raw_groups(
@@ -926,13 +940,9 @@ fn process_raw_groups(
             .map(|&idx| valid_files[idx as usize].to_file_metadata())
             .collect();
 
+        // Pass use_pdqhash to analyze_group to pick correct distance metric
         let info = if use_pdqhash {
-            analyze_group_with_features(
-                &mut group_data,
-                valid_files,
-                &config.group_by.to_lowercase(),
-                &ext_priorities
-            )
+            analyze_group_with_features(&mut group_data, valid_files, &config.group_by.to_lowercase(), &ext_priorities)
         } else {
             analyze_group(&mut group_data, &config.group_by.to_lowercase(), &ext_priorities, false)
         };
@@ -984,48 +994,6 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
     }
 }
 
-pub fn analyze_group(
-    files: &mut Vec<FileMetadata>,
-    sort_order: &str,
-    #[allow(unused)] ext_priorities: &HashMap<String, usize>,
-    use_pdqhash: bool,
-) -> GroupInfo {
-    if files.is_empty() { return GroupInfo { max_dist: 0, status: GroupStatus::None }; }
-
-    let mut counts = HashMap::new();
-    for f in files.iter() { *counts.entry(f.content_hash).or_insert(0) += 1; }
-
-    let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) = files.drain(..)
-        .partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
-
-    sort_files(&mut duplicates, "name-natural");
-    sort_files(&mut unique, sort_order);
-    files.append(&mut duplicates);
-    files.append(&mut unique);
-
-    let max_d = if use_pdqhash {
-        if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
-            files.iter()
-                .filter_map(|f| f.pdqhash)
-                .map(|h| pivot.hamming_distance(&h))
-                .max()
-                .unwrap_or(0)
-        } else { 0 }
-    } else if let Some(first) = files.first() {
-        let pivot = first.phash;
-        files.iter()
-            .map(|f| pivot.hamming_distance(&f.phash))
-            .max()
-            .unwrap_or(0)
-    } else { 0 };
-
-    let has_duplicates = !counts.values().all(|&c| c == 1);
-    let all_identical = counts.len() == 1;
-    let status = if all_identical { GroupStatus::AllIdentical } else if has_duplicates { GroupStatus::SomeIdentical } else { GroupStatus::None };
-
-    GroupInfo { max_dist: max_d, status }
-}
-
 fn analyze_group_with_features(
     files: &mut Vec<FileMetadata>,
     valid_files: &[ScannedFile],
@@ -1033,6 +1001,10 @@ fn analyze_group_with_features(
     #[allow(unused)] ext_priorities: &HashMap<String, usize>,
 ) -> GroupInfo {
     if files.is_empty() { return GroupInfo { max_dist: 0, status: GroupStatus::None }; }
+
+    // Deduplicate
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.dedup_by(|a, b| a.path == b.path);
 
     let mut counts = HashMap::new();
     for f in files.iter() { *counts.entry(f.content_hash).or_insert(0) += 1; }
@@ -1057,20 +1029,11 @@ fn analyze_group_with_features(
         let pivot_variants = pivot_feats.generate_dihedral_hashes();
         files.iter().map(|f| {
             if let Some(h) = f.pdqhash {
-                pivot_variants.iter()
-                    .map(|v| v.hamming_distance(&h))
-                    .min()
-                    .unwrap_or(255)
+                pivot_variants.iter().map(|v| v.hamming_distance(&h)).min().unwrap_or(255)
             } else { 0 }
-        })
-        .max()
-        .unwrap_or(0)
+        }).max().unwrap_or(0)
     } else if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
-        files.iter()
-            .filter_map(|f| f.pdqhash)
-            .map(|h| pivot.hamming_distance(&h))
-            .max()
-            .unwrap_or(0)
+        files.iter().filter_map(|f| f.pdqhash).map(|h| pivot.hamming_distance(&h)).max().unwrap_or(0)
     } else { 0 };
 
     let has_duplicates = !counts.values().all(|&c| c == 1);
@@ -1080,18 +1043,12 @@ fn analyze_group_with_features(
     GroupInfo { max_dist: max_d, status }
 }
 
-/// Sort files so same-stem files are adjacent, with non-raw before raw.
-/// e.g., dsc_1335.jpg, dsc_1335.nef, dsc_1336.jpg, dsc_1336.nef
 fn sort_by_stem_then_ext(files: &mut [FileMetadata]) {
     files.sort_by(|a, b| {
-        let stem_a = a.path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let stem_b = b.path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-
-        match natord::compare(&stem_a, &stem_b) {
-            std::cmp::Ordering::Equal => {
-                // Same stem: non-raw first (false < true)
-                is_raw_ext(&a.path).cmp(&is_raw_ext(&b.path))
-            }
+        let stem_a = a.path.file_stem().unwrap_or_default();
+        let stem_b = b.path.file_stem().unwrap_or_default();
+        match stem_a.cmp(stem_b) {
+            std::cmp::Ordering::Equal => is_raw_ext(&a.path).cmp(&is_raw_ext(&b.path)),
             other => other,
         }
     });
@@ -1101,11 +1058,33 @@ pub fn is_raw_ext(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).map(|e| RAW_EXTS.contains(&e.to_lowercase().as_str())).unwrap_or(false)
 }
 
-fn is_image_ext(path: &Path) -> bool {
+pub fn is_image_ext(path: &Path) -> bool {
     path.extension().and_then(|s| s.to_str()).map(|ext| {
         let e = ext.to_lowercase();
         matches!(e.as_str(), "jpg"|"jpeg"|"png"|"webp"|"bmp"|"tiff"|"tif"|"avif"|"heic"|"heif"|"tga"|"xbm"|"xpm") || RAW_EXTS.contains(&e.as_str())
     }).unwrap_or(false)
+}
+
+fn group_with_phash(
+    valid_files: &[ScannedFile],
+    config: &ScanConfig,
+) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
+    // Pass the generator function explicitly
+    group_files_generic(
+        valid_files,
+        config,
+        |f| f.phash,
+        |_f, h| {
+            crate::phash::generate_dihedral_hashes(h)
+        }
+    )
+}
+
+fn group_with_pdqhash(valid_files: &[ScannedFile], config: &ScanConfig) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
+    group_files_generic(
+        valid_files, config, |f| f.pdqhash,
+        |f, h| if let Some(features) = &f.pdq_features { features.generate_dihedral_hashes() } else { vec![h] }
+    )
 }
 
 pub fn scan_for_view(
@@ -1226,3 +1205,4 @@ mod tests {
         );
     }
 }
+

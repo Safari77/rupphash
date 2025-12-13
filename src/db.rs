@@ -9,6 +9,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 const CONFIG_FILE_NAME: &str = "phdupes.conf";
 const DB_FILE_NAME_PHASH: &str = "phdupes_phash";
 const DB_FILE_NAME_PDQHASH: &str = "phdupes_pdqhash";
+const DB_FILE_NAME_FEATURES: &str = "phdupes_features";
+
 use crate::scanner::RAW_EXTS;
 
 /// Hash algorithm selection
@@ -46,7 +48,7 @@ pub struct GuiConfig {
     pub font_monospace: Option<String>,
     pub font_ui: Option<String>,
     pub font_scale: Option<f32>,
-    pub preload_count: Option<usize>, // New Configuration Field
+    pub preload_count: Option<usize>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub panel_width: Option<f32>,
@@ -95,10 +97,52 @@ struct Config {
     gui: GuiConfig,
 }
 
+// Struct to hold cached data to avoid file reads
+#[derive(Debug, Clone)]
+pub struct CachedFeatures {
+    pub width: u32,
+    pub height: u32,
+    pub orientation: u8,
+    pub coefficients: Vec<f32>, // Flat array of coefficients
+}
+
+impl CachedFeatures {
+    // Simple manual serialization to avoid adding new dependencies like bincode
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9 + self.coefficients.len() * 4);
+        out.extend_from_slice(&self.width.to_le_bytes());
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.push(self.orientation);
+        for c in &self.coefficients {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 9 { return None; }
+        let w = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+        let h = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+        let o = bytes[8];
+
+        let coeff_bytes = &bytes[9..];
+        if coeff_bytes.len() % 4 != 0 { return None; }
+
+        let count = coeff_bytes.len() / 4;
+        let mut coeffs = Vec::with_capacity(count);
+        for chunk in coeff_bytes.chunks_exact(4) {
+            coeffs.push(f32::from_le_bytes(chunk.try_into().ok()?));
+        }
+
+        Some(Self { width: w, height: h, orientation: o, coefficients: coeffs })
+    }
+}
+
 pub struct AppContext {
     pub env: Arc<Environment>,
     pub hash_db: Database,
     pub meta_db: Database,
+    pub feature_db: Database,
     pub content_key: [u8; 32],
     pub meta_key: [u8; 32],
     pub grouping_config: GroupingConfig,
@@ -112,7 +156,12 @@ pub enum HashValue {
     PdqHash([u8; 32]),
 }
 
-pub type DbUpdate = (Option<([u8; 32], [u8; 32])>, Option<([u8; 32], HashValue)>);
+// (Meta Update, Hash Update, Feature Update)
+pub type DbUpdate = (
+    Option<([u8; 32], [u8; 32])>,
+    Option<([u8; 32], HashValue)>,
+    Option<([u8; 32], CachedFeatures)>
+);
 
 impl AppContext {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -174,8 +223,9 @@ impl AppContext {
         };
 
         let mut master_key_bytes = [0u8; 32];
-        hex::decode_to_slice(config.master_key.trim_start_matches("0x"), &mut master_key_bytes)
-            .map_err(|_| "Invalid master_key hex string")?;
+        if hex::decode_to_slice(config.master_key.trim_start_matches("0x"), &mut master_key_bytes).is_err() {
+            eprintln!("Invalid master_key hex string, using default");
+        }
 
         let mut content_material = master_key_bytes;
         content_material[0] ^= 0b0000_0001;
@@ -189,16 +239,18 @@ impl AppContext {
 
         let env = Environment::new()
             .set_map_size(10485760 * 200)
-            .set_max_dbs(5)
+            .set_max_dbs(10)
             .open(&db_path)?;
 
         let hash_db = env.open_db(None)?;
         let meta_db = env.create_db(Some("file_metadata"), DatabaseFlags::empty())?;
+        let feature_db = env.create_db(Some(DB_FILE_NAME_FEATURES), DatabaseFlags::empty())?;
 
         Ok(Self {
             env: Arc::new(env),
             hash_db,
             meta_db,
+            feature_db,
             content_key,
             meta_key,
             grouping_config: config.grouping,
@@ -233,6 +285,16 @@ impl AppContext {
         }
     }
 
+    // Get cached features (coeffs + metadata)
+    pub fn get_features(&self, content_hash: &[u8; 32]) -> Result<Option<CachedFeatures>, lmdb::Error> {
+        let txn = self.env.begin_ro_txn()?;
+        match txn.get(self.feature_db, content_hash) {
+            Ok(bytes) => Ok(CachedFeatures::from_bytes(bytes)),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn get_content_hash(&self, meta_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, lmdb::Error> {
         let txn = self.env.begin_ro_txn()?;
         match txn.get(self.meta_db, meta_hash) {
@@ -249,10 +311,12 @@ impl AppContext {
         let env = self.env.clone();
         let meta_db = self.meta_db;
         let hash_db = self.hash_db;
+        let feature_db = self.feature_db;
 
         thread::spawn(move || {
             let mut meta_updates = Vec::new();
-            let mut hash_updates: Vec<([u8; 32], HashValue)> = Vec::new();
+            let mut hash_updates = Vec::new();
+            let mut feature_updates = Vec::new();
             let mut last_flush = Instant::now();
             let flush_interval = Duration::from_secs(1);
             let max_buffer = 1000;
@@ -261,22 +325,24 @@ impl AppContext {
                 let msg = rx.recv_timeout(Duration::from_millis(100));
 
                 match msg {
-                    Ok((meta_op, hash_op)) => {
-                        if let Some(m) = meta_op { meta_updates.push(m); }
-                        if let Some(h) = hash_op { hash_updates.push(h); }
+                    Ok((m, h, f)) => {
+                        if let Some(up) = m { meta_updates.push(up); }
+                        if let Some(up) = h { hash_updates.push(up); }
+                        if let Some(up) = f { feature_updates.push(up); }
                     },
-                    Err(RecvTimeoutError::Timeout) => {},
                     Err(RecvTimeoutError::Disconnected) => {
-                        let _ = Self::write_batch(&env, meta_db, hash_db, &meta_updates, &hash_updates);
+                        let _ = Self::write_batch(&env, meta_db, hash_db, feature_db, &meta_updates, &hash_updates, &feature_updates);
                         break;
-                    }
+                    },
+                    _ => {}
                 }
 
-                if (last_flush.elapsed() >= flush_interval || meta_updates.len() >= max_buffer || hash_updates.len() >= max_buffer)
-                    && (!meta_updates.is_empty() || !hash_updates.is_empty()) {
-                        if Self::write_batch(&env, meta_db, hash_db, &meta_updates, &hash_updates).is_ok() {
+                if (last_flush.elapsed() >= flush_interval || meta_updates.len() >= max_buffer || hash_updates.len() >= max_buffer || feature_updates.len() >= max_buffer)
+                    && (!meta_updates.is_empty() || !hash_updates.is_empty() || !feature_updates.is_empty()) {
+                        if Self::write_batch(&env, meta_db, hash_db, feature_db, &meta_updates, &hash_updates, &feature_updates).is_ok() {
                             meta_updates.clear();
                             hash_updates.clear();
+                            feature_updates.clear();
                         }
                         last_flush = Instant::now();
                     }
@@ -288,8 +354,10 @@ impl AppContext {
         env: &Environment,
         meta_db: Database,
         hash_db: Database,
+        feature_db: Database,
         meta_updates: &Vec<([u8; 32], [u8; 32])>,
-        hash_updates: &Vec<([u8; 32], HashValue)>
+        hash_updates: &Vec<([u8; 32], HashValue)>,
+        feature_updates: &Vec<([u8; 32], CachedFeatures)>
     ) -> Result<(), lmdb::Error> {
         let mut txn = env.begin_rw_txn()?;
         for (key, val) in meta_updates {
@@ -306,6 +374,10 @@ impl AppContext {
                 },
             }
         }
+        for (key, features) in feature_updates {
+            let bytes = features.to_bytes();
+            txn.put(feature_db, key, &bytes, WriteFlags::empty())?;
+        }
         txn.commit()
     }
 
@@ -321,10 +393,11 @@ impl AppContext {
 
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
-            eprintln!("[DEBUG-DB] Read existing config, length = {} bytes", content.len());
-            let cfg: Config = toml::from_str(&content)?;
-            eprintln!("[DEBUG-DB] Parsed config, old gui: width={:?}, height={:?}, panel_width={:?}",
-                cfg.gui.width, cfg.gui.height, cfg.gui.panel_width);
+            let mut cfg: Config = toml::from_str(&content)?;
+            cfg.gui = gui_config.clone();
+
+            let toml_str = toml::to_string_pretty(&cfg)?;
+            fs::write(&config_path, toml_str)?;
         } else {
             eprintln!("[DEBUG-DB] Config file does not exist at {:?}", config_path);
         }
