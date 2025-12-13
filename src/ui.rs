@@ -21,6 +21,7 @@ pub struct TuiApp {
     list_state: ListState,
     view_height: usize,
     rename_buffer: String,
+    search_buffer: String,
 }
 
 impl TuiApp {
@@ -34,6 +35,7 @@ impl TuiApp {
             list_state,
             view_height: 0,
             rename_buffer: String::new(),
+            search_buffer: String::new(),
         }
     }
 
@@ -158,6 +160,26 @@ impl TuiApp {
             }
             return;
         }
+        if self.state.show_search {
+            match code {
+                KeyCode::Esc => {
+                    self.state.handle_input(InputIntent::CancelSearch);
+                    self.search_buffer.clear();
+                }
+                KeyCode::Enter => {
+                    self.state.handle_input(InputIntent::SubmitSearch(self.search_buffer.clone()));
+                    self.search_buffer.clear();
+                }
+                KeyCode::Backspace => {
+                    self.search_buffer.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.search_buffer.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
 
         // 7. Standard Navigation & Actions
         let intent = match code {
@@ -194,6 +216,16 @@ impl TuiApp {
                     self.rename_buffer = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 }
                 Some(InputIntent::StartRename)
+            },
+                        KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
+                 Some(InputIntent::StartSearch)
+            },
+            KeyCode::F(3) | KeyCode::Char('n') => { // 'n' for next is common tui convention
+                 if modifiers.contains(KeyModifiers::SHIFT) || code == KeyCode::Char('N') {
+                     Some(InputIntent::PrevSearchResult)
+                 } else {
+                     Some(InputIntent::NextSearchResult)
+                 }
             },
             KeyCode::Char('s') => Some(InputIntent::ShowSortSelection),
             KeyCode::Char('h') => Some(InputIntent::ToggleRelativeTime),
@@ -368,6 +400,14 @@ impl TuiApp {
         // 4. Error Popup
         if let Some(err_text) = &self.state.error_popup {
             render_popup(frame, "ERROR", err_text, 80, 40, Color::Red);
+        }
+
+        if self.state.show_search {
+            let block = Block::default().title("Find (Regex)").borders(Borders::ALL).style(Style::default().bg(Color::Blue).fg(Color::White));
+            let paragraph = Paragraph::new(self.search_buffer.clone()).block(block);
+            let area = centered_rect(60, 10, frame.area());
+            frame.render_widget(Clear, area);
+            frame.render_widget(paragraph, area);
         }
     }
 }
