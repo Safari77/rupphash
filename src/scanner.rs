@@ -554,8 +554,16 @@ pub fn scan_and_group(
 
         let mut mh = blake3::Hasher::new_keyed(&ctx_ref.meta_key);
         mh.update(&mtime_ns.to_le_bytes());
-        mh.update(&id_hash.to_le_bytes());
         mh.update(&size.to_le_bytes());
+        // Bind to filesystem identity (dev, inode) - survives renames
+        if let Some((dev, inode)) = dev_inode {
+            mh.update(&dev.to_le_bytes());
+            mh.update(&inode.to_le_bytes());
+        } else {
+            // Fallback for platforms without inode support: use id_hash
+            mh.update(&id_hash.to_le_bytes());
+        }
+
         let meta_key: [u8; 32] = *mh.finalize().as_bytes();
 
         let mut phash: Option<u64> = None;
