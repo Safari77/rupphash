@@ -85,6 +85,32 @@ pub fn get_content_identical_counts(files: &[FileMetadata]) -> HashMap<[u8; 32],
     counts
 }
 
+pub fn get_content_subgroups(group: &[FileMetadata]) -> HashMap<[u8; 32], usize> {
+    let mut counts = HashMap::new();
+    for f in group {
+        if let Some(ph) = f.pixel_hash {
+            *counts.entry(ph).or_insert(0) += 1;
+        }
+    }
+
+    let mut ids = HashMap::new();
+    let mut next_id = 1;
+
+    // Assign IDs in order of appearance in the list to keep UI stable
+    for f in group {
+        if let Some(ph) = f.pixel_hash {
+            // Only assign an ID if this hash appears more than once (is a duplicate)
+            if *counts.get(&ph).unwrap_or(&0) > 1 {
+                if !ids.contains_key(&ph) {
+                    ids.insert(ph, next_id);
+                    next_id += 1;
+                }
+            }
+        }
+    }
+    ids
+}
+
 // --- AppState ---
 
 pub struct AppState {
