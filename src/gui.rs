@@ -314,29 +314,32 @@ impl GuiApp {
                 let exif_orientation = crate::scanner::get_orientation(path, Some(&data));
                 eprintln!("[DEBUG] load_and_process_image RAW exif_orientation={}", exif_orientation);
 
-                if let Ok(mut raw) = rsraw::RawImage::open(&data)
-                    && raw.unpack().is_ok() {
+                if let Ok(mut raw) = rsraw::RawImage::open(&data) {
                         let dims = (raw.width() as u32, raw.height() as u32);
 
                         // Try Thumbnail
-                        if use_thumbnails && let Some(thumb) = Self::extract_best_thumbnail(&mut raw) {
+                        if use_thumbnails {
+                            if let Some(thumb) = Self::extract_best_thumbnail(&mut raw) {
                              // Thumbnails are extracted as-is (not rotated by rsraw),
                              // so we need to apply EXIF orientation during rendering
                              eprintln!("[DEBUG] load_and_process_image RAW using thumbnail, applying exif_orientation={}", exif_orientation);
-                             (thumb, dims, exif_orientation)
-                        } else {
-                            // Full Decode - rsraw applies rotation automatically,
-                            // so we return orientation=1 (no additional rotation needed)
-                            raw.set_use_camera_wb(true);
-                            if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
-                                let w = processed.width() as usize;
-                                let h = processed.height() as usize;
-                                if processed.len() == w * h * 3 {
-                                    eprintln!("[DEBUG] load_and_process_image RAW full decode, orientation=1 (rsraw rotates)");
-                                    (egui::ColorImage::from_rgb([w, h], &processed), dims, 1)
-                                } else { return None; }
-                            } else { return None; }
+                             return Some((thumb, dims, exif_orientation));
+                            }
                         }
+                        // Full Decode - rsraw applies rotation automatically,
+                        // so we return orientation=1 (no additional rotation needed)
+                        raw.set_use_camera_wb(true);
+                        if raw.unpack().is_ok() {
+                        if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
+                            let w = processed.width() as usize;
+                            let h = processed.height() as usize;
+                            if processed.len() == w * h * 3 {
+                                eprintln!("[DEBUG] load_and_process_image RAW full decode, orientation=1 (rsraw rotates)");
+                                return Some((egui::ColorImage::from_rgb([w, h], &processed), dims, 1));
+                            }
+                        }
+                    }
+                    return None;
                 } else { return None; }
             } else { return None; }
         } else {
@@ -1062,7 +1065,6 @@ impl GuiApp {
     fn compute_histogram_from_raw(path: &std::path::Path) -> Option<[u32; 256]> {
         let data = fs::read(path).ok()?;
         let mut raw = rsraw::RawImage::open(&data).ok()?;
-        raw.unpack().ok()?;
 
         // Try to extract thumbnail first (faster)
         if let Ok(thumbs) = raw.extract_thumbs()
@@ -1079,21 +1081,22 @@ impl GuiApp {
                 }
 
         // Fallback: process the full RAW (slower)
-        raw.set_use_camera_wb(true);
-        if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
-            let mut hist = [0u32; 256];
-            // RGB data - convert to greyscale using luminance formula
-            // Y = 0.299*R + 0.587*G + 0.114*B
-            for chunk in processed.chunks_exact(3) {
-                let r = chunk[0] as u32;
-                let g = chunk[1] as u32;
-                let b = chunk[2] as u32;
-                let grey = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
-                hist[grey as usize] += 1;
+        if raw.unpack().is_ok() {
+            raw.set_use_camera_wb(true);
+            if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
+                let mut hist = [0u32; 256];
+                // RGB data - convert to greyscale using luminance formula
+                // Y = 0.299*R + 0.587*G + 0.114*B
+                for chunk in processed.chunks_exact(3) {
+                    let r = chunk[0] as u32;
+                    let g = chunk[1] as u32;
+                    let b = chunk[2] as u32;
+                    let grey = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
+                    hist[grey as usize] += 1;
+                }
+                return Some(hist);
             }
-            return Some(hist);
         }
-
         None
     }
 
