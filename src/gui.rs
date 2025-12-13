@@ -1,5 +1,5 @@
 use eframe::egui;
-use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_content_identical_counts, get_hardlink_groups};
+use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_content_identical_counts, get_content_subgroups, get_hardlink_groups};
 use crate::format_relative_time;
 use crate::GroupStatus;
 use crate::db::AppContext;
@@ -1741,36 +1741,67 @@ impl eframe::App for GuiApp {
                         let counts = get_bit_identical_counts(group);
                         let hardlink_groups = get_hardlink_groups(group);
                         let pixel_counts = get_content_identical_counts(group);
+                        // Pre-calculate subgroups for this group
+                        let content_subgroups = get_content_subgroups(group);
 
                         for (f_idx, file) in group.iter().enumerate() {
                             let is_selected = g_idx == self.state.current_group_idx && f_idx == self.state.current_file_idx;
                             let is_marked = self.state.marked_for_deletion.contains(&file.path);
                             let exists = file.path.exists();
-                            let is_bit_identical = !self.state.view_mode && *counts.get(&file.content_hash).unwrap_or(&0) > 1;
-                            let is_content_identical = file.pixel_hash
-                                .map(|ph| *pixel_counts.get(&ph).unwrap_or(&0) > 1)
-                                .unwrap_or(false);
-                            // Logic: Bit Identical implies Content Identical, so only show "C" if NOT Bit Identical
-                            let show_c_flag = is_content_identical && !is_bit_identical;
-                            let is_hardlinked = !self.state.view_mode && file.dev_inode
+
+                            // Status Checks
+                            let is_bit_identical = *counts.get(&file.content_hash).unwrap_or(&0) > 1;
+                            let is_hardlinked = file.dev_inode
                                 .map(|di| hardlink_groups.contains_key(&di))
                                 .unwrap_or(false);
 
-                            let text = format!("{} {}{}{}",
+                            // Content Group ID (e.g., 1, 2)
+                            let content_id = file.pixel_hash.and_then(|ph| content_subgroups.get(&ph));
+                            let is_content_identical = content_id.is_some();
+
+                            // Format the "C" label: "C1 ", "C2 ", or "   "
+                            let c_label = if let Some(id) = content_id {
+                                format!("C{:<1}", id) // "C1"
+                            } else {
+                                "  ".to_string()
+                            };
+
+                            // Build the text string
+                            // Layout: [M] [L] [C1] [Path]
+                            let text = format!("{} {} {} {}",
                                 if is_marked     { "M" } else { " " },
-                                if is_hardlinked { "L " } else { "  " },
-                                if show_c_flag { "C" } else { " " },
+                                if is_hardlinked { "L" } else { " " },
+                                c_label,
                                 format_path_depth(&file.path, self.state.path_display_depth)
                             );
+
                             let mut label_text = egui::RichText::new(text).family(egui::FontFamily::Monospace);
+
                             if !is_selected {
                                 if !exists { label_text = label_text.color(egui::Color32::RED).strikethrough(); }
                                 else if is_marked { label_text = label_text.color(egui::Color32::RED); }
                                 else if is_hardlinked { label_text = label_text.color(egui::Color32::LIGHT_BLUE); }
-                                else if is_bit_identical { label_text = label_text.color(egui::Color32::GREEN); }
-                                else if show_c_flag { label_text = label_text.color(egui::Color32::GOLD); }
+                                else if is_bit_identical {
+                                    // Bit identical files are technically "C1" too, but Green takes precedence.
+                                    // The "C1" tag remains visible in the text so you know which group it belongs to.
+                                    label_text = label_text.color(egui::Color32::GREEN);
+                                }
+                                else if is_content_identical {
+                                    // Files that are ONLY content identical (Gold)
+                                    label_text = label_text.color(egui::Color32::GOLD);
+                                }
                             }
 
+                            // FEATURE: Highlight peers of the currently selected file
+                            // If I select a "C1" file, make all other "C1" files bold/bright
+                            if let Some(current_file) = group.get(self.state.current_file_idx) {
+                                if !is_selected
+                                    && current_file.pixel_hash.is_some()
+                                        && current_file.pixel_hash == file.pixel_hash
+                                {
+                                    label_text = label_text.strong().background_color(egui::Color32::from_black_alpha(40));
+                                }
+                            }
                             // Use Button with selected and wrap_mode to prevent word wrap
                             let resp = ui.add(egui::Button::new(label_text).selected(is_selected).wrap_mode(egui::TextWrapMode::Truncate));
                             if resp.clicked() {

@@ -974,18 +974,50 @@ pub fn analyze_group(
 ) -> GroupInfo {
     if files.is_empty() { return GroupInfo { max_dist: 0, status: GroupStatus::None }; }
 
-    // Explicitly deduplicate files by path
+    // Deduplicate
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files.dedup_by(|a, b| a.path == b.path);
 
-    let mut counts = HashMap::new();
-    for f in files.iter() { *counts.entry(f.content_hash).or_insert(0) += 1; }
+    // 1. Count Bit-Identical (Content Hash)
+    let mut bit_counts = HashMap::new();
+    for f in files.iter() { *bit_counts.entry(f.content_hash).or_insert(0) += 1; }
 
+    // 2. Count Pixel-Identical (Pixel Hash)
+    let mut pixel_counts = HashMap::new();
+    for f in files.iter() {
+        if let Some(ph) = f.pixel_hash {
+             *pixel_counts.entry(ph).or_insert(0) += 1;
+        }
+    }
+
+    // 3. Partition: Anything that is a duplicate (Bit OR Pixel) goes to the top
     let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) = files.drain(..)
-        .partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
+        .partition(|f| {
+            let is_bit_dupe = *bit_counts.get(&f.content_hash).unwrap_or(&0) > 1;
+            let is_pixel_dupe = f.pixel_hash.map(|ph| *pixel_counts.get(&ph).unwrap_or(&0) > 1).unwrap_or(false);
+            is_bit_dupe || is_pixel_dupe
+        });
 
-    sort_files(&mut duplicates, "name-natural");
+    // 4. Sort Duplicates: Cluster by PixelHash, then ContentHash, then Name
+    duplicates.sort_by(|a, b| {
+        // Primary: Keep C1, C2, C3 groups together
+        let ph_cmp = a.pixel_hash.cmp(&b.pixel_hash);
+        if ph_cmp != std::cmp::Ordering::Equal { return ph_cmp; }
+
+        // Secondary: Keep L groups together within C groups
+        let ch_cmp = a.content_hash.cmp(&b.content_hash);
+        if ch_cmp != std::cmp::Ordering::Equal { return ch_cmp; }
+
+        // Tertiary: Stable sort by name
+        let name_a = a.path.file_name().unwrap_or_default();
+        let name_b = b.path.file_name().unwrap_or_default();
+        natord::compare(&name_a.to_string_lossy(), &name_b.to_string_lossy())
+    });
+
+    // 5. Sort Unique: Standard user sort
     sort_files(&mut unique, sort_order);
+
+    // 6. Combine
     files.append(&mut duplicates);
     files.append(&mut unique);
 
@@ -998,8 +1030,8 @@ pub fn analyze_group(
         files.iter().map(|f| pivot.hamming_distance(&f.phash)).max().unwrap_or(0)
     } else { 0 };
 
-    let has_duplicates = !counts.values().all(|&c| c == 1);
-    let all_identical = counts.len() == 1;
+    let has_duplicates = !bit_counts.values().all(|&c| c == 1);
+    let all_identical = bit_counts.len() == 1;
     let status = if all_identical { GroupStatus::AllIdentical } else if has_duplicates { GroupStatus::SomeIdentical } else { GroupStatus::None };
 
     GroupInfo { max_dist: max_d, status }
