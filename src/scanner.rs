@@ -861,10 +861,19 @@ fn group_files_generic<H>(
     extract_hash: impl Fn(&ScannedFile) -> Option<H> + Sync + Send,
     generate_variants: impl Fn(&ScannedFile, H) -> Vec<H> + Sync + Send,
 ) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize)
-where H: HammingHash + std::fmt::Debug
+where H: HammingHash + std::fmt::Debug + Clone + Copy
 {
-    let hashes: Vec<H> = valid_files.iter().filter_map(&extract_hash).collect();
-    if hashes.is_empty() { return (Vec::new(), Vec::new(), 0); }
+// Collect hashes AND their original indices to handle files with missing hashes (None)
+    let valid_entries: Vec<(usize, H)> = valid_files.iter()
+        .enumerate()
+        .filter_map(|(i, f)| extract_hash(f).map(|h| (i, h)))
+        .collect();
+
+    if valid_entries.is_empty() { return (Vec::new(), Vec::new(), 0); }
+
+    // Separate them for MIH and index mapping
+    let hashes: Vec<H> = valid_entries.iter().map(|(_, h)| *h).collect();
+    let dense_to_sparse: Vec<usize> = valid_entries.iter().map(|(i, _)| *i).collect();
 
     let mih = MIHIndex::new(hashes.clone());
     let n = valid_files.len();
@@ -882,9 +891,6 @@ where H: HammingHash + std::fmt::Debug
                     let variants = generate_variants(file, hash);
 
                     for variant in variants {
-                        // Clear visited FOR EACH VARIANT.
-                        // We must re-check candidates against this new rotation
-                        // because the distance will be different.
                         visited.clear();
 
                         for k in 0..H::NUM_CHUNKS {
@@ -893,34 +899,30 @@ where H: HammingHash + std::fmt::Debug
 
                             let mut check_bucket = |val: u16| {
                                 let flat_idx = chunk_base + val as usize;
-                                // Unsafe get for speed (MIHIndex is guaranteed valid size)
                                 let start = unsafe { *mih.offsets.get_unchecked(flat_idx) } as usize;
                                 let end = unsafe { *mih.offsets.get_unchecked(flat_idx + 1) } as usize;
                                 let bucket = unsafe { mih.values.get_unchecked(start..end) };
 
-                                for &cand_id in bucket {
-                                    let cid = cand_id as usize;
-                                    if cid == i { continue; } // Don't match self
+                                for &dense_id in bucket {
+                                    // Map dense ID (from MIH) back to original file index
+                                    let cand_idx = unsafe { *dense_to_sparse.get_unchecked(dense_id as usize) };
 
-                                    // OPTIMIZATION 1: If we already matched this file
-                                    // (via a previous variant), skip it.
-                                    if results.contains(&cand_id) { continue; }
+                                    if cand_idx == i { continue; } // Don't match self
 
-                                    // OPTIMIZATION 2: If we already checked this file
-                                    // *for this specific variant* (e.g. in another chunk), skip.
-                                    // 'visited.set' returns true if already present.
-                                    if visited.set(cid) { continue; }
+                                    if results.contains(&(cand_idx as u32)) { continue; }
+                                    if visited.set(cand_idx) { continue; }
 
                                     comparison_count.fetch_add(1, Ordering::Relaxed);
-                                    let cand_hash = unsafe { mih.db_hashes.get_unchecked(cid) };
+
+                                    // Use dense_id to look up hash directly (faster than extracting again)
+                                    let cand_hash = unsafe { mih.db_hashes.get_unchecked(dense_id as usize) };
 
                                     if variant.hamming_distance(cand_hash) <= config.similarity {
-                                        results.push(cand_id);
+                                        results.push(cand_idx as u32);
                                     }
                                 }
                             };
 
-                            // Standard MIH Multi-Probe Logic
                             check_bucket(q_chunk);
                             if config.similarity / (H::NUM_CHUNKS as u32) >= 1 {
                                 let bits = H::bit_width_per_chunk();
