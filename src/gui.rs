@@ -351,11 +351,12 @@ impl GuiApp {
             } else { return None; }
         } else {
             // B. STANDARD FILES (JPG, PNG, HEIC)
-            // Read orientation lazily
-            let orientation = crate::scanner::get_orientation(path, None);
-            eprintln!("[DEBUG] load_and_process_image OTHER get_orientation={}", orientation);
-            if let Ok(reader) = image::ImageReader::open(path).and_then(|r| r.with_guessed_format()) {
-                if let Ok(dyn_img) = reader.decode() {
+            if let Ok(bytes) = fs::read(path) {
+                let orientation = crate::scanner::get_orientation(path, Some(&bytes));
+                eprintln!("[DEBUG] load_and_process_image OTHER get_orientation={}", orientation);
+
+                // Decode from memory buffer
+                if let Ok(dyn_img) = image::load_from_memory(&bytes) {
                     let dims = (dyn_img.width(), dyn_img.height());
                     let buf = dyn_img.to_rgba8();
                     let pixels = buf.as_flat_samples();
