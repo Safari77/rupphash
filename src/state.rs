@@ -37,6 +37,7 @@ pub enum InputIntent {
     ShowSortSelection,
     ChangeSortOrder(String),
     NextGroupByDist,
+    PreviousGroupByDist,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +371,25 @@ impl AppState {
                     self.set_status(format!("Jumped to Dist: {}", self.group_infos[new_idx].max_dist), false);
                 } else {
                     self.set_status("No groups with higher distance found.".to_string(), false);
+                }
+            },
+            InputIntent::PreviousGroupByDist => {
+                if self.groups.is_empty() { return; }
+                let current_dist = self.group_infos[self.current_group_idx].max_dist;
+
+                // Find the last group preceding current one that has strictly smaller max_dist
+                if let Some(new_idx) = self.group_infos.iter()
+                    .enumerate()
+                    .take(self.current_group_idx)
+                    .rposition(|(_, info)| info.max_dist < current_dist)
+                {
+                    self.current_group_idx = new_idx;
+                    self.current_file_idx = 0;
+                    self.manual_rotation = 0;
+                    self.selection_changed = true;
+                    self.set_status(format!("Jumped to Dist: {}", self.group_infos[new_idx].max_dist), false);
+                } else {
+                    self.set_status("No groups with smaller distance found.".to_string(), false);
                 }
             },
             InputIntent::ChangeSortOrder(_) => {},

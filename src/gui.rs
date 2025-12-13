@@ -1273,8 +1273,13 @@ impl eframe::App for GuiApp {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) { *intent.borrow_mut() = Some(InputIntent::NextItem); }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) { *intent.borrow_mut() = Some(InputIntent::PrevItem); }
             if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) { *intent.borrow_mut() = Some(InputIntent::PageDown); }
-            if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::PageDown)) { *intent.borrow_mut() = Some(InputIntent::NextGroupByDist); }
+            if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::PageDown)) {
+                *intent.borrow_mut() = Some(InputIntent::NextGroupByDist);
+            }
             if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) { *intent.borrow_mut() = Some(InputIntent::PageUp); }
+            if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::PageUp)) {
+                *intent.borrow_mut() = Some(InputIntent::PreviousGroupByDist);
+            }
             if ctx.input(|i| i.key_pressed(egui::Key::Home)) { *intent.borrow_mut() = Some(InputIntent::Home); }
             if ctx.input(|i| i.key_pressed(egui::Key::End)) { *intent.borrow_mut() = Some(InputIntent::End); }
             if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::Tab)) { *intent.borrow_mut() = Some(InputIntent::PrevGroup); }
