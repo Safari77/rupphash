@@ -808,19 +808,21 @@ impl GuiApp {
             } else { 1 }
         } else { 1 };
 
-        // DEBUG: Trace orientation lookup
-        if let Some(group) = self.state.groups.get(self.state.current_group_idx) {
-            if let Some(file) = group.get(self.state.current_file_idx) {
-                eprintln!("[DEBUG-RENDER] group_idx={}, file_idx={}, path={:?}, file.orientation={}, used_orientation={}",
-                    self.state.current_group_idx, self.state.current_file_idx,
-                    file.path.file_name().unwrap_or_default(), file.orientation, orientation);
+        if false {
+            // DEBUG: Trace orientation lookup
+            if let Some(group) = self.state.groups.get(self.state.current_group_idx) {
+                if let Some(file) = group.get(self.state.current_file_idx) {
+                    eprintln!("[DEBUG-RENDER] group_idx={}, file_idx={}, path={:?}, file.orientation={}, used_orientation={}",
+                        self.state.current_group_idx, self.state.current_file_idx,
+                        file.path.file_name().unwrap_or_default(), file.orientation, orientation);
+                } else {
+                    eprintln!("[DEBUG-RENDER] group_idx={}, file_idx={} - FILE NOT FOUND, defaulting to 1",
+                        self.state.current_group_idx, self.state.current_file_idx);
+                }
             } else {
-                eprintln!("[DEBUG-RENDER] group_idx={}, file_idx={} - FILE NOT FOUND, defaulting to 1",
-                    self.state.current_group_idx, self.state.current_file_idx);
+                eprintln!("[DEBUG-RENDER] group_idx={} - GROUP NOT FOUND, defaulting to 1",
+                    self.state.current_group_idx);
             }
-        } else {
-            eprintln!("[DEBUG-RENDER] group_idx={} - GROUP NOT FOUND, defaulting to 1",
-                self.state.current_group_idx);
         }
 
         let manual_rot = self.state.manual_rotation % 4;
