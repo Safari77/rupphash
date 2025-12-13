@@ -1670,65 +1670,57 @@ impl eframe::App for GuiApp {
                     }
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    // Show progress when loading
                     if self.state.is_loading {
                         let (current, total) = self.scan_progress;
-                        if total > 0 {
-                            ui.label(format!("Scanning: {}/{} files...", current, total));
-                            let progress = current as f32 / total as f32;
-                            ui.add(egui::ProgressBar::new(progress).show_percentage());
-                        } else {
-                            ui.label("Scanning...");
-                            ui.spinner();
-                        }
-                    } else if self.state.groups.is_empty() && self.subdirs.is_empty() {
-                        ui.label(if self.state.view_mode { "No images found." } else { "No duplicates found." });
-                    }
+                        if total > 0 { ui.label(format!("Scanning: {}/{} files...", current, total)); ui.add(egui::ProgressBar::new(current as f32 / total as f32).show_percentage()); } else { ui.label("Scanning..."); ui.spinner(); }
+                    } else if self.state.groups.is_empty() && self.subdirs.is_empty() { ui.label(if self.state.view_mode { "No images found." } else { "No duplicates found." }); }
 
-                    // In view mode, show subdirectories at the top
                     let mut dir_to_open: Option<std::path::PathBuf> = None;
                     if self.state.view_mode && !self.state.is_loading {
-                        // Parent directory entry
-                        if let Some(ref current) = self.current_dir
-                            && let Some(parent) = current.parent() {
-                                let resp = ui.add(egui::Button::new(
-                                    egui::RichText::new("📁 ..")
-                                        .color(egui::Color32::YELLOW)
-                                ).wrap_mode(egui::TextWrapMode::Truncate));
-                                if resp.clicked() {
-                                    dir_to_open = Some(parent.to_path_buf());
-                                }
+                        if let Some(ref current) = self.current_dir && let Some(parent) = current.parent() {
+                                if ui.add(egui::Button::new(egui::RichText::new("📁 ..").color(egui::Color32::YELLOW)).wrap_mode(egui::TextWrapMode::Truncate)).clicked() { dir_to_open = Some(parent.to_path_buf()); }
                             }
-
-                        // Subdirectories
                         for subdir in &self.subdirs {
-                            let dir_name = subdir.file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| subdir.to_string_lossy().to_string());
-
-                            let resp = ui.add(egui::Button::new(
-                                egui::RichText::new(format!("📁 {}", dir_name))
-                                    .color(egui::Color32::LIGHT_BLUE)
-                            ).wrap_mode(egui::TextWrapMode::Truncate));
-                            if resp.clicked() {
-                                dir_to_open = Some(subdir.clone());
-                            }
+                            let dir_name = subdir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| subdir.to_string_lossy().to_string());
+                            if ui.add(egui::Button::new(egui::RichText::new(format!("📁 {}", dir_name)).color(egui::Color32::LIGHT_BLUE)).wrap_mode(egui::TextWrapMode::Truncate)).clicked() { dir_to_open = Some(subdir.clone()); }
                         }
-
-                        // Separator between directories and files
-                        if !self.subdirs.is_empty() || self.current_dir.as_ref().and_then(|c| c.parent()).is_some() {
-                            ui.separator();
-                        }
+                        if !self.subdirs.is_empty() || self.current_dir.as_ref().and_then(|c| c.parent()).is_some() { ui.separator(); }
                     }
 
-                            // We collect actions to perform after the loop
+                    // --- VIRTUALIZATION / CLIPPING LOGIC ---
+                    let spacing = ui.spacing().item_spacing.y;
+                    let header_height = ui.text_style_height(&egui::TextStyle::Body) + spacing;
+                    let font_id_main = egui::TextStyle::Monospace.resolve(ui.style());
+                    let font_id_meta = egui::FontId::monospace(10.0);
+                    // Use "Ij" to cover both ascenders and descenders for accurate height
+                    let button_height = ui.painter().layout_no_wrap("Ij".to_string(), font_id_main.clone(), egui::Color32::default()).rect.height() + (ui.spacing().button_padding.y * 2.0);
+                    let meta_height = ui.painter().layout_no_wrap("Ij".to_string(), font_id_meta.clone(), egui::Color32::default()).rect.height();
+                    let file_row_height = button_height + spacing + meta_height + spacing;
+                    let separator_height = 10.0;
+
+                    let clip_rect = ui.clip_rect();
+                    let start_y = ui.cursor().min.y;
+                    let mut current_y = start_y;
+
                     let mut action_rename = false;
                     let mut action_delete = false;
                     let mut new_selection = None;
 
                     for (g_idx, group) in self.state.groups.iter().enumerate() {
-                        // Only show group headers in duplicate mode
-                        if !self.state.view_mode {
+                        let header_visible = !self.state.view_mode;
+                        let current_header_height = if header_visible { header_height } else { 0.0 };
+                        let group_content_height = (group.len() as f32 * file_row_height) + if header_visible { separator_height } else { 0.0 };
+                        let group_total_height = current_header_height + group_content_height;
+
+                        let is_group_visible = (current_y + group_total_height > clip_rect.min.y) && (current_y < clip_rect.max.y);
+
+                        if !is_group_visible {
+                            ui.add_space(group_total_height);
+                            current_y += group_total_height;
+                            continue;
+                        }
+
+                        if header_visible {
                             let info = &self.state.group_infos[g_idx];
                             let (header_text, header_color) = match info.status {
                                 GroupStatus::AllIdentical => (format!("Group {} - Bit-identical (hardlinks in light blue)", g_idx + 1), egui::Color32::GREEN),
@@ -1736,140 +1728,88 @@ impl eframe::App for GuiApp {
                                 GroupStatus::None => (format!("Group {} (Dist: {})", g_idx + 1, info.max_dist), egui::Color32::YELLOW),
                             };
                             ui.colored_label(header_color, header_text);
+                            current_y += header_height;
                         }
 
                         let counts = get_bit_identical_counts(group);
                         let hardlink_groups = get_hardlink_groups(group);
-                        let pixel_counts = get_content_identical_counts(group);
-                        // Pre-calculate subgroups for this group
+                        // NEW: Subgroups
                         let content_subgroups = get_content_subgroups(group);
 
                         for (f_idx, file) in group.iter().enumerate() {
+                            let is_file_visible = (current_y + file_row_height > clip_rect.min.y) && (current_y < clip_rect.max.y);
+
+                            if !is_file_visible {
+                                ui.add_space(file_row_height);
+                                current_y += file_row_height;
+                                continue;
+                            }
+
                             let is_selected = g_idx == self.state.current_group_idx && f_idx == self.state.current_file_idx;
                             let is_marked = self.state.marked_for_deletion.contains(&file.path);
                             let exists = file.path.exists();
+                            let is_bit_identical = !self.state.view_mode && *counts.get(&file.content_hash).unwrap_or(&0) > 1;
+                            let is_hardlinked = !self.state.view_mode && file.dev_inode.map(|di| hardlink_groups.contains_key(&di)).unwrap_or(false);
 
-                            // Status Checks
-                            let is_bit_identical = *counts.get(&file.content_hash).unwrap_or(&0) > 1;
-                            let is_hardlinked = file.dev_inode
-                                .map(|di| hardlink_groups.contains_key(&di))
-                                .unwrap_or(false);
-
-                            // Content Group ID (e.g., 1, 2)
                             let content_id = file.pixel_hash.and_then(|ph| content_subgroups.get(&ph));
                             let is_content_identical = content_id.is_some();
+                            let c_label = if let Some(id) = content_id { format!("C{:<1}", id) } else { "  ".to_string() };
 
-                            // Format the "C" label: "C1 ", "C2 ", or "   "
-                            let c_label = if let Some(id) = content_id {
-                                format!("C{:<1}", id) // "C1"
-                            } else {
-                                "  ".to_string()
-                            };
-
-                            // Build the text string
-                            // Layout: [M] [L] [C1] [Path]
                             let text = format!("{} {} {} {}",
                                 if is_marked     { "M" } else { " " },
                                 if is_hardlinked { "L" } else { " " },
                                 c_label,
                                 format_path_depth(&file.path, self.state.path_display_depth)
                             );
-
                             let mut label_text = egui::RichText::new(text).family(egui::FontFamily::Monospace);
-
                             if !is_selected {
                                 if !exists { label_text = label_text.color(egui::Color32::RED).strikethrough(); }
                                 else if is_marked { label_text = label_text.color(egui::Color32::RED); }
                                 else if is_hardlinked { label_text = label_text.color(egui::Color32::LIGHT_BLUE); }
-                                else if is_bit_identical {
-                                    // Bit identical files are technically "C1" too, but Green takes precedence.
-                                    // The "C1" tag remains visible in the text so you know which group it belongs to.
-                                    label_text = label_text.color(egui::Color32::GREEN);
-                                }
-                                else if is_content_identical {
-                                    // Files that are ONLY content identical (Gold)
-                                    label_text = label_text.color(egui::Color32::GOLD);
-                                }
+                                else if is_bit_identical { label_text = label_text.color(egui::Color32::GREEN); }
+                                else if is_content_identical { label_text = label_text.color(egui::Color32::GOLD); }
                             }
 
-                            // FEATURE: Highlight peers of the currently selected file
-                            // If I select a "C1" file, make all other "C1" files bold/bright
                             if let Some(current_file) = group.get(self.state.current_file_idx) {
-                                if !is_selected
-                                    && current_file.pixel_hash.is_some()
-                                        && current_file.pixel_hash == file.pixel_hash
-                                {
-                                    label_text = label_text.strong().background_color(egui::Color32::from_black_alpha(40));
-                                }
+                                 if !is_selected && current_file.pixel_hash.is_some() && current_file.pixel_hash == file.pixel_hash {
+                                     label_text = label_text.strong().background_color(egui::Color32::from_black_alpha(40));
+                                 }
                             }
-                            // Use Button with selected and wrap_mode to prevent word wrap
+
                             let resp = ui.add(egui::Button::new(label_text).selected(is_selected).wrap_mode(egui::TextWrapMode::Truncate));
-                            if resp.clicked() {
-                                new_selection = Some((g_idx, f_idx));
-                            }
-
-                            // Context Menu with Rename and Delete
+                            if resp.clicked() { new_selection = Some((g_idx, f_idx)); }
                             resp.context_menu(|ui| {
-                                if ui.button("Rename (R)").clicked() {
-                                    ui.close();
-                                    action_rename = true;
-                                }
-                                if ui.button("Delete (Del)").clicked() {
-                                    ui.close();
-                                    action_delete = true;
-                                }
+                                if ui.button("Rename (R)").clicked() { ui.close(); action_rename = true; }
+                                if ui.button("Delete (Del)").clicked() { ui.close(); action_delete = true; }
                             });
-
                             if is_selected && self.state.selection_changed { resp.scroll_to_me(Some(egui::Align::Center)); }
 
-                            // Restore Metadata Row (Compact) - also no wrap
                             let size_kb = file.size / 1024;
                             let time_str = if self.state.show_relative_times {
                                 let ts = Timestamp::from_second(file.modified.timestamp()).unwrap().checked_add(jiff::SignedDuration::from_nanos(file.modified.timestamp_subsec_nanos() as i64)).unwrap();
                                 format_relative_time(ts)
-                            } else {
-                                file.modified.format("%Y-%m-%d %H:%M:%S").to_string()
-                            };
+                            } else { file.modified.format("%Y-%m-%d %H:%M:%S").to_string() };
                             let res_str = file.resolution.map(|(w, h)| format!("{}x{}", w, h)).unwrap_or("?".to_string());
 
-                            ui.add(egui::Label::new(egui::RichText::new(format!("{} | {} KB | {}", time_str, size_kb, res_str))
-                                .size(10.0)
-                                .family(egui::FontFamily::Monospace)
-                                .color(if is_selected { egui::Color32::WHITE } else { egui::Color32::GRAY })).wrap_mode(egui::TextWrapMode::Truncate));
+                            ui.add(egui::Label::new(egui::RichText::new(format!("{} | {} KB | {}", time_str, size_kb, res_str)).size(10.0).family(egui::FontFamily::Monospace).color(if is_selected { egui::Color32::WHITE } else { egui::Color32::GRAY })).wrap_mode(egui::TextWrapMode::Truncate));
+
+                            current_y += file_row_height;
                         }
-                        if !self.state.view_mode { ui.separator(); }
+                        if header_visible {
+                            ui.separator();
+                            current_y += separator_height;
+                        }
                     }
 
-                    // Apply deferred actions
-                    if let Some((g, f)) = new_selection {
-                        self.state.current_group_idx = g;
-                        self.state.current_file_idx = f;
-                        self.state.selection_changed = true;
-                    }
-                    if action_rename {
-                        // Set rename_input before triggering StartRename (same as keyboard handling)
-                        if let Some(path) = self.state.get_current_image_path() {
-                            self.rename_input = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                        }
-                        self.state.handle_input(InputIntent::StartRename);
-                    }
-                    if action_delete {
-                        self.state.handle_input(InputIntent::DeleteImmediate);
-                    }
-                    if let Some(dir) = dir_to_open {
-                        self.change_directory(dir);
-                    }
-
-                    // Reset selection_changed after scroll has been applied
+                    if let Some((g, f)) = new_selection { self.state.current_group_idx = g; self.state.current_file_idx = f; self.state.selection_changed = true; }
+                    if action_rename { if let Some(path) = self.state.get_current_image_path() { self.rename_input = path.file_name().unwrap_or_default().to_string_lossy().to_string(); } self.state.handle_input(InputIntent::StartRename); }
+                    if action_delete { self.state.handle_input(InputIntent::DeleteImmediate); }
+                    if let Some(dir) = dir_to_open { self.change_directory(dir); }
                     self.state.selection_changed = false;
                 });
             });
-            // Track panel width for saving
             let rendered_width = panel_response.response.rect.width();
-            if (rendered_width - self.panel_width).abs() > 1.0 {
-                eprintln!("[DEBUG-PANEL] Width changed: {} -> {}", self.panel_width, rendered_width);
-            }
-            self.panel_width = rendered_width;
+            if (rendered_width - self.panel_width).abs() > 1.0 { self.panel_width = rendered_width; }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
