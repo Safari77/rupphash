@@ -173,8 +173,13 @@ impl TuiApp {
                     Some(InputIntent::PageDown)
                 }
             },
-            KeyCode::PageUp => Some(InputIntent::PageUp),
-
+            KeyCode::PageUp => {
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    Some(InputIntent::PreviousGroupByDist)
+                } else {
+                    Some(InputIntent::PageUp)
+                }
+            },
             KeyCode::Tab => Some(InputIntent::NextGroup),
             KeyCode::BackTab => Some(InputIntent::PrevGroup),
             KeyCode::Home => Some(InputIntent::Home),
