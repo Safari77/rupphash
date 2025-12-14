@@ -1729,7 +1729,7 @@ impl eframe::App for GuiApp {
 
             // Delay panel width restoration until after font_scale is applied
             // On first frames (ppp=1), use a default. Once ppp stabilizes (>1), apply saved width.
-            let should_apply_saved_width = !self.initial_panel_width_applied && ppp > 1.5;
+            let should_apply_saved_width = !self.initial_panel_width_applied;
 
             if should_apply_saved_width {
                 eprintln!("[DEBUG-PANEL] Applying saved panel width {} (ppp={})", self.saved_panel_width, ppp);
