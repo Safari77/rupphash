@@ -368,6 +368,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if args.use_trash {
+        use trash::os_limited::trash_folders;
+        let bins = trash_folders()?;
+        eprintln!("Trash folders on this system: {bins:#?}");
+    }
+
     // View mode uses GUI by default unless --use-tui specified
     let use_gui = args.use_gui || (is_view_mode && !args.use_tui);
 
