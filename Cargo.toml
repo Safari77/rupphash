@@ -42,6 +42,9 @@ kamadak-exif = "0.6.1"
 natord = "1.0.9"
 lmdb-rkv = { git = "https://github.com/Safari77/lmdb-rs-mozilla" }
 regex = "1.12"
+geo = { version = "0.32", features = ["serde"] }
+solar-positioning = "0.4"
+tzf-rs = "1.1"
 
 # GUI
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
@@ -61,4 +64,8 @@ path = "src/phdupes.rs"
 [[bin]]
 name = "phash_test"
 path = "src/phash_test.rs"
+
+[[bin]]
+name = "position_test"
+path = "src/position_test.rs"
 

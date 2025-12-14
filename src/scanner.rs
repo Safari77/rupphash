@@ -218,15 +218,22 @@ fn extract_gps_coordinates(exif_data: &exif::Exif) -> Option<(f64, f64)> {
     Some((lat, lon))
 }
 
-/// Parse GPS coordinate from EXIF rational values (degrees, minutes, seconds)
+/// Parse GPS coordinate magnitude from EXIF rational values (DMS -> Decimal).
+/// 
+/// Note: This always returns a positive value. The caller must apply the
+/// sign based on the GPSLatitudeRef (N/S) or GPSLongitudeRef (E/W) tags.
 fn parse_gps_coordinate(value: &exif::Value) -> Option<f64> {
-    if let exif::Value::Rational(rats) = value
-        && rats.len() >= 3 {
-            let degrees = rats[0].num as f64 / rats[0].denom as f64;
-            let minutes = rats[1].num as f64 / rats[1].denom as f64;
-            let seconds = rats[2].num as f64 / rats[2].denom as f64;
+    if let exif::Value::Rational(rats) = value {
+        if rats.len() >= 3 {
+            if rats[0].denom == 0 || rats[1].denom == 0 || rats[2].denom == 0 {
+                return None;
+            }
+            let degrees = rats[0].to_f64();
+            let minutes = rats[1].to_f64();
+            let seconds = rats[2].to_f64();
             return Some(degrees + minutes / 60.0 + seconds / 3600.0);
         }
+    }
     None
 }
 
