@@ -14,6 +14,7 @@ use libheif_rs::HeifContext;
 use image::GenericImageView;
 use zune_jpeg::JpegDecoder as ZuneDecoder;
 use jpeg_decoder::Decoder as Tier2Decoder;
+use exif::{In, Reader, Tag, Value};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -24,6 +25,7 @@ use crate::{FileMetadata, GroupInfo, GroupStatus};
 use crate::phash::DctPhash;
 use crate::hamminghash::{MIHIndex, HammingHash, SparseBitSet};
 use crate::db::{AppContext, HashAlgorithm, HashValue};
+use crate::helper_exif::{parse_gps_coordinate, extract_gps_lat_lon};
 
 pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf"];
 
@@ -89,7 +91,7 @@ pub fn get_exif_tags(path: &Path, tag_names: &[String], decimal_coords: bool) ->
 
     // Pre-extract GPS coordinates for derived values (only if needed)
     let gps_coords = if tag_names.iter().any(|t| is_derived_tag(t)) {
-        extract_gps_coordinates(&exif_data)
+        extract_gps_lat_lon(&exif_data)
     } else {
         None
     };
@@ -194,49 +196,6 @@ fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
     image::load_from_memory(bytes).ok()
 }
 
-/// Extract GPS coordinates from EXIF data as (latitude, longitude)
-fn extract_gps_coordinates(exif_data: &exif::Exif) -> Option<(f64, f64)> {
-    let lat_field = exif_data.get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY)?;
-    let lon_field = exif_data.get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY)?;
-    let lat_ref = exif_data.get_field(exif::Tag::GPSLatitudeRef, exif::In::PRIMARY);
-    let lon_ref = exif_data.get_field(exif::Tag::GPSLongitudeRef, exif::In::PRIMARY);
-
-    let lat = parse_gps_coordinate(&lat_field.value)?;
-    let lon = parse_gps_coordinate(&lon_field.value)?;
-
-    // Apply reference (N/S for latitude, E/W for longitude)
-    let lat = if let Some(ref_field) = lat_ref {
-        let ref_str = ref_field.value.display_as(exif::Tag::GPSLatitudeRef).to_string();
-        if ref_str.trim().eq_ignore_ascii_case("S") { -lat } else { lat }
-    } else { lat };
-
-    let lon = if let Some(ref_field) = lon_ref {
-        let ref_str = ref_field.value.display_as(exif::Tag::GPSLongitudeRef).to_string();
-        if ref_str.trim().eq_ignore_ascii_case("W") { -lon } else { lon }
-    } else { lon };
-
-    Some((lat, lon))
-}
-
-/// Parse GPS coordinate magnitude from EXIF rational values (DMS -> Decimal).
-/// 
-/// Note: This always returns a positive value. The caller must apply the
-/// sign based on the GPSLatitudeRef (N/S) or GPSLongitudeRef (E/W) tags.
-fn parse_gps_coordinate(value: &exif::Value) -> Option<f64> {
-    if let exif::Value::Rational(rats) = value {
-        if rats.len() >= 3 {
-            if rats[0].denom == 0 || rats[1].denom == 0 || rats[2].denom == 0 {
-                return None;
-            }
-            let degrees = rats[0].to_f64();
-            let minutes = rats[1].to_f64();
-            let seconds = rats[2].to_f64();
-            return Some(degrees + minutes / 60.0 + seconds / 3600.0);
-        }
-    }
-    None
-}
-
 /// Get a derived value based on tag name and available data
 fn get_derived_value(tag_name: &str, gps_coords: Option<(f64, f64)>) -> Option<String> {
     match tag_name.to_lowercase().as_str() {
@@ -330,6 +289,8 @@ fn parse_exif_tag_name(name: &str) -> Option<(exif::Tag, exif::In)> {
         "gpslatitude" => exif::Tag::GPSLatitude,
         "gpslongitude" => exif::Tag::GPSLongitude,
         "gpsaltitude" => exif::Tag::GPSAltitude,
+        "gpstimestamp" => exif::Tag::GPSTimeStamp,
+        "gpsdatestamp" => exif::Tag::GPSDateStamp,
         "exposurebias" | "exposurebiasvalue" => exif::Tag::ExposureBiasValue,
         "colorspace" => exif::Tag::ColorSpace,
         "scenetype" => exif::Tag::SceneType,
@@ -354,6 +315,8 @@ pub fn get_supported_exif_tags() -> Vec<(&'static str, &'static str)> {
         ("DateTime", "Date/time original (alias for DateTimeOriginal)"),
         ("DateTimeOriginal", "Date/time when photo was taken"),
         ("DateTimeDigitized", "Date/time when photo was digitized"),
+        ("GPSTimeStamp", "Time of last GPS sync in UTC"),
+        ("GPSDateStamp", "Date of last GPS sync in UTC"),
         ("ExposureTime", "Exposure time (shutter speed)"),
         ("Exposure", "Exposure time (alias)"),
         ("FNumber", "F-number (aperture)"),

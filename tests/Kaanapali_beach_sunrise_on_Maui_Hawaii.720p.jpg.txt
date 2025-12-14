@@ -1,0 +1,30 @@
+Modifications made:
+magick Kaanapali_beach_sunset_on_Maui_Hawaii_\(45015472644\).jpg -resize 1280x720 -quality 70 Kaanapali_beach_sunset_on_Maui_Hawaii.720p.jpg
+
+Source: https://commons.wikimedia.org/wiki/File:Kaanapali_beach_sunset_on_Maui_Hawaii_%2845015472644%29.jpg
+Author: dronepicr
+License: Creative Commons Attribution 2.0 Generic
+
+Note:
+The camera's internal clock claimed it was morning (06:10 AM), which would mean the sun was rising in the East (behind the mountains).
+However, the embedded GPS Time is recorded by satellites in UTC (05:10).
+Converting this to Hawaii time (05:10 - 10 hours) yields 19:10 (7:10 PM).
+The Result: At 7:10 PM, the sun is setting in the West (~288°), which matches
+the filename ("sunset") and the location (Kaanapali Beach).
+
+This now gives correct data:
+$ ./target/release/position_test --gpstime tests/Kaanapali_beach_sunrise_on_Maui_Hawaii.720p.jpg
+Helsinki to Tampere Distance: 161.220 km, Compass Bearing: 337.110°
+GPSDateStamp: 'Some(Field { tag: Tag(Gps, 29), ifd_num: In(0), value: Ascii(["2018:08:09"]) })'
+GPSTimeStamp: 'Some(Field { tag: Tag(Gps, 7), ifd_num: In(0), value: Rational([Rational(5/1), Rational(10/1), Rational(21912/1000)]) })'
+--- Input Data ---
+File:       tests/Kaanapali_beach_sunrise_on_Maui_Hawaii.720p.jpg
+Lat/Lon:    20.91297, -156.69383
+Altitude:   10.8 m
+Date Clean: '2018-08-09 05:10:21' (GPS UTC)
+
+--- Result ---
+Sun Altitude:  -2.9160 deg
+Sun Azimuth:   288.2067 deg
+Timezone:      UTC (+00:00)
+
