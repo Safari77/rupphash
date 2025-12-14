@@ -43,6 +43,7 @@ INFO OVERLAYS & DISPLAY
 ------------------------------------------------------------------------------
 I                    : Toggle Histogram overlay
 E                    : Toggle EXIF Info overlay
+G                    : Toggle EXIF Local time/GPS (UTC) in Solar Position calcs
 H                    : Toggle Relative Times (e.g., "1h 20s ago" vs absolute date)
 P                    : Toggle Path Visibility depth in the sidebar
 T                    : Open Sort Order menu (Name, Date, Size, Random)

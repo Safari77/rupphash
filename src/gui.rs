@@ -5,6 +5,7 @@ use crate::GroupStatus;
 use crate::db::AppContext;
 use crate::scanner::{self, ScanConfig, is_raw_ext};
 use crate::{FileMetadata, GroupInfo};
+use crate::position;
 use jiff::Timestamp;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -99,6 +100,8 @@ pub struct GuiApp {
 
     // EXIF info display
     show_exif: bool,
+    search_sun_azimuth_enabled: bool,
+    search_sun_altitude_enabled: bool,
 
     // Cache for current image's histogram and EXIF data (to avoid reloading on toggle)
     cached_histogram: Option<(std::path::PathBuf, [u32; 256])>,
@@ -167,7 +170,7 @@ impl GuiApp {
             active_window,
             last_window_size: initial_window_size,
             panel_width,
-            saved_panel_width: panel_width,  // Preserve original value
+            saved_panel_width: panel_width,
             current_dir: None,
             show_dir_picker: false,
             dir_list: Vec::new(),
@@ -178,6 +181,8 @@ impl GuiApp {
             completion_index: 0,
             show_histogram: false,
             show_exif: false,
+            search_sun_azimuth_enabled: false,
+            search_sun_altitude_enabled: false,
             cached_histogram: None,
             cached_exif: None,
             search_input: String::new(),
@@ -280,6 +285,8 @@ impl GuiApp {
             completion_index: 0,
             show_histogram: false,
             show_exif: false,
+            search_sun_azimuth_enabled: false,
+            search_sun_altitude_enabled: false,
             cached_histogram: None,
             cached_exif: None,
             search_input: String::new(),
@@ -636,7 +643,7 @@ impl GuiApp {
         }
     }
 
-    /// Perform search with EXIF caching
+    /// Perform search with EXIF caching and special range queries
     fn perform_search_with_cache(&mut self, query: String) {
         use regex::RegexBuilder;
 
@@ -646,62 +653,128 @@ impl GuiApp {
             return;
         }
 
-        let re = match RegexBuilder::new(&query).case_insensitive(true).build() {
-            Ok(r) => r,
-            Err(e) => {
-                self.state.error_popup = Some(format!("Invalid Regex:\n{}", e));
-                return;
+        // 1. Check for Special Range Search Syntax (sun_az=X-Y or sun_alt=X-Y)
+        let mut sun_range_search: Option<(bool, f64, f64)> = None; // (is_azimuth, min, max)
+
+        let lower_query = query.to_lowercase();
+        let (is_az, rest) = if let Some(stripped) = lower_query.strip_prefix("sun_az=") {
+            (true, stripped)
+        } else if let Some(stripped) = lower_query.strip_prefix("sun_alt=") {
+            (false, stripped)
+        } else {
+            (false, "")
+        };
+
+        if !rest.is_empty() {
+            // Regex to strictly parse two numbers separated by a hyphen
+            // Matches: start, optional minus, digits/dots, hyphen, optional minus, digits/dots, end
+            let range_re = regex::Regex::new(r"^(-?[\d\.]+)-(-?[\d\.]+)$").unwrap();
+
+            if let Some(caps) = range_re.captures(rest) {
+                if let (Ok(min), Ok(max)) = (caps[1].parse::<f64>(), caps[2].parse::<f64>()) {
+                    sun_range_search = Some((is_az, min, max));
+                }
             }
+        }
+
+        // 2. Compile Regex (Conditionally)
+        let re = if sun_range_search.is_none() {
+            match RegexBuilder::new(&query).case_insensitive(true).build() {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    self.state.error_popup = Some(format!("Invalid Regex:\n{}", e));
+                    return;
+                }
+            }
+        } else {
+            None
         };
 
         let include_exif = self.state.search_include_exif;
+        // If range search is active or specific checkboxes enabled, we MUST fetch sun position
+        let include_sun = sun_range_search.is_some() || self.search_sun_azimuth_enabled || self.search_sun_altitude_enabled;
+        let use_gps = self.state.use_gps_utc;
 
-        // List of EXIF tags to search (same as in scanner.rs)
-        let search_tag_names: Vec<String> = vec![
+        // Base tags
+        let mut search_tag_names: Vec<String> = vec![
             "Make", "Model", "LensModel", "LensMake", "Software", "Artist", "Copyright",
             "DateTimeOriginal", "DateTimeDigitized", "ExposureTime", "FNumber", "ISO",
             "FocalLength", "FocalLength35mm", "ExposureProgram", "MeteringMode", "Flash",
             "WhiteBalance", "ExposureBias", "ColorSpace", "Contrast", "Saturation", "Sharpness",
         ].into_iter().map(String::from).collect();
 
+        // Add DerivedSunPosition if needed
+        if include_sun {
+            search_tag_names.push("DerivedSunPosition".to_string());
+        }
+
         for (g_idx, group) in self.state.groups.iter().enumerate() {
             for (f_idx, file) in group.iter().enumerate() {
-                // Skip deleted files and invalidate their cache
+                // Skip deleted files
                 if !file.path.exists() {
                     self.exif_search_cache.remove(&file.path);
                     continue;
                 }
 
-                let name = file.path.file_name().unwrap_or_default().to_string_lossy();
+                // Handle Range Search (Sun Position)
+                if let Some((is_azimuth_search, min_val, max_val)) = sun_range_search {
+                    // We need the EXIF data including derived sun position
+                    let exif_tags = if let Some(cached) = self.exif_search_cache.get(&file.path)
+                        && cached.iter().any(|(k, _)| k == "Sun Position") {
+                            cached.clone()
+                        } else {
+                            let mut tags = scanner::get_exif_tags(&file.path, &search_tag_names, false, use_gps);
+                            // Ensure country is also there if we are rebuilding cache
+                            let country_tags = scanner::get_exif_tags(&file.path, &["DerivedCountry".to_string()], false, use_gps);
+                            tags.extend(country_tags);
+                            self.exif_search_cache.insert(file.path.clone(), tags.clone());
+                            tags
+                        };
 
-                // Check filename first
-                if re.is_match(&name) {
-                    self.state.search_results.push((g_idx, f_idx, "Filename".to_string()));
-                    continue;
+                    // Find Sun Position tag
+                    if let Some((_, val_str)) = exif_tags.iter().find(|(k, _)| k == "Sun Position") {
+                        if let Some((alt, az)) = position::parse_sun_pos_string(val_str) {
+                            let val_to_check = if is_azimuth_search { az } else { alt };
+                            if val_to_check >= min_val && val_to_check <= max_val {
+                                let type_str = if is_azimuth_search { "Azimuth" } else { "Altitude" };
+                                self.state.search_results.push((g_idx, f_idx, format!("Sun {}", type_str)));
+                            }
+                        }
+                    }
+                    continue; // Skip standard regex check for this file if doing range search
                 }
 
-                // If EXIF search is enabled, check EXIF data with caching
-                if include_exif {
-                    // Get EXIF data from cache or read from file
-                    let exif_tags = if let Some(cached) = self.exif_search_cache.get(&file.path) {
-                        cached.clone()
-                    } else {
-                        let tags = scanner::get_exif_tags(&file.path, &search_tag_names, false);
-                        // Also get derived country
-                        let mut all_tags = tags;
-                        let country_tags = scanner::get_exif_tags(&file.path, &["DerivedCountry".to_string()], false);
-                        all_tags.extend(country_tags);
-                        self.exif_search_cache.insert(file.path.clone(), all_tags.clone());
-                        all_tags
-                    };
+                // Standard Regex Search
+                let name = file.path.file_name().unwrap_or_default().to_string_lossy();
 
-                    // Search through cached EXIF tags
-                    for (tag_name, tag_value) in &exif_tags {
-                        if re.is_match(tag_value) {
-                            // Use display name for Country
-                            let display_name = if tag_name == "DerivedCountry" { "Country" } else { tag_name };
-                            self.state.search_results.push((g_idx, f_idx, display_name.to_string()));
-                            break; // Only add each file once
+                // Only use regex if we have one (i.e., not a range search)
+                if let Some(re_ref) = &re {
+                    if re_ref.is_match(&name) {
+                        self.state.search_results.push((g_idx, f_idx, "Filename".to_string()));
+                        continue;
+                    }
+
+                    if include_exif {
+                        // Get EXIF data
+                        let exif_tags = if let Some(cached) = self.exif_search_cache.get(&file.path) {
+                            cached.clone()
+                        } else {
+                            let mut tags = scanner::get_exif_tags(&file.path, &search_tag_names, false, use_gps);
+                            let country_tags = scanner::get_exif_tags(&file.path, &["DerivedCountry".to_string()], false, false);
+                            tags.extend(country_tags);
+                            self.exif_search_cache.insert(file.path.clone(), tags.clone());
+                            tags
+                        };
+
+                        for (tag_name, tag_value) in &exif_tags {
+                            if re_ref.is_match(tag_value) {
+                                // Use display name
+                                let display_name = if tag_name == "DerivedCountry" { "Country" }
+                                else if tag_name == "DerivedSunPosition" { "Sun Position" }
+                                else { tag_name };
+                                self.state.search_results.push((g_idx, f_idx, display_name.to_string()));
+                                break;
+                            }
                         }
                     }
                 }
@@ -716,7 +789,7 @@ impl GuiApp {
             self.state.current_file_idx = f;
             self.state.selection_changed = true;
             self.state.status_message = Some((format!("Found {} matches. Match 1/{} in [{}]. (F3/Shift+F3 to nav)",
-                self.state.search_results.len(), self.state.search_results.len(), match_source), false));
+            self.state.search_results.len(), self.state.search_results.len(), match_source), false));
             self.status_set_time = Some(std::time::Instant::now());
         } else {
             let source = if include_exif { "filenames or EXIF data" } else { "filenames" };
@@ -1245,17 +1318,32 @@ impl GuiApp {
         }
 
         let decimal_mode = &self.ctx.gui_config.decimal_coords.unwrap_or(false);
+        let use_gps = self.state.use_gps_utc;
+
         // Check cache first
         let tags = if let Some((cached_path, cached_tags)) = &self.cached_exif {
             if cached_path == path {
                 cached_tags.clone()
             } else {
-                let new_tags = crate::scanner::get_exif_tags(path, exif_tags, *decimal_mode);
+                // Cache miss (or invalidated by 'G')
+                let new_tags = scanner::get_exif_tags(path, exif_tags, *decimal_mode, use_gps);
                 self.cached_exif = Some((path.to_path_buf(), new_tags.clone()));
+                // Check fallback warning during load
+                if use_gps && !crate::scanner::has_gps_time(path) {
+                    // We only warn if the user explicitly wanted Sun Position
+                    if exif_tags.iter().any(|t| t.eq_ignore_ascii_case("DerivedSunPosition")) {
+                        self.state.status_message = Some((
+                            "Sun Position: GPS Time missing, using Local.".to_string(), 
+                            true
+                        ));
+                        self.status_set_time = Some(std::time::Instant::now());
+                    }
+                }
+
                 new_tags
             }
         } else {
-            let new_tags = crate::scanner::get_exif_tags(path, exif_tags, *decimal_mode);
+            let new_tags = scanner::get_exif_tags(path, exif_tags, *decimal_mode, use_gps);
             self.cached_exif = Some((path.to_path_buf(), new_tags.clone()));
             new_tags
         };
@@ -1507,6 +1595,30 @@ impl eframe::App for GuiApp {
             if ctx.input(|i| i.key_pressed(egui::Key::I)) { self.show_histogram = !self.show_histogram; }
             if ctx.input(|i| i.key_pressed(egui::Key::E)) { self.show_exif = !self.show_exif; }
 
+            if ctx.input(|i| i.key_pressed(egui::Key::G)) {
+                // Toggle Time Source
+                self.state.use_gps_utc = !self.state.use_gps_utc;
+                self.cached_exif = None;
+                self.exif_search_cache.clear();
+                // Show status
+                let mode = if self.state.use_gps_utc { "GPS (UTC)" } else { "EXIF (Local)" };
+                self.state.status_message = Some((format!("Sun Position Time: {}", mode), false));
+                self.status_set_time = Some(std::time::Instant::now());
+
+                // Check fallback immediately for current file
+                if self.state.use_gps_utc {
+                    if let Some(path) = self.state.get_current_image_path() {
+                        if !crate::scanner::has_gps_time(path) {
+                            self.state.status_message = Some((
+                                    "Sun Position: GPS Time missing, falling back to Local time.".to_string(),
+                                    true // Error color
+                            ));
+                            self.status_set_time = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+            }
+
             // View Mode Only
             if self.state.view_mode {
                 if ctx.input(|i| i.key_pressed(egui::Key::C)) { self.open_dir_picker(); }
@@ -1614,7 +1726,10 @@ impl eframe::App for GuiApp {
             egui::Window::new("Find String (Regex)")
                 .collapsible(false)
                 .show(ctx, |ui| {
-                    ui.label("Case-insensitive regex search:");
+                    ui.label("Search options:");
+                    ui.label("• Filename regex (default)");
+                    ui.label("• 'sun_az=170-190' (numeric range)");
+                    ui.label("• 'sun_alt=-3-3' (numeric range)");
 
                     let res = ui.text_edit_singleline(&mut self.search_input);
 
@@ -1623,8 +1738,14 @@ impl eframe::App for GuiApp {
                         self.search_focus_requested = true;
                     }
 
-                    // Checkbox for including EXIF data in search
-                    ui.checkbox(&mut self.state.search_include_exif, "Include EXIF data");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.state.search_include_exif, "Include EXIF");
+                        ui.separator();
+                        ui.checkbox(&mut self.search_sun_azimuth_enabled, "Calc Azimuth");
+                        ui.checkbox(&mut self.search_sun_altitude_enabled, "Calc Altitude");
+                    });
+
+                    ui.small("Checking Azimuth/Altitude enables calculation for all files (slower).");
 
                     // Check both has_focus (typing) and lost_focus (committed via Enter)
                     let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
