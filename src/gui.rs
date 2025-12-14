@@ -104,6 +104,9 @@ pub struct GuiApp {
     cached_exif: Option<(std::path::PathBuf, Vec<(String, String)>)>,
     search_input: String,
     search_focus_requested: bool,
+
+    // EXIF cache for search (persists across searches)
+    exif_search_cache: HashMap<std::path::PathBuf, Vec<(String, String)>>,
 }
 
 impl GuiApp {
@@ -177,6 +180,7 @@ impl GuiApp {
             cached_exif: None,
             search_input: String::new(),
             search_focus_requested: false,
+            exif_search_cache: HashMap::new(),
         }
     }
 
@@ -277,6 +281,7 @@ impl GuiApp {
             cached_exif: None,
             search_input: String::new(),
             search_focus_requested: false,
+            exif_search_cache: HashMap::new(),
         }
     }
 
@@ -622,8 +627,91 @@ impl GuiApp {
             // Clear caches
             self.raw_cache.clear();
             self.raw_loading.clear();
+            self.exif_search_cache.clear();
             if let Ok(mut w) = self.active_window.write() { w.clear(); }
             self.last_preload_pos = None;
+        }
+    }
+
+    /// Perform search with EXIF caching
+    fn perform_search_with_cache(&mut self, query: String) {
+        use regex::RegexBuilder;
+
+        self.state.search_results.clear();
+        if query.is_empty() {
+            self.state.show_search = false;
+            return;
+        }
+
+        let re = match RegexBuilder::new(&query).case_insensitive(true).build() {
+            Ok(r) => r,
+            Err(e) => {
+                self.state.error_popup = Some(format!("Invalid Regex:\n{}", e));
+                return;
+            }
+        };
+
+        let include_exif = self.state.search_include_exif;
+
+        // List of EXIF tags to search (same as in scanner.rs)
+        let search_tag_names: Vec<String> = vec![
+            "Make", "Model", "LensModel", "LensMake", "Software", "Artist", "Copyright",
+            "DateTimeOriginal", "DateTimeDigitized", "ExposureTime", "FNumber", "ISO",
+            "FocalLength", "FocalLength35mm", "ExposureProgram", "MeteringMode", "Flash",
+            "WhiteBalance", "ExposureBias", "ColorSpace", "Contrast", "Saturation", "Sharpness",
+        ].into_iter().map(String::from).collect();
+
+        for (g_idx, group) in self.state.groups.iter().enumerate() {
+            for (f_idx, file) in group.iter().enumerate() {
+                let name = file.path.file_name().unwrap_or_default().to_string_lossy();
+
+                // Check filename first
+                if re.is_match(&name) {
+                    self.state.search_results.push((g_idx, f_idx, "Filename".to_string()));
+                    continue;
+                }
+
+                // If EXIF search is enabled, check EXIF data with caching
+                if include_exif {
+                    // Get EXIF data from cache or read from file
+                    let exif_tags = if let Some(cached) = self.exif_search_cache.get(&file.path) {
+                        cached.clone()
+                    } else {
+                        let tags = scanner::get_exif_tags(&file.path, &search_tag_names, false);
+                        // Also get derived country
+                        let mut all_tags = tags;
+                        let country_tags = scanner::get_exif_tags(&file.path, &["DerivedCountry".to_string()], false);
+                        all_tags.extend(country_tags);
+                        self.exif_search_cache.insert(file.path.clone(), all_tags.clone());
+                        all_tags
+                    };
+
+                    // Search through cached EXIF tags
+                    for (tag_name, tag_value) in &exif_tags {
+                        if re.is_match(tag_value) {
+                            // Use display name for Country
+                            let display_name = if tag_name == "DerivedCountry" { "Country" } else { tag_name };
+                            self.state.search_results.push((g_idx, f_idx, display_name.to_string()));
+                            break; // Only add each file once
+                        }
+                    }
+                }
+            }
+        }
+
+        if !self.state.search_results.is_empty() {
+            self.state.show_search = false;
+            self.state.current_search_match = 0;
+            let (g, f, ref match_source) = self.state.search_results[0];
+            self.state.current_group_idx = g;
+            self.state.current_file_idx = f;
+            self.state.selection_changed = true;
+            self.state.status_message = Some((format!("Found {} matches. Match 1/{} in [{}]. (F3/Shift+F3 to nav)",
+                self.state.search_results.len(), self.state.search_results.len(), match_source), false));
+            self.status_set_time = Some(std::time::Instant::now());
+        } else {
+            let source = if include_exif { "filenames or EXIF data" } else { "filenames" };
+            self.state.error_popup = Some(format!("No matches found in {} for:\n'{}'", source, query));
         }
     }
 
@@ -1476,7 +1564,8 @@ impl eframe::App for GuiApp {
                 });
 
             if submit {
-                self.state.handle_input(InputIntent::SubmitSearch(self.search_input.clone()));
+                let query = self.search_input.clone();
+                self.perform_search_with_cache(query);
             }
             if cancel {
                 self.state.handle_input(InputIntent::CancelSearch);
