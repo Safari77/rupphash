@@ -1712,8 +1712,19 @@ impl eframe::App for GuiApp {
             });
 
             if submit {
+                // Clean up the old texture from cache immediately
+                if let Some(state) = &self.state.renaming {
+                    self.raw_cache.remove(&state.original_path);
+                }
+
                 self.state.handle_input(InputIntent::SubmitRename(self.rename_input.clone()));
                 self.completion_candidates.clear();
+
+                // Force preload recalculation.
+                // Since indices (group_idx, file_idx) don't change during rename, perform_preload
+                // would otherwise skip updating the 'active_window' list sent to workers.
+                // Workers would then reject the new filename because it's not in their allow-list.
+                self.last_preload_pos = None;
             }
             if cancel {
                 self.state.handle_input(InputIntent::Cancel);
