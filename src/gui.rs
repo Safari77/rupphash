@@ -1448,7 +1448,7 @@ impl eframe::App for GuiApp {
             let mut submit = false;
             let mut cancel = false;
 
-            egui::Window::new("Find File (Regex)")
+            egui::Window::new("Find String (Regex)")
                 .collapsible(false)
                 .show(ctx, |ui| {
                     ui.label("Case-insensitive regex search:");
@@ -1459,6 +1459,9 @@ impl eframe::App for GuiApp {
                         res.request_focus();
                         self.search_focus_requested = true;
                     }
+
+                    // Checkbox for including EXIF data in search
+                    ui.checkbox(&mut self.state.search_include_exif, "Include EXIF data");
 
                     // Check both has_focus (typing) and lost_focus (committed via Enter)
                     let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
