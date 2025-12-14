@@ -88,6 +88,7 @@ pub struct GuiApp {
     dir_list: Vec<std::path::PathBuf>,
     dir_picker_selection: usize,
     subdirs: Vec<std::path::PathBuf>,  // Subdirectories in current directory
+    dir_selection_idx: Option<usize>,  // None = files selected, Some(idx) = directory idx selected
 
     // Tab Completion State
     completion_candidates: Vec<String>,
@@ -172,6 +173,7 @@ impl GuiApp {
             dir_list: Vec::new(),
             dir_picker_selection: 0,
             subdirs: Vec::new(),
+            dir_selection_idx: None,
             completion_candidates: Vec::new(),
             completion_index: 0,
             show_histogram: false,
@@ -273,6 +275,7 @@ impl GuiApp {
             dir_list: Vec::new(),
             dir_picker_selection: 0,
             subdirs: Vec::new(),
+            dir_selection_idx: None,
             completion_candidates: Vec::new(),
             completion_index: 0,
             show_histogram: false,
@@ -663,6 +666,12 @@ impl GuiApp {
 
         for (g_idx, group) in self.state.groups.iter().enumerate() {
             for (f_idx, file) in group.iter().enumerate() {
+                // Skip deleted files and invalidate their cache
+                if !file.path.exists() {
+                    self.exif_search_cache.remove(&file.path);
+                    continue;
+                }
+
                 let name = file.path.file_name().unwrap_or_default().to_string_lossy();
 
                 // Check filename first
@@ -1396,10 +1405,76 @@ impl eframe::App for GuiApp {
                     self.change_directory(selected_dir);
                 }
         } else if !self.state.is_loading && self.state.renaming.is_none() && !self.state.show_sort_selection && !self.state.show_search {
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) { *intent.borrow_mut() = Some(InputIntent::NextItem); }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) { *intent.borrow_mut() = Some(InputIntent::PrevItem); }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) { *intent.borrow_mut() = Some(InputIntent::NextItem); }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) { *intent.borrow_mut() = Some(InputIntent::PrevItem); }
+            // Calculate total directory count (parent + subdirs) for view mode navigation
+            let has_parent = self.state.view_mode && self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+            let total_dirs = if self.state.view_mode {
+                (if has_parent { 1 } else { 0 }) + self.subdirs.len()
+            } else { 0 };
+            let has_files = !self.state.groups.is_empty() && !self.state.groups[0].is_empty();
+
+            // Handle Up/Left navigation
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowLeft)) {
+                if self.state.view_mode && total_dirs > 0 {
+                    if let Some(dir_idx) = self.dir_selection_idx {
+                        // Already in directory list, move up
+                        if dir_idx > 0 {
+                            self.dir_selection_idx = Some(dir_idx - 1);
+                        }
+                        // At top of directory list, stay there
+                    } else if self.state.current_file_idx == 0 {
+                        // At first file, move to directory list (last directory)
+                        self.dir_selection_idx = Some(total_dirs - 1);
+                    } else {
+                        // Normal file navigation
+                        *intent.borrow_mut() = Some(InputIntent::PrevItem);
+                    }
+                } else {
+                    *intent.borrow_mut() = Some(InputIntent::PrevItem);
+                }
+            }
+
+            // Handle Down/Right navigation
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowRight)) {
+                if self.state.view_mode && self.dir_selection_idx.is_some() {
+                    let dir_idx = self.dir_selection_idx.unwrap();
+                    if dir_idx + 1 < total_dirs {
+                        // Move down in directory list
+                        self.dir_selection_idx = Some(dir_idx + 1);
+                    } else if has_files {
+                        // At bottom of directory list, move to first file
+                        self.dir_selection_idx = None;
+                        self.state.current_file_idx = 0;
+                        self.state.selection_changed = true;
+                    }
+                    // If no files, stay at last directory
+                } else {
+                    *intent.borrow_mut() = Some(InputIntent::NextItem);
+                }
+            }
+
+            // Handle Enter to open selected directory
+            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if self.state.view_mode && let Some(dir_idx) = self.dir_selection_idx {
+                    // Determine which directory to open
+                    let dir_to_open = if has_parent {
+                        if dir_idx == 0 {
+                            // Parent directory
+                            self.current_dir.as_ref().and_then(|c| c.parent()).map(|p| p.to_path_buf())
+                        } else {
+                            // Subdirectory (index adjusted for parent)
+                            self.subdirs.get(dir_idx - 1).cloned()
+                        }
+                    } else {
+                        // No parent, subdirs start at index 0
+                        self.subdirs.get(dir_idx).cloned()
+                    };
+                    if let Some(dir) = dir_to_open {
+                        self.dir_selection_idx = None;
+                        self.change_directory(dir);
+                    }
+                }
+            }
+
             if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) { *intent.borrow_mut() = Some(InputIntent::PageDown); }
             if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::PageDown)) {
                 *intent.borrow_mut() = Some(InputIntent::NextGroupByDist);
@@ -1888,14 +1963,30 @@ impl eframe::App for GuiApp {
 
                     let mut dir_to_open: Option<std::path::PathBuf> = None;
                     if self.state.view_mode && !self.state.is_loading {
+                        let has_parent = self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+                        let mut dir_idx: usize = 0;
+
+                        // Parent directory ".."
                         if let Some(ref current) = self.current_dir && let Some(parent) = current.parent() {
-                                if ui.add(egui::Button::new(egui::RichText::new("📁 ..").color(egui::Color32::YELLOW)).wrap_mode(egui::TextWrapMode::Truncate)).clicked() { dir_to_open = Some(parent.to_path_buf()); }
+                                let is_selected = self.dir_selection_idx == Some(dir_idx);
+                                let text = egui::RichText::new("📁 ..").color(egui::Color32::YELLOW);
+                                let btn = egui::Button::new(text).selected(is_selected).wrap_mode(egui::TextWrapMode::Truncate);
+                                if ui.add(btn).clicked() { dir_to_open = Some(parent.to_path_buf()); }
+                                dir_idx += 1;
                             }
+
+                        // Subdirectories
                         for subdir in &self.subdirs {
+                            let is_selected = self.dir_selection_idx == Some(dir_idx);
                             let dir_name = subdir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| subdir.to_string_lossy().to_string());
-                            if ui.add(egui::Button::new(egui::RichText::new(format!("📁 {}", dir_name)).color(egui::Color32::LIGHT_BLUE)).wrap_mode(egui::TextWrapMode::Truncate)).clicked() { dir_to_open = Some(subdir.clone()); }
+                            let text = egui::RichText::new(format!("📁 {}", dir_name)).color(egui::Color32::LIGHT_BLUE);
+                            let btn = egui::Button::new(text).selected(is_selected).wrap_mode(egui::TextWrapMode::Truncate);
+                            if ui.add(btn).clicked() {
+                                dir_to_open = Some(subdir.clone());
+                            }
+                            dir_idx += 1;
                         }
-                        if !self.subdirs.is_empty() || self.current_dir.as_ref().and_then(|c| c.parent()).is_some() { ui.separator(); }
+                        if !self.subdirs.is_empty() || has_parent { ui.separator(); }
                     }
 
                     // --- VIRTUALIZATION / CLIPPING LOGIC ---
@@ -1948,7 +2039,10 @@ impl eframe::App for GuiApp {
                         let content_subgroups = get_content_subgroups(group);
 
                         for (f_idx, file) in group.iter().enumerate() {
-                            let is_selected = g_idx == self.state.current_group_idx && f_idx == self.state.current_file_idx;
+                            // File is only selected if no directory is selected
+                            let is_selected = self.dir_selection_idx.is_none()
+                                && g_idx == self.state.current_group_idx
+                                && f_idx == self.state.current_file_idx;
                             // Define visibility
                             let is_file_visible = (current_y + file_row_height > clip_rect.min.y) && (current_y < clip_rect.max.y);
                             // If this is the selected file and selection changed,
@@ -2024,11 +2118,18 @@ impl eframe::App for GuiApp {
                         }
                     }
 
-                    if let Some((g, f)) = new_selection { self.state.current_group_idx = g;
-                        self.state.current_file_idx = f; self.state.selection_changed = true; }
+                    if let Some((g, f)) = new_selection {
+                        self.dir_selection_idx = None;  // Clear directory selection when file clicked
+                        self.state.current_group_idx = g;
+                        self.state.current_file_idx = f;
+                        self.state.selection_changed = true;
+                    }
                     if action_rename { if let Some(path) = self.state.get_current_image_path() { self.rename_input = path.file_name().unwrap_or_default().to_string_lossy().to_string(); } self.state.handle_input(InputIntent::StartRename); }
                     if action_delete { self.state.handle_input(InputIntent::DeleteImmediate); }
-                    if let Some(dir) = dir_to_open { self.change_directory(dir); }
+                    if let Some(dir) = dir_to_open {
+                        self.dir_selection_idx = None;  // Clear directory selection when changing directory
+                        self.change_directory(dir);
+                    }
                     self.state.selection_changed = false;
                 });
             });
