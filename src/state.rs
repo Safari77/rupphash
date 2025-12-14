@@ -35,6 +35,9 @@ pub enum InputIntent {
     ToggleSlideshow,      // Pause/resume slideshow
     ToggleFullscreen,
     RotateCW,
+    FlipHorizontal,       // Flip image left-right (Y key)
+    FlipVertical,         // Flip image up-down (U key)
+    ResetTransform,       // Reset rotation and flip state (Backspace key)
     ShowSortSelection,
     ChangeSortOrder(String),
     NextGroupByDist,
@@ -51,6 +54,20 @@ pub struct RenameState {
     pub group_idx: usize,
     pub file_idx: usize,
     pub original_path: PathBuf,
+}
+
+/// Per-file transform state (rotation and flips)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileTransform {
+    pub rotation: u8,        // 0-3 (90° increments clockwise)
+    pub flip_horizontal: bool, // Left-right flip
+    pub flip_vertical: bool,   // Up-down flip
+}
+
+impl FileTransform {
+    pub fn is_default(&self) -> bool {
+        self.rotation == 0 && !self.flip_horizontal && !self.flip_vertical
+    }
 }
 
 // --- Shared Helpers ---
@@ -156,6 +173,9 @@ pub struct AppState {
     pub show_search: bool,
     pub search_results: Vec<(usize, usize)>, // (group_idx, file_idx)
     pub current_search_match: usize,
+
+    // Per-file transform state (rotation and flips)
+    pub file_transforms: HashMap<PathBuf, FileTransform>,
 }
 
 impl AppState {
@@ -202,6 +222,7 @@ impl AppState {
             show_search: false,
             search_results: Vec::new(),
             current_search_match: 0,
+            file_transforms: HashMap::new(),
         }
     }
 
@@ -360,7 +381,33 @@ impl AppState {
                 self.is_fullscreen = !self.is_fullscreen;
             },
             InputIntent::RotateCW => {
+                // Per-file rotation
+                if let Some(path) = self.get_current_image_path().cloned() {
+                    let transform = self.file_transforms.entry(path).or_default();
+                    transform.rotation = (transform.rotation + 1) % 4;
+                }
+                // Also update legacy manual_rotation for compatibility
                 self.manual_rotation = (self.manual_rotation + 1) % 4;
+            },
+            InputIntent::FlipHorizontal => {
+                // Per-file horizontal flip (left-right)
+                if let Some(path) = self.get_current_image_path().cloned() {
+                    let transform = self.file_transforms.entry(path).or_default();
+                    transform.flip_horizontal = !transform.flip_horizontal;
+                }
+            },
+            InputIntent::FlipVertical => {
+                // Per-file vertical flip (up-down)
+                if let Some(path) = self.get_current_image_path().cloned() {
+                    let transform = self.file_transforms.entry(path).or_default();
+                    transform.flip_vertical = !transform.flip_vertical;
+                }
+            },
+            InputIntent::ResetTransform => {
+                // Reset transforms for ALL files
+                self.file_transforms.clear();
+                // Also reset legacy manual_rotation
+                self.manual_rotation = 0;
             },
             InputIntent::ShowSortSelection => {
                 self.show_sort_selection = true;
@@ -435,6 +482,19 @@ impl AppState {
         } else {
             None
         }
+    }
+
+    /// Get the transform state for the current file (or default if none set)
+    pub fn get_current_file_transform(&self) -> FileTransform {
+        self.get_current_image_path()
+            .and_then(|path| self.file_transforms.get(path))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Get the transform state for a specific file path (or default if none set)
+    pub fn get_file_transform(&self, path: &PathBuf) -> FileTransform {
+        self.file_transforms.get(path).copied().unwrap_or_default()
     }
 
     fn perform_rename(&mut self, new_name: String) {
@@ -644,9 +704,9 @@ impl AppState {
 
     fn perform_search(&mut self, query: String) {
         self.search_results.clear();
-        if query.is_empty() { 
+        if query.is_empty() {
             self.show_search = false;
-            return; 
+            return;
         }
 
         let re = match RegexBuilder::new(&query).case_insensitive(true).build() {

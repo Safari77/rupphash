@@ -828,12 +828,15 @@ impl GuiApp {
 
     // Helper to render texture with pan/zoom logic
     fn render_image_texture(&mut self, ui: &mut egui::Ui, texture_id: egui::TextureId, texture_size: egui::Vec2, available_rect: egui::Rect, current_group_idx: usize) {
-        // --- 1. Calculate Rotation ---
+        // --- 1. Calculate Rotation and Flip ---
         let orientation = if let Some(group) = self.state.groups.get(self.state.current_group_idx) {
             if let Some(file) = group.get(self.state.current_file_idx) {
                 file.orientation
             } else { 1 }
         } else { 1 };
+
+        // Get per-file transform state
+        let file_transform = self.state.get_current_file_transform();
 
         if false {
             // DEBUG: Trace orientation lookup
@@ -852,7 +855,8 @@ impl GuiApp {
             }
         }
 
-        let manual_rot = self.state.manual_rotation % 4;
+        // Use per-file rotation instead of global manual_rotation
+        let manual_rot = file_transform.rotation % 4;
 
         let exif_angle = match orientation {
             3 => PI,
@@ -867,8 +871,9 @@ impl GuiApp {
         static DEBUG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let count = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if count % 60 == 0 {
-            eprintln!("[DEBUG-ROTATION] orientation={}, exif_angle={:.4} rad ({:.1}°), manual_rot={}, total_angle={:.4} rad ({:.1}°)",
-                orientation, exif_angle, exif_angle.to_degrees(), manual_rot, total_angle, total_angle.to_degrees());
+            eprintln!("[DEBUG-ROTATION] orientation={}, exif_angle={:.4} rad ({:.1}°), manual_rot={}, total_angle={:.4} rad ({:.1}°), flip_h={}, flip_v={}",
+                orientation, exif_angle, exif_angle.to_degrees(), manual_rot, total_angle, total_angle.to_degrees(),
+                file_transform.flip_horizontal, file_transform.flip_vertical);
         }
 
         let exif_steps = match orientation { 3 => 2, 6 => 1, 8 => 3, _ => 0 };
@@ -950,11 +955,21 @@ impl GuiApp {
         // Clip to the available area so zoomed images don't spill out
         let _painter = ui.painter().with_clip_rect(available_rect);
 
-        // Paint the image into the calculated paint_rect, applying rotation.
+        // Calculate UV coordinates for flipping
+        // Default UV: top-left (0,0) to bottom-right (1,1)
+        let (u_min, u_max) = if file_transform.flip_horizontal { (1.0, 0.0) } else { (0.0, 1.0) };
+        let (v_min, v_max) = if file_transform.flip_vertical { (1.0, 0.0) } else { (0.0, 1.0) };
+        let uv = egui::Rect::from_min_max(
+            egui::pos2(u_min, v_min),
+            egui::pos2(u_max, v_max)
+        );
+
+        // Paint the image into the calculated paint_rect, applying rotation and flips.
         // egui::Image logic: Fits texture to paint_rect, then rotates around paint_rect center.
         // Since paint_rect matches the texture aspect ratio (scaled), the fit is 1:1 (no distortion).
         // Then rotation spins it to match target_rect (visual).
         egui::Image::from_texture((texture_id, texture_size))
+            .uv(uv)
             .rotate(total_angle, egui::Vec2::splat(0.5))
             .paint_at(ui, paint_rect);
 
@@ -1323,6 +1338,9 @@ impl eframe::App for GuiApp {
             if ctx.input(|i| i.key_pressed(egui::Key::S)) { *intent.borrow_mut() = Some(InputIntent::ToggleSlideshow); }
             if ctx.input(|i| i.key_pressed(egui::Key::F)) { *intent.borrow_mut() = Some(InputIntent::ToggleFullscreen); }
             if ctx.input(|i| i.key_pressed(egui::Key::O)) { *intent.borrow_mut() = Some(InputIntent::RotateCW); }
+            if ctx.input(|i| i.key_pressed(egui::Key::Y)) { *intent.borrow_mut() = Some(InputIntent::FlipHorizontal); }
+            if ctx.input(|i| i.key_pressed(egui::Key::U)) { *intent.borrow_mut() = Some(InputIntent::FlipVertical); }
+            if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) { *intent.borrow_mut() = Some(InputIntent::ResetTransform); }
             if ctx.input(|i| i.key_pressed(egui::Key::I)) { self.show_histogram = !self.show_histogram; }
             if ctx.input(|i| i.key_pressed(egui::Key::E)) { self.show_exif = !self.show_exif; }
 
