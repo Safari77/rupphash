@@ -19,7 +19,7 @@ FILE OPERATIONS
 Space                : Toggle "Mark" status (for bulk deletion/moving)
 D                    : Execute deletion of ALL marked files (with confirm)
 M                    : Move ALL marked files to target dir (with confirm)
-Delete / Backspace   : Delete the currently selected file immediately
+Delete               : Delete the currently selected file immediately
 R                    : Rename the currently selected file
 Ctrl + L             : Reload/Rescan the file list
 
@@ -31,6 +31,10 @@ W                    : Cycle View Mode (Fit Window -> Fit Width -> Fit Height)
 Z                    : Cycle Zoom Level (1:1 -> 2x -> 4x -> 8x -> Fit)
 X                    : Toggle Zoom Type (Absolute vs Relative to window)
 O                    : Rotate image 90° Clockwise (Visual only)
+Y                    : Flip image horizontally
+U                    : Flip image vertically
+Backspace            : Reset manual state of rotations and flips
+                     : States are remembered for each file individually
 F                    : Toggle Fullscreen mode
 S                    : Toggle Slideshow (Pause/Resume)
 Mouse Drag           : Pan image (when zoomed in)
@@ -39,7 +43,7 @@ INFO OVERLAYS & DISPLAY
 ------------------------------------------------------------------------------
 I                    : Toggle Histogram overlay
 E                    : Toggle EXIF Info overlay
-H                    : Toggle Relative Times (e.g., "2m ago" vs absolute date)
+H                    : Toggle Relative Times (e.g., "1h 20s ago" vs absolute date)
 P                    : Toggle Path Visibility depth in the sidebar
 T                    : Open Sort Order menu (Name, Date, Size, Random)
 
@@ -48,7 +52,7 @@ INTERFACE LAYOUT
 V                    : Shrink the sidebar panel width
 B                    : Expand the sidebar panel width
 
-VIEW MODE SPECIFIC (Browser Mode)
+VIEW MODE SPECIFIC (View Mode, --view)
 ------------------------------------------------------------------------------
 C                    : Open Directory Picker to change folders
 . (Period)           : Go up one directory level
