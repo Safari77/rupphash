@@ -171,8 +171,9 @@ pub struct AppState {
     pub manual_rotation: u8,
     pub use_pdqhash: bool,
     pub show_search: bool,
-    pub search_results: Vec<(usize, usize)>, // (group_idx, file_idx)
+    pub search_results: Vec<(usize, usize, String)>, // (group_idx, file_idx, match_source)
     pub current_search_match: usize,
+    pub search_include_exif: bool,  // Include EXIF data in search
 
     // Per-file transform state (rotation and flips)
     pub file_transforms: HashMap<PathBuf, FileTransform>,
@@ -222,6 +223,7 @@ impl AppState {
             show_search: false,
             search_results: Vec::new(),
             current_search_match: 0,
+            search_include_exif: false,
             file_transforms: HashMap::new(),
         }
     }
@@ -717,11 +719,23 @@ impl AppState {
             }
         };
 
+        let include_exif = self.search_include_exif;
+
         for (g_idx, group) in self.groups.iter().enumerate() {
             for (f_idx, file) in group.iter().enumerate() {
                 let name = file.path.file_name().unwrap_or_default().to_string_lossy();
+
+                // Check filename first
                 if re.is_match(&name) {
-                    self.search_results.push((g_idx, f_idx));
+                    self.search_results.push((g_idx, f_idx, "Filename".to_string()));
+                    continue;
+                }
+
+                // If EXIF search is enabled, also check EXIF data
+                if include_exif {
+                    if let Some(tag_name) = crate::scanner::find_matching_exif_tag(&file.path, &re) {
+                        self.search_results.push((g_idx, f_idx, tag_name));
+                    }
                 }
             }
         }
@@ -729,13 +743,15 @@ impl AppState {
         if !self.search_results.is_empty() {
             self.show_search = false;
             self.current_search_match = 0;
-            let (g, f) = self.search_results[0];
+            let (g, f, ref match_source) = self.search_results[0];
             self.current_group_idx = g;
             self.current_file_idx = f;
             self.selection_changed = true;
-            self.set_status(format!("Found {} matches. (F3/Shift+F3 to nav)", self.search_results.len()), false);
+            self.set_status(format!("Found {} matches. Match 1/{} in [{}]. (F3/Shift+F3 to nav)",
+                self.search_results.len(), self.search_results.len(), match_source), false);
         } else {
-            self.error_popup = Some(format!("No matches found for:\n'{}'", query));
+            let source = if include_exif { "filenames or EXIF data" } else { "filenames" };
+            self.error_popup = Some(format!("No matches found in {} for:\n'{}'", source, query));
         }
     }
 
@@ -752,11 +768,11 @@ impl AppState {
             }
         }
 
-        let (g, f) = self.search_results[self.current_search_match];
+        let (g, f, ref match_source) = self.search_results[self.current_search_match];
         self.current_group_idx = g;
         self.current_file_idx = f;
         self.selection_changed = true;
-        self.set_status(format!("Match {}/{}", self.current_search_match + 1, self.search_results.len()), false);
+        self.set_status(format!("Match {}/{} in [{}]", self.current_search_match + 1, self.search_results.len(), match_source), false);
     }
 
     fn perform_move_marked(&mut self) {

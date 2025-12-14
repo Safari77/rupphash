@@ -108,6 +108,118 @@ pub fn get_exif_tags(path: &Path, tag_names: &[String], decimal_coords: bool) ->
     results
 }
 
+/// Get all available EXIF data as a single searchable string
+/// Returns tag names and values concatenated, suitable for regex searching
+pub fn get_all_exif_as_string(path: &Path) -> String {
+    let Some(exif_data) = read_exif_data(path, None) else {
+        return String::new();
+    };
+
+    let mut parts = Vec::new();
+
+    // List of common tags to extract for searching
+    let search_tags = [
+        (exif::Tag::Make, "Make"),
+        (exif::Tag::Model, "Model"),
+        (exif::Tag::LensModel, "LensModel"),
+        (exif::Tag::LensMake, "LensMake"),
+        (exif::Tag::Software, "Software"),
+        (exif::Tag::Artist, "Artist"),
+        (exif::Tag::Copyright, "Copyright"),
+        (exif::Tag::DateTimeOriginal, "DateTimeOriginal"),
+        (exif::Tag::DateTimeDigitized, "DateTimeDigitized"),
+        (exif::Tag::ExposureTime, "ExposureTime"),
+        (exif::Tag::FNumber, "FNumber"),
+        (exif::Tag::PhotographicSensitivity, "ISO"),
+        (exif::Tag::FocalLength, "FocalLength"),
+        (exif::Tag::FocalLengthIn35mmFilm, "FocalLength35mm"),
+        (exif::Tag::ExposureProgram, "ExposureProgram"),
+        (exif::Tag::MeteringMode, "MeteringMode"),
+        (exif::Tag::Flash, "Flash"),
+        (exif::Tag::WhiteBalance, "WhiteBalance"),
+        (exif::Tag::ExposureBiasValue, "ExposureBias"),
+        (exif::Tag::ColorSpace, "ColorSpace"),
+        (exif::Tag::Contrast, "Contrast"),
+        (exif::Tag::Saturation, "Saturation"),
+        (exif::Tag::Sharpness, "Sharpness"),
+        (exif::Tag::ImageDescription, "ImageDescription"),
+        (exif::Tag::UserComment, "UserComment"),
+    ];
+
+    for (tag, name) in search_tags {
+        if let Some(field) = exif_data.get_field(tag, exif::In::PRIMARY) {
+            let value_str = format_exif_value(&field.value, tag, false);
+            if !value_str.is_empty() {
+                parts.push(format!("{}:{}", name, value_str));
+            }
+        }
+    }
+
+    // Also try to get derived country from GPS
+    if let Some(coords) = extract_gps_coordinates(&exif_data) {
+        if let Some(country) = derive_country(coords.0, coords.1) {
+            parts.push(format!("Country:{}", country));
+        }
+    }
+
+    parts.join(" ")
+}
+
+/// Find which EXIF tag matches the given regex pattern
+/// Returns the tag name if found, or None if no match
+pub fn find_matching_exif_tag(path: &Path, re: &regex::Regex) -> Option<String> {
+    let exif_data = read_exif_data(path, None)?;
+
+    // List of common tags to search
+    let search_tags = [
+        (exif::Tag::Make, "Make"),
+        (exif::Tag::Model, "Model"),
+        (exif::Tag::LensModel, "LensModel"),
+        (exif::Tag::LensMake, "LensMake"),
+        (exif::Tag::Software, "Software"),
+        (exif::Tag::Artist, "Artist"),
+        (exif::Tag::Copyright, "Copyright"),
+        (exif::Tag::DateTimeOriginal, "DateTimeOriginal"),
+        (exif::Tag::DateTimeDigitized, "DateTimeDigitized"),
+        (exif::Tag::ExposureTime, "ExposureTime"),
+        (exif::Tag::FNumber, "FNumber"),
+        (exif::Tag::PhotographicSensitivity, "ISO"),
+        (exif::Tag::FocalLength, "FocalLength"),
+        (exif::Tag::FocalLengthIn35mmFilm, "FocalLength35mm"),
+        (exif::Tag::ExposureProgram, "ExposureProgram"),
+        (exif::Tag::MeteringMode, "MeteringMode"),
+        (exif::Tag::Flash, "Flash"),
+        (exif::Tag::WhiteBalance, "WhiteBalance"),
+        (exif::Tag::ExposureBiasValue, "ExposureBias"),
+        (exif::Tag::ColorSpace, "ColorSpace"),
+        (exif::Tag::Contrast, "Contrast"),
+        (exif::Tag::Saturation, "Saturation"),
+        (exif::Tag::Sharpness, "Sharpness"),
+        (exif::Tag::ImageDescription, "ImageDescription"),
+        (exif::Tag::UserComment, "UserComment"),
+    ];
+
+    for (tag, name) in search_tags {
+        if let Some(field) = exif_data.get_field(tag, exif::In::PRIMARY) {
+            let value_str = format_exif_value(&field.value, tag, false);
+            if !value_str.is_empty() && re.is_match(&value_str) {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    // Also check derived country from GPS
+    if let Some(coords) = extract_gps_coordinates(&exif_data) {
+        if let Some(country) = derive_country(coords.0, coords.1) {
+            if re.is_match(&country) {
+                return Some("Country".to_string());
+            }
+        }
+    }
+
+    None
+}
+
 /// Check if a tag name is a derived value (not a real EXIF tag)
 fn is_derived_tag(name: &str) -> bool {
     matches!(name.to_lowercase().as_str(), "derivedcountry" | "country")
