@@ -705,6 +705,8 @@ impl AppState {
     }
 
     fn perform_search(&mut self, query: String) {
+        // Note: EXIF-aware search with caching is handled by GuiApp::perform_search_with_cache
+        // This is a simple filename-only fallback
         self.search_results.clear();
         if query.is_empty() {
             self.show_search = false;
@@ -719,23 +721,12 @@ impl AppState {
             }
         };
 
-        let include_exif = self.search_include_exif;
-
         for (g_idx, group) in self.groups.iter().enumerate() {
             for (f_idx, file) in group.iter().enumerate() {
                 let name = file.path.file_name().unwrap_or_default().to_string_lossy();
 
-                // Check filename first
                 if re.is_match(&name) {
                     self.search_results.push((g_idx, f_idx, "Filename".to_string()));
-                    continue;
-                }
-
-                // If EXIF search is enabled, also check EXIF data
-                if include_exif {
-                    if let Some(tag_name) = crate::scanner::find_matching_exif_tag(&file.path, &re) {
-                        self.search_results.push((g_idx, f_idx, tag_name));
-                    }
                 }
             }
         }
@@ -750,8 +741,7 @@ impl AppState {
             self.set_status(format!("Found {} matches. Match 1/{} in [{}]. (F3/Shift+F3 to nav)",
                 self.search_results.len(), self.search_results.len(), match_source), false);
         } else {
-            let source = if include_exif { "filenames or EXIF data" } else { "filenames" };
-            self.error_popup = Some(format!("No matches found in {} for:\n'{}'", source, query));
+            self.error_popup = Some(format!("No matches found for:\n'{}'", query));
         }
     }
 
