@@ -50,6 +50,9 @@ pub fn sun_alt_and_azimuth(
         return Err(format!("Coordinates out of bounds: {}, {}", lat, lon));
     }
 
+    eprintln!("sun_alt_and_azimuth time={} lat={} lon={} alt={:?} use_utc={}",
+        local_time_str, lat, lon, altitude, use_gps_utc);
+
     // If using GPS time, we force UTC. Otherwise, we resolve the local timezone.
     let tz_name = if use_gps_utc {
         "UTC".to_string()
@@ -108,6 +111,27 @@ pub fn sun_alt_and_azimuth(
         Some(RefractionCorrection::standard()),
     )
     .map_err(|_| "SPA calculation failed")?;
-
+    eprintln!("  TZ={}", tz_display);
     Ok((pos.elevation_angle(), pos.azimuth(), tz_display))
+}
+
+/// Helper to format sun position consistently for UI and parsing
+pub fn format_sun_pos(alt: f64, az: f64) -> String {
+    format!("Alt: {:.3}°, Az: {:.3}°", alt, az)
+}
+
+/// Helper to parse sun position string back to values (Alt, Az)
+pub fn parse_sun_pos_string(s: &str) -> Option<(f64, f64)> {
+    // Expected format: "Alt: 12.531°, Az: 123.433°"
+    let clean = s.replace('°', "");
+    let parts: Vec<&str> = clean.split(',').collect();
+    if parts.len() < 2 { return None; }
+
+    let alt_part = parts[0].trim().strip_prefix("Alt:")?.trim();
+    let az_part = parts[1].trim().strip_prefix("Az:")?.trim();
+
+    let alt = alt_part.parse::<f64>().ok()?;
+    let az = az_part.parse::<f64>().ok()?;
+
+    Some((alt, az))
 }

@@ -21,6 +21,7 @@ mod scanner;
 mod hamminghash;
 #[allow(unused)]
 mod helper_exif;
+mod position;
 
 #[derive(Debug, Clone)]
 pub struct FileMetadata {

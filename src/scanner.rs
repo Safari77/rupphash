@@ -25,7 +25,8 @@ use crate::{FileMetadata, GroupInfo, GroupStatus};
 use crate::phash::DctPhash;
 use crate::hamminghash::{MIHIndex, HammingHash, SparseBitSet};
 use crate::db::{AppContext, HashAlgorithm, HashValue};
-use crate::helper_exif::{parse_gps_coordinate, extract_gps_lat_lon};
+use crate::helper_exif::{parse_gps_coordinate, extract_gps_lat_lon, get_altitude, get_date_str};
+use crate::position;
 
 pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf"];
 
@@ -79,47 +80,118 @@ pub fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
     1
 }
 
-/// Get multiple EXIF tags as a vector of (tag_name, value) pairs
-/// Only returns tags that exist in the image
-/// Supports derived values like DerivedCountry
-pub fn get_exif_tags(path: &Path, tag_names: &[String], decimal_coords: bool) -> Vec<(String, String)> {
-    let Some(exif_data) = read_exif_data(path, None) else {
-        return Vec::new();
-    };
-
-    let mut results = Vec::new();
-
-    // Pre-extract GPS coordinates for derived values (only if needed)
-    let gps_coords = if tag_names.iter().any(|t| is_derived_tag(t)) {
-        extract_gps_lat_lon(&exif_data)
-    } else {
-        None
-    };
-
-    for tag_name in tag_names {
-        // Check for derived tags first
-        if let Some(value) = get_derived_value(tag_name, gps_coords) {
-            results.push((format_derived_tag_display_name(tag_name), value));
-        } else if let Some((tag, in_value)) = parse_exif_tag_name(tag_name)
-            && let Some(field) = exif_data.get_field(tag, in_value) {
-                let value_str = format_exif_value(&field.value, tag, decimal_coords);
-                results.push((tag_name.clone(), value_str));
-            }
+pub fn has_gps_time(path: &Path) -> bool {
+    if let Some(exif) = read_exif_data(path, None) {
+        return crate::helper_exif::get_date_str(&exif, true).is_some();
     }
-
-    results
+    false
 }
 
 /// Check if a tag name is a derived value (not a real EXIF tag)
 fn is_derived_tag(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(), "derivedcountry" | "country")
+    matches!(name.to_lowercase().as_str(), "derivedcountry" | "country" | "derivedsunposition")
 }
 
 /// Get the display name for a derived tag
 fn format_derived_tag_display_name(name: &str) -> String {
     match name.to_lowercase().as_str() {
         "derivedcountry" => "Country".to_string(),
+        "derivedsunposition" => "Sun Position".to_string(),
         _ => name.to_string(),
+    }
+}
+
+/// Get multiple EXIF tags as a vector of (tag_name, value) pairs
+pub fn get_exif_tags(path: &Path, tag_names: &[String], decimal_coords: bool, use_gps_utc: bool) -> Vec<(String, String)> {
+    let Some(exif_data) = read_exif_data(path, None) else {
+        return Vec::new();
+    };
+
+    let mut results = Vec::new();
+
+    // Pre-extract GPS coordinates if needed for derived values
+    let needs_gps = tag_names.iter().any(|t| is_derived_tag(t));
+    let gps_coords = if needs_gps {
+        extract_gps_lat_lon(&exif_data)
+    } else {
+        None
+    };
+
+    // Pre-extract Data for Sun Position if needed
+    let needs_sun = tag_names.iter().any(|t| t.eq_ignore_ascii_case("DerivedSunPosition"));
+    let sun_inputs = if needs_sun && gps_coords.is_some() {
+        let alt = get_altitude(&exif_data);
+        Some(alt)
+    } else {
+        None
+    };
+
+    for tag_name in tag_names {
+        // Check for derived tags first
+        if let Some(derived_entries) = get_derived_value(tag_name, gps_coords, &sun_inputs, &exif_data, use_gps_utc) {
+            results.extend(derived_entries);
+        } else if let Some((tag, in_value)) = parse_exif_tag_name(tag_name)
+            && let Some(field) = exif_data.get_field(tag, in_value) {
+                let value_str = format_exif_value(&field.value, tag, decimal_coords);
+                results.push((tag_name.clone(), value_str));
+        }
+    }
+
+    results
+}
+
+/// Get derived values based on tag name and available data
+/// Returns a vector because one derived tag (like SunPosition) might expand into multiple display lines
+fn get_derived_value(
+    tag_name: &str, 
+    gps_coords: Option<(f64, f64)>, 
+    sun_inputs: &Option<Option<f64>>, 
+    exif_data: &exif::Exif,
+    use_gps_utc: bool
+) -> Option<Vec<(String, String)>> {
+    match tag_name.to_lowercase().as_str() {
+        "derivedcountry" => {
+            let (lat, lon) = gps_coords?;
+            let val = derive_country(lat, lon)?;
+            Some(vec![("Country".to_string(), val)])
+        },
+        "derivedsunposition" => {
+            let (lat, lon) = gps_coords?;
+            let alt_m = sun_inputs.as_ref()?.unwrap_or(0.0);
+
+            // Determine which time to use
+            let mut date_str = None;
+            let mut final_use_utc = false;
+
+            if use_gps_utc {
+                // Try GPS first
+                if let Some(d) = get_date_str(exif_data, true) {
+                    date_str = Some(d);
+                    final_use_utc = true; // Success, we are using UTC
+                }
+            }
+
+            // Fallback (or default) to Local time
+            if date_str.is_none() {
+                date_str = get_date_str(exif_data, false);
+                // final_use_utc remains false
+            }
+
+            if let Some(d) = date_str {
+                if let Ok((elev, az, tz)) = position::sun_alt_and_azimuth(&d, lat, lon, Some(alt_m), final_use_utc) {
+                    // Split into two lines as requested
+                    Some(vec![
+                        ("Sun Position".to_string(), crate::position::format_sun_pos(elev, az)),
+                        ("TZ at GPS pos".to_string(), tz)
+                    ])
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        },
+        _ => None,
     }
 }
 
@@ -194,17 +266,6 @@ fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
     // This handles AVIF, WebP, and corrupted files.
     eprintln!("[DEBUG-LOAD] {:?} -> Fallback (image crate)", path.file_name().unwrap_or_default());
     image::load_from_memory(bytes).ok()
-}
-
-/// Get a derived value based on tag name and available data
-fn get_derived_value(tag_name: &str, gps_coords: Option<(f64, f64)>) -> Option<String> {
-    match tag_name.to_lowercase().as_str() {
-        "derivedcountry" => {
-            let (lat, lon) = gps_coords?;
-            derive_country(lat, lon)
-        },
-        _ => None,
-    }
 }
 
 /// Derive country name from GPS coordinates using country-boundaries
@@ -353,6 +414,7 @@ pub fn get_supported_exif_tags() -> Vec<(&'static str, &'static str)> {
         ("GPSAltitude", "GPS altitude"),
         // Derived values (computed from other EXIF data)
         ("DerivedCountry", "Country name derived from GPS coordinates"),
+        ("DerivedSunPosition", "Sun Altitude and Azimuth calculated from time & location"),
     ]
 }
 
