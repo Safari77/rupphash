@@ -43,13 +43,19 @@ pub fn sun_alt_and_azimuth(
     lat: f64,
     lon: f64,
     altitude: Option<f64>,
+    use_gps_utc: bool,
 ) -> Result<(f64, f64, String), String> {
 
     if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
         return Err(format!("Coordinates out of bounds: {}, {}", lat, lon));
     }
 
-    let tz_name = resolve_timezone(lon, lat);
+    // If using GPS time, we force UTC. Otherwise, we resolve the local timezone.
+    let tz_name = if use_gps_utc {
+        "UTC".to_string()
+    } else {
+        resolve_timezone(lon, lat)
+    };
 
     // Only replace colons if the DATE part actually looks like "YYYY:MM:DD"
     let clean_time = local_time_str.trim().replace(' ', "T");
@@ -65,6 +71,7 @@ pub fn sun_alt_and_azimuth(
     let civil_dt = final_time_str.parse::<CivilDateTime>()
         .map_err(|e| format!("Date Parse Error: '{}' -> {}", final_time_str, e))?;
 
+    // Create Zoned time. Jiff handles "UTC" correctly as a timezone name.
     let zoned_time: Zoned = civil_dt.in_tz(&tz_name)
         .map_err(|e| format!("Timezone Error ({}): {}", tz_name, e))?;
 

@@ -19,6 +19,8 @@ mod gui;
 mod state;
 mod scanner;
 mod hamminghash;
+#[allow(unused)]
+mod helper_exif;
 
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
