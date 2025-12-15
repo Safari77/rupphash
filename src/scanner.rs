@@ -143,9 +143,9 @@ pub fn get_exif_tags(path: &Path, tag_names: &[String], decimal_coords: bool, us
 /// Get derived values based on tag name and available data
 /// Returns a vector because one derived tag (like SunPosition) might expand into multiple display lines
 fn get_derived_value(
-    tag_name: &str, 
-    gps_coords: Option<(f64, f64)>, 
-    sun_inputs: &Option<Option<f64>>, 
+    tag_name: &str,
+    gps_coords: Option<(f64, f64)>,
+    sun_inputs: &Option<Option<f64>>,
     exif_data: &exif::Exif,
     use_gps_utc: bool
 ) -> Option<Vec<(String, String)>> {
@@ -899,118 +899,214 @@ pub fn scan_and_group(
     combined.into_iter().unzip()
 }
 
-// --- Generic Grouping Implementation ---
-fn group_files_generic<H>(
+// --- 1. Define Strategy Trait
+trait GroupingStrategy<H>: Sync + Send {
+    fn extract_hash(&self, file: &ScannedFile) -> Option<H>;
+    // Write variants into a fixed-size buffer to avoid Vec allocation.
+    // Returns the number of variants written.
+    fn generate_variants(&self, file: &ScannedFile, hash: H, out: &mut [H; 8]) -> usize;
+}
+
+struct PhashStrategy;
+impl GroupingStrategy<u64> for PhashStrategy {
+    #[inline(always)]
+    fn extract_hash(&self, file: &ScannedFile) -> Option<u64> {
+        file.phash
+    }
+
+    #[inline(always)]
+    fn generate_variants(&self, _file: &ScannedFile, hash: u64, out: &mut [u64; 8]) -> usize {
+        // pHash always generates 8 dihedral variants
+        let vars = crate::phash::generate_dihedral_hashes(hash);
+        for (i, v) in vars.iter().enumerate().take(8) {
+            out[i] = *v;
+        }
+        vars.len().min(8)
+    }
+}
+
+struct PdqStrategy;
+impl GroupingStrategy<[u8; 32]> for PdqStrategy {
+    #[inline(always)]
+    fn extract_hash(&self, file: &ScannedFile) -> Option<[u8; 32]> {
+        file.pdqhash
+    }
+
+    #[inline(always)]
+    fn generate_variants(&self, file: &ScannedFile, hash: [u8; 32], out: &mut [[u8; 32]; 8]) -> usize {
+        if let Some(features) = &file.pdq_features {
+            let vars = features.generate_dihedral_hashes();
+            let count = vars.len().min(8);
+            for (i, v) in vars.iter().enumerate().take(count) {
+                out[i] = *v;
+            }
+            count
+        } else {
+            out[0] = hash;
+            1
+        }
+    }
+}
+
+// --- 2. Optimized Generic Grouping ---
+fn group_files_generic<H, S>(
     valid_files: &[ScannedFile],
     config: &ScanConfig,
-    extract_hash: impl Fn(&ScannedFile) -> Option<H> + Sync + Send,
-    generate_variants: impl Fn(&ScannedFile, H) -> Vec<H> + Sync + Send,
+    strategy: S, // Pass the struct, not closures
 ) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize)
-where H: HammingHash + std::fmt::Debug + Clone + Copy
+where
+    H: HammingHash + std::fmt::Debug + Clone + Copy + Default,
+    S: GroupingStrategy<H>
 {
-// Collect hashes AND their original indices to handle files with missing hashes (None)
+    // Collect hashes AND their original indices
     let valid_entries: Vec<(usize, H)> = valid_files.iter()
         .enumerate()
-        .filter_map(|(i, f)| extract_hash(f).map(|h| (i, h)))
+        .filter_map(|(i, f)| strategy.extract_hash(f).map(|h| (i, h)))
         .collect();
 
     if valid_entries.is_empty() { return (Vec::new(), Vec::new(), 0); }
 
-    // Separate them for MIH and index mapping
     let hashes: Vec<H> = valid_entries.iter().map(|(_, h)| *h).collect();
     let dense_to_sparse: Vec<usize> = valid_entries.iter().map(|(i, _)| *i).collect();
 
     let mih = MIHIndex::new(hashes.clone());
     let n = valid_files.len();
-    let comparison_count = AtomicUsize::new(0);
 
-    let adjacency: Vec<Vec<u32>> = valid_files
-        .par_iter()
-        .enumerate()
+    // Manually chunk the data to amortize allocation costs.
+    const CHUNK_SIZE: usize = 2000;
+
+    // Flattened edge list (A, B)
+    let edges: Vec<(u32, u32)> = valid_files
+        .par_chunks(CHUNK_SIZE)
+        .enumerate() // This gives us the chunk index (0, 1, 2...)
         .map_init(
-            || (SparseBitSet::new(n), Vec::new()),
-            |(visited, results), (i, file)| {
-                results.clear();
+            || (SparseBitSet::new(n), Vec::new(), [H::default(); 8]),
+            |(visited, local_edges, variants_buf), (chunk_idx, chunk)| {
+                local_edges.clear();
 
-                if let Some(hash) = extract_hash(file) {
-                    let variants = generate_variants(file, hash);
+                // Calculate the real global index for the first file in this chunk
+                let chunk_base_idx = chunk_idx * CHUNK_SIZE;
 
-                    for variant in variants {
-                        visited.clear();
+                for (offset, file) in chunk.iter().enumerate() {
+                    let i = chunk_base_idx + offset; // Global index of current file
 
-                        for k in 0..H::NUM_CHUNKS {
-                            let q_chunk = variant.get_chunk(k);
-                            let chunk_base = k * H::NUM_BUCKETS;
+                    if let Some(hash) = strategy.extract_hash(file) {
+                        // Generate variants into stack buffer (no Vec alloc)
+                        let count = strategy.generate_variants(file, hash, variants_buf);
+                        let variants = &variants_buf[0..count];
 
-                            let mut check_bucket = |val: u16| {
-                                let flat_idx = chunk_base + val as usize;
-                                let start = unsafe { *mih.offsets.get_unchecked(flat_idx) } as usize;
-                                let end = unsafe { *mih.offsets.get_unchecked(flat_idx + 1) } as usize;
-                                let bucket = unsafe { mih.values.get_unchecked(start..end) };
+                        for &variant in variants {
+                            // Each variant is a distinct query. We must allow the same candidate
+                            // to be checked again if it matches a different rotation.
+                            visited.clear();
 
-                                for &dense_id in bucket {
-                                    // Map dense ID (from MIH) back to original file index
-                                    let cand_idx = unsafe { *dense_to_sparse.get_unchecked(dense_id as usize) };
+                            // Manual inline of check_bucket to ensure no closure overhead
+                            for k in 0..H::NUM_CHUNKS {
+                                let q_chunk = variant.get_chunk(k);
+                                let chunk_base = k * H::NUM_BUCKETS;
 
-                                    if cand_idx == i { continue; } // Don't match self
+                                // Inline the check_neighbors logic:
+                                let check_neighbors = config.similarity / (H::NUM_CHUNKS as u32) >= 1;
+                                let limit = if check_neighbors { 1 + H::bit_width_per_chunk() } else { 1 };
 
-                                    if results.contains(&(cand_idx as u32)) { continue; }
-                                    if visited.set(cand_idx) { continue; }
+                                for pass in 0..limit {
+                                    let query_val = if pass == 0 {
+                                        q_chunk
+                                    } else {
+                                        q_chunk ^ (1 << (pass - 1))
+                                    };
 
-                                    comparison_count.fetch_add(1, Ordering::Relaxed);
+                                    let flat_idx = chunk_base + query_val as usize;
+                                    let start = unsafe { *mih.offsets.get_unchecked(flat_idx) } as usize;
+                                    let end = unsafe { *mih.offsets.get_unchecked(flat_idx + 1) } as usize;
 
-                                    // Use dense_id to look up hash directly (faster than extracting again)
-                                    let cand_hash = unsafe { mih.db_hashes.get_unchecked(dense_id as usize) };
+                                    // Direct pointer access to avoid bounds checks in tight loop
+                                    if start < end {
+                                        let bucket = unsafe { mih.values.get_unchecked(start..end) };
+                                        for &dense_id in bucket {
+                                            // dense_id is the index in `hashes` / `dense_to_sparse`
+                                            // We need to map it to the real file index `cand_idx`
+                                            let cand_idx = unsafe { *dense_to_sparse.get_unchecked(dense_id as usize) };
 
-                                    if variant.hamming_distance(cand_hash) <= config.similarity {
-                                        results.push(cand_idx as u32);
+                                            // Only record edges where cand_idx > i
+                                            if cand_idx <= i { continue; }
+
+                                            if visited.set(cand_idx) { continue; }
+
+                                            let cand_hash = unsafe { mih.db_hashes.get_unchecked(dense_id as usize) };
+                                            if variant.hamming_distance(cand_hash) <= config.similarity {
+                                                local_edges.push((i as u32, cand_idx as u32));
+                                            }
+                                        }
                                     }
-                                }
-                            };
-
-                            check_bucket(q_chunk);
-                            if config.similarity / (H::NUM_CHUNKS as u32) >= 1 {
-                                let bits = H::bit_width_per_chunk();
-                                for bit in 0..bits {
-                                    check_bucket(q_chunk ^ (1 << bit));
                                 }
                             }
                         }
                     }
                 }
-                results.clone()
+                local_edges.clone()
             }
         )
+        .flatten()
         .collect();
 
-    let mut visited_cluster = vec![false; n];
-    let mut groups = Vec::new();
+    let comparison_count = edges.len();
 
-    for i in 0..n {
-        if visited_cluster[i] { continue; }
-        if adjacency[i].is_empty() { continue; }
+    // Union-Find to build groups from Edge List
+    let mut parent: Vec<usize> = (0..n).collect();
 
-        let mut group = vec![i as u32];
-        visited_cluster[i] = true;
-        let mut stack = adjacency[i].clone();
-
-        while let Some(neighbor) = stack.pop() {
-            if !visited_cluster[neighbor as usize] {
-                visited_cluster[neighbor as usize] = true;
-                group.push(neighbor);
-                stack.extend_from_slice(&adjacency[neighbor as usize]);
-            }
-        }
-        if group.len() > 1 { groups.push(group); }
+    fn find(parent: &mut [usize], i: usize) -> usize {
+        let mut root = i;
+        while root != parent[root] { root = parent[root]; }
+        let mut curr = i;
+        while curr != root { let next = parent[curr]; parent[curr] = root; curr = next; }
+        root
     }
 
+    fn union(parent: &mut [usize], i: usize, j: usize) {
+        let root_i = find(parent, i);
+        let root_j = find(parent, j);
+        if root_i != root_j { parent[root_i] = root_j; }
+    }
+
+    for (u, v) in edges {
+        union(&mut parent, u as usize, v as usize);
+    }
+
+    // Collect components
+    let mut groups_map: HashMap<usize, Vec<u32>> = HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        if root != i || groups_map.contains_key(&root) {
+            groups_map.entry(root).or_default().push(i as u32);
+        }
+    }
+
+    let raw_groups: Vec<Vec<u32>> = groups_map.into_values()
+        .filter(|g| g.len() > 1)
+        .collect();
+
     // Merge RAW+JPG logic
-    let groups = merge_groups_by_stem(groups, valid_files);
+    let groups = merge_groups_by_stem(raw_groups, valid_files);
 
     // Process Metadata
     let is_pdq = std::any::type_name::<H>().contains("u8");
     let (g, i) = process_raw_groups(groups, valid_files, config, is_pdq);
-    (g, i, comparison_count.load(Ordering::Relaxed))
+
+    (g, i, comparison_count)
+}
+
+// --- 3. Wrapper Functions ---
+
+fn group_with_phash(
+    valid_files: &[ScannedFile],
+    config: &ScanConfig,
+) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
+    group_files_generic(valid_files, config, PhashStrategy)
+}
+
+fn group_with_pdqhash(valid_files: &[ScannedFile], config: &ScanConfig) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
+    group_files_generic(valid_files, config, PdqStrategy)
 }
 
 pub fn analyze_group(
@@ -1020,10 +1116,6 @@ pub fn analyze_group(
     use_pdqhash: bool,
 ) -> GroupInfo {
     if files.is_empty() { return GroupInfo { max_dist: 0, status: GroupStatus::None }; }
-
-    // Deduplicate
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    files.dedup_by(|a, b| a.path == b.path);
 
     // 1. Count Bit-Identical (Content Hash)
     let mut bit_counts = HashMap::new();
@@ -1045,20 +1137,12 @@ pub fn analyze_group(
             is_bit_dupe || is_pixel_dupe
         });
 
-    // 4. Sort Duplicates: Cluster by PixelHash, then ContentHash, then Name
-    duplicates.sort_by(|a, b| {
-        // Primary: Keep C1, C2, C3 groups together
-        let ph_cmp = a.pixel_hash.cmp(&b.pixel_hash);
-        if ph_cmp != std::cmp::Ordering::Equal { return ph_cmp; }
-
-        // Secondary: Keep L groups together within C groups
-        let ch_cmp = a.content_hash.cmp(&b.content_hash);
-        if ch_cmp != std::cmp::Ordering::Equal { return ch_cmp; }
-
-        // Tertiary: Stable sort by name
-        let name_a = a.path.file_name().unwrap_or_default();
-        let name_b = b.path.file_name().unwrap_or_default();
-        natord::compare(&name_a.to_string_lossy(), &name_b.to_string_lossy())
+    duplicates.sort_by_cached_key(|f| {
+        (
+            f.pixel_hash,
+            f.content_hash,
+            f.path.file_name().unwrap_or_default().to_string_lossy().to_string()
+        )
     });
 
     // 5. Sort Unique: Standard user sort
@@ -1084,81 +1168,76 @@ pub fn analyze_group(
     GroupInfo { max_dist: max_d, status }
 }
 
-/// Merge groups that contain files with the same stem (e.g., dsc_1335.jpg and dsc_1335.nef).
-/// This handles the case where RAW and JPEG have different hashes but should be considered the same "shot".
 fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> Vec<Vec<u32>> {
-    let original_count = groups.len();
-
-    // Optimization: Don't do work if there's nothing to merge
     if groups.len() < 2 { return groups; }
 
-    // Build map: (Parent Dir, Stem) -> List of Group Indices containing this stem
-    // e.g. (" /photos", "IMG_001") -> [Group 5, Group 12]
-    let mut stem_to_groups: HashMap<(std::path::PathBuf, std::ffi::OsString), Vec<usize>> = HashMap::new();
+    use std::hash::{Hash, Hasher};
+    use rustc_hash::FxHasher;
 
-    for (group_idx, group) in groups.iter().enumerate() {
-        for &file_idx in group {
-            // Safety check for index
-            if let Some(file) = valid_files.get(file_idx as usize) {
-                let path = &file.path;
-                if let (Some(parent), Some(stem)) = (path.parent(), path.file_stem()) {
-                    let key = (parent.to_path_buf(), stem.to_os_string());
-                    stem_to_groups.entry(key).or_default().push(group_idx);
-                }
+    // Helper to hash a path component to u64 quickly
+    fn hash_component<T: Hash>(t: T) -> u64 {
+        let mut s = FxHasher::default();
+        t.hash(&mut s);
+        s.finish()
+    }
+
+    // Flatten groups into a sortable list of (ParentHash, StemHash, GroupIndex)
+    let mut entries: Vec<(u64, u64, usize)> = Vec::with_capacity(valid_files.len());
+
+    for (g_idx, group) in groups.iter().enumerate() {
+        for &f_idx in group {
+            // Safety: Indices are guaranteed valid by upstream logic
+            let f = &valid_files[f_idx as usize];
+            if let (Some(parent), Some(stem)) = (f.path.parent(), f.path.file_stem()) {
+                let p_hash = hash_component(parent);
+                let s_hash = hash_component(stem);
+                entries.push((p_hash, s_hash, g_idx));
             }
         }
     }
 
-    // Union-Find Data Structure
+    // Sort by Parent -> Stem (Grouping identical stems together)
+    entries.par_sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0).then(a.1.cmp(&b.1))
+    });
+
+    // Union-Find Merge Logic
     let mut parent: Vec<usize> = (0..groups.len()).collect();
-
     fn find(parent: &mut [usize], i: usize) -> usize {
-        if parent[i] != i {
-            parent[i] = find(parent, parent[i]);
-        }
-        parent[i]
+        let mut root = i;
+        while root != parent[root] { root = parent[root]; }
+        let mut curr = i;
+        while curr != root { let next = parent[curr]; parent[curr] = root; curr = next; }
+        root
+    }
+    fn union(parent: &mut [usize], i: usize, j: usize) {
+        let root_i = find(parent, i);
+        let root_j = find(parent, j);
+        if root_i != root_j { parent[root_i] = root_j; }
     }
 
-    fn union(parent: &mut [usize], a: usize, b: usize) {
-        let ra = find(parent, a);
-        let rb = find(parent, b);
-        if ra != rb {
-            parent[ra] = rb;
-        }
-    }
-
-    // Merge groups that share a stem
-    for group_indices in stem_to_groups.values() {
-        if group_indices.len() > 1 {
-            let first = group_indices[0];
-            for &other in &group_indices[1..] {
-                union(&mut parent, first, other);
-            }
+    // Iterate linearly and merge adjacent identical stems
+    for w in entries.windows(2) {
+        if w[0].0 == w[1].0 && w[0].1 == w[1].1 {
+            union(&mut parent, w[0].2, w[1].2);
         }
     }
 
-    // Collect the merged results
-    let mut merged: HashMap<usize, Vec<u32>> = HashMap::new();
-    for (group_idx, group) in groups.into_iter().enumerate() {
-        let root = find(&mut parent, group_idx);
-        merged.entry(root).or_default().extend(group);
+    // Rebuild Groups
+    let mut merged_map: HashMap<usize, Vec<u32>> = HashMap::new();
+    for (old_idx, group) in groups.into_iter().enumerate() {
+        let root = find(&mut parent, old_idx);
+        merged_map.entry(root).or_default().extend(group);
     }
 
-    // Format output: Deduplicate indices within the new merged groups
-    let result: Vec<Vec<u32>> = merged.into_values().map(|mut g| {
+    merged_map.into_values().map(|mut g| {
         g.sort_unstable();
         g.dedup();
         g
-    }).collect();
-
-    if result.len() != original_count {
-        eprintln!("[DEBUG-MERGE] Collapsed {} hash groups into {} actual photo groups (matched RAW+JPG).",
-            original_count, result.len());
-    }
-
-    result
+    }).collect()
 }
 
+// PARALLELIZED GROUP PROCESSING
 fn process_raw_groups(
     raw_groups: Vec<Vec<u32>>,
     valid_files: &[ScannedFile],
@@ -1170,50 +1249,84 @@ fn process_raw_groups(
         .map(|(i, e)| (e.to_lowercase(), i))
         .collect();
 
-    let mut processed_groups = Vec::new();
-    let mut processed_infos = Vec::new();
-
-    for group_indices in raw_groups {
-        let mut group_data: Vec<FileMetadata> = group_indices.iter()
-            .map(|&idx| valid_files[idx as usize].to_file_metadata())
-            .collect();
-
-        // Pass use_pdqhash to analyze_group to pick correct distance metric
-        let info = if use_pdqhash {
-            analyze_group_with_features(&mut group_data, valid_files, &config.group_by.to_lowercase(), &ext_priorities)
-        } else {
-            analyze_group(&mut group_data, &config.group_by.to_lowercase(), &ext_priorities, false)
-        };
-
-        processed_groups.push(group_data);
-        processed_infos.push(info);
+    // Build read-only lookup map
+    let mut features_map = HashMap::new();
+    if use_pdqhash {
+        for vf in valid_files {
+            if let Some(feats) = &vf.pdq_features {
+                features_map.insert(&vf.path, feats);
+            }
+        }
     }
-    (processed_groups, processed_infos)
+
+    // Process groups in parallel using Rayon
+    let results: Vec<(Vec<FileMetadata>, GroupInfo)> = raw_groups.into_par_iter()
+        .map(|group_indices| {
+            let mut group_data: Vec<FileMetadata> = group_indices.iter()
+                .map(|&idx| valid_files[idx as usize].to_file_metadata())
+                .collect();
+
+            let info = if use_pdqhash {
+                analyze_group_with_features(
+                    &mut group_data,
+                    &features_map,
+                    &config.group_by.to_lowercase(),
+                    &ext_priorities
+                )
+            } else {
+                analyze_group(&mut group_data, &config.group_by.to_lowercase(), &ext_priorities, false)
+            };
+
+            (group_data, info)
+        })
+        .collect();
+
+    results.into_iter().unzip()
+}
+
+// Helper struct to force natural sort comparison
+#[derive(PartialEq, Eq)]
+struct NaturalSortKey(String);
+
+impl PartialOrd for NaturalSortKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NaturalSortKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        natord::compare(&self.0, &other.0)
+    }
 }
 
 pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
     use rand::seq::SliceRandom;
     match sort_order {
-        "name" => files.sort_by(|a, b| {
-            let name_a = a.path.file_name().map(|s| s.to_string_lossy().to_lowercase());
-            let name_b = b.path.file_name().map(|s| s.to_string_lossy().to_lowercase());
-            name_a.cmp(&name_b)
-        }),
-        "name-desc" => files.sort_by(|a, b| {
-            let name_a = a.path.file_name().map(|s| s.to_string_lossy().to_lowercase());
-            let name_b = b.path.file_name().map(|s| s.to_string_lossy().to_lowercase());
-            name_b.cmp(&name_a)
-        }),
-        "name-natural" => files.sort_by(|a, b| {
-            let name_a = a.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-            let name_b = b.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-            natord::compare(&name_a, &name_b)
-        }),
-        "name-natural-desc" => files.sort_by(|a, b| {
-            let name_a = a.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-            let name_b = b.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-            natord::compare(&name_b, &name_a)
-        }),
+        "name" => {
+            // OPTIMIZATION: Parse path only once per file using cached key
+            files.sort_by_cached_key(|f| {
+                f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+            });
+        },
+        "name-desc" => {
+            files.sort_by_cached_key(|f| {
+                f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+            });
+            files.reverse();
+        },
+        "name-natural" => {
+            // OPTIMIZATION: Use wrapper struct to cache string AND use natural compare
+            files.sort_by_cached_key(|f| {
+                NaturalSortKey(f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+            });
+        },
+        "name-natural-desc" => {
+            files.sort_by_cached_key(|f| {
+                NaturalSortKey(f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+            });
+            files.reverse();
+        },
         "date" => files.sort_by(|a, b| a.modified.cmp(&b.modified)),
         "date-desc" => files.sort_by(|a, b| b.modified.cmp(&a.modified)),
         "size" => files.sort_by(|a, b| a.size.cmp(&b.size)),
@@ -1223,10 +1336,9 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
             files.shuffle(&mut rng);
         },
         _ => {
-            files.sort_by(|a, b| {
-                let name_a = a.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-                let name_b = b.path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-                natord::compare(&name_a, &name_b)
+            // Default fallback (Name Natural)
+            files.sort_by_cached_key(|f| {
+                NaturalSortKey(f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
             });
         }
     }
@@ -1234,15 +1346,11 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
 
 fn analyze_group_with_features(
     files: &mut Vec<FileMetadata>,
-    valid_files: &[ScannedFile],
+    features_map: &HashMap<&std::path::PathBuf, &crate::pdqhash::PdqFeatures>,
     sort_order: &str,
     #[allow(unused)] ext_priorities: &HashMap<String, usize>,
 ) -> GroupInfo {
     if files.is_empty() { return GroupInfo { max_dist: 0, status: GroupStatus::None }; }
-
-    // Deduplicate
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    files.dedup_by(|a, b| a.path == b.path);
 
     let mut counts = HashMap::new();
     for f in files.iter() { *counts.entry(f.content_hash).or_insert(0) += 1; }
@@ -1250,18 +1358,23 @@ fn analyze_group_with_features(
     let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) = files.drain(..)
         .partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
 
-    sort_files(&mut duplicates, sort_order);
+    duplicates.sort_by_cached_key(|f| {
+        (
+            f.pixel_hash,
+            f.content_hash,
+            f.path.file_name().unwrap_or_default().to_string_lossy().to_string()
+        )
+    });
+
     sort_files(&mut unique, sort_order);
     files.append(&mut duplicates);
     files.append(&mut unique);
 
-    // Sort so same-stem files are adjacent, with non-raw (jpg) before raw (nef)
     sort_by_stem_then_ext(files);
 
-    // Find pivot features by path lookup (after sorting, first file is the pivot)
     let pivot_features = files.first()
-        .and_then(|pivot| valid_files.iter().find(|vf| vf.path == pivot.path))
-        .and_then(|vf| vf.pdq_features.as_ref());
+        .and_then(|pivot| features_map.get(&pivot.path))
+        .copied(); // Dereference &&PdqFeatures to &PdqFeatures
 
     let max_d = if let Some(pivot_feats) = pivot_features {
         let pivot_variants = pivot_feats.generate_dihedral_hashes();
@@ -1282,13 +1395,10 @@ fn analyze_group_with_features(
 }
 
 fn sort_by_stem_then_ext(files: &mut [FileMetadata]) {
-    files.sort_by(|a, b| {
-        let stem_a = a.path.file_stem().unwrap_or_default();
-        let stem_b = b.path.file_stem().unwrap_or_default();
-        match stem_a.cmp(stem_b) {
-            std::cmp::Ordering::Equal => is_raw_ext(&a.path).cmp(&is_raw_ext(&b.path)),
-            other => other,
-        }
+    files.sort_by_cached_key(|f| {
+        let stem = f.path.file_stem().unwrap_or_default().to_os_string();
+        let is_raw = is_raw_ext(&f.path);
+        (stem, is_raw)
     });
 }
 
@@ -1305,28 +1415,6 @@ pub fn is_image_ext(path: &Path) -> bool {
             |"xbm"|"xpm"|"ora"|"otb"|"pcx"|"sgi"|"wbmp")
             || RAW_EXTS.contains(&e.as_str())
     }).unwrap_or(false)
-}
-
-fn group_with_phash(
-    valid_files: &[ScannedFile],
-    config: &ScanConfig,
-) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
-    // Pass the generator function explicitly
-    group_files_generic(
-        valid_files,
-        config,
-        |f| f.phash,
-        |_f, h| {
-            crate::phash::generate_dihedral_hashes(h)
-        }
-    )
-}
-
-fn group_with_pdqhash(valid_files: &[ScannedFile], config: &ScanConfig) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
-    group_files_generic(
-        valid_files, config, |f| f.pdqhash,
-        |f, h| if let Some(features) = &f.pdq_features { features.generate_dihedral_hashes() } else { vec![h] }
-    )
 }
 
 pub fn scan_for_view(

@@ -11,6 +11,13 @@ use crate::scanner::ScanConfig;
 use crate::state::get_bit_identical_counts;
 use libheif_rs::integration::image::register_all_decoding_hooks;
 
+#[cfg(not(target_env = "msvc"))]
+use jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 mod phash;
 mod pdqhash;
 mod db;
