@@ -1370,6 +1370,66 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
     }
 }
 
+/// Sort directories by the given sort order (same options as files)
+pub fn sort_directories(dirs: &mut Vec<std::path::PathBuf>, sort_order: &str) {
+    use rand::seq::SliceRandom;
+    match sort_order {
+        "name" => {
+            dirs.sort_by_cached_key(|d| {
+                d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+            });
+        },
+        "name-desc" => {
+            dirs.sort_by_cached_key(|d| {
+                d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+            });
+            dirs.reverse();
+        },
+        "name-natural" | "" => {
+            dirs.sort_by_cached_key(|d| {
+                NaturalSortKey(d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+            });
+        },
+        "name-natural-desc" => {
+            dirs.sort_by_cached_key(|d| {
+                NaturalSortKey(d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+            });
+            dirs.reverse();
+        },
+        "date" => {
+            dirs.sort_by_cached_key(|d| {
+                fs::metadata(d).ok().and_then(|m| m.modified().ok()).unwrap_or(UNIX_EPOCH)
+            });
+        },
+        "date-desc" => {
+            dirs.sort_by_cached_key(|d| {
+                std::cmp::Reverse(fs::metadata(d).ok().and_then(|m| m.modified().ok()).unwrap_or(UNIX_EPOCH))
+            });
+        },
+        "size" => {
+            // For directories, size doesn't make much sense, so sort by name
+            dirs.sort_by_cached_key(|d| {
+                NaturalSortKey(d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+            });
+        },
+        "size-desc" => {
+            dirs.sort_by_cached_key(|d| {
+                NaturalSortKey(d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+            });
+        },
+        "random" => {
+            let mut rng = rand::rng();
+            dirs.shuffle(&mut rng);
+        },
+        _ => {
+            // Default fallback (Name Natural)
+            dirs.sort_by_cached_key(|d| {
+                NaturalSortKey(d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+            });
+        }
+    }
+}
+
 fn analyze_group_with_features(
     files: &mut Vec<FileMetadata>,
     features_map: &HashMap<&std::path::PathBuf, &crate::pdqhash::PdqFeatures>,
@@ -1479,7 +1539,8 @@ pub fn scan_for_view(
              }
         }
     }
-    subdirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    // Apply same sort order to directories as files
+    sort_directories(&mut subdirs, sort_order);
 
     let total_files = raw_paths.len();
     if let Some(tx) = &progress_tx { let _ = tx.send((0, total_files)); }
