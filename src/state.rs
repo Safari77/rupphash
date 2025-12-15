@@ -65,9 +65,6 @@ pub struct FileTransform {
 }
 
 impl FileTransform {
-    pub fn is_default(&self) -> bool {
-        self.rotation == 0 && !self.flip_horizontal && !self.flip_vertical
-    }
 }
 
 // --- Shared Helpers ---
@@ -495,6 +492,7 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    #[allow(unused)]
     /// Get the transform state for a specific file path (or default if none set)
     pub fn get_file_transform(&self, path: &PathBuf) -> FileTransform {
         self.file_transforms.get(path).copied().unwrap_or_default()
