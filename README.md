@@ -9,6 +9,10 @@ metadata caching (encrypted with XChaCha20Poly1305, LMDB database),
 Search inside Exif tags (also supports derived values like Country (from GPS location),
 and Sun Azimuth, Sun Altitude (from GPS date, location, and the location’s timezone).
 
+A million files takes about 2.5 GiB of memory.
+500,000 files takes about 15-20s to Group on a modern CPU (after all the data has been loaded).
+For hard-linked files PDQ features is stored only once (per file data) in memory.
+
 Duplicates can be found by content (perceptual), or idendical pixel data
 (--pixel-hash converts data to 16bit values for comparison),
 or whole file comparison (bit-identical, using blake3).
