@@ -122,7 +122,7 @@ pub struct GuiApp {
 impl GuiApp {
     /// Create a new GuiApp for duplicate detection mode
     pub fn new(ctx: AppContext, scan_config: ScanConfig, show_relative_times: bool, use_trash: bool,
-        group_by: String, ext_priorities: HashMap<String, usize>, use_raw_thumbnails: bool,) -> Self {
+        group_by: String, ext_priorities: HashMap<String, usize>, use_raw_thumbnails: bool) -> Self {
         let use_pdqhash = ctx.hash_algorithm == crate::db::HashAlgorithm::PdqHash;
         let mut state = AppState::new(
             Vec::new(),
@@ -145,12 +145,7 @@ impl GuiApp {
             ctx.gui_config.width.unwrap_or(1280),
             ctx.gui_config.height.unwrap_or(720)
         ));
-
-        eprintln!("[DEBUG-CONFIG] new() - Loaded from config: window={}x{}, panel_width={}",
-            ctx.gui_config.width.unwrap_or(1280),
-            ctx.gui_config.height.unwrap_or(720),
-            panel_width);
-        eprintln!("[DEBUG-CONFIG] new() - Raw config values: width={:?}, height={:?}, panel_width={:?}",
+        eprintln!("[DEBUG-CONFIG] new() - config values: width={:?}, height={:?}, panel_width={:?}",
             ctx.gui_config.width, ctx.gui_config.height, ctx.gui_config.panel_width);
 
         Self {
@@ -2119,42 +2114,31 @@ impl eframe::App for GuiApp {
             // Delay panel width restoration until after font_scale is applied
             let ppp = ctx.pixels_per_point();
 
-            // Only print debug every 60 frames to reduce spam
-            use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
-            static FRAME_COUNT: AtomicU32 = AtomicU32::new(0);
-            let frame = FRAME_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-            if frame.is_multiple_of(60) {
-                let ppp = ctx.pixels_per_point();
-                if false {
-                    eprintln!("[DEBUG-PANEL] frame={}, window={}x{}px ({}x{} logical), panel_width={}",
-                        frame,
-                        (window_width * ppp) as u32, (ctx.used_rect().height() * ppp) as u32,
-                        window_width as u32, ctx.used_rect().height() as u32,
-                        self.panel_width);
-                }
-            }
-
-            // Delay panel width restoration until after font_scale is applied
-            // On first frames (ppp=1), use a default. Once ppp stabilizes (>1), apply saved width.
-            let should_apply_saved_width = !self.initial_panel_width_applied;
+            // Ensure window is actually ready (width > 100) before applying the saved width.
+            // This prevents clamping to 0.0 on the first frame if viewport isn't ready.
+            let window_ready = window_width > 100.0;
+            let should_apply_saved_width = !self.initial_panel_width_applied && window_ready;
 
             if should_apply_saved_width {
                 eprintln!("[DEBUG-PANEL] Applying saved panel width {} (ppp={})", self.saved_panel_width, ppp);
                 self.initial_panel_width_applied = true;
             }
 
+            let panel_id = if self.initial_panel_width_applied { "list_panel_main" } else { "list_panel_init" };
             let panel_builder = egui::SidePanel::left("list_panel")
                 .resizable(true)
-                .min_width(96.0);
+                .min_width(160.0);
 
             // Apply width logic to the builder
             let panel = if force_panel_resize {
+                // User pressed 'V' or 'B'
                 panel_builder.exact_width(self.panel_width)
-            } else if should_apply_saved_width {
-                panel_builder.exact_width(self.saved_panel_width.min(panel_max_width))
             } else if self.initial_panel_width_applied {
-                panel_builder.default_width(self.panel_width).max_width(panel_max_width)
+                // Normal running state: Use saved width as default.
+                // Since we switched IDs to "list_panel_main", this will be respected on the first "applied" frame.
+                panel_builder.default_width(self.saved_panel_width).max_width(panel_max_width)
             } else {
+                // Startup state: just keep it functional
                 panel_builder.default_width(200.0).max_width(panel_max_width)
             };
 
@@ -2179,6 +2163,8 @@ impl eframe::App for GuiApp {
 
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         if self.state.groups.is_empty() {
+                            // Subtract 16.0 to account for egui's frame margins
+                            ui.set_min_width((self.saved_panel_width - 16.0).max(100.0));
                             ui.label(if self.state.view_mode { "No images found." } else { "No duplicates found." });
                             return;
                         }
@@ -2398,9 +2384,18 @@ impl eframe::App for GuiApp {
                         if action_rename { self.state.handle_input(InputIntent::StartRename); }
                         if action_delete { self.state.handle_input(InputIntent::ExecuteDelete); }
                     });
-                });
-            }
+            });
+            // In Duplicate Mode, groups are empty during the scan.
+            // We must NOT save the width of the "No duplicates found" label (~160px).
+            let has_content = !self.state.groups.is_empty();
 
+            if window_width > 400.0 && has_content {
+                let current_w = panel_response.response.rect.width();
+                if current_w > 200.0 {
+                    self.panel_width = current_w;
+                }
+            }
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             let available_rect = ui.available_rect_before_wrap();
             if let Some(path) = current_image_path {
