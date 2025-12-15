@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 use libheif_rs::HeifContext;
@@ -597,7 +598,7 @@ struct ScannedFile {
     pub dev_inode: Option<(u64, u64)>,
     pub phash: Option<u64>,
     pub pdqhash: Option<[u8; 32]>,
-    pub pdq_features: Option<crate::pdqhash::PdqFeatures>,
+    pub pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>>,
     pub pixel_hash: Option<[u8; 32]>,
 }
 
@@ -658,7 +659,7 @@ pub fn scan_and_group(
     let db_handle = ctx.start_db_writer(rx);
     let processed_count = AtomicUsize::new(0);
 
-    let valid_files: Vec<ScannedFile> = all_files.par_iter().filter_map(|path| {
+    let mut valid_files: Vec<ScannedFile> = all_files.par_iter().filter_map(|path| {
         if let Some(prog_tx) = &progress_tx {
             let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
             if current.is_multiple_of(10) || current == total_files {
@@ -689,7 +690,7 @@ pub fn scan_and_group(
 
         let mut phash: Option<u64> = None;
         let mut pdqhash: Option<[u8; 32]> = None;
-        let mut pdq_features: Option<crate::pdqhash::PdqFeatures> = None;
+        let mut pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>> = None;
         // IMPORTANT: new_meta tracks updates to the file_metadata DB.
         // Even if we hit the cache, we MUST set this to refresh the timestamp.
         let mut new_meta = None;
@@ -711,13 +712,13 @@ pub fn scan_and_group(
                 if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
                     pdqhash = Some(h);
                     if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
-                        // Ensure cached features are valid length (256)
                         if feats.coefficients.len() == 256 {
                             resolution = Some((feats.width, feats.height));
                             orientation = feats.orientation;
                             let mut coeffs = [0.0; 256];
                             coeffs.copy_from_slice(&feats.coefficients);
-                            pdq_features = Some(crate::pdqhash::PdqFeatures { coefficients: coeffs });
+                            pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures { coefficients: coeffs }));
+
                             cache_hit_full = true;
                         }
                     }
@@ -814,7 +815,11 @@ pub fn scan_and_group(
                         if let Some((features, _)) = crate::pdqhash::generate_pdq_features(img) {
                             let hash = features.to_hash();
                             pdqhash = Some(hash);
-                            pdq_features = Some(features.clone());
+
+                            let mut coeffs = [0.0; 256];
+                            coeffs.copy_from_slice(&features.coefficients);
+                            let feats = crate::pdqhash::PdqFeatures { coefficients: coeffs };
+                            pdq_features = Some(Arc::new(feats.clone()));
 
                             let cached_feats = crate::db::CachedFeatures {
                                 width: resolution.unwrap_or((0,0)).0,
@@ -869,6 +874,27 @@ pub fn scan_and_group(
 
     drop(tx);
     db_handle.join().expect("DB writer thread panicked");
+
+    // Deduplicate PDQ Features for Hardlinks
+    if use_pdqhash {
+        let mut feature_cache: HashMap<(u64, u64), Arc<crate::pdqhash::PdqFeatures>> = HashMap::new();
+
+        for file in valid_files.iter_mut() {
+            if let Some(dev_inode) = file.dev_inode {
+                if let Some(features) = &file.pdq_features {
+                    if let Some(cached) = feature_cache.get(&dev_inode) {
+                        // Found existing features for this inode, reuse the pointer!
+                        file.pdq_features = Some(cached.clone());
+                    } else {
+                        // First time seeing this inode, cache it
+                        feature_cache.insert(dev_inode, features.clone());
+                    }
+                }
+            }
+        }
+        // feature_cache drops here, freeing the strong references. 
+        // Only the unique Arcs held by ScannedFiles remain.
+    }
 
     let hash_elapsed = hash_start.elapsed();
     eprintln!("[DEBUG] Algorithm: {}", if use_pdqhash { "PDQ hash" } else { "pHash" });
@@ -1254,7 +1280,7 @@ fn process_raw_groups(
     if use_pdqhash {
         for vf in valid_files {
             if let Some(feats) = &vf.pdq_features {
-                features_map.insert(&vf.path, feats);
+                features_map.insert(&vf.path, &**feats);
             }
         }
     }
