@@ -892,7 +892,7 @@ pub fn scan_and_group(
                 }
             }
         }
-        // feature_cache drops here, freeing the strong references. 
+        // feature_cache drops here, freeing the strong references.
         // Only the unique Arcs held by ScannedFiles remain.
     }
 

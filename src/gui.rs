@@ -2178,8 +2178,8 @@ impl eframe::App for GuiApp {
                     }
 
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        if self.state.groups.is_empty() { 
-                            ui.label(if self.state.view_mode { "No images found." } else { "No duplicates found." }); 
+                        if self.state.groups.is_empty() {
+                            ui.label(if self.state.view_mode { "No images found." } else { "No duplicates found." });
                             return;
                         }
 
@@ -2232,7 +2232,7 @@ impl eframe::App for GuiApp {
                                 let target_screen_pos = egui::pos2(scroll_top.x, scroll_top.y + target_y_offset);
 
                                 ui.scroll_to_rect(
-                                    egui::Rect::from_min_size(target_screen_pos, egui::vec2(100.0, file_row_total_h)), 
+                                    egui::Rect::from_min_size(target_screen_pos, egui::vec2(100.0, file_row_total_h)),
                                     Some(egui::Align::Center)
                                 );
                                 self.state.selection_changed = false;
@@ -2242,7 +2242,7 @@ impl eframe::App for GuiApp {
                         // --- 4. ALLOCATE SCROLL SPACE ---
                         // This creates the scrollbar thumb at the correct size
                         ui.allocate_rect(
-                            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(0.0, self.total_content_height)), 
+                            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(0.0, self.total_content_height)),
                             egui::Sense::hover()
                         );
 
@@ -2275,7 +2275,7 @@ impl eframe::App for GuiApp {
                             if show_headers {
                                 let info = &self.state.group_infos[g_idx];
                                 let header_rect = egui::Rect::from_min_size(
-                                    egui::pos2(ui.min_rect().left(), current_y), 
+                                    egui::pos2(ui.min_rect().left(), current_y),
                                     egui::vec2(ui.available_width(), header_height)
                                 );
 
@@ -2295,7 +2295,7 @@ impl eframe::App for GuiApp {
 
                             for (f_idx, file) in group.iter().enumerate() {
                                 let file_rect = egui::Rect::from_min_size(
-                                    egui::pos2(ui.min_rect().left(), current_y), 
+                                    egui::pos2(ui.min_rect().left(), current_y),
                                     egui::vec2(ui.available_width(), file_row_total_h)
                                 );
 
@@ -2346,12 +2346,10 @@ impl eframe::App for GuiApp {
 
                                     // --- METADATA ROW ---
                                     let meta_rect = egui::Rect::from_min_size(egui::pos2(file_rect.min.x, current_y + row_btn_h + spacing), egui::vec2(file_rect.width(), row_meta_h));
+// 1. Format Strings
+                                    let size_str = if file.size < 1024 { format!("{} B", file.size) }
+                                                   else { format!("{:.0} KB", file.size as f32 / 1024.0) };
 
-                                    // 1. Format Size
-                                    let size_str = if file.size < 1024 { format!("{} B", file.size) } 
-                                    else { format!("{:.0} KB", file.size as f32 / 1024.0) };
-
-                                    // 2. Format Time
                                     let time_str = if self.state.show_relative_times {
                                         let ts = Timestamp::from_second(file.modified.timestamp()).unwrap()
                                             .checked_add(jiff::SignedDuration::from_nanos(file.modified.timestamp_subsec_nanos() as i64)).unwrap();
@@ -2360,14 +2358,36 @@ impl eframe::App for GuiApp {
                                         file.modified.format("%Y-%m-%d %H:%M:%S").to_string()
                                     };
 
-                                    // 3. Format Resolution
-                                    let res_str = file.resolution.map(|(w, h)| format!(" | {}x{}", w, h)).unwrap_or_default();
+                                    let res_str = file.resolution.map(|(w, h)| format!("{}x{}", w, h)).unwrap_or_default();
 
-                                    ui.put(meta_rect, egui::Label::new(
-                                            egui::RichText::new(format!("{} | {}{}", time_str, size_str, res_str))
-                                            .size(10.0)
-                                            .color(egui::Color32::GRAY)
-                                    ));
+                                    // 2. Calculate Layout Rects (50% - 25% - 25%)
+                                    let w = meta_rect.width();
+                                    let w_date = w * 0.50;
+                                    let w_size = w * 0.25;
+                                    let w_res  = w * 0.25;
+
+                                    let rect_date = egui::Rect::from_min_size(meta_rect.min, egui::vec2(w_date, meta_rect.height()));
+                                    let rect_size = egui::Rect::from_min_size(meta_rect.min + egui::vec2(w_date, 0.0), egui::vec2(w_size, meta_rect.height()));
+                                    let rect_res  = egui::Rect::from_min_size(meta_rect.min + egui::vec2(w_date + w_size, 0.0), egui::vec2(w_res, meta_rect.height()));
+
+                                    // DATE (Left aligned)
+                                    ui.put(rect_date, egui::Label::new(
+                                        egui::RichText::new(time_str).size(10.0).color(egui::Color32::GRAY)
+                                    ).truncate());
+
+                                    // SIZE (Right aligned for numbers)
+                                    ui.allocate_ui_at_rect(rect_size, |ui| {
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(egui::RichText::new(size_str).size(10.0).color(egui::Color32::GRAY));
+                                        });
+                                    });
+
+                                    // RESOLUTION (Right aligned)
+                                    ui.allocate_ui_at_rect(rect_res, |ui| {
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(egui::RichText::new(res_str).size(10.0).color(egui::Color32::GRAY));
+                                        });
+                                    });
                                 }
                                 current_y += file_row_total_h;
                             }
