@@ -325,6 +325,7 @@ fn run_interactive_cli_delete(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     register_all_decoding_hooks();
+    image_extras::register();
     let args = Cli::parse();
 
     // Handle --show-exif-tags early, before validation
@@ -345,8 +346,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
-
-    image_extras::register();
 
     let sort_order = args.sort.to_lowercase();
     let is_view_mode = args.is_view_mode();

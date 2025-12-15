@@ -370,8 +370,20 @@ impl GuiApp {
                 let orientation = crate::scanner::get_orientation(path, Some(&bytes));
                 eprintln!("[DEBUG] load_and_process_image OTHER get_orientation={}", orientation);
 
-                // Decode from memory buffer
-                if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                // Chain with_guessed_format(). If it fails (IO error), fallback to a fresh reader.
+                let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                    .with_guessed_format()
+                    .unwrap_or_else(|_| image::ImageReader::new(std::io::Cursor::new(&bytes)));
+
+                // Fallback to file extension if magic bytes didn't work (common for PCX/TGA)
+                if reader.format().is_none() {
+                    if let Ok(fmt) = image::ImageFormat::from_path(path) {
+                        reader.set_format(fmt);
+                    }
+                }
+
+                // Decode
+                if let Ok(dyn_img) = reader.decode() {
                     let dims = (dyn_img.width(), dyn_img.height());
                     let buf = dyn_img.to_rgba8();
                     let pixels = buf.as_flat_samples();
@@ -410,35 +422,35 @@ impl GuiApp {
                 color_image.as_raw().to_vec(),
                 pixel_type
             ) {
-                 let mut dst_image = FastImage::new(
-                     new_w as u32,
-                     new_h as u32,
-                     pixel_type
-                 );
+                let mut dst_image = FastImage::new(
+                    new_w as u32,
+                    new_h as u32,
+                    pixel_type
+                );
 
-                 // Resize using Lanczos3 for quality or Bilinear for speed
-                 // FilterType::Bilinear is usually safe and very fast for downscaling
-                 let mut resizer = Resizer::new();
-                 if resizer.resize(&src_image, &mut dst_image, &ResizeOptions::default()).is_ok() {
-                     println!("[DEBUG] Fast-Resized {:?} from {}x{} to {}x{}", path, w, h, new_w, new_h);
+                // Resize using Lanczos3 for quality or Bilinear for speed
+                // FilterType::Bilinear is usually safe and very fast for downscaling
+                let mut resizer = Resizer::new();
+                if resizer.resize(&src_image, &mut dst_image, &ResizeOptions::default()).is_ok() {
+                    println!("[DEBUG] Fast-Resized {:?} from {}x{} to {}x{}", path, w, h, new_w, new_h);
 
-                     // Convert back to egui
-                     match pixel_type {
-                         PixelType::U8x4 => {
-                             color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                 [new_w, new_h],
-                                 dst_image.buffer()
-                             );
-                         },
-                         PixelType::U8x3 => {
-                             color_image = egui::ColorImage::from_rgb(
-                                 [new_w, new_h],
-                                 dst_image.buffer()
-                             );
-                         },
-                         _ => {}
-                     }
-                 }
+                    // Convert back to egui
+                    match pixel_type {
+                        PixelType::U8x4 => {
+                            color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                [new_w, new_h],
+                                dst_image.buffer()
+                            );
+                        },
+                        PixelType::U8x3 => {
+                            color_image = egui::ColorImage::from_rgb(
+                                [new_w, new_h],
+                                dst_image.buffer()
+                            );
+                        },
+                        _ => {}
+                    }
+                }
             }
         }
 

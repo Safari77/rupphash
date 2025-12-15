@@ -263,9 +263,22 @@ fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
         _ => {}
     }
 
-    // This handles AVIF, WebP, and corrupted files.
+    // This handles AVIF, WebP, PCX etc (image-extras) and corrupted files.
     eprintln!("[DEBUG-LOAD] {:?} -> Fallback (image crate)", path.file_name().unwrap_or_default());
-    image::load_from_memory(bytes).ok()
+
+    // Chain with_guessed_format(). If it fails (IO error), fallback to a fresh reader.
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .unwrap_or_else(|_| image::ImageReader::new(std::io::Cursor::new(bytes)));
+
+    // Fallback to extension if format is still unknown
+    if reader.format().is_none() {
+        if let Ok(fmt) = image::ImageFormat::from_path(path) {
+            reader.set_format(fmt);
+        }
+    }
+
+    reader.decode().ok()
 }
 
 /// Derive country name from GPS coordinates using country-boundaries
@@ -1286,7 +1299,11 @@ pub fn is_raw_ext(path: &Path) -> bool {
 pub fn is_image_ext(path: &Path) -> bool {
     path.extension().and_then(|s| s.to_str()).map(|ext| {
         let e = ext.to_lowercase();
-        matches!(e.as_str(), "jpg"|"jpeg"|"png"|"webp"|"bmp"|"tiff"|"tif"|"avif"|"heic"|"heif"|"tga"|"xbm"|"xpm") || RAW_EXTS.contains(&e.as_str())
+        matches!(e.as_str(), "dds"|"exr"|"ff"|"hdr"|"ico"|"pnm"|"qoi"|"gif"|"jpg"|"jpeg"|"png"|"webp"
+            |"bmp"|"tiff"|"tif"|"avif"|"heic"|"heif"|"tga"
+            // image-extras
+            |"xbm"|"xpm"|"ora"|"otb"|"pcx"|"sgi"|"wbmp")
+            || RAW_EXTS.contains(&e.as_str())
     }).unwrap_or(false)
 }
 
