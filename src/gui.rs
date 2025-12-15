@@ -6,6 +6,7 @@ use crate::db::AppContext;
 use crate::scanner::{self, ScanConfig, is_raw_ext};
 use crate::{FileMetadata, GroupInfo};
 use crate::position;
+use chrono;
 use jiff::Timestamp;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -89,8 +90,10 @@ pub struct GuiApp {
     show_dir_picker: bool,
     dir_list: Vec<std::path::PathBuf>,
     dir_picker_selection: usize,
+    dir_picker_scroll_to_selection: bool,  // True when keyboard nav should scroll to selection
     subdirs: Vec<std::path::PathBuf>,  // Subdirectories in current directory
     dir_selection_idx: Option<usize>,  // None = files selected, Some(idx) = directory idx selected
+    dir_scroll_to_selection: bool,     // True when keyboard nav should scroll to dir in main panel
 
     // Tab Completion State
     completion_candidates: Vec<String>,
@@ -177,8 +180,10 @@ impl GuiApp {
             show_dir_picker: false,
             dir_list: Vec::new(),
             dir_picker_selection: 0,
+            dir_picker_scroll_to_selection: false,
             subdirs: Vec::new(),
             dir_selection_idx: None,
+            dir_scroll_to_selection: false,
             completion_candidates: Vec::new(),
             completion_index: 0,
             show_histogram: false,
@@ -285,8 +290,10 @@ impl GuiApp {
             show_dir_picker: false,
             dir_list: Vec::new(),
             dir_picker_selection: 0,
+            dir_picker_scroll_to_selection: false,
             subdirs: Vec::new(),
             dir_selection_idx: None,
+            dir_scroll_to_selection: false,
             completion_candidates: Vec::new(),
             completion_index: 0,
             show_histogram: false,
@@ -894,7 +901,16 @@ impl GuiApp {
     }
 
     fn get_title_string(&self) -> String {
-        format!("{} v{} | Groups: {} | Files: {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), self.state.groups.len(), self.state.last_file_count)
+        if self.state.view_mode {
+            let dir_count = self.subdirs.len() + if self.current_dir.as_ref().and_then(|c| c.parent()).is_some() { 1 } else { 0 };
+            if dir_count > 0 {
+                format!("{} v{} | Dirs: {} | Files: {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), dir_count, self.state.last_file_count)
+            } else {
+                format!("{} v{} | Files: {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), self.state.last_file_count)
+            }
+        } else {
+            format!("{} v{} | Groups: {} | Files: {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), self.state.groups.len(), self.state.last_file_count)
+        }
     }
 
     fn update_view_state<F>(&mut self, f: F) where F: FnOnce(&mut GroupViewState) {
@@ -1552,11 +1568,34 @@ impl eframe::App for GuiApp {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp))
                 && self.dir_picker_selection > 0 {
                     self.dir_picker_selection -= 1;
+                    self.dir_picker_scroll_to_selection = true;
                 }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown))
                 && self.dir_picker_selection + 1 < self.dir_list.len() {
                     self.dir_picker_selection += 1;
+                    self.dir_picker_scroll_to_selection = true;
                 }
+            // PageUp - move up by 10 items
+            if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
+                self.dir_picker_selection = self.dir_picker_selection.saturating_sub(10);
+                self.dir_picker_scroll_to_selection = true;
+            }
+            // PageDown - move down by 10 items
+            if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
+                let max_idx = self.dir_list.len().saturating_sub(1);
+                self.dir_picker_selection = (self.dir_picker_selection + 10).min(max_idx);
+                self.dir_picker_scroll_to_selection = true;
+            }
+            // Home - go to first item
+            if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
+                self.dir_picker_selection = 0;
+                self.dir_picker_scroll_to_selection = true;
+            }
+            // End - go to last item
+            if ctx.input(|i| i.key_pressed(egui::Key::End)) {
+                self.dir_picker_selection = self.dir_list.len().saturating_sub(1);
+                self.dir_picker_scroll_to_selection = true;
+            }
             if ctx.input(|i| i.key_pressed(egui::Key::Enter))
                 && let Some(selected_dir) = self.dir_list.get(self.dir_picker_selection).cloned() {
                     self.show_dir_picker = false;
@@ -1577,11 +1616,13 @@ impl eframe::App for GuiApp {
                         // Already in directory list, move up
                         if dir_idx > 0 {
                             self.dir_selection_idx = Some(dir_idx - 1);
+                            self.dir_scroll_to_selection = true;  // Trigger scroll to selected dir
                         }
                         // At top of directory list, stay there
                     } else if self.state.current_file_idx == 0 {
                         // At first file, move to directory list (last directory)
                         self.dir_selection_idx = Some(total_dirs - 1);
+                        self.dir_scroll_to_selection = true;  // Trigger scroll to selected dir
                     } else {
                         // Normal file navigation
                         *intent.borrow_mut() = Some(InputIntent::PrevItem);
@@ -1598,6 +1639,7 @@ impl eframe::App for GuiApp {
                     if dir_idx + 1 < total_dirs {
                         // Move down in directory list
                         self.dir_selection_idx = Some(dir_idx + 1);
+                        self.dir_scroll_to_selection = true;  // Trigger scroll to selected dir
                     } else if has_files {
                         // At bottom of directory list, move to first file
                         self.dir_selection_idx = None;
@@ -1633,16 +1675,115 @@ impl eframe::App for GuiApp {
                 }
             }
 
-            if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) { *intent.borrow_mut() = Some(InputIntent::PageDown); }
+            // PageDown - in view mode, handle directories too
+            if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
+                if self.state.view_mode {
+                    let has_parent = self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+                    let total_dirs = (if has_parent { 1 } else { 0 }) + self.subdirs.len();
+                    let total_files = self.state.groups.first().map(|g| g.len()).unwrap_or(0);
+                    let page_size = 15;
+
+                    if let Some(dir_idx) = self.dir_selection_idx {
+                        // Currently in directories
+                        let new_idx = dir_idx + page_size;
+                        if new_idx < total_dirs {
+                            self.dir_selection_idx = Some(new_idx);
+                            self.dir_scroll_to_selection = true;
+                        } else if total_files > 0 {
+                            // Jump to files
+                            self.dir_selection_idx = None;
+                            let file_offset = new_idx - total_dirs;
+                            self.state.current_file_idx = file_offset.min(total_files.saturating_sub(1));
+                            self.state.selection_changed = true;
+                        } else {
+                            // No files, stay at last directory
+                            self.dir_selection_idx = Some(total_dirs.saturating_sub(1));
+                            self.dir_scroll_to_selection = true;
+                        }
+                    } else {
+                        // Currently in files, use normal behavior
+                        *intent.borrow_mut() = Some(InputIntent::PageDown);
+                    }
+                } else {
+                    *intent.borrow_mut() = Some(InputIntent::PageDown);
+                }
+            }
             if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::PageDown)) {
                 *intent.borrow_mut() = Some(InputIntent::NextGroupByDist);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) { *intent.borrow_mut() = Some(InputIntent::PageUp); }
+
+            // PageUp - in view mode, handle directories too
+            if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
+                if self.state.view_mode {
+                    let has_parent = self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+                    let total_dirs = (if has_parent { 1 } else { 0 }) + self.subdirs.len();
+                    let page_size = 15;
+
+                    if self.dir_selection_idx.is_some() {
+                        // Currently in directories
+                        let dir_idx = self.dir_selection_idx.unwrap();
+                        if dir_idx >= page_size {
+                            self.dir_selection_idx = Some(dir_idx - page_size);
+                        } else {
+                            self.dir_selection_idx = Some(0);
+                        }
+                        self.dir_scroll_to_selection = true;
+                    } else if self.state.current_file_idx == 0 && total_dirs > 0 {
+                        // At first file, jump to directories
+                        self.dir_selection_idx = Some(total_dirs.saturating_sub(1));
+                        self.dir_scroll_to_selection = true;
+                    } else if self.state.current_file_idx < page_size && total_dirs > 0 {
+                        // Would go past first file, jump to directories
+                        let remaining = page_size - self.state.current_file_idx;
+                        self.dir_selection_idx = Some(total_dirs.saturating_sub(remaining).max(0));
+                        self.dir_scroll_to_selection = true;
+                    } else {
+                        // Normal file navigation
+                        *intent.borrow_mut() = Some(InputIntent::PageUp);
+                    }
+                } else {
+                    *intent.borrow_mut() = Some(InputIntent::PageUp);
+                }
+            }
             if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::PageUp)) {
                 *intent.borrow_mut() = Some(InputIntent::PreviousGroupByDist);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Home)) { *intent.borrow_mut() = Some(InputIntent::Home); }
-            if ctx.input(|i| i.key_pressed(egui::Key::End)) { *intent.borrow_mut() = Some(InputIntent::End); }
+
+            // Home - in view mode, go to first directory (or first file if no dirs)
+            if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
+                if self.state.view_mode {
+                    let has_parent = self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+                    let total_dirs = (if has_parent { 1 } else { 0 }) + self.subdirs.len();
+                    if total_dirs > 0 {
+                        self.dir_selection_idx = Some(0);
+                        self.dir_scroll_to_selection = true;
+                    } else {
+                        *intent.borrow_mut() = Some(InputIntent::Home);
+                    }
+                } else {
+                    *intent.borrow_mut() = Some(InputIntent::Home);
+                }
+            }
+
+            // End - in view mode, go to last file (or last directory if no files)
+            if ctx.input(|i| i.key_pressed(egui::Key::End)) {
+                if self.state.view_mode {
+                    let total_files = self.state.groups.first().map(|g| g.len()).unwrap_or(0);
+                    if total_files > 0 {
+                        self.dir_selection_idx = None;
+                        *intent.borrow_mut() = Some(InputIntent::End);
+                    } else {
+                        let has_parent = self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+                        let total_dirs = (if has_parent { 1 } else { 0 }) + self.subdirs.len();
+                        if total_dirs > 0 {
+                            self.dir_selection_idx = Some(total_dirs.saturating_sub(1));
+                            self.dir_scroll_to_selection = true;
+                        }
+                    }
+                } else {
+                    *intent.borrow_mut() = Some(InputIntent::End);
+                }
+            }
             if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::Tab)) { *intent.borrow_mut() = Some(InputIntent::PrevGroup); }
             else if ctx.input(|i| i.key_pressed(egui::Key::Tab)) { *intent.borrow_mut() = Some(InputIntent::NextGroup); }
             if ctx.input(|i| i.key_pressed(egui::Key::Space)) { *intent.borrow_mut() = Some(InputIntent::ToggleMark); }
@@ -1784,7 +1925,7 @@ impl eframe::App for GuiApp {
             egui::Window::new("Confirm Delete").collapsible(false).show(ctx, |ui| {
                 let filename = self.state.get_current_image_path().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_default();
                 ui.label(format!("Delete current file?\n{}", filename));
-                if ui.button("Yes (y)").clicked() { self.state.handle_input(InputIntent::ConfirmDeleteImmediate); }
+                if ui.button("Yes (y)").clicked() { self.state.handle_input(InputIntent::ConfirmDeleteImmediate); self.cache_dirty = true; }
                 if ui.button("No (n)").clicked() { self.state.handle_input(InputIntent::Cancel); }
             });
         }
@@ -1975,6 +2116,10 @@ impl eframe::App for GuiApp {
                 if sort == "CANCEL" {
                     self.state.handle_input(InputIntent::Cancel);
                 } else {
+                    // Update stored preference for future scans
+                    self.view_mode_sort = Some(sort.clone());
+                    // Explicitly sort subdirectories (AppState only handles files)
+                    scanner::sort_directories(&mut self.subdirs, &sort);
                     self.state.handle_input(InputIntent::ChangeSortOrder(sort));
                     self.cache_dirty = true;
                 }
@@ -1984,50 +2129,150 @@ impl eframe::App for GuiApp {
         // Directory picker dialog (view mode)
         if self.show_dir_picker {
             let mut selected_dir: Option<std::path::PathBuf> = None;
+            let mut clicked_idx: Option<usize> = None;
+            let show_relative = self.state.show_relative_times;
+            let scroll_to_sel = self.dir_picker_scroll_to_selection;
 
             egui::Window::new("Select Directory")
                 .collapsible(false)
                 .resizable(true)
-                .default_width(500.0)
+                .default_width(650.0)
+                .min_width(450.0)
                 .show(ctx, |ui| {
-                    ui.label("Use ↑/↓ to navigate, Enter to select, Esc to cancel");
+                    ui.label("Use ↑/↓/PgUp/PgDn/Home/End to navigate, Enter to select, Esc to cancel");
                     ui.separator();
 
-                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
-                        for (idx, dir_path) in self.dir_list.iter().enumerate() {
-                            let is_selected = idx == self.dir_picker_selection;
-                            let is_parent = idx == 0 && self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+                    egui::ScrollArea::vertical()
+                        .max_height(400.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let available_w = ui.available_width();
+                            ui.set_min_width(available_w);
 
-                            let display_name = if is_parent {
-                                ".. (parent directory)".to_string()
-                            } else {
-                                dir_path.file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| dir_path.to_string_lossy().to_string())
-                            };
+                            for (idx, dir_path) in self.dir_list.iter().enumerate() {
+                                let is_selected = idx == self.dir_picker_selection;
+                                let is_parent = idx == 0 && self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
 
-                            let resp = ui.selectable_label(is_selected, &display_name);
-                            if resp.clicked() {
-                                selected_dir = Some(dir_path.clone());
+                                // Get modification time
+                                let mod_time_str = if let Ok(meta) = fs::metadata(dir_path) {
+                                    if let Ok(modified) = meta.modified() {
+                                        let dt: chrono::DateTime<chrono::Utc> = modified.into();
+                                        if show_relative {
+                                            let ts = Timestamp::from_second(dt.timestamp()).unwrap();
+                                            format_relative_time(ts)
+                                        } else {
+                                            dt.format("%Y-%m-%d %H:%M").to_string()
+                                        }
+                                    } else {
+                                        String::new()
+                                    }
+                                } else {
+                                    String::new()
+                                };
+
+                                let dir_name = if is_parent {
+                                    "📁 .. (parent)".to_string()
+                                } else {
+                                    format!("📁 {}", dir_path.file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| dir_path.to_string_lossy().to_string()))
+                                };
+
+                                // Layout: directory name (2/3) + modification time (1/3)
+                                let row_rect = ui.available_rect_before_wrap();
+                                let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(available_w, row_height),
+                                    egui::Sense::click()
+                                );
+
+                                // Draw selection background
+                                if is_selected {
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        2.0,
+                                        ui.visuals().selection.bg_fill
+                                    );
+                                } else if resp.hovered() {
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        2.0,
+                                        ui.visuals().widgets.hovered.bg_fill
+                                    );
+                                }
+
+                                // Draw directory name (left 2/3)
+                                let name_rect = egui::Rect::from_min_size(
+                                    rect.min,
+                                    egui::vec2(available_w * 0.67, row_height)
+                                );
+                                let text_color = if is_parent {
+                                    egui::Color32::YELLOW
+                                } else {
+                                    egui::Color32::LIGHT_BLUE
+                                };
+                                ui.painter().text(
+                                    name_rect.left_center() + egui::vec2(4.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    &dir_name,
+                                    egui::FontId::default(),
+                                    text_color
+                                );
+
+                                // Draw modification time (right 1/3)
+                                let time_rect = egui::Rect::from_min_size(
+                                    rect.min + egui::vec2(available_w * 0.67, 0.0),
+                                    egui::vec2(available_w * 0.33, row_height)
+                                );
+                                ui.painter().text(
+                                    time_rect.right_center() - egui::vec2(4.0, 0.0),
+                                    egui::Align2::RIGHT_CENTER,
+                                    &mod_time_str,
+                                    egui::FontId::new(11.0, egui::FontFamily::Monospace),
+                                    egui::Color32::GRAY
+                                );
+
+                                // Single click selects, double click opens
+                                if resp.clicked() {
+                                    clicked_idx = Some(idx);
+                                }
+                                if resp.double_clicked() {
+                                    selected_dir = Some(dir_path.clone());
+                                }
+
+                                // Only scroll to selected item when keyboard navigation triggered it
+                                if is_selected && scroll_to_sel {
+                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                }
                             }
-                            if is_selected {
-                                resp.scroll_to_me(Some(egui::Align::Center));
-                                resp.request_focus();
+
+                            if self.dir_list.is_empty() {
+                                ui.label("No subdirectories found");
+                            }
+                        });
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Open (Enter)").clicked() {
+                            if let Some(dir) = self.dir_list.get(self.dir_picker_selection).cloned() {
+                                selected_dir = Some(dir);
                             }
                         }
-
-                        if self.dir_list.is_empty() {
-                            ui.label("No subdirectories found");
+                        if ui.button("Cancel (Esc)").clicked() {
+                            self.show_dir_picker = false;
                         }
                     });
-
-                    ui.separator();
-                    if ui.button("Cancel (Esc)").clicked() {
-                        self.show_dir_picker = false;
-                    }
                 });
 
-            // Apply deferred directory change
+            // Clear scroll flag after rendering
+            self.dir_picker_scroll_to_selection = false;
+
+            // Handle single click - update selection index
+            if let Some(idx) = clicked_idx {
+                self.dir_picker_selection = idx;
+            }
+
+            // Apply deferred directory change (from double-click or Enter)
             if let Some(dir) = selected_dir {
                 self.show_dir_picker = false;
                 self.change_directory(dir);
@@ -2161,13 +2406,159 @@ impl eframe::App for GuiApp {
                         ui.separator();
                     }
 
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        if self.state.groups.is_empty() {
+                    // Calculate target scroll offset if we need to scroll to selected item
+                    let scroll_to_file = self.state.selection_changed && self.dir_selection_idx.is_none();
+                    let scroll_to_dir = self.dir_scroll_to_selection;
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("file_list_scroll")
+                        .show(ui, |ui| {
+                        let no_files = self.state.groups.is_empty() || self.state.groups.iter().all(|g| g.is_empty());
+                        let no_dirs = self.subdirs.is_empty() && self.current_dir.as_ref().and_then(|c| c.parent()).is_none();
+
+                        if no_files && no_dirs {
                             // Subtract 16.0 to account for egui's frame margins
                             ui.set_min_width((self.saved_panel_width - 16.0).max(100.0));
                             ui.label(if self.state.view_mode { "No images found." } else { "No duplicates found." });
                             return;
                         }
+
+                        let mut dir_to_open: Option<std::path::PathBuf> = None;
+                        let show_relative = self.state.show_relative_times;
+
+                        // Calculate offset caused by directories
+                        let files_start_offset = if self.state.view_mode && !self.state.is_loading {
+                            let start_cursor_y = ui.cursor().min.y;
+                            let has_parent = self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+                            let mut dir_idx: usize = 0;
+                            let available_w = ui.available_width();
+
+                            // Parent directory ".."
+                            if let Some(ref current) = self.current_dir && let Some(parent) = current.parent() {
+                                let is_selected = self.dir_selection_idx == Some(dir_idx);
+
+                                // Get modification time for parent
+                                let mod_time_str = if let Ok(meta) = fs::metadata(parent) {
+                                    if let Ok(modified) = meta.modified() {
+                                        let dt: chrono::DateTime<chrono::Utc> = modified.into();
+                                        if show_relative {
+                                            let ts = Timestamp::from_second(dt.timestamp()).unwrap();
+                                            format_relative_time(ts)
+                                        } else {
+                                            dt.format("%Y-%m-%d %H:%M").to_string()
+                                        }
+                                    } else { String::new() }
+                                } else { String::new() };
+
+                                // Custom row with name (2/3) + time (1/3)
+                                let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(available_w, row_height),
+                                    egui::Sense::click()
+                                );
+
+                                // Draw selection/hover background
+                                if is_selected {
+                                    ui.painter().rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
+                                } else if resp.hovered() {
+                                    ui.painter().rect_filled(rect, 2.0, ui.visuals().widgets.hovered.bg_fill);
+                                }
+
+                                // Draw directory name (left 2/3)
+                                ui.painter().text(
+                                    rect.left_center() + egui::vec2(4.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    "📁 ..",
+                                    egui::FontId::default(),
+                                    egui::Color32::YELLOW
+                                );
+
+                                // Draw modification time (right 1/3)
+                                ui.painter().text(
+                                    rect.right_center() - egui::vec2(4.0, 0.0),
+                                    egui::Align2::RIGHT_CENTER,
+                                    &mod_time_str,
+                                    egui::FontId::new(10.0, egui::FontFamily::Monospace),
+                                    egui::Color32::GRAY
+                                );
+
+                                if resp.clicked() { dir_to_open = Some(parent.to_path_buf()); }
+                                // Only scroll when keyboard navigation triggered it
+                                if is_selected && scroll_to_dir {
+                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                }
+                                dir_idx += 1;
+                            }
+
+                            // Subdirectories
+                            for subdir in &self.subdirs.clone() {
+                                let is_selected = self.dir_selection_idx == Some(dir_idx);
+                                let dir_name = subdir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| subdir.to_string_lossy().to_string());
+
+                                // Get modification time
+                                let mod_time_str = if let Ok(meta) = fs::metadata(subdir) {
+                                    if let Ok(modified) = meta.modified() {
+                                        let dt: chrono::DateTime<chrono::Utc> = modified.into();
+                                        if show_relative {
+                                            let ts = Timestamp::from_second(dt.timestamp()).unwrap();
+                                            format_relative_time(ts)
+                                        } else {
+                                            dt.format("%Y-%m-%d %H:%M").to_string()
+                                        }
+                                    } else { String::new() }
+                                } else { String::new() };
+
+                                // Custom row with name (2/3) + time (1/3)
+                                let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(available_w, row_height),
+                                    egui::Sense::click()
+                                );
+
+                                // Draw selection/hover background
+                                if is_selected {
+                                    ui.painter().rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
+                                } else if resp.hovered() {
+                                    ui.painter().rect_filled(rect, 2.0, ui.visuals().widgets.hovered.bg_fill);
+                                }
+
+                                // Draw directory name (left 2/3)
+                                ui.painter().text(
+                                    rect.left_center() + egui::vec2(4.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    &format!("📁 {}", dir_name),
+                                    egui::FontId::default(),
+                                    egui::Color32::LIGHT_BLUE
+                                );
+
+                                // Draw modification time (right 1/3)
+                                ui.painter().text(
+                                    rect.right_center() - egui::vec2(4.0, 0.0),
+                                    egui::Align2::RIGHT_CENTER,
+                                    &mod_time_str,
+                                    egui::FontId::new(10.0, egui::FontFamily::Monospace),
+                                    egui::Color32::GRAY
+                                );
+
+                                if resp.clicked() {
+                                    dir_to_open = Some(subdir.clone());
+                                }
+                                // Only scroll when keyboard navigation triggered it
+                                if is_selected && scroll_to_dir {
+                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                }
+                                dir_idx += 1;
+                            }
+
+                            if !self.subdirs.is_empty() || has_parent { ui.separator(); }
+
+                            ui.cursor().min.y - start_cursor_y
+                        } else {
+                            0.0
+                        };
+
+                        // Clear the scroll flag after rendering directories
+                        self.dir_scroll_to_selection = false;
 
                         // --- 1. LAYOUT CONSTANTS ---
                         let spacing = ui.spacing().item_spacing.y;
@@ -2210,8 +2601,8 @@ impl eframe::App for GuiApp {
                                 let header_offset = if show_headers { header_height } else { 0.0 };
                                 let file_offset = self.state.current_file_idx as f32 * file_row_total_h;
 
-                                // Offset relative to content top
-                                let target_y_offset = group_start_y + header_offset + file_offset;
+                                // Offset relative to content top (including directories)
+                                let target_y_offset = files_start_offset + group_start_y + header_offset + file_offset;
 
                                 // Convert to SCREEN COORDINATES
                                 let scroll_top = ui.min_rect().min;
@@ -2227,6 +2618,8 @@ impl eframe::App for GuiApp {
 
                         // --- 4. ALLOCATE SCROLL SPACE ---
                         // This creates the scrollbar thumb at the correct size
+                        // Note: ui.cursor() is now *after* the directories.
+                        // total_content_height contains only files. Directories are already accounted for by cursor position.
                         ui.allocate_rect(
                             egui::Rect::from_min_size(ui.cursor().min, egui::vec2(0.0, self.total_content_height)),
                             egui::Sense::hover()
@@ -2234,14 +2627,21 @@ impl eframe::App for GuiApp {
 
                         // --- 5. VISIBILITY CULLING ---
                         let clip_rect = ui.clip_rect();
-                        let scroll_y = clip_rect.min.y - ui.min_rect().min.y;
+                        // Scroll offset relative to FILE LIST start
+                        // ui.min_rect().min.y is content top.
+                        // We subtract files_start_offset to align 0.0 with the first file group.
+                        let scroll_y = (clip_rect.min.y - ui.min_rect().min.y) - files_start_offset;
 
                         // Binary search for the first visible group
-                        let start_idx = match self.group_y_offsets.binary_search_by(|y| {
-                            if *y > scroll_y { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
-                        }) {
-                            Ok(i) => i,
-                            Err(i) => i.saturating_sub(1),
+                        let start_idx = if scroll_y <= 0.0 {
+                            0
+                        } else {
+                            match self.group_y_offsets.binary_search_by(|y| {
+                                if *y > scroll_y { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
+                            }) {
+                                Ok(i) => i,
+                                Err(i) => i.saturating_sub(1),
+                            }
                         };
 
                         let mut action_rename = false;
@@ -2249,7 +2649,8 @@ impl eframe::App for GuiApp {
                         let mut copy_path_target: Option<String> = None;
 
                         // --- 6. RENDER LOOP ---
-                        let start_y = ui.min_rect().min.y;
+                        // Base absolute Y for the file list
+                        let start_y = ui.min_rect().min.y + files_start_offset;
 
                         for (g_idx, group) in self.state.groups.iter().enumerate().skip(start_idx) {
                             let group_y = self.group_y_offsets[g_idx];
@@ -2303,6 +2704,11 @@ impl eframe::App for GuiApp {
                                     }
 
                                     let resp = ui.put(btn_rect, egui::Button::new(rich_text).selected(is_selected).wrap_mode(egui::TextWrapMode::Truncate));
+
+                                    // Scroll to selected file when navigating with keyboard
+                                    if is_selected && scroll_to_file {
+                                        resp.scroll_to_me(Some(egui::Align::Center));
+                                    }
 
                                     // Handle Click (Select)
                                     if resp.clicked() {
@@ -2383,6 +2789,12 @@ impl eframe::App for GuiApp {
                         if let Some(path) = copy_path_target { ctx.copy_text(path); }
                         if action_rename { self.state.handle_input(InputIntent::StartRename); }
                         if action_delete { self.state.handle_input(InputIntent::ExecuteDelete); }
+
+                        // Defer directory change to avoid borrow conflict
+                        if let Some(dir) = dir_to_open {
+                             self.dir_selection_idx = None;
+                             self.change_directory(dir);
+                        }
                     });
             });
             // In Duplicate Mode, groups are empty during the scan.
