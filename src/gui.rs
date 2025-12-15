@@ -2371,8 +2371,6 @@ impl eframe::App for GuiApp {
                                 }
                                 current_y += file_row_total_h;
                             }
-
-                            if show_headers { current_y += separator_h; }
                         }
 
                         // Execute Context Menu Actions (Outside Loop)
