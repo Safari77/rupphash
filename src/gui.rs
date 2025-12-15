@@ -841,12 +841,6 @@ impl GuiApp {
     }
 
     pub fn run(self) -> Result<(), eframe::Error> {
-        let initial_title = if self.state.is_loading {
-            format!("{} v{} | Scanning...", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
-        } else {
-            self.get_title_string()
-        };
-
         // Config stores physical pixels (screen_rect * ppp after font_scale applied)
         // with_inner_size is called BEFORE font_scale, when ppp=1.0
         // So physical pixels = logical points at that moment
@@ -859,7 +853,7 @@ impl GuiApp {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([width, height])
-                .with_title(initial_title),
+                .with_decorations(false),
             ..Default::default()
         };
 
@@ -1345,7 +1339,7 @@ impl GuiApp {
                     // We only warn if the user explicitly wanted Sun Position
                     if exif_tags.iter().any(|t| t.eq_ignore_ascii_case("DerivedSunPosition")) {
                         self.state.status_message = Some((
-                            "Sun Position: GPS Time missing, using Local.".to_string(), 
+                            "Sun Position: GPS Time missing, using Local.".to_string(),
                             true
                         ));
                         self.status_set_time = Some(std::time::Instant::now());
@@ -1437,6 +1431,59 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let title_text = if self.state.is_loading {
+            format!("{} v{} | Scanning... {}/{}",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+                self.scan_progress.0,
+                self.scan_progress.1
+            )
+        } else {
+            self.get_title_string()
+        };
+
+        // Send the title to the OS (updates Alt-Tab / Taskbar name)
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title_text.clone()));
+        if !self.state.is_fullscreen {
+            egui::TopBottomPanel::top("custom_title_bar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let height = 12.0;
+                    ui.label(egui::RichText::new(title_text).strong());
+                    // --- Window Dragging Logic ---
+                    let available_width = ui.available_width() - 60.0;
+                    let response = ui.allocate_response(
+                        egui::vec2(available_width, height),
+                        egui::Sense::click_and_drag()
+                    );
+                    if response.dragged() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+
+                    // --- Window Controls ---
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("❌").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if ui.button("🗖").clicked() {
+                            let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+                        }
+                        if ui.button("🗕").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                    });
+                });
+            });
+        }
+
+        // Sync metadata title (for Alt-Tab / Taskbar)
+        let current_title = if self.state.is_loading {
+            format!("Scanning... {}/{}", self.scan_progress.0, self.scan_progress.1)
+        } else {
+            self.get_title_string()
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(current_title));
+
         // Local flag to force egui to respect our manual resize this frame
         let mut force_panel_resize = false;
 
