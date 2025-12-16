@@ -1125,7 +1125,6 @@ impl eframe::App for GuiApp {
                         let clip_rect = ui.clip_rect();
                         // Scroll offset relative to FILE LIST start
                         // ui.min_rect().min.y is content top.
-                        // We subtract files_start_offset to align 0.0 with the first file group.
                         let scroll_y = (clip_rect.min.y - ui.min_rect().min.y) - files_start_offset;
 
                         // Binary search for the first visible group
@@ -1180,6 +1179,7 @@ impl eframe::App for GuiApp {
                             let content_subgroups = get_content_subgroups(group);
 
                             for (f_idx, file) in group.iter().enumerate() {
+                                // 1. Calculate Rects
                                 let file_rect = egui::Rect::from_min_size(
                                     egui::pos2(ui.min_rect().left(), current_y),
                                     egui::vec2(ui.available_width(), file_row_total_h)
@@ -1198,47 +1198,36 @@ impl eframe::App for GuiApp {
                                         .map(|di| hardlink_groups.contains_key(&di))
                                         .unwrap_or(false);
 
-                                    // Content Group ID (e.g., 1, 2)
+                                    // Content Group ID
                                     let content_id = file.pixel_hash.and_then(|ph| content_subgroups.get(&ph));
                                     let is_content_identical = content_id.is_some();
-                                    // Use a fixed width for markers (approx 45px covers "M L C1")
-                                    let marker_min_width = 55.0;
-                                    let btn_rect = egui::Rect::from_min_size(
+
+                                    // --- LAYOUT ---
+                                    // Two main rects: header_rect (marker + filename) and meta_rect (details)
+                                    let header_rect = egui::Rect::from_min_size(
                                         egui::pos2(file_rect.min.x, current_y),
                                         egui::vec2(file_rect.width(), row_btn_h)
                                     );
 
-                                    // Define Marker Rect (Fixed Width)
-                                    let marker_rect = egui::Rect::from_min_size(
-                                        btn_rect.min,
-                                        egui::vec2(marker_min_width, row_btn_h)
+                                    let meta_rect = egui::Rect::from_min_size(
+                                        egui::pos2(file_rect.min.x, current_y + row_btn_h + spacing),
+                                        egui::vec2(file_rect.width(), row_meta_h)
                                     );
 
-                                    // Define Filename Rect (Takes strictly the remaining space)
-                                    let filename_rect = egui::Rect::from_min_size(
-                                        egui::pos2(btn_rect.min.x + marker_min_width, btn_rect.min.y),
-                                        egui::vec2((btn_rect.width() - marker_min_width).max(0.0), row_btn_h)
-                                    );
+                                    // --- TEXT GENERATION ---
+                                    let c_label = if let Some(id) = content_id { format!("C{} ", id) } else { "  ".to_string() };
 
-                                    // Format the "C" label: "C1", "C2", or empty
-                                    let c_label = if let Some(id) = content_id {
-                                        format!("C{}  ", id)
-                                    } else {
-                                        "    ".to_string()
-                                    };
-
-                                    // Build the marker text string: [M] [L] [C1]
-                                    // Use explicit spaces for monospace alignment
-                                    let marker_text = format!("{} {} {}",
-                                        if is_marked     { "M" } else { " " },
-                                        if is_hardlinked { "L" } else { " " },
+                                    let marker_text = format!("{} {} {} ",
+                                        if is_marked      { "M" } else { " " },
+                                        if is_hardlinked  { "L" } else { " " },
                                         c_label
                                     );
-
                                     let filename_text = format_path_depth(&file.path, self.state.path_display_depth);
 
-                                    // 1. Determine Base Colors
-                                    let (marker_color, mut filename_text_color) = if !exists {
+                                    // --- COLORS ---
+                                    let (marker_color, filename_color) = if is_selected {
+                                        (None, None)
+                                    } else if !exists {
                                         (Some(egui::Color32::RED), Some(egui::Color32::RED))
                                     } else if is_marked {
                                         (Some(egui::Color32::MAGENTA), Some(egui::Color32::MAGENTA))
@@ -1249,34 +1238,23 @@ impl eframe::App for GuiApp {
                                     } else if is_content_identical {
                                         (Some(egui::Color32::GOLD), Some(egui::Color32::GOLD))
                                     } else {
-                                        (None, None) // Default gray/white
+                                        (None, None)
                                     };
 
-                                    // 2. PAINT SELECTION BACKGROUND
-                                    if is_selected {
-                                        ui.painter().rect_filled(
-                                            filename_rect,
-                                            0.0, // Rounding (0.0 = sharp corners)
-                                            egui::Color32::from_rgb(0, 92, 128) // Deep Blue Background
-                                        );
-                                        filename_text_color = Some(egui::Color32::WHITE);
-                                    }
-
-                                    // 3. Build Marker RichText
-                                    let mut marker_rich = egui::RichText::new(&marker_text).monospace();
+                                    // --- RICH TEXT ---
+                                    let mut marker_rich = egui::RichText::new(&marker_text).family(egui::FontFamily::Monospace);
                                     if let Some(col) = marker_color { marker_rich = marker_rich.color(col); }
                                     if !exists && !is_selected { marker_rich = marker_rich.strikethrough(); }
 
-                                    // 4. Build Filename RichText
-                                    let mut filename_rich = egui::RichText::new(&filename_text).monospace();
-                                    if let Some(col) = filename_text_color { filename_rich = filename_rich.color(col); }
+                                    let mut filename_rich = egui::RichText::new(&filename_text).family(egui::FontFamily::Monospace);
+                                    if let Some(col) = filename_color { filename_rich = filename_rich.color(col); }
                                     if !exists && !is_selected { filename_rich = filename_rich.strikethrough(); }
 
-                                    // Highlight content-identical peers logic
+                                    // Highlight peers
                                     if let Some(current_file) = group.get(self.state.current_file_idx) {
                                         if !is_selected
                                             && current_file.pixel_hash.is_some()
-                                            && current_file.pixel_hash == file.pixel_hash
+                                                && current_file.pixel_hash == file.pixel_hash
                                         {
                                             let bg = egui::Color32::from_black_alpha(40);
                                             marker_rich = marker_rich.strong().background_color(bg);
@@ -1284,83 +1262,89 @@ impl eframe::App for GuiApp {
                                         }
                                     }
 
-                                    // Draw marker label
-                                    ui.scope_builder(
-                                        egui::UiBuilder::new()
-                                            .max_rect(marker_rect)
-                                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                                        |ui| { ui.label(marker_rich); }
-                                    );
+                                    // --- RENDER ---
 
-                                    // Draw filename button
-                                    let mut clicked = false;
-                                    let mut secondary_clicked = false;
-
-                                    ui.scope_builder(
-                                        egui::UiBuilder::new()
-                                            .max_rect(filename_rect)
-                                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                                        |ui| {
-                                            let btn = egui::Button::new(filename_rich)
-                                                .frame(false) // No default frame, we painted our own
-                                                .wrap_mode(egui::TextWrapMode::Truncate);
-
-                                            let resp = ui.add(btn);
-                                            if resp.clicked() { clicked = true; }
-                                            if resp.secondary_clicked() { secondary_clicked = true; }
-
-                                            // Context menu hook
-                                            resp.context_menu(|ui| {
-                                                if ui.button("Rename (R)").clicked() {
-                                                    ui.close(); action_rename = true; }
-                                                if ui.button("Copy full path").clicked() {
-                                                    ui.close(); copy_path_target = Some(file.path.to_string_lossy().to_string());
-                                                }
-                                                if ui.button("Delete (Del)").clicked() { ui.close(); action_delete = true; }
-                                            });
-
-                                            if is_selected && scroll_to_file {
-                                                resp.scroll_to_me(Some(egui::Align::Center));
-                                            }
-                                        }
-                                    );
-                                    // Handle Click (Select)
-                                    if clicked {
-                                        self.state.current_group_idx = g_idx;
-                                        self.state.current_file_idx = f_idx;
-                                        self.dir_selection_idx = None;
-                                        ctx.request_repaint();
-                                    }
-
-                                    // Handle Right-Click (Select + Context Menu)
-                                    if secondary_clicked {
-                                        self.state.current_group_idx = g_idx;
-                                        self.state.current_file_idx = f_idx;
-                                        self.dir_selection_idx = None;
-                                        ctx.request_repaint();
-                                    }
-
-                                    // --- METADATA ROW ---
-                                    let meta_rect = egui::Rect::from_min_size(
-                                        egui::pos2(file_rect.min.x, current_y + row_btn_h + spacing),
-                                        egui::vec2(file_rect.width(), row_meta_h)
-                                    );
-
-                                    // 1. PAINT METADATA BACKGROUND
-                                    // We paint the full width of the metadata row to ensure
-                                    // the Date/Size/Res columns are all readable.
+                                    // 1. Draw Selection Backgrounds
                                     if is_selected {
+                                        // Draw one solid block for the header (Marker + Filename)
+                                        ui.painter().rect_filled(
+                                            header_rect,
+                                            0.0,
+                                            egui::Color32::from_rgb(0, 92, 128)
+                                        );
+                                        // Draw block for metadata
                                         ui.painter().rect_filled(
                                             meta_rect,
                                             0.0,
-                                            egui::Color32::from_rgb(0, 85, 118) // Deeper Blue
+                                            egui::Color32::from_rgb(0, 76, 108)
                                         );
+
+                                        // Update text color for contrast
+                                        marker_rich = marker_rich.color(egui::Color32::WHITE);
+                                        filename_rich = filename_rich.color(egui::Color32::WHITE);
                                     }
 
-                                    // 2. Format Strings
-                                    let size_str = if file.size < 1024 { format!("{} B", file.size) }
-                                    else { format!("{:.0} KB", file.size as f32 / 1024.0) };
+                                    // 2. Draw Text Content inside Header Rect
+                                    ui.allocate_ui_at_rect(header_rect, |ui| {
+                                        // We use a horizontal layout to put marker and filename side-by-side
+                                        ui.horizontal(|ui| { // XXX
+                                            // Remove spacing between items if you want them tighter
+                                            ui.spacing_mut().item_spacing.x = 0.0;
 
+                                            ui.label(marker_rich);
+                                            // Label will truncate if it hits the end of header_rect
+                                            ui.label(filename_rich);
+                                        });
+                                    });
+
+                                    // 3. Create Interactions
+                                    // We create an invisible interaction layer over the header_rect
+                                    let header_resp = ui.interact(header_rect, ui.id().with("hdr").with(g_idx).with(f_idx), egui::Sense::click());
+
+                                    // We create interaction for meta_rect
+                                    let meta_resp = ui.interact(meta_rect, ui.id().with("meta").with(g_idx).with(f_idx), egui::Sense::click());
+
+                                    // --- INTERACTION HANDLING ---
+                                    let any_clicked = header_resp.clicked() || meta_resp.clicked();
+                                    let any_sec_clicked = header_resp.secondary_clicked() || meta_resp.secondary_clicked();
+
+                                    if is_selected && scroll_to_file {
+                                        header_resp.scroll_to_me(Some(egui::Align::Center));
+                                    }
+
+                                    if any_clicked || any_sec_clicked {
+                                        self.state.current_group_idx = g_idx;
+                                        self.state.current_file_idx = f_idx;
+                                        self.dir_selection_idx = None;
+                                        ctx.request_repaint();
+                                    }
+
+                                    if header_resp.hovered() || meta_resp.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+
+                                    // Context Menu (Shared)
+                                    let context_menu_logic = |ui: &mut egui::Ui, action_rename: &mut bool, action_delete: &mut bool, copy_target: &mut Option<String>, path: &std::path::Path| {
+                                        if ui.button("Rename (R)").clicked() { ui.close(); *action_rename = true; }
+                                        if ui.button("Copy full path").clicked() {
+                                            ui.close();
+                                            *copy_target = Some(path.to_string_lossy().to_string());
+                                        }
+                                        if ui.button("Delete (Del)").clicked() { ui.close(); *action_delete = true; }
+                                    };
+
+                                    // Attach context menu to both rects
+                                    header_resp.context_menu(|ui| context_menu_logic(ui, &mut action_rename, &mut action_delete, &mut copy_path_target, &file.path));
+                                    meta_resp.context_menu(|ui| context_menu_logic(ui, &mut action_rename, &mut action_delete, &mut copy_path_target, &file.path));
+
+                                    // --- RENDER METADATA ---
+                                    let size_str = if file.size < 1024 {
+                                        format!("{} B", file.size)
+                                    } else if file.size < 1048576 {
+                                        format!("{:.2} KiB", file.size as f32 / 1024.0)
+                                    } else {
+                                        format!("{:.2} MiB", file.size as f32 / 1048576.0)
+                                    };
                                     let time_str = if self.state.show_relative_times {
                                         let ts = Timestamp::from_second(file.modified.timestamp()).unwrap()
                                             .checked_add(jiff::SignedDuration::from_nanos(file.modified.timestamp_subsec_nanos() as i64)).unwrap();
@@ -1368,57 +1352,33 @@ impl eframe::App for GuiApp {
                                     } else {
                                         file.modified.format("%Y-%m-%d %H:%M:%S").to_string()
                                     };
+                                    let res_str = file.resolution.map(|(w, h)| format!("{}x{}  ", w, h)).unwrap_or_default();
 
-                                    let res_str = file.resolution.map(|(w, h)| format!("{}x{}", w, h)).unwrap_or_default();
+                                    let w_meta = meta_rect.width();
+                                    let h_meta = meta_rect.height();
+                                    let x_meta = meta_rect.min.x;
+                                    let y_meta = meta_rect.min.y;
+                                    let w_date = w_meta * 0.50;
+                                    let w_col  = w_meta * 0.25;
 
-                                    // 3. Setup Layout Dimensions
-                                    let w = meta_rect.width();
-                                    let h = meta_rect.height();
-                                    let x = meta_rect.min.x;
-                                    let y = meta_rect.min.y;
+                                    let r_date = egui::Rect::from_min_size(egui::pos2(x_meta, y_meta),                  egui::vec2(w_date, h_meta));
+                                    let r_size = egui::Rect::from_min_size(egui::pos2(x_meta + w_date, y_meta),         egui::vec2(w_col, h_meta));
+                                    let r_res  = egui::Rect::from_min_size(egui::pos2(x_meta + w_date + w_col, y_meta), egui::vec2(w_col, h_meta));
 
-                                    // Define widths (50% - 25% - 25%)
-                                    let w_date = w * 0.50;
-                                    let w_col  = w * 0.25;
+                                    let meta_color = if is_selected { egui::Color32::WHITE } else { egui::Color32::GRAY };
+                                    let make_text = |s| egui::RichText::new(s).size(10.0).color(meta_color);
 
-                                    // Define Rects
-                                    let r_date = egui::Rect::from_min_size(egui::pos2(x, y),                  egui::vec2(w_date, h));
-                                    let r_size = egui::Rect::from_min_size(egui::pos2(x + w_date, y),         egui::vec2(w_col, h));
-                                    let r_res  = egui::Rect::from_min_size(egui::pos2(x + w_date + w_col, y), egui::vec2(w_col, h));
-
-                                    // 4. Helper for text styling (Adaptive Color)
-                                    // Switch to WHITE if selected, otherwise keep it GRAY
-                                    let meta_text_color = if is_selected { egui::Color32::WHITE } else { egui::Color32::GRAY };
-                                    let make_text = |s| egui::RichText::new(s).size(10.0).color(meta_text_color);
-
-                                    // 5. DATE (Left aligned)
                                     ui.scope_builder(
-                                        egui::UiBuilder::new()
-                                        .max_rect(r_date)
-                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                                        |ui| {
-                                            ui.label(make_text(time_str));
-                                        },
+                                        egui::UiBuilder::new().max_rect(r_date).layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                        |ui| { ui.label(make_text(time_str)); },
                                     );
-
-                                    // 6. SIZE (Right aligned)
                                     ui.scope_builder(
-                                        egui::UiBuilder::new()
-                                        .max_rect(r_size)
-                                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
-                                        |ui| {
-                                            ui.label(make_text(size_str));
-                                        },
+                                        egui::UiBuilder::new().max_rect(r_size).layout(egui::Layout::right_to_left(egui::Align::Center)),
+                                        |ui| { ui.label(make_text(size_str)); },
                                     );
-
-                                    // 7. RESOLUTION (Right aligned)
                                     ui.scope_builder(
-                                        egui::UiBuilder::new()
-                                        .max_rect(r_res)
-                                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
-                                        |ui| {
-                                            ui.label(make_text(res_str));
-                                        },
+                                        egui::UiBuilder::new().max_rect(r_res).layout(egui::Layout::right_to_left(egui::Align::Center)),
+                                        |ui| { ui.label(make_text(res_str)); },
                                     );
                                 }
                                 current_y += file_row_total_h;
