@@ -6,6 +6,7 @@ license = "GPL-3.0"
 authors = ["Sami Farin"]
 
 [dependencies]
+anyhow = "1.0"
 blake3 = "1.5"
 chacha20poly1305 = "0.10"
 chrono = "0.4"
@@ -16,6 +17,7 @@ crossbeam-channel = "0.5"
 crossterm = "0.29"
 dirs = "6"
 fast_image_resize = "5.4"
+filetime = "0.2.26"
 flate2 = { version = "1.1", features = ["zlib-ng"], default-features = false }
 geo = { version = "0.32", features = ["serde"] }
 getrandom = "0.3.4"
@@ -26,9 +28,11 @@ jemallocator = "0.5"
 jiff = { version = "0.2", features = ["serde"] }
 jpeg-decoder = "0.3.2"
 kamadak-exif = "0.6.1"
+libc = "0.2"
 libheif-rs = { version = "2.5", features = ["image"] }
 lmdb-rkv = { git = "https://github.com/Safari77/lmdb-rs-mozilla" }
 natord = "1.0.9"
+nix = { version = "0", features = ["fs", "user"] }
 rand = "0.9"
 ratatui = "0.29"
 rayon = "1.11.0"
@@ -44,6 +48,7 @@ trash = "5.2"
 tzf-rs = "1.1"
 unicode-width = "0.2"
 walkdir = "2.5.0"
+xattr = "1.6"
 zerocopy = "0.8.31"
 zune-jpeg = "0.4"
 
