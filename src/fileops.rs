@@ -96,15 +96,15 @@ fn atomic_copy_move(src: &Path, dst: &Path) -> std::io::Result<()> {
     // Copy Data
     std::io::copy(&mut reader, &mut writer)?;
 
-    // Restore Permissions (Best Effort)
-    let mut perms = metadata.permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Restore Permissions (Best Effort)
+        let mut perms = metadata.permissions();
         perms = std::fs::Permissions::from_mode(perms.mode());
-    }
-    if let Err(e) = std::fs::set_permissions(dst, perms) {
-        eprintln!("[WARN] Failed to restore permissions on {:?}: {}", dst, e);
+        if let Err(e) = std::fs::set_permissions(dst, perms) {
+            eprintln!("[WARN] Failed to restore permissions on {:?}: {}", dst, e);
+        }
     }
 
     // Restore Timestamps (mtime, atime)
