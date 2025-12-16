@@ -19,6 +19,8 @@ FILE OPERATIONS
 Space                : Toggle "Mark" status (for bulk deletion/moving)
 D                    : Execute deletion of ALL marked files (with confirm)
 M                    : Move ALL marked files to target dir (with confirm)
+                       Use --move-marked parameter or enter dest directory
+                       when prompted.
 Delete               : Delete the currently selected file immediately
 R                    : Rename the currently selected file
 Ctrl + L             : Reload/Rescan the file list

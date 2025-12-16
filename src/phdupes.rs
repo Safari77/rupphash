@@ -25,6 +25,7 @@ mod ui;
 mod gui;
 mod state;
 mod scanner;
+mod fileops;
 mod hamminghash;
 #[allow(unused)]
 mod helper_exif;

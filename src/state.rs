@@ -1,9 +1,11 @@
 use std::path::{PathBuf, Path};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use regex::RegexBuilder;
+
 use crate::{FileMetadata, GroupInfo};
 use crate::scanner::{analyze_group, sort_files};
-use regex::RegexBuilder;
+use crate::fileops;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputIntent {
@@ -770,43 +772,36 @@ impl AppState {
             return;
         };
 
-        if self.marked_for_deletion.is_empty() { return; }
+        let paths_to_move = if self.marked_for_deletion.is_empty() {
+            if let Some(p) = self.get_current_image_path() {
+                vec![p.clone()]
+            } else {
+                return; // Should be handled by InputIntent check, but safety check here
+            }
+        } else {
+            self.marked_for_deletion.clone()
+        };
 
+        if paths_to_move.is_empty() { return; }
         let mut success_count = 0;
         let mut failed_paths = HashSet::new();
-        let paths_to_move = self.marked_for_deletion.clone();
         let mut error_details = Vec::new();
 
         for path in &paths_to_move {
             let filename = path.file_name().unwrap_or_default();
             let dest = target_dir.join(filename);
 
-            // Check if destination exists
-            if dest.exists() {
-                error_details.push(format!("• {:?}: destination exists", filename));
-                failed_paths.insert(path.clone());
-                continue;
-            }
-
-            match fs::rename(path, &dest) {
+            match fileops::perform_atomic_move(path, &dest) {
                 Ok(_) => {
                     success_count += 1;
                 },
-                Err(_) => {
-                    // Try copy + delete if rename fails (cross-device)
-                    match fs::copy(path, &dest).and_then(|_| fs::remove_file(path)) {
-                        Ok(_) => success_count += 1,
-                        Err(e2) => {
-                            // Clean up partial copy
-                            let _ = fs::remove_file(&dest);
-                            error_details.push(format!("• {:?}: {}", filename, e2));
-                            failed_paths.insert(path.clone());
-                        }
-                    }
+                Err(e) => {
+                    // e is now a standard std::io::Error with a descriptive message
+                    error_details.push(format!("• {:?}: {}", filename, e));
+                    failed_paths.insert(path.clone());
                 }
             }
         }
-
         self.marked_for_deletion.retain(|p| failed_paths.contains(p));
 
         if success_count > 0 {
@@ -859,6 +854,7 @@ impl AppState {
         }
     }
 }
+
 
 /// Returns a map of (dev, ino) -> Vec<&FileMetadata> for files that are hardlinked
 pub fn get_hardlink_groups(group: &[FileMetadata]) -> HashMap<(u64, u64), Vec<usize>> {

@@ -6,6 +6,7 @@ use crate::format_relative_time;
 use jiff::Timestamp;
 use std::cell::RefCell;
 use std::fs;
+use std::path::Path;
 
 use super::app::GuiApp;
 use super::image::{ViewMode, GroupViewState};
@@ -18,6 +19,10 @@ pub(super) fn handle_input(
     force_panel_resize: &mut bool) {
     // Input handling
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+         if app.show_move_input {
+            app.show_move_input = false;
+            return;
+        }
         if app.show_dir_picker {
             app.show_dir_picker = false;
         } else if app.state.show_search {
@@ -30,6 +35,9 @@ pub(super) fn handle_input(
     // Ctrl+Q to quit (triggers on_exit to save window size)
     if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Q)) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+    if app.show_move_input {
+        return;
     }
 
     // Directory picker navigation
@@ -69,7 +77,8 @@ pub(super) fn handle_input(
             && let Some(selected_dir) = app.dir_list.get(app.dir_picker_selection).cloned() {
                 app.show_dir_picker = false;
                 app.change_directory(selected_dir);
-            }
+        }
+        return;
     } else if !app.state.is_loading && app.state.renaming.is_none() && !app.state.show_sort_selection && !app.state.show_search {
         // Calculate total directory count (parent + subdirs) for view mode navigation
         let has_parent = app.state.view_mode && app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
@@ -265,7 +274,34 @@ pub(super) fn handle_input(
         if ctx.input(|i| i.key_pressed(egui::Key::X)) { *intent.borrow_mut() = Some(InputIntent::ToggleZoomRelative); }
         if ctx.input(|i| i.key_pressed(egui::Key::P)) { *intent.borrow_mut() = Some(InputIntent::TogglePathVisibility); }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) { *intent.borrow_mut() = Some(InputIntent::DeleteImmediate); }
-        if ctx.input(|i| i.key_pressed(egui::Key::M)) { *intent.borrow_mut() = Some(InputIntent::MoveMarked); }
+        // Intercept MoveMarked intent or Key::M
+        if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+            // Check if there is anything to move at all.
+            // We need either Marked Files OR a Current File (fallback).
+            let has_marked = !app.state.marked_for_deletion.is_empty();
+            let has_current = app.state.get_current_image_path().is_some();
+
+            if !has_marked && !has_current {
+                // Nothing to move. Show status immediately.
+                app.state.status_message = Some(("No files marked and no file selected.".to_string(), true));
+                app.status_set_time = Some(std::time::Instant::now());
+            } else {
+                // Allow Shift+M to force editing the target even if set
+                let force_edit = ctx.input(|i| i.modifiers.shift);
+
+                if app.state.move_target.is_some() && !force_edit {
+                    *intent.borrow_mut() = Some(InputIntent::MoveMarked);
+                } else {
+                    app.show_move_input = true;
+                    // Pre-fill with existing target if we have one
+                    if let Some(ref current) = app.state.move_target {
+                        app.move_input = current.to_string_lossy().to_string();
+                    } else {
+                        app.move_input.clear();
+                    }
+                }
+            }
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::S)) { *intent.borrow_mut() = Some(InputIntent::ToggleSlideshow); }
         if ctx.input(|i| i.key_pressed(egui::Key::F)) { *intent.borrow_mut() = Some(InputIntent::ToggleFullscreen); }
         if ctx.input(|i| i.key_pressed(egui::Key::O)) { *intent.borrow_mut() = Some(InputIntent::RotateCW); }
@@ -412,15 +448,147 @@ pub(super) fn handle_dialogs(app: &mut GuiApp, ctx: &egui::Context, force_panel_
     if app.state.show_move_confirmation {
         if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
             app.state.handle_input(InputIntent::ConfirmMoveMarked);
+            app.cache_dirty = true;
         } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
             app.state.handle_input(InputIntent::Cancel);
         }
         egui::Window::new("Confirm Move").collapsible(false).show(ctx, |ui| {
             let target = app.state.move_target.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-            ui.label(format!("Move marked files to:\n{}", target));
-            if ui.button("Yes (y)").clicked() { app.state.handle_input(InputIntent::ConfirmMoveMarked); app.cache_dirty = true; }
-            if ui.button("No (n)").clicked() { app.state.handle_input(InputIntent::Cancel); }
+
+            let msg = if app.state.marked_for_deletion.is_empty() {
+                if let Some(p) = app.state.get_current_image_path() {
+                    let name = p.file_name().unwrap_or_default().to_string_lossy();
+                    format!("Move current file '{}' to:\n{}", name, target)
+                } else {
+                    format!("Move 0 files to:\n{}", target)
+                }
+            } else {
+                format!("Move {} marked files to:\n{}", app.state.marked_for_deletion.len(), target)
+            };
+
+            ui.label(msg);
+            ui.horizontal(|ui| {
+                if ui.button("Yes (y)").clicked() {
+                    app.state.handle_input(InputIntent::ConfirmMoveMarked);
+                    app.cache_dirty = true;
+                }
+                if ui.button("No (n)").clicked() {
+                    app.state.handle_input(InputIntent::Cancel);
+                }
+
+                // Add "Change Target" button
+                if ui.button("Change Target...").clicked() {
+                    // Close this confirmation
+                    app.state.show_move_confirmation = false;
+                    // Open input dialog
+                    app.show_move_input = true;
+                    // Pre-fill input with the bad target so it can be edited
+                    app.move_input = target;
+                }
+            });
         });
+    }
+
+    // Move Input Dialog
+    if app.show_move_input {
+        let mut submit = false;
+        let mut cancel = false;
+        let mut request_focus_back = false;
+
+        egui::Window::new("Move to Directory")
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("Enter destination directory:");
+
+                // Color logic: RED if directory doesn't exist, Default (text color) otherwise
+                let path_exists = Path::new(&app.move_input).is_dir();
+                let text_color = if !path_exists && !app.move_input.is_empty() {
+                    egui::Color32::RED
+                } else {
+                    ui.visuals().text_color()
+                };
+
+                let res = ui.add(
+                    egui::TextEdit::singleline(&mut app.move_input)
+                    .text_color(text_color)
+                    .desired_width(300.0)
+                );
+
+                if !app.state.show_sort_selection && !app.state.show_confirmation {
+                    res.request_focus();
+                }
+
+                // Tab Completion (DIRECTORIES ONLY)
+                if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                    request_focus_back = true;
+                    let path_buf = std::path::PathBuf::from(&app.move_input);
+                    let (parent, prefix) = if app.move_input.ends_with(std::path::MAIN_SEPARATOR) {
+                        (Some(path_buf.as_path()), "".to_string())
+                    } else {
+                        (path_buf.parent(), path_buf.file_name().unwrap_or_default().to_string_lossy().to_string())
+                    };
+
+                    if let Some(parent_dir) = parent {
+                        // Check if we need to refresh candidates
+                        let prev_idx = if !app.move_completion_candidates.is_empty() {
+                            (app.move_completion_index + app.move_completion_candidates.len() - 1) % app.move_completion_candidates.len()
+                        } else { 0 };
+
+                        let input_matches_candidate = !app.move_completion_candidates.is_empty()
+                            && app.move_completion_candidates[prev_idx] == app.move_input;
+
+                        if app.move_completion_candidates.is_empty() || !input_matches_candidate {
+                            app.move_completion_candidates.clear();
+                            app.move_completion_index = 0;
+                            if let Ok(entries) = fs::read_dir(parent_dir) {
+                                for entry in entries.flatten() {
+                                    // Filter: ONLY DIRECTORIES
+                                    if let Ok(ft) = entry.file_type() {
+                                        if ft.is_dir() {
+                                            let name = entry.path().to_string_lossy().to_string();
+                                            if name.starts_with(&app.move_input) || entry.file_name().to_string_lossy().starts_with(&prefix) {
+                                                // Store full path for convenience
+                                                app.move_completion_candidates.push(name);
+                                            }
+                                        }
+                                    }
+                                }
+                                app.move_completion_candidates.sort();
+                            }
+                        }
+
+                        if !app.move_completion_candidates.is_empty() {
+                            app.move_input = app.move_completion_candidates[app.move_completion_index].clone();
+                            app.move_completion_index = (app.move_completion_index + 1) % app.move_completion_candidates.len();
+                        }
+                    }
+                }
+
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) { submit = true; }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) { cancel = true; }
+
+                if request_focus_back { res.request_focus(); }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Move Here").clicked() { submit = true; }
+                    if ui.button("Cancel").clicked() { cancel = true; }
+                });
+            });
+
+        if submit {
+            let target_path = std::path::PathBuf::from(&app.move_input);
+            if target_path.is_dir() {
+                // Set the target and trigger the standard confirmation flow
+                app.state.move_target = Some(target_path);
+                app.show_move_input = false;
+                app.state.handle_input(InputIntent::MoveMarked);
+            } else {
+                app.state.error_popup = Some("Target is not a valid directory.".to_string());
+            }
+        }
+        if cancel {
+            app.show_move_input = false;
+        }
     }
 
     // Search Dialog with Fixes

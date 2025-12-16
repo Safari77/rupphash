@@ -3,9 +3,8 @@ use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_c
 use crate::format_relative_time;
 use crate::GroupStatus;
 use crate::db::AppContext;
-use crate::scanner::{self, ScanConfig, is_raw_ext};
+use crate::scanner::{self, ScanConfig};
 use crate::{FileMetadata, GroupInfo};
-use crate::position;
 use chrono;
 use jiff::Timestamp;
 use std::collections::{HashMap, HashSet};
@@ -14,8 +13,6 @@ use std::thread;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::cell::RefCell;
 use std::fs;
-use std::path::Path;
-use std::f32::consts::PI;
 
 use super::image::{ViewMode, GroupViewState};
 
@@ -34,6 +31,10 @@ pub struct GuiApp {
     pub(super) scan_progress: (usize, usize),
 
     pub(super) rename_input: String,
+    pub(super) show_move_input: bool,
+    pub(super) move_input: String,
+    pub(super) move_completion_candidates: Vec<String>,
+    pub(super) move_completion_index: usize,
     pub(super) last_preload_pos: Option<(usize, usize)>,
     pub(super) status_set_time: Option<std::time::Instant>,
     pub(super) slideshow_last_advance: Option<std::time::Instant>,
@@ -139,6 +140,10 @@ impl GuiApp {
             scan_progress_rx: None,
             scan_progress: (0, 0),
             rename_input: String::new(),
+            show_move_input: false,
+            move_input: String::new(),
+            move_completion_candidates: Vec::new(),
+            move_completion_index: 0,
             last_preload_pos: None,
             status_set_time: None,
             slideshow_last_advance: None,
@@ -249,6 +254,10 @@ impl GuiApp {
             scan_progress_rx: None,
             scan_progress: (0, 0),
             rename_input: String::new(),
+            show_move_input: false,
+            move_input: String::new(),
+            move_completion_candidates: Vec::new(),
+            move_completion_index: 0,
             last_preload_pos: None,
             status_set_time: None,
             slideshow_last_advance: None,

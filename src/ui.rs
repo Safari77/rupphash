@@ -22,6 +22,10 @@ pub struct TuiApp {
     list_state: ListState,
     view_height: usize,
     rename_buffer: String,
+    show_move_input: bool,
+    move_buffer: String,
+    move_completion_candidates: Vec<String>,
+    move_completion_index: usize,
     search_buffer: String,
     // Completion state
     completion_candidates: Vec<String>,
@@ -39,6 +43,10 @@ impl TuiApp {
             list_state,
             view_height: 0,
             rename_buffer: String::new(),
+            show_move_input: false,
+            move_buffer: String::new(),
+            move_completion_candidates: Vec::new(),
+            move_completion_index: 0,
             search_buffer: String::new(),
             completion_candidates: Vec::new(),
             completion_index: 0,
@@ -91,13 +99,76 @@ impl TuiApp {
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
-        // 1. Error Popup
+        // Error Popup
         if self.state.error_popup.is_some() {
             self.state.handle_input(InputIntent::Cancel);
             return;
         }
 
-        // 2. Renaming Input
+        // Move
+        if self.show_move_input {
+            match code {
+                KeyCode::Esc => {
+                    self.show_move_input = false;
+                    self.move_buffer.clear();
+                }
+                KeyCode::Enter => {
+                    let path = std::path::PathBuf::from(&self.move_buffer);
+                    if path.is_dir() {
+                        self.state.move_target = Some(path);
+                        self.show_move_input = false;
+                        self.state.handle_input(InputIntent::MoveMarked);
+                    } else {
+                        // Flash error or set error state
+                    }
+                }
+                KeyCode::Backspace => { self.move_buffer.pop(); }
+                KeyCode::Char(c) => { self.move_buffer.push(c); }
+                KeyCode::Tab => {
+                    // Similar Directory-Only Completion Logic as GUI
+                    let path_buf = std::path::PathBuf::from(&self.move_buffer);
+                    let (parent, prefix) = if self.move_buffer.ends_with(std::path::MAIN_SEPARATOR) {
+                        (Some(path_buf.as_path()), "".to_string())
+                    } else {
+                         (path_buf.parent(), path_buf.file_name().unwrap_or_default().to_string_lossy().to_string())
+                    };
+
+                    if let Some(parent_dir) = parent {
+                        let prev_idx = if !self.move_completion_candidates.is_empty() {
+                            (self.move_completion_index + self.move_completion_candidates.len() - 1) % self.move_completion_candidates.len()
+                        } else { 0 };
+                        let match_candidate = !self.move_completion_candidates.is_empty() && self.move_completion_candidates[prev_idx] == self.move_buffer;
+
+                        if self.move_completion_candidates.is_empty() || !match_candidate {
+                             self.move_completion_candidates.clear();
+                             self.move_completion_index = 0;
+                             if let Ok(entries) = fs::read_dir(parent_dir) {
+                                 for entry in entries.flatten() {
+                                     if let Ok(ft) = entry.file_type() {
+                                         if ft.is_dir() {
+                                             let name = entry.path().to_string_lossy().to_string();
+                                              // Basic prefix check
+                                             if name.starts_with(&self.move_buffer) || entry.file_name().to_string_lossy().starts_with(&prefix) {
+                                                  self.move_completion_candidates.push(name);
+                                             }
+                                         }
+                                     }
+                                 }
+                                 self.move_completion_candidates.sort();
+                             }
+                        }
+                        if !self.move_completion_candidates.is_empty() {
+                            self.move_buffer = self.move_completion_candidates[self.move_completion_index].clone();
+                            self.move_completion_index = (self.move_completion_index + 1) % self.move_completion_candidates.len();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Renaming Input
         if self.state.renaming.is_some() {
             match code {
                 KeyCode::Esc => {
@@ -255,7 +326,15 @@ impl TuiApp {
 
             KeyCode::Char(' ') => Some(InputIntent::ToggleMark),
             KeyCode::Char('d') | KeyCode::Delete => Some(InputIntent::ExecuteDelete),
-            KeyCode::Char('m') => Some(InputIntent::MoveMarked),
+            KeyCode::Char('m') => {
+                 if self.state.move_target.is_some() {
+                     Some(InputIntent::MoveMarked)
+                 } else {
+                     self.show_move_input = true;
+                     self.move_buffer.clear();
+                     None
+                 }
+            },
             KeyCode::Char('r') => {
                 // Pre-fill buffer with current filename
                 if let Some(path) = self.state.get_current_image_path() {
