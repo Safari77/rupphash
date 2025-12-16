@@ -365,7 +365,14 @@ pub(super) fn handle_dialogs(app: &mut GuiApp, ctx: &egui::Context, force_panel_
                 ViewMode::ManualZoom(_) => ViewMode::FitWindow,
                 _ => ViewMode::ManualZoom(1.0),
             }; }); },
-            InputIntent::StartRename => { if let Some(path) = app.state.get_current_image_path() { app.rename_input = path.file_name().unwrap_or_default().to_string_lossy().to_string(); app.state.handle_input(i); } },
+            InputIntent::StartRename => {
+                if let Some(path) = app.state.get_current_image_path() {
+                    app.rename_input = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    app.completion_candidates.clear();
+                    app.completion_index = 0;
+                    app.state.handle_input(i);
+                }
+            },
             _ => app.state.handle_input(i),
         }
     }
