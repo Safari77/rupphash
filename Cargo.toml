@@ -24,7 +24,6 @@ getrandom = "0.3.4"
 hex = "0.4"
 image-extras = { git = "https://github.com/image-rs/image-extras", branch = "main" }
 image = { version = "0.25", features = ["avif-native"] }
-jemallocator = "0.5"
 jiff = { version = "0.2", features = ["serde"] }
 jpeg-decoder = "0.3.2"
 kamadak-exif = "0.6.1"
@@ -48,7 +47,6 @@ trash = "5.2"
 tzf-rs = "1.1"
 unicode-width = "0.2"
 walkdir = "2.5.0"
-xattr = "1.6"
 zerocopy = "0.8.31"
 zune-jpeg = "0.4"
 
@@ -75,3 +73,6 @@ path = "src/phash_test.rs"
 name = "position_test"
 path = "src/position_test.rs"
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+jemallocator = "0.5"
+xattr = "1.6"
