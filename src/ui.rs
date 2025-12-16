@@ -1,5 +1,6 @@
 use std::io::{self, Stdout};
 use std::time::Duration;
+use std::fs; // Added for directory scanning
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -22,6 +23,9 @@ pub struct TuiApp {
     view_height: usize,
     rename_buffer: String,
     search_buffer: String,
+    // Completion state
+    completion_candidates: Vec<String>,
+    completion_index: usize,
 }
 
 impl TuiApp {
@@ -36,6 +40,8 @@ impl TuiApp {
             view_height: 0,
             rename_buffer: String::new(),
             search_buffer: String::new(),
+            completion_candidates: Vec::new(),
+            completion_index: 0,
         }
     }
 
@@ -97,16 +103,56 @@ impl TuiApp {
                 KeyCode::Esc => {
                     self.state.handle_input(InputIntent::Cancel);
                     self.rename_buffer.clear();
+                    self.completion_candidates.clear();
                 }
                 KeyCode::Enter => {
                     self.state.handle_input(InputIntent::SubmitRename(self.rename_buffer.clone()));
                     self.rename_buffer.clear();
+                    self.completion_candidates.clear();
                 }
                 KeyCode::Backspace => {
                     self.rename_buffer.pop();
                 }
                 KeyCode::Char(c) => {
                     self.rename_buffer.push(c);
+                }
+                KeyCode::Tab => {
+                    let parent = if let Some(state) = &self.state.renaming {
+                        state.original_path.parent().map(|p| p.to_path_buf())
+                    } else { None };
+
+                    if let Some(parent_dir) = parent {
+                        // Calculate previous index to check if input matches what we last auto-completed
+                        let prev_idx = if !self.completion_candidates.is_empty() {
+                            (self.completion_index + self.completion_candidates.len() - 1) % self.completion_candidates.len()
+                        } else { 0 };
+
+                        // Check if the current input matches the candidate we just showed.
+                        let input_matches_candidate = !self.completion_candidates.is_empty()
+                            && self.completion_candidates[prev_idx] == self.rename_buffer;
+
+                        // If empty or user typed something new, scan for new candidates
+                        if self.completion_candidates.is_empty() || !input_matches_candidate {
+                            self.completion_candidates.clear();
+                            self.completion_index = 0;
+                            if let Ok(entries) = fs::read_dir(&parent_dir) {
+                                let prefix = self.rename_buffer.clone();
+                                for entry in entries.flatten() {
+                                    let name = entry.file_name().to_string_lossy().to_string();
+                                    if name.starts_with(&prefix) {
+                                        self.completion_candidates.push(name);
+                                    }
+                                }
+                                self.completion_candidates.sort();
+                            }
+                        }
+
+                        // Apply the next completion
+                        if !self.completion_candidates.is_empty() {
+                            self.rename_buffer = self.completion_candidates[self.completion_index].clone();
+                            self.completion_index = (self.completion_index + 1) % self.completion_candidates.len();
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -215,6 +261,9 @@ impl TuiApp {
                 if let Some(path) = self.state.get_current_image_path() {
                     self.rename_buffer = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 }
+                // Clear any old completion state
+                self.completion_candidates.clear();
+                self.completion_index = 0;
                 Some(InputIntent::StartRename)
             },
                         KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
