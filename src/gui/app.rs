@@ -1418,7 +1418,15 @@ impl eframe::App for GuiApp {
 
                         // Execute Context Menu Actions (Outside Loop)
                         if let Some(path) = copy_path_target { ctx.copy_text(path); }
-                        if action_rename { self.state.handle_input(InputIntent::StartRename); }
+                        if action_rename {
+                            if let Some(path) = self.state.get_current_image_path() {
+                                self.rename_input = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            }
+                            self.completion_candidates.clear();
+                            self.completion_index = 0;
+                            self.state.handle_input(InputIntent::StartRename);
+                        }
+
                         if action_delete { self.state.handle_input(InputIntent::ExecuteDelete); }
 
                         // Defer directory change to avoid borrow conflict
