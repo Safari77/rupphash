@@ -644,6 +644,7 @@ impl GuiApp {
         eprintln!("[DEBUG-RUN] self.panel_width at run() = {}", self.panel_width);
 
         let options = eframe::NativeOptions {
+            renderer: eframe::Renderer::Wgpu,
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([width, height])
                 .with_decorations(false),
@@ -675,7 +676,7 @@ impl GuiApp {
         }))
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         eprintln!("[DEBUG-EXIT] on_exit called");
         eprintln!("[DEBUG-EXIT] last_window_size = {:?}", self.last_window_size);
         eprintln!("[DEBUG-EXIT] panel_width = {}", self.panel_width);
