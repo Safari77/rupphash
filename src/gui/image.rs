@@ -80,31 +80,38 @@ fn load_and_process_image(path: &std::path::Path, use_thumbnails: bool) -> Optio
             eprintln!("[DEBUG] load_and_process_image RAW exif_orientation={}", exif_orientation);
 
             if let Ok(mut raw) = rsraw::RawImage::open(&data) {
-                    let dims = (raw.width() as u32, raw.height() as u32);
+                let dims = (raw.width() as u32, raw.height() as u32);
+                // 1. Attempt to get a thumbnail first
+                let maybe_thumb = if use_thumbnails {
+                    extract_best_thumbnail(&mut raw)
+                } else {
+                    None
+                };
 
-                    // Try Thumbnail
-                    if use_thumbnails {
-                        if let Some(thumb) = extract_best_thumbnail(&mut raw) {
-                         // Thumbnails are extracted as-is (not rotated by rsraw),
-                         // so we need to apply EXIF orientation during rendering
-                         eprintln!("[DEBUG] load_and_process_image RAW using thumbnail, applying exif_orientation={}", exif_orientation);
-                         return Some((thumb, dims, exif_orientation));
-                        }
-                    }
-                    // Full Decode - rsraw applies rotation automatically,
-                    // so we return orientation=1 (no additional rotation needed)
+                // 2. Decide: Use Thumbnail OR Fallback to Full Decode
+                if let Some(thumb) = maybe_thumb {
+                    eprintln!("[DEBUG] RAW using thumbnail, applying exif_orientation={}", exif_orientation);
+                    // SUCCESS (Thumbnail): Return tuple to 'let', falling through to resize
+                    (thumb, dims, exif_orientation)
+                } else {
+                    // FALLBACK: Full Decode
                     raw.set_use_camera_wb(true);
                     if raw.unpack().is_ok() {
-                    if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
-                        let w = processed.width() as usize;
-                        let h = processed.height() as usize;
-                        if processed.len() == w * h * 3 {
-                            eprintln!("[DEBUG] load_and_process_image RAW full decode, orientation=1 (rsraw rotates)");
-                            return Some((egui::ColorImage::from_rgb([w, h], &processed), dims, 1));
-                        }
-                    }
+                        if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
+                            let w = processed.width() as usize;
+                            let h = processed.height() as usize;
+                            if processed.len() == w * h * 3 {
+                                eprintln!("[DEBUG] RAW full decode, orientation=1");
+                                // SUCCESS (Full Decode): Return tuple to 'let', falling through to resize
+                                (
+                                    egui::ColorImage::from_rgb([w, h], &processed),
+                                    dims,
+                                    1 // rsraw handles rotation
+                                )
+                            } else { return None; }
+                        } else { return None; }
+                    } else { return None; }
                 }
-                return None;
             } else { return None; }
         } else { return None; }
     } else {
