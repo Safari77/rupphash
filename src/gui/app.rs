@@ -17,6 +17,7 @@ use std::fs;
 use super::image::{ViewMode, GroupViewState};
 
 use crate::gui::APP_TITLE;
+use crate::gui::image::MAX_TEXTURE_SIDE;
 
 pub struct GuiApp {
     pub(super) state: AppState,
@@ -1350,7 +1351,14 @@ impl eframe::App for GuiApp {
                                     } else {
                                         file.modified.format("%Y-%m-%d %H:%M:%S").to_string()
                                     };
-                                    let res_str = file.resolution.map(|(w, h)| format!("{}x{}  ", w, h)).unwrap_or_default();
+                                    let res_str = file.resolution.map(|(w, h)| {
+                                        if w > MAX_TEXTURE_SIDE.try_into().unwrap()
+                                            || h > MAX_TEXTURE_SIDE.try_into().unwrap() {
+                                            format!("<{}x{}  ", w, h)
+                                        } else {
+                                            format!(" {}x{}  ", w, h)
+                                        }
+                                    }).unwrap_or_default();
 
                                     let w_meta = meta_rect.width();
                                     let h_meta = meta_rect.height();

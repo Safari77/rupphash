@@ -13,6 +13,8 @@ use fast_image_resize::{Resizer, ResizeOptions, PixelType};
 use super::app::GuiApp;
 use crate::scanner;
 
+pub const MAX_TEXTURE_SIDE: usize = 8192;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[derive(Default)]
 pub(super) enum ViewMode {
@@ -147,7 +149,6 @@ fn load_and_process_image(path: &std::path::Path, use_thumbnails: bool) -> Optio
     };
 
     // --- STEP 2: FAST RESIZING (AVX2/SIMD) ---
-    const MAX_TEXTURE_SIDE: usize = 8192;
     let w = color_image.width();
     let h = color_image.height();
 
