@@ -268,7 +268,7 @@ impl AppContext {
         // 1. Content Key: For blinding file content (keyed hash)
         let content_key = blake3::derive_key("phdupes:content_key", &master_key_bytes);
 
-        // 2. Meta Key: For blinding metadata (mtime/inode)
+        // 2. Meta Key: For blinding metadata (mtime/unique_file_id)
         let meta_key = blake3::derive_key("phdupes:meta_key", &master_key_bytes);
 
         // 3. Encryption Key: For ChaCha20Poly1305 database encryption
@@ -613,7 +613,10 @@ impl AppContext {
                         if let Some(up) = p { pixel_updates.push(up); }
                     },
                     Err(RecvTimeoutError::Disconnected) => {
-                        let _ = Self::write_batch(&cipher, &env, meta_db, hash_db, feature_db, pixel_db, &meta_updates, &hash_updates, &feature_updates, &pixel_updates);
+                        if let Err(e) = Self::write_batch(&cipher, &env, meta_db, hash_db,
+                            feature_db, pixel_db, &meta_updates, &hash_updates, &feature_updates, &pixel_updates) {
+                            eprintln!("[ERROR-DB] Final write_batch failed: {:?}", e);
+                        }
                         break;
                     },
                     _ => {}
@@ -622,14 +625,20 @@ impl AppContext {
                 if (last_flush.elapsed() >= flush_interval || meta_updates.len() >= max_buffer || hash_updates.len() >= max_buffer || feature_updates.len() >= max_buffer || pixel_updates.len() >= max_buffer)
                     && (!meta_updates.is_empty() || !hash_updates.is_empty()
                         || !feature_updates.is_empty()) || !pixel_updates.is_empty() {
-                        if Self::write_batch(&cipher, &env, meta_db, hash_db, feature_db, pixel_db, &meta_updates, &hash_updates, &feature_updates, &pixel_updates).is_ok() {
-                            meta_updates.clear();
-                            hash_updates.clear();
-                            feature_updates.clear();
-                            pixel_updates.clear();
+                        match Self::write_batch(&cipher, &env, meta_db, hash_db, feature_db, pixel_db, &meta_updates, &hash_updates, &feature_updates, &pixel_updates) {
+                            Ok(()) => {
+                                meta_updates.clear();
+                                hash_updates.clear();
+                                feature_updates.clear();
+                                pixel_updates.clear();
+                            }
+                            Err(e) => {
+                                eprintln!("[ERROR-DB] write_batch failed: {:?}", e);
+                                // Don't clear - will retry on next flush
+                            }
                         }
                         last_flush = Instant::now();
-                    }
+                }
             }
         })
     }
