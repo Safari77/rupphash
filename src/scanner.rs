@@ -642,16 +642,16 @@ pub fn scan_and_group(
         let mtime = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
         let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
         let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-        let unique_file_id = fileops::get_file_key(&path);
+        let unique_file_id = fileops::get_file_key(&path)?;
 
         let mut mh = blake3::Hasher::new_keyed(&ctx_ref.meta_key);
         mh.update(&mtime_ns.to_le_bytes());
         mh.update(&size.to_le_bytes());
         // Bind to filesystem identity (dev, inode) - survives renames
         mh.update(&unique_file_id.to_le_bytes());
-
         let meta_key: [u8; 32] = *mh.finalize().as_bytes();
-
+        eprintln!("[DEBUG] mtime_ns/size/unique_file_id {} = {} {} {}",
+            path.display(), mtime_ns, size, unique_file_id);
         let mut phash: Option<u64> = None;
         let mut pdqhash: Option<[u8; 32]> = None;
         let mut pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>> = None;
@@ -1538,7 +1538,7 @@ pub fn scan_for_view(
             let orientation = get_orientation(path, None);
             eprintln!("[DEBUG-SCAN] scan_for_view get_orientation={} for {:?}", orientation, path.file_name().unwrap_or_default());
 
-            let unique_file_id = get_file_key(path);
+            let unique_file_id = get_file_key(path)?;
 
             Some(FileMetadata {
                 path: path.clone(),
