@@ -430,9 +430,7 @@ impl TuiApp {
                 let is_marked = self.state.marked_for_deletion.contains(&file.path);
                 let is_selected = g_idx == self.state.current_group_idx && f_idx == self.state.current_file_idx;
                 let is_bit_identical = *counts.get(&file.content_hash).unwrap_or(&0) > 1;
-                let is_hardlinked = file.dev_inode
-                    .map(|di| hardlink_groups.contains_key(&di))
-                    .unwrap_or(false);
+                let is_hardlinked = hardlink_groups.contains_key(&file.unique_file_id);
 
                 let style = if is_selected {
                     Style::default().fg(Color::Blue)

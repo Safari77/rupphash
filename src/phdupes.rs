@@ -42,7 +42,7 @@ pub struct FileMetadata {
     pub content_hash: [u8; 32],
     pub pixel_hash: Option<[u8; 32]>,
     pub orientation: u8, // Added: EXIF orientation (1-8)
-    pub dev_inode: Option<(u64, u64)>,
+    pub unique_file_id: u128, // Always has dev+inode
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,11 +169,6 @@ struct Cli {
     /// Use PDQ hash instead of pHash for duplicate detection
     #[arg(long)]
     pdqhash: bool,
-
-    /// IGNORE device ID (treats all files as if on dev 0).
-    /// Useful for ZFS snapshots where dev ID changes but inodes stay the same.
-    #[arg(long)]
-    ignore_dev_id: bool,
 
     /// Show all supported EXIF tag names for use in exif_tags configuration
     #[arg(long)]
@@ -416,7 +411,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         group_by: sort_order.clone(),
         extensions: ctx.grouping_config.extensions.clone(),
         ignore_same_stem: ctx.grouping_config.ignore_same_stem,
-        ignore_dev_id: args.ignore_dev_id,
         calc_pixel_hash: args.pixel_hash,
     };
 

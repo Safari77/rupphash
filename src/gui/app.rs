@@ -220,7 +220,6 @@ impl GuiApp {
             group_by: sort_order.clone(),
             extensions: Vec::new(),
             ignore_same_stem: false,
-            ignore_dev_id: false,
             calc_pixel_hash: false,
         };
 
@@ -1194,9 +1193,7 @@ impl eframe::App for GuiApp {
 
                                     // Status Checks
                                     let is_bit_identical = *counts.get(&file.content_hash).unwrap_or(&0) > 1;
-                                    let is_hardlinked = file.dev_inode
-                                        .map(|di| hardlink_groups.contains_key(&di))
-                                        .unwrap_or(false);
+                                    let is_hardlinked = hardlink_groups.contains_key(&file.unique_file_id);
 
                                     // Content Group ID
                                     let content_id = file.pixel_hash.and_then(|ph| content_subgroups.get(&ph));
@@ -1285,17 +1282,17 @@ impl eframe::App for GuiApp {
                                     }
 
                                     // 2. Draw Text Content inside Header Rect
-                                    ui.allocate_ui_at_rect(header_rect, |ui| {
-                                        // We use a horizontal layout to put marker and filename side-by-side
-                                        ui.horizontal(|ui| { // XXX
-                                            // Remove spacing between items if you want them tighter
-                                            ui.spacing_mut().item_spacing.x = 0.0;
-
-                                            ui.label(marker_rich);
-                                            // Label will truncate if it hits the end of header_rect
-                                            ui.label(filename_rich);
-                                        });
-                                    });
+                                    ui.scope_builder(
+                                        egui::UiBuilder::new().max_rect(header_rect),
+                                        |ui| {
+                                            // We use a horizontal layout to put marker and filename side-by-side
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 0.0;
+                                                ui.label(marker_rich);
+                                                ui.label(filename_rich);
+                                            });
+                                    }
+                                    );
 
                                     // 3. Create Interactions
                                     // We create an invisible interaction layer over the header_rect
