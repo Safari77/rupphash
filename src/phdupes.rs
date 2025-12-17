@@ -373,6 +373,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    #[cfg(unix)]
     if args.use_trash {
         use trash::os_limited::trash_folders;
         let bins = trash_folders()?;
