@@ -669,6 +669,8 @@ pub fn scan_and_group(
         let mut new_pixel = None; // For DB update
 
         if !force_rehash && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
+            eprintln!("Cache HIT  meta_key {:x?} for {:?}",
+                hex::encode(meta_key), path.display());
             ck = ch;
             // Refresh timestamp
             new_meta = Some((meta_key, ck));
@@ -689,6 +691,7 @@ pub fn scan_and_group(
                 }
             } else if let Ok(Some(h)) = ctx_ref.get_phash(&ch) {
                 phash = Some(h);
+                cache_hit_full = true;
             }
             // If user wants pixel hash, try to fetch it from DB.
             if config.calc_pixel_hash {
@@ -702,6 +705,8 @@ pub fn scan_and_group(
         }
 
         if !cache_hit_full {
+            eprintln!("Cache MISS meta_key {:x?} for {:?}",
+                hex::encode(meta_key), path.display());
             let bytes = fs::read(path).ok();
 
             if let Some(ref b) = bytes {
@@ -720,24 +725,20 @@ pub fn scan_and_group(
 
                 if is_raw_ext(path) {
                     // RAW FILE: Extract Largest JPEG Thumbnail
-                    if config.calc_pixel_hash {
-                        if let Ok(mut raw) = rsraw::RawImage::open(b) {
-                            if let Ok(thumbs) = raw.extract_thumbs() {
-                                // Find largest JPEG thumbnail
-                                if let Some(thumb) = thumbs.into_iter()
-                                    .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
-                                        .max_by_key(|t| t.width * t.height)
-                                {
-                                    // Decode using our robust fast loader.
-                                    // We pass a dummy path to force it to treat bytes as JPEG.
-                                    img_for_hashing = load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data);
+                    // We need the image for PDQ/pHash even if pixel_hash is disabled.
+                    if let Ok(mut raw) = rsraw::RawImage::open(b) {
+                        if let Ok(thumbs) = raw.extract_thumbs() {
+                            // Find largest JPEG thumbnail
+                            if let Some(thumb) = thumbs.into_iter()
+                                .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
+                                .max_by_key(|t| t.width * t.height)
+                            {
+                                // Decode using our robust fast loader.
+                                img_for_hashing = load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data);
 
-                                    // If we got a valid image, we can also use its resolution
-                                    // if we didn't have one already (often faster than parsing headers twice)
-                                    if let Some(img) = &img_for_hashing {
-                                        if resolution.is_none() {
-                                            resolution = Some(img.dimensions());
-                                        }
+                                if let Some(img) = &img_for_hashing {
+                                    if resolution.is_none() {
+                                        resolution = Some(img.dimensions());
                                     }
                                 }
                             }
