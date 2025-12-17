@@ -419,6 +419,7 @@ impl AppContext {
                     let arr: [u8; 32] = decrypted.try_into().map_err(|_| lmdb::Error::Corrupted)?;
                     Ok(Some(arr))
                 } else {
+                    eprintln!("[ERROR-DB] get_pdqhash Corruped content_hash={:x?}", content_hash);
                     Err(lmdb::Error::Corrupted)
                 }
             },
@@ -435,10 +436,14 @@ impl AppContext {
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
                     Ok(CachedFeatures::from_bytes(&decrypted))
                 } else {
+                    eprintln!("[ERROR] get_features Corrupted ch={:x?}", content_hash);
                     Err(lmdb::Error::Corrupted)
                 }
             },
-            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(lmdb::Error::NotFound) => {
+                eprintln!("[DEBUG-DB] get_features NotFound ch={:x?}", hex::encode(content_hash));
+                Ok(None)
+            }
             Err(e) => Err(e),
         }
     }
@@ -457,6 +462,7 @@ impl AppContext {
                         Ok(Some(arr))
                     } else {
                         // Strict check: if size is wrong, it's corrupted or old format
+                        eprintln!("[ERROR] get_content_hash Corrupted mh={:x?}", meta_hash);
                         Err(lmdb::Error::Corrupted)
                     }
                 } else {

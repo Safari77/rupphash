@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use filetime::FileTime;
 use file_id::FileId;
-use std::hash::{Hasher};
 
 // Standard filename limit for most filesystems
 const MAX_FILENAME_BYTES: usize = 255;
