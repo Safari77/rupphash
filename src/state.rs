@@ -857,14 +857,14 @@ impl AppState {
 
 
 /// Returns a map of (dev, ino) -> Vec<&FileMetadata> for files that are hardlinked
-pub fn get_hardlink_groups(group: &[FileMetadata]) -> HashMap<(u64, u64), Vec<usize>> {
-    let mut groups: HashMap<(u64, u64), Vec<usize>> = HashMap::new();
+pub fn get_hardlink_groups(group: &[FileMetadata]) -> HashMap<u128, Vec<usize>> {
+    let mut groups: HashMap<u128, Vec<usize>> = HashMap::new();
+
     for (idx, f) in group.iter().enumerate() {
-        if let Some(dev_ino) = f.dev_inode {
-            groups.entry(dev_ino).or_default().push(idx);
-        }
+        groups.entry(f.unique_file_id).or_default().push(idx); 
     }
     // Only keep groups with 2+ files (actual hardlinks)
     groups.retain(|_, v| v.len() > 1);
+
     groups
 }

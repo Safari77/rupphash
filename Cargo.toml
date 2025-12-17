@@ -18,6 +18,7 @@ crossterm = "0.29"
 dirs = "6"
 fast_image_resize = "5.4"
 filetime = "0.2.26"
+file-id = "0.2.3"
 flate2 = { version = "1.1", features = ["zlib-ng"], default-features = false }
 geo = { version = "0.32", features = ["serde"] }
 getrandom = "0.3.4"

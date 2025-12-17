@@ -17,48 +17,19 @@ use zune_jpeg::JpegDecoder as ZuneDecoder;
 use jpeg_decoder::Decoder as Tier2Decoder;
 use exif::{In, Reader, Tag, Value};
 
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
-
 use crate::{FileMetadata, GroupInfo, GroupStatus};
 use crate::phash::DctPhash;
 use crate::hamminghash::{MIHIndex, HammingHash, SparseBitSet};
 use crate::db::{AppContext, HashAlgorithm, HashValue};
 use crate::helper_exif::{parse_gps_coordinate, extract_gps_lat_lon, get_altitude, get_date_str};
 use crate::position;
+use crate::fileops;
+use crate::fileops::get_file_key;
 
 pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf"];
 
 trait BufReadSeek: std::io::BufRead + std::io::Seek {}
 impl<T: std::io::BufRead + std::io::Seek> BufReadSeek for T {}
-
-// --- Identifier Helpers ---
-fn get_file_identifiers(metadata: &fs::Metadata, ignore_dev_id: bool) -> (u64, Option<(u64, u64)>) {
-    #[cfg(unix)]
-    {
-        let inode = metadata.ino();
-        let dev = if ignore_dev_id { 0 } else { metadata.dev() };
-        (inode, Some((dev, inode)))
-    }
-    #[cfg(windows)]
-    {
-        // On Windows: volume_serial_number ~ dev, file_index ~ inode
-        let idx = metadata.file_index().unwrap_or(0);
-        let vol = if ignore_dev_id { 0 } else { metadata.volume_serial_number().unwrap_or(0) as u64 };
-
-        if idx == 0 && vol == 0 {
-            (0, None)
-        } else {
-            (idx, Some((vol, idx)))
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        (0, None)
-    }
-}
 
 pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exif::Exif> {
     let mut reader: Box<dyn BufReadSeek> = match preloaded_bytes {
@@ -583,7 +554,6 @@ pub struct ScanConfig {
     pub group_by: String,
     pub extensions: Vec<String>,
     pub ignore_same_stem: bool,
-    pub ignore_dev_id: bool,
     pub calc_pixel_hash: bool,
 }
 
@@ -595,7 +565,7 @@ struct ScannedFile {
     pub resolution: Option<(u32, u32)>,
     pub content_hash: [u8; 32],
     pub orientation: u8,
-    pub dev_inode: Option<(u64, u64)>,
+    pub unique_file_id: u128,
     pub phash: Option<u64>,
     pub pdqhash: Option<[u8; 32]>,
     pub pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>>,
@@ -613,7 +583,7 @@ impl ScannedFile {
             resolution: self.resolution,
             content_hash: self.content_hash,
             orientation: self.orientation,
-            dev_inode: self.dev_inode,
+            unique_file_id: self.unique_file_id,
             pixel_hash: self.pixel_hash,
         }
     }
@@ -672,19 +642,13 @@ pub fn scan_and_group(
         let mtime = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
         let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
         let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-        let (id_hash, dev_inode) = get_file_identifiers(&metadata, config.ignore_dev_id);
+        let unique_file_id = fileops::get_file_key(&path);
 
         let mut mh = blake3::Hasher::new_keyed(&ctx_ref.meta_key);
         mh.update(&mtime_ns.to_le_bytes());
         mh.update(&size.to_le_bytes());
         // Bind to filesystem identity (dev, inode) - survives renames
-        if let Some((dev, inode)) = dev_inode {
-            mh.update(&dev.to_le_bytes());
-            mh.update(&inode.to_le_bytes());
-        } else {
-            // Fallback for platforms without inode support: use id_hash
-            mh.update(&id_hash.to_le_bytes());
-        }
+        mh.update(&unique_file_id.to_le_bytes());
 
         let meta_key: [u8; 32] = *mh.finalize().as_bytes();
 
@@ -864,7 +828,7 @@ pub fn scan_and_group(
             resolution,
             content_hash: ck,
             orientation,
-            dev_inode,
+            unique_file_id,
             phash,
             pdqhash,
             pdq_features,
@@ -877,18 +841,17 @@ pub fn scan_and_group(
 
     // Deduplicate PDQ Features for Hardlinks
     if use_pdqhash {
-        let mut feature_cache: HashMap<(u64, u64), Arc<crate::pdqhash::PdqFeatures>> = HashMap::new();
+        let mut feature_cache: HashMap<u128, Arc<crate::pdqhash::PdqFeatures>> = HashMap::new();
 
         for file in valid_files.iter_mut() {
-            if let Some(dev_inode) = file.dev_inode {
-                if let Some(features) = &file.pdq_features {
-                    if let Some(cached) = feature_cache.get(&dev_inode) {
-                        // Found existing features for this inode, reuse the pointer!
-                        file.pdq_features = Some(cached.clone());
-                    } else {
-                        // First time seeing this inode, cache it
-                        feature_cache.insert(dev_inode, features.clone());
-                    }
+            let unique_file_id = file.unique_file_id;
+            if let Some(features) = &file.pdq_features {
+                if let Some(cached) = feature_cache.get(&unique_file_id) {
+                    // Found existing features for this ID, reuse the pointer!
+                    file.pdq_features = Some(cached.clone());
+                } else {
+                    // First time seeing this ID, cache it
+                    feature_cache.insert(unique_file_id, features.clone());
                 }
             }
         }
@@ -1575,7 +1538,7 @@ pub fn scan_for_view(
             let orientation = get_orientation(path, None);
             eprintln!("[DEBUG-SCAN] scan_for_view get_orientation={} for {:?}", orientation, path.file_name().unwrap_or_default());
 
-            let (_, dev_inode) = get_file_identifiers(&metadata, false);
+            let unique_file_id = get_file_key(path);
 
             Some(FileMetadata {
                 path: path.clone(),
@@ -1587,7 +1550,7 @@ pub fn scan_for_view(
                 content_hash: [0u8; 32],
                 pixel_hash: None,
                 orientation,
-                dev_inode,
+                unique_file_id,
             })
         }).collect();
 

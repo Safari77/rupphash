@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use filetime::FileTime;
+use file_id::FileId;
 
 // Standard filename limit for most filesystems
 const MAX_FILENAME_BYTES: usize = 255;
@@ -260,4 +261,31 @@ fn truncate_str_to_byte_limit(s: &str, max_bytes: usize) -> &str {
     }
 
     &s[..end]
+}
+
+pub fn get_file_key(path: &Path) -> u128 {
+    let id = {
+        #[cfg(unix)]
+        { file_id::get_file_id(path).unwrap() }
+        #[cfg(windows)]
+        { file_id::get_high_res_file_id(path).unwrap() }
+        #[cfg(not(any(unix, windows)))]
+        { panic!("Unsupported platform") }
+    };
+
+    match id {
+        // Perfect fit: (Device << 64) | Inode
+        FileId::Inode { device_id, inode_number } => {
+            ((device_id as u128) << 64) | (inode_number as u128)
+        },
+        // LowRes: (Volume << 64) | Index
+        FileId::LowRes { volume_serial_number, file_index } => {
+            ((volume_serial_number as u128) << 64) | (file_index as u128)
+        },
+        // HighRes: XOR Volume into the upper bits of the 128-bit File ID
+        // This keeps the lower 64-bits (most entropy) pure.
+        FileId::HighRes { volume_serial_number, file_id } => {
+            file_id ^ ((volume_serial_number as u128) << 64)
+        }
+    }
 }
