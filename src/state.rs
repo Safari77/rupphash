@@ -31,7 +31,7 @@ pub enum InputIntent {
     CycleZoom,
     StartRename,
     SubmitRename(String),
-    ReloadList,
+    RefreshDirCache,
     ToggleZoomRelative,
     TogglePathVisibility,
     ToggleSlideshow,      // Pause/resume slideshow
@@ -149,6 +149,7 @@ pub struct AppState {
     pub group_by: String,
     pub ext_priorities: HashMap<String, usize>,
     pub status_message: Option<(String, bool)>,
+    pub status_set_time: Option<std::time::Instant>,
     pub show_confirmation: bool,
     pub show_move_confirmation: bool,
     pub show_delete_immediate_confirmation: bool,
@@ -201,6 +202,7 @@ impl AppState {
             group_by,
             ext_priorities,
             status_message: None,
+            status_set_time: None,
             show_confirmation: false,
             show_move_confirmation: false,
             show_delete_immediate_confirmation: false,
@@ -358,7 +360,7 @@ impl AppState {
                 }
             },
             InputIntent::SubmitRename(_) => {},
-            InputIntent::ReloadList => { self.is_loading = true; },
+            InputIntent::RefreshDirCache => {},
             InputIntent::ToggleZoomRelative => {
                 self.zoom_relative = !self.zoom_relative;
                 self.selection_changed = true;
@@ -472,8 +474,9 @@ impl AppState {
         }
     }
 
-    fn set_status(&mut self, msg: String, is_error: bool) {
+    pub fn set_status(&mut self, msg: String, is_error: bool) {
         self.status_message = Some((msg, is_error));
+        self.status_set_time = Some(std::time::Instant::now());
     }
 
     pub fn get_current_image_path(&self) -> Option<&PathBuf> {

@@ -1,23 +1,34 @@
-use eframe::egui;
-use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_content_subgroups, get_hardlink_groups};
-use crate::format_relative_time;
-use crate::GroupStatus;
-use crate::db::AppContext;
-use crate::scanner::{self, ScanConfig};
-use crate::{FileMetadata, GroupInfo};
 use chrono;
-use jiff::Timestamp;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
-use std::thread;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use eframe::egui;
+use jiff::Timestamp;
+use notify::{Watcher, RecursiveMode, RecommendedWatcher, Event, Result as NotifyResult};
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::{Arc, RwLock};
+use std::sync::mpsc::{channel, Receiver as StdReceiver};
+use std::thread;
+use std::time::{Duration, Instant}; // Added Duration/Instant
 
 use super::image::{ViewMode, GroupViewState};
 
+use crate::db::AppContext;
+use crate::{FileMetadata, GroupInfo};
+use crate::format_relative_time;
+use crate::GroupStatus;
 use crate::gui::APP_TITLE;
 use crate::gui::image::MAX_TEXTURE_SIDE;
+use crate::scanner::{self, ScanConfig};
+use crate::state::{AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_content_subgroups, get_hardlink_groups};
+
+// Define a cache struct to hold the data we previously fetched every frame
+#[derive(Clone)]
+pub struct DirCacheEntry {
+    pub path: std::path::PathBuf,
+    pub display_name: String,
+    pub modified_display: String,
+}
 
 pub struct GuiApp {
     pub(super) state: AppState,
@@ -37,7 +48,6 @@ pub struct GuiApp {
     pub(super) move_completion_candidates: Vec<String>,
     pub(super) move_completion_index: usize,
     pub(super) last_preload_pos: Option<(usize, usize)>,
-    pub(super) status_set_time: Option<std::time::Instant>,
     pub(super) slideshow_last_advance: Option<std::time::Instant>,
 
     // View mode: if Some, use scan_for_view with this sort order instead of scan_and_group
@@ -99,6 +109,18 @@ pub struct GuiApp {
     pub(super) group_y_offsets: Vec<f32>, // Cached Y position of every group
     pub(super) total_content_height: f32, // Total scrollable height
     pub(super) cache_dirty: bool,         // Flag to rebuild offsets
+                                          //
+    pub(super) watcher: Option<RecommendedWatcher>,
+    pub(super) fs_event_rx: Option<StdReceiver<NotifyResult<Event>>>,
+    pub(super) subdirs_cache: Vec<DirCacheEntry>,
+    pub(super) parent_cache: Option<DirCacheEntry>,
+
+    // --- FS Event Debouncing ---
+    pub(super) fs_mod_files: HashSet<String>,
+    pub(super) fs_mod_dirs: HashSet<String>,
+    pub(super) fs_rem_files: HashSet<String>,
+    pub(super) fs_rem_dirs: HashSet<String>,
+    pub(super) last_fs_refresh: Instant,
 }
 
 impl GuiApp {
@@ -146,7 +168,6 @@ impl GuiApp {
             move_completion_candidates: Vec::new(),
             move_completion_index: 0,
             last_preload_pos: None,
-            status_set_time: None,
             slideshow_last_advance: None,
             view_mode_sort: None,
             raw_cache: HashMap::new(),
@@ -181,6 +202,15 @@ impl GuiApp {
             group_y_offsets: Vec::new(),
             total_content_height: 0.0,
             cache_dirty: true,
+            watcher: None,
+            fs_event_rx: None,
+            subdirs_cache: Vec::new(),
+            parent_cache: None,
+            fs_mod_files: HashSet::new(),
+            fs_mod_dirs: HashSet::new(),
+            fs_rem_files: HashSet::new(),
+            fs_rem_dirs: HashSet::new(),
+            last_fs_refresh: Instant::now(),
         }
     }
 
@@ -203,19 +233,26 @@ impl GuiApp {
             HashMap::new(),
             false, // view mode doesn't use hashing
         );
-        state.is_loading = true;
+        // Don't set is_loading = true yet; we'll populate synchronously first
         state.view_mode = true;
         state.move_target = move_target;
         state.slideshow_interval = slideshow_interval;
 
-        // Determine initial directory from paths
-        let current_dir = paths.first()
+        // Canonicalize all input paths to ensure absolute paths throughout
+        let canonical_paths: Vec<String> = paths.iter()
+            .filter_map(|p| {
+                let path = std::path::Path::new(p);
+                path.canonicalize().ok().map(|c| c.to_string_lossy().to_string())
+            })
+            .collect();
+
+        // Determine initial directory from paths (use canonicalized paths)
+        let current_dir = canonical_paths.first()
             .map(std::path::PathBuf::from)
-            .and_then(|p| if p.is_dir() { Some(p) } else { p.parent().map(|p| p.to_path_buf()) })
-            .and_then(|p| p.canonicalize().ok());
+            .and_then(|p| if p.is_dir() { Some(p) } else { p.parent().map(|p| p.to_path_buf()) });
 
         let scan_config = ScanConfig {
-            paths,
+            paths: canonical_paths,
             rehash: false,
             similarity: 0,
             group_by: sort_order.clone(),
@@ -243,6 +280,54 @@ impl GuiApp {
         eprintln!("[DEBUG-CONFIG] new_view_mode() - Raw config values: width={:?}, height={:?}, panel_width={:?}",
             ctx.gui_config.width, ctx.gui_config.height, ctx.gui_config.panel_width);
 
+        // Immediately populate directories and files from the current directory
+        // This avoids the spinner on startup and ensures instant display
+        let mut subdirs = Vec::new();
+        let mut files = Vec::new();
+        if let Some(ref dir) = current_dir {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    // Canonicalize each entry path to ensure absolute paths in FileMetadata
+                    if let Ok(canonical) = entry_path.canonicalize() {
+                        if canonical.is_dir() {
+                            subdirs.push(canonical);
+                        } else if scanner::is_image_ext(&canonical) {
+                            if let Ok(meta) = entry.metadata() {
+                                let size = meta.len();
+                                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH).into();
+                                if let Some(unique_file_id) = crate::fileops::get_file_key(&canonical) {
+                                    files.push(FileMetadata {
+                                        path: canonical,
+                                        size,
+                                        modified,
+                                        phash: 0,
+                                        pdqhash: None,
+                                        resolution: None,
+                                        content_hash: [0u8; 32],
+                                        pixel_hash: None,
+                                        orientation: 1,
+                                        unique_file_id,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Sort files and directories according to the sort order
+            scanner::sort_files(&mut files, &sort_order);
+            scanner::sort_directories(&mut subdirs, &sort_order);
+        }
+
+        // Set up initial state with the files we found
+        let has_files = !files.is_empty();
+        state.groups = if has_files { vec![files] } else { Vec::new() };
+        state.group_infos = if has_files { vec![GroupInfo { max_dist: 0, status: GroupStatus::None }] } else { Vec::new() };
+        state.last_file_count = state.groups.first().map_or(0, |g| g.len());
+        // No need for background scan since we've already loaded everything
+        state.is_loading = false;
+
         Self {
             state,
             group_views: HashMap::new(),
@@ -259,7 +344,6 @@ impl GuiApp {
             move_completion_candidates: Vec::new(),
             move_completion_index: 0,
             last_preload_pos: None,
-            status_set_time: None,
             slideshow_last_advance: None,
             view_mode_sort: Some(sort_order),
             raw_cache: HashMap::new(),
@@ -277,7 +361,7 @@ impl GuiApp {
             dir_list: Vec::new(),
             dir_picker_selection: 0,
             dir_picker_scroll_to_selection: false,
-            subdirs: Vec::new(),
+            subdirs,
             dir_selection_idx: None,
             dir_scroll_to_selection: false,
             completion_candidates: Vec::new(),
@@ -294,6 +378,15 @@ impl GuiApp {
             group_y_offsets: Vec::new(),
             total_content_height: 0.0,
             cache_dirty: true,
+            watcher: None,
+            fs_event_rx: None,
+            subdirs_cache: Vec::new(),
+            parent_cache: None,
+            fs_mod_files: HashSet::new(),
+            fs_mod_dirs: HashSet::new(),
+            fs_rem_files: HashSet::new(),
+            fs_rem_dirs: HashSet::new(),
+            last_fs_refresh: Instant::now(),
         }
     }
 
@@ -302,7 +395,56 @@ impl GuiApp {
         self
     }
 
-    /// Change to a new directory and trigger rescan (view mode only)
+    /// Set status message with automatic 5-second timeout
+    pub(super) fn set_status(&mut self, msg: String, is_error: bool) {
+        self.state.set_status(msg, is_error);
+    }
+
+    // 1. Helper to build cache entry (does the stat() call ONCE)
+    fn create_dir_cache_entry(path: &std::path::Path, show_relative: bool) -> DirCacheEntry {
+        eprintln!("create_dir_cache_entry {}", path.display());
+        let modified_display = if let Ok(meta) = fs::metadata(path) {
+            if let Ok(modified) = meta.modified() {
+                let dt: chrono::DateTime<chrono::Utc> = modified.into();
+                if show_relative {
+                    let ts = Timestamp::from_second(dt.timestamp()).unwrap();
+                    crate::format_relative_time(ts)
+                } else {
+                    dt.format("%Y-%m-%d %H:%M").to_string()
+                }
+            } else { String::new() }
+        } else { String::new() };
+
+        let display_name = path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+        DirCacheEntry {
+            path: path.to_path_buf(),
+            display_name,
+            modified_display,
+        }
+    }
+
+    // Setup filesystem watcher for current directory
+    fn setup_watcher(&mut self) {
+        if !self.state.view_mode { return; }
+        let Some(dir) = &self.current_dir else { return };
+
+        let (tx, rx) = channel();
+        match notify::recommended_watcher(tx) {
+            Ok(mut watcher) => {
+                if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                    eprintln!("Notify watch error: {:?}", e);
+                }
+                self.watcher = Some(watcher);
+                self.fs_event_rx = Some(rx);
+            }
+            Err(e) => eprintln!("Failed to create watcher: {:?}", e),
+        }
+    }
+
+    // Setup watcher and populate cache
     pub(super) fn change_directory(&mut self, new_dir: std::path::PathBuf) {
         if !self.state.view_mode { return; }
 
@@ -310,24 +452,310 @@ impl GuiApp {
             self.current_dir = Some(canonical.clone());
             self.scan_config.paths = vec![canonical.to_string_lossy().to_string()];
 
-            // Clear current state and trigger rescan
-            self.state.groups.clear();
-            self.state.group_infos.clear();
-            self.state.current_group_idx = 0;
-            self.state.current_file_idx = 0;
-            self.state.is_loading = true;
-            self.scan_rx = None;
-            self.scan_progress_rx = None;
-            self.scan_progress = (0, 0);
+            // Change process working directory so relative paths work
+            let _ = std::env::set_current_dir(&canonical);
 
-            // Clear caches
+            self.setup_watcher();
+
+            // Clear caches first
             self.raw_cache.clear();
             self.raw_loading.clear();
             self.exif_search_cache.clear();
             if let Ok(mut w) = self.active_window.write() { w.clear(); }
             self.last_preload_pos = None;
+
+            // Immediately populate directories and files (synchronously)
+            // This ensures instant display without waiting for background scan
+            self.subdirs.clear();
+            let mut files = Vec::new();
+
+            if let Ok(entries) = fs::read_dir(&canonical) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    // Canonicalize each entry path to ensure absolute paths in FileMetadata
+                    if let Ok(entry_canonical) = entry_path.canonicalize() {
+                        if entry_canonical.is_dir() {
+                            self.subdirs.push(entry_canonical);
+                        } else if scanner::is_image_ext(&entry_canonical) {
+                            if let Ok(meta) = entry.metadata() {
+                                let size = meta.len();
+                                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH).into();
+                                if let Some(unique_file_id) = crate::fileops::get_file_key(&entry_canonical) {
+                                    files.push(FileMetadata {
+                                        path: entry_canonical,
+                                        size,
+                                        modified,
+                                        phash: 0,
+                                        pdqhash: None,
+                                        resolution: None,
+                                        content_hash: [0u8; 32],
+                                        pixel_hash: None,
+                                        orientation: 1,
+                                        unique_file_id,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Sort files and directories according to the sort order
+            if let Some(ref sort_order) = self.view_mode_sort {
+                scanner::sort_files(&mut files, sort_order);
+            }
+            scanner::sort_directories(&mut self.subdirs, &self.state.group_by);
+
+            // Update state with the files we found
+            let has_files = !files.is_empty();
+            self.state.groups = if has_files { vec![files] } else { Vec::new() };
+            self.state.group_infos = if has_files { vec![GroupInfo { max_dist: 0, status: GroupStatus::None }] } else { Vec::new() };
+            self.state.current_group_idx = 0;
+            self.state.current_file_idx = 0;
+            self.state.last_file_count = self.state.groups.first().map_or(0, |g| g.len());
+
+            // No background scan needed - we've already loaded everything synchronously
+            self.state.is_loading = false;
+            self.scan_rx = None;
+            self.scan_progress_rx = None;
+            self.scan_progress = (0, 0);
+
+            // Refresh directory cache for display
+            self.refresh_dir_cache(false);
+            self.cache_dirty = true;
         }
     }
+
+    fn refresh_dir_cache(&mut self, rescan_fs: bool) {
+        self.subdirs_cache.clear();
+        self.parent_cache = None;
+
+        let Some(current) = &self.current_dir else { return };
+        let current = current.clone();
+        let show_relative = self.state.show_relative_times;
+
+        if let Some(parent) = current.parent() {
+            self.parent_cache = Some(Self::create_dir_cache_entry(parent, show_relative));
+        }
+
+        if rescan_fs {
+            // Snapshot existing metadata by inode to preserve resolution/hashes across refreshes
+            let existing: HashMap<u128, FileMetadata> = if !self.state.groups.is_empty() {
+                self.state.groups[0].iter().map(|f| (f.unique_file_id, f.clone())).collect()
+            } else {
+                HashMap::new()
+            };
+
+            self.subdirs.clear();
+            let mut new_files = Vec::new();
+
+            if let Ok(entries) = fs::read_dir(&current) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+
+                    // Canonicalize each entry path to ensure absolute paths
+                    if let Ok(canonical) = entry_path.canonicalize() {
+                        if canonical.is_dir() {
+                            self.subdirs.push(canonical);
+                        } else if self.state.view_mode && crate::scanner::is_image_ext(&canonical) {
+                            if let Ok(meta) = entry.metadata() {
+                                let size = meta.len();
+                                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH).into();
+                                if let Some(unique_file_id) = crate::fileops::get_file_key(&canonical) {
+                                    if let Some(old) = existing.get(&unique_file_id) {
+                                        // Preserve resolution/hashes, update path/size/modified
+                                        let mut recovered = old.clone();
+                                        recovered.path = canonical;
+                                        recovered.size = size;
+                                        recovered.modified = modified;
+                                        new_files.push(recovered);
+                                    } else {
+                                        new_files.push(FileMetadata {
+                                            path: canonical, size, modified,
+                                            phash: 0, pdqhash: None, resolution: None,
+                                            content_hash: [0u8; 32], pixel_hash: None,
+                                            orientation: 1, unique_file_id,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            crate::scanner::sort_directories(&mut self.subdirs, &self.state.group_by);
+
+            if self.state.view_mode {
+                if let Some(sort_order) = &self.view_mode_sort {
+                    crate::scanner::sort_files(&mut new_files, sort_order);
+                }
+                self.state.groups = vec![new_files];
+                self.state.group_infos = vec![GroupInfo { max_dist: 0, status: GroupStatus::None }];
+                self.state.last_file_count = self.state.groups.first().map_or(0, |g| g.len());
+            }
+        }
+
+        for dir in &self.subdirs {
+            self.subdirs_cache.push(Self::create_dir_cache_entry(dir, show_relative));
+        }
+    }
+
+    fn check_fs_events(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.fs_event_rx else { return };
+        let mut got_events = false;
+
+        // Helper: Decide if a path name "looks like" an image file or is a directory.
+        // Since the file might be gone (Remove event), we can't always stat it.
+        // We rely on the extension as a heuristic for deleted items.
+        let classify = |path: &std::path::Path| -> bool {
+            // If it exists on disk, check the real type
+            if path.exists() {
+                if path.is_dir() { return false; }
+                return crate::scanner::is_image_ext(path);
+            }
+            // If it was removed, assume it was a file if it had an image extension
+            crate::scanner::is_image_ext(path)
+        };
+
+        while let Ok(res) = rx.try_recv() {
+            if let Ok(event) = res {
+                got_events = true;
+
+                // 1. Handle Atomic Rename (source -> dest)
+                if let notify::EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::Both)) = event.kind {
+                    // event.paths[0] is source (old name), event.paths[1] is dest (new name)
+                    if let (Some(_source), Some(dest)) = (event.paths.first(), event.paths.get(1)) {
+                        if let Some(name) = dest.file_name() {
+                            let name_str = name.to_string_lossy().to_string();
+                            // We only report the NEW name as "modified/created"
+                            if classify(dest) {
+                                self.fs_mod_files.insert(name_str);
+                            } else {
+                                self.fs_mod_dirs.insert(name_str);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // 2. Handle Specific Events
+                match event.kind {
+                    notify::EventKind::Remove(_) => {
+                        for path in &event.paths {
+                            if let Some(name) = path.file_name() {
+                                let name_str = name.to_string_lossy().to_string();
+                                if classify(path) {
+                                    self.fs_rem_files.insert(name_str);
+                                } else {
+                                    self.fs_rem_dirs.insert(name_str);
+                                }
+                            }
+                        }
+                    }
+                    notify::EventKind::Create(_) |
+                        notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
+                            for path in &event.paths {
+                                if let Some(name) = path.file_name() {
+                                    let name_str = name.to_string_lossy().to_string();
+                                    if classify(path) {
+                                        self.fs_mod_files.insert(name_str);
+                                    } else {
+                                        self.fs_mod_dirs.insert(name_str);
+                                    }
+                                }
+                            }
+                        }
+                    _ => {}
+                }
+            }
+        }
+
+        // Debounce Logic: Only refresh if we have events AND enough time passed
+        let has_pending = !self.fs_mod_files.is_empty() || !self.fs_mod_dirs.is_empty() ||
+            !self.fs_rem_files.is_empty() || !self.fs_rem_dirs.is_empty();
+
+        if has_pending {
+            let debounce_dur = Duration::from_millis(500);
+            let time_since = self.last_fs_refresh.elapsed();
+
+            if time_since >= debounce_dur {
+                // Time to refresh!
+                self.refresh_dir_cache(true);
+                self.last_preload_pos = None;
+                self.last_fs_refresh = Instant::now();
+
+                // Set user preference for max list items
+                let list_limit = 8;
+
+                // Build status message from buffered events
+                let format_list = |label: &str, items: &mut HashSet<String>| -> Option<String> {
+                    if items.is_empty() { return None; }
+                    let count = items.len();
+                    let mut sorted: Vec<_> = items.drain().collect();
+                    sorted.sort();
+
+                    // Take top N for display based on config
+                    let display_items: Vec<String> = sorted.iter().take(list_limit).cloned().collect();
+                    let joined = display_items.join(", ");
+                    let suffix = if count > list_limit { ", ..." } else { "" };
+
+                    Some(format!("{} {} {}: {}{}",
+                            label, count,
+                            if count == 1 { "item" } else { "items" },
+                            joined, suffix
+                    ))
+                };
+
+                let mut parts = Vec::new();
+
+                // 1. Files
+                if !self.fs_mod_files.is_empty() {
+                    let count = self.fs_mod_files.len();
+                    let mut sorted: Vec<_> = self.fs_mod_files.drain().collect();
+                    sorted.sort();
+                    let display: Vec<_> = sorted.iter().take(list_limit).cloned().collect();
+                    let extra = if count > list_limit { ", ..." } else { "" };
+                    parts.push(format!("{} files ({}{})", count, display.join(", "), extra));
+                }
+                if !self.fs_rem_files.is_empty() {
+                    let count = self.fs_rem_files.len();
+                    let mut sorted: Vec<_> = self.fs_rem_files.drain().collect();
+                    sorted.sort();
+                    let display: Vec<_> = sorted.iter().take(list_limit).cloned().collect();
+                    let extra = if count > list_limit { ", ..." } else { "" };
+                    parts.push(format!("removed {} files ({}{})", count, display.join(", "), extra));
+                }
+
+                // 2. Dirs
+                if !self.fs_mod_dirs.is_empty() {
+                    let count = self.fs_mod_dirs.len();
+                    let mut sorted: Vec<_> = self.fs_mod_dirs.drain().collect();
+                    sorted.sort();
+                    let display: Vec<_> = sorted.iter().take(list_limit).cloned().collect();
+                    let extra = if count > list_limit { ", ..." } else { "" };
+                    parts.push(format!("{} dirs ({}{})", count, display.join(", "), extra));
+                }
+                if !self.fs_rem_dirs.is_empty() {
+                    let count = self.fs_rem_dirs.len();
+                    let mut sorted: Vec<_> = self.fs_rem_dirs.drain().collect();
+                    sorted.sort();
+                    let display: Vec<_> = sorted.iter().take(list_limit).cloned().collect();
+                    let extra = if count > list_limit { ", ..." } else { "" };
+                    parts.push(format!("removed {} dirs ({}{})", count, display.join(", "), extra));
+                }
+
+                if !parts.is_empty() && self.state.status_message.is_none() {
+                    self.set_status(format!("FS: {}", parts.join("; ")), false);
+                }
+            } else {
+                // Not enough time passed, schedule a repaint soon to check again
+                let remaining = debounce_dur - time_since;
+                ctx.request_repaint_after(remaining);
+            }
+        }
+    }
+
 
     // Handles streaming batches for instant feedback
     pub(super) fn check_reload(&mut self, ctx: &egui::Context) {
@@ -436,6 +864,7 @@ impl GuiApp {
                 self.cache_dirty = true;
                 self.state.group_infos = new_infos;
                 self.subdirs = new_subdirs;
+                self.refresh_dir_cache(false);
                 self.state.last_file_count = self.state.groups.iter().map(|g| g.len()).sum();
 
                 // Clamp or reset indices to prevent panic if new list is smaller
@@ -707,6 +1136,16 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.check_fs_events(ctx);
+        // Initial setup for view mode: create watcher (but don't refresh while scanning)
+        if self.state.view_mode && self.current_dir.is_some() && self.watcher.is_none() {
+            self.setup_watcher();
+            // Only refresh cache if not currently scanning (scan will populate groups)
+            if !self.state.is_loading {
+                self.refresh_dir_cache(true);
+            }
+        }
+
         let title_text = if self.state.is_loading {
             format!("{} | Scanning... {}/{}", APP_TITLE, self.scan_progress.0, self.scan_progress.1
             )
@@ -765,26 +1204,42 @@ impl eframe::App for GuiApp {
             self.initial_scale_applied = true;
         }
 
-        if let Some(set_time) = self.status_set_time
-            && set_time.elapsed() > std::time::Duration::from_secs(3) {
+        if let Some(set_time) = self.state.status_set_time
+            && set_time.elapsed() > std::time::Duration::from_secs(5) {
                 self.state.status_message = None;
-                self.status_set_time = None;
+                self.state.status_set_time = None;
             }
 
         // Receive finished raw images from worker thread pool
-        while let Ok((path, maybe_result)) = self.image_preload_rx.try_recv() {
-            if let Some((color_image, actual_resolution, orientation)) = maybe_result {
+        // Use try_recv() which returns Err on empty OR disconnected channel
+        // This prevents panic loops if the worker thread pool terminates
+        loop {
+            match self.image_preload_rx.try_recv() {
+                Ok((path, maybe_result)) => {
+                    if let Some((color_image, actual_resolution, orientation)) = maybe_result {
 
-                // Now 'orientation' is defined and passed correctly
-                super::image::update_file_metadata(self, &path, actual_resolution.0, actual_resolution.1, orientation);
+                        // Now 'orientation' is defined and passed correctly
+                        super::image::update_file_metadata(self, &path, actual_resolution.0, actual_resolution.1, orientation);
 
-                let name = format!("img_{}", path.display());
-                let texture = ctx.load_texture(name, color_image, Default::default());
-                self.raw_cache.insert(path.clone(), texture);
+                        let name = format!("img_{}", path.display());
+                        let texture = ctx.load_texture(name, color_image, Default::default());
+                        self.raw_cache.insert(path.clone(), texture);
+                    }
+                    // Always remove from loading set
+                    self.raw_loading.remove(&path);
+                    ctx.request_repaint();
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    // No more messages available right now, exit loop
+                    break;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // Channel disconnected (worker threads terminated)
+                    // Log warning and exit loop to prevent panic
+                    eprintln!("[WARN] Image preload channel disconnected - worker threads may have terminated");
+                    break;
+                }
             }
-            // Always remove from loading set
-            self.raw_loading.remove(&path);
-            ctx.request_repaint();
         }
 
         self.check_reload(ctx);
@@ -795,6 +1250,19 @@ impl eframe::App for GuiApp {
         // Handle input and dialogs
         super::dialogs::handle_input(self, ctx, &intent, &mut force_panel_resize);
         super::dialogs::handle_dialogs(self, ctx, &mut force_panel_resize, &intent);
+
+        // Handle RefreshDirCache (Ctrl+L) - preserves resolution data
+        if let Some(InputIntent::RefreshDirCache) = *intent.borrow() {
+            if self.state.view_mode {
+                self.refresh_dir_cache(true);
+                self.cache_dirty = true;
+                // Force re-preload in case current file changed (e.g., after rename)
+                self.last_preload_pos = None;
+            } else {
+                // Duplicate mode: trigger full rescan
+                self.state.is_loading = true;
+            }
+        }
 
         // --- RENDER ---
         let current_image_path = self.state.get_current_image_path().cloned();
@@ -822,7 +1290,11 @@ impl eframe::App for GuiApp {
 
                      let move_status = if self.state.move_target.is_some() { " | [M]ove" } else { "" };
                      let del_key = if self.state.view_mode { " | [Del]ete" } else { "" };
-                     let rot_str = if !self.state.manual_rotation.is_multiple_of(4) { format!(" | [O] Rot: {}°", (self.state.manual_rotation % 4) * 90) } else { "".to_string() };
+                     let rot_str = if !self.state.manual_rotation.is_multiple_of(4) {
+                         format!(" | [O] Rot: {}°", (self.state.manual_rotation % 4) * 90)
+                     } else {
+                         "".to_string()
+                     };
                      let sort_str = if self.state.view_mode { " | [T] Sort" } else { "" };
                      let hist_str = if self.show_histogram { " | [I] Hist" } else { "" };
                      let exif_str = if self.show_exif { " | [E] EXIF" } else { "" };
@@ -926,42 +1398,26 @@ impl eframe::App for GuiApp {
                         // Calculate offset caused by directories
                         let files_start_offset = if self.state.view_mode && !self.state.is_loading {
                             let start_cursor_y = ui.cursor().min.y;
-                            let has_parent = self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
                             let mut dir_idx: usize = 0;
                             let available_w = ui.available_width();
 
-                            // Parent directory ".."
-                            if let Some(ref current) = self.current_dir && let Some(parent) = current.parent() {
+                            // --- 1. Render Parent ".." ---
+                            if let Some(ref entry) = self.parent_cache {
                                 let is_selected = self.dir_selection_idx == Some(dir_idx);
+                                let mod_time_str = &entry.modified_display;
 
-                                // Get modification time for parent
-                                let mod_time_str = if let Ok(meta) = fs::metadata(parent) {
-                                    if let Ok(modified) = meta.modified() {
-                                        let dt: chrono::DateTime<chrono::Utc> = modified.into();
-                                        if show_relative {
-                                            let ts = Timestamp::from_second(dt.timestamp()).unwrap();
-                                            format_relative_time(ts)
-                                        } else {
-                                            dt.format("%Y-%m-%d %H:%M").to_string()
-                                        }
-                                    } else { String::new() }
-                                } else { String::new() };
-
-                                // Custom row with name (2/3) + time (1/3)
                                 let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
                                 let (rect, resp) = ui.allocate_exact_size(
                                     egui::vec2(available_w, row_height),
                                     egui::Sense::click()
                                 );
 
-                                // Draw selection/hover background
                                 if is_selected {
                                     ui.painter().rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
                                 } else if resp.hovered() {
                                     ui.painter().rect_filled(rect, 2.0, ui.visuals().widgets.hovered.bg_fill);
                                 }
 
-                                // Draw directory name (left 2/3)
                                 ui.painter().text(
                                     rect.left_center() + egui::vec2(4.0, 0.0),
                                     egui::Align2::LEFT_CENTER,
@@ -969,57 +1425,39 @@ impl eframe::App for GuiApp {
                                     egui::FontId::default(),
                                     egui::Color32::YELLOW
                                 );
-
-                                // Draw modification time (right 1/3)
                                 ui.painter().text(
                                     rect.right_center() - egui::vec2(4.0, 0.0),
                                     egui::Align2::RIGHT_CENTER,
-                                    &mod_time_str,
+                                    mod_time_str,
                                     egui::FontId::new(10.0, egui::FontFamily::Monospace),
                                     egui::Color32::GRAY
                                 );
 
-                                if resp.clicked() { dir_to_open = Some(parent.to_path_buf()); }
-                                // Only scroll when keyboard navigation triggered it
+                                if resp.clicked() { dir_to_open = Some(entry.path.clone()); }
                                 if is_selected && scroll_to_dir {
                                     resp.scroll_to_me(Some(egui::Align::Center));
                                 }
                                 dir_idx += 1;
                             }
 
-                            // Subdirectories
-                            for subdir in &self.subdirs.clone() {
+                            // --- 2. Render Subdirectories ---
+                            for entry in &self.subdirs_cache {
                                 let is_selected = self.dir_selection_idx == Some(dir_idx);
-                                let dir_name = subdir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| subdir.to_string_lossy().to_string());
+                                let dir_name = &entry.display_name;
+                                let mod_time_str = &entry.modified_display;
 
-                                // Get modification time
-                                let mod_time_str = if let Ok(meta) = fs::metadata(subdir) {
-                                    if let Ok(modified) = meta.modified() {
-                                        let dt: chrono::DateTime<chrono::Utc> = modified.into();
-                                        if show_relative {
-                                            let ts = Timestamp::from_second(dt.timestamp()).unwrap();
-                                            format_relative_time(ts)
-                                        } else {
-                                            dt.format("%Y-%m-%d %H:%M").to_string()
-                                        }
-                                    } else { String::new() }
-                                } else { String::new() };
-
-                                // Custom row with name (2/3) + time (1/3)
                                 let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
                                 let (rect, resp) = ui.allocate_exact_size(
                                     egui::vec2(available_w, row_height),
                                     egui::Sense::click()
                                 );
 
-                                // Draw selection/hover background
                                 if is_selected {
                                     ui.painter().rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
                                 } else if resp.hovered() {
                                     ui.painter().rect_filled(rect, 2.0, ui.visuals().widgets.hovered.bg_fill);
                                 }
 
-                                // Draw directory name (left 2/3)
                                 ui.painter().text(
                                     rect.left_center() + egui::vec2(4.0, 0.0),
                                     egui::Align2::LEFT_CENTER,
@@ -1028,27 +1466,28 @@ impl eframe::App for GuiApp {
                                     egui::Color32::LIGHT_BLUE
                                 );
 
-                                // Draw modification time (right 1/3)
                                 ui.painter().text(
                                     rect.right_center() - egui::vec2(4.0, 0.0),
                                     egui::Align2::RIGHT_CENTER,
-                                    &mod_time_str,
+                                    mod_time_str,
                                     egui::FontId::new(10.0, egui::FontFamily::Monospace),
                                     egui::Color32::GRAY
                                 );
 
                                 if resp.clicked() {
-                                    dir_to_open = Some(subdir.clone());
+                                    dir_to_open = Some(entry.path.clone());
                                 }
-                                // Only scroll when keyboard navigation triggered it
                                 if is_selected && scroll_to_dir {
                                     resp.scroll_to_me(Some(egui::Align::Center));
                                 }
                                 dir_idx += 1;
                             }
 
-                            if !self.subdirs.is_empty() || has_parent { ui.separator(); }
+                            if !self.subdirs_cache.is_empty() || self.parent_cache.is_some() {
+                                ui.separator();
+                            }
 
+                            // Return the height consumed by directories
                             ui.cursor().min.y - start_cursor_y
                         } else {
                             0.0
@@ -1191,7 +1630,6 @@ impl eframe::App for GuiApp {
                                 if current_y + file_row_total_h > clip_rect.min.y {
                                     let is_selected = self.dir_selection_idx.is_none() && g_idx == self.state.current_group_idx && f_idx == self.state.current_file_idx;
                                     let is_marked = self.state.marked_for_deletion.contains(&file.path);
-                                    let exists = file.path.exists();
 
                                     // Status Checks
                                     let is_bit_identical = *counts.get(&file.content_hash).unwrap_or(&0) > 1;
@@ -1226,8 +1664,6 @@ impl eframe::App for GuiApp {
                                     // --- COLORS ---
                                     let (marker_color, filename_color) = if is_selected {
                                         (None, None)
-                                    } else if !exists {
-                                        (Some(egui::Color32::RED), Some(egui::Color32::RED))
                                     } else if is_marked {
                                         (Some(egui::Color32::MAGENTA), Some(egui::Color32::MAGENTA))
                                     } else if is_hardlinked {
@@ -1243,11 +1679,9 @@ impl eframe::App for GuiApp {
                                     // --- RICH TEXT ---
                                     let mut marker_rich = egui::RichText::new(&marker_text).family(egui::FontFamily::Monospace);
                                     if let Some(col) = marker_color { marker_rich = marker_rich.color(col); }
-                                    if !exists && !is_selected { marker_rich = marker_rich.strikethrough(); }
 
                                     let mut filename_rich = egui::RichText::new(&filename_text).family(egui::FontFamily::Monospace);
                                     if let Some(col) = filename_color { filename_rich = filename_rich.color(col); }
-                                    if !exists && !is_selected { filename_rich = filename_rich.strikethrough(); }
 
                                     // Highlight peers
                                     if let Some(current_file) = group.get(self.state.current_file_idx) {

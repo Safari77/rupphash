@@ -33,6 +33,7 @@ libheif-rs = { version = "2.5", features = ["image"] }
 lmdb-rkv = { git = "https://github.com/Safari77/lmdb-rs-mozilla" }
 natord = "1.0.9"
 nix = { version = "0", features = ["fs", "user"] }
+notify = "8.2"
 rand = "0.9"
 ratatui = "0.29"
 rayon = "1.11.0"
