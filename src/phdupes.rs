@@ -18,7 +18,6 @@ use jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-mod phash;
 mod pdqhash;
 mod db;
 mod ui;
@@ -36,7 +35,6 @@ pub struct FileMetadata {
     pub path: PathBuf,
     pub size: u64,
     pub modified: DateTime<Utc>,
-    pub phash: u64,
     pub pdqhash: Option<[u8; 32]>,
     pub resolution: Option<(u32, u32)>,
     pub content_hash: [u8; 32],
@@ -103,8 +101,8 @@ pub fn analyze_group(
     group_by: &str,
     ext_priorities: &HashMap<String, usize>
 ) -> GroupInfo {
-    // Delegate to scanner's analyze_group with phash mode
-    scanner::analyze_group(files, group_by, ext_priorities, false)
+    // Delegate to scanner's analyze_group with
+    scanner::analyze_group(files, group_by, ext_priorities)
 }
 
 // --- CLI Definition ---
@@ -120,7 +118,7 @@ struct Cli {
     rehash: bool,
     #[arg(long)]
     rehash_only: bool,
-    /// Similarity threshold (default: 5 for pHash, 40 for PDQ hash)
+    /// Similarity threshold (default: 40 for PDQ hash)
     #[arg(long)]
     similarity: Option<u32>,
     /// Calculate hash of raw pixel data to find content-identical files (e.g. PNG vs JPG)
@@ -166,10 +164,6 @@ struct Cli {
     #[arg(long)]
     raw_thumbnails: bool,
 
-    /// Use PDQ hash instead of pHash for duplicate detection
-    #[arg(long)]
-    pdqhash: bool,
-
     /// Show all supported EXIF tag names for use in exif_tags configuration
     #[arg(long)]
     show_exif_tags: bool,
@@ -182,19 +176,13 @@ struct Cli {
 impl Cli {
     fn validate(&self) -> Result<(), String> {
         // Validate similarity based on hash algorithm
-        let max_similarity = if self.pdqhash {
-            crate::hamminghash::MAX_SIMILARITY_256
-        } else {
-            crate::hamminghash::MAX_SIMILARITY_64
-        };
+        let max_similarity = crate::hamminghash::MAX_SIMILARITY_256;
 
         let similarity = self.get_similarity();
         if similarity > max_similarity {
             return Err(format!(
-                "Similarity must be 0-{} for {}. Got {}.",
-                max_similarity,
-                if self.pdqhash { "PDQ hash" } else { "pHash" },
-                similarity
+                "Similarity must be 0-{} for PDQ hash. Got {}.",
+                max_similarity, similarity
             ));
         }
 
@@ -226,23 +214,13 @@ impl Cli {
     }
 
     /// Check if we're in view mode (explicit or implied)
-    fn is_view_mode(&self) -> bool {
-        self.view || self.shuffle || self.slideshow.is_some()
-    }
+    fn is_view_mode(&self) -> bool { self.view || self.shuffle || self.slideshow.is_some() }
 
     /// Get the hash algorithm based on CLI flags
-    fn hash_algorithm(&self) -> HashAlgorithm {
-        if self.pdqhash {
-            HashAlgorithm::PdqHash
-        } else {
-            HashAlgorithm::PHash
-        }
-    }
+    fn hash_algorithm(&self) -> HashAlgorithm { HashAlgorithm::PdqHash }
 
     /// Get similarity threshold with algorithm-specific defaults
-    fn get_similarity(&self) -> u32 {
-        self.similarity.unwrap_or(if self.pdqhash { 40 } else { 5 })
-    }
+    fn get_similarity(&self) -> u32 { self.similarity.unwrap_or(40) }
 }
 
 // --- CLI Helpers ---
@@ -358,8 +336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(seconds) = args.prune {
         let ctx = AppContext::with_algorithm(hash_algorithm)?;
 
-        println!("Pruning entries older than {} seconds) from {} database...",
-            seconds, if args.pdqhash { "PDQ hash" } else { "pHash" });
+        println!("Pruning entries older than {} seconds) from PDQ hash database...", seconds);
 
         match ctx.prune(seconds) {
             Ok((meta_count, hash_count)) => {
@@ -427,8 +404,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|(i, e)| (e.to_lowercase(), i))
             .collect();
 
-        println!("Launching GUI with {} algorithm (similarity: {})...",
-            if args.pdqhash { "PDQ hash" } else { "pHash" },
+        println!("Launching GUI with PDQ hash algorithm (similarity: {})...",
             similarity);
         let app = gui::GuiApp::new(
             ctx,
@@ -448,9 +424,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // For non-GUI modes, scan first then display results
     let (final_groups, final_infos) = scanner::scan_and_group(&scan_config, &ctx, None);
-    println!("Found {} duplicate groups using {}.",
-        final_groups.len(),
-        if args.pdqhash { "PDQ hash" } else { "pHash" });
+    println!("Found {} duplicate groups using PDQ hash.", final_groups.len());
 
     if args.use_tui {
         let ext_priorities: HashMap<String, usize> = ctx.grouping_config.extensions.iter()
@@ -465,7 +439,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.use_trash,
             sort_order,
             ext_priorities,
-            args.pdqhash,
         );
         state.move_target = args.move_marked.clone();
 

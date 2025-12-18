@@ -1,6 +1,7 @@
 use rayon::prelude::*;
 
 // 15 bits for 64-bit hash (approx 23% difference)
+#[allow(unused)]
 pub const MAX_SIMILARITY_64: u32 = 15;
 // 60 bits for 256-bit hash (approx 23% difference to match pHash strictness)
 // Note: If you want strictly "near duplicates", use 30. If you want "visually similar", use 60.
@@ -144,6 +145,7 @@ impl SparseBitSet {
 }
 
 // --- Main Grouping Function ---
+#[allow(unused)]
 pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Vec<u32>> {
     let n = index.db_hashes.len();
     let chunk_tolerance = max_dist / (H::NUM_CHUNKS as u32);

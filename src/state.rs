@@ -169,7 +169,6 @@ pub struct AppState {
     pub slideshow_paused: bool,
     pub is_fullscreen: bool,
     pub manual_rotation: u8,
-    pub use_pdqhash: bool,
     pub show_search: bool,
     pub search_results: Vec<(usize, usize, String)>, // (group_idx, file_idx, match_source)
     pub current_search_match: usize,
@@ -187,7 +186,6 @@ impl AppState {
         use_trash: bool,
         group_by: String,
         ext_priorities: HashMap<String, usize>,
-        use_pdqhash: bool,
     ) -> Self {
         let count = groups.iter().map(|g| g.len()).sum();
         Self {
@@ -220,7 +218,6 @@ impl AppState {
             slideshow_paused: false,
             is_fullscreen: false,
             manual_rotation: 0,
-            use_pdqhash,
             show_search: false,
             search_results: Vec::new(),
             current_search_match: 0,
@@ -637,7 +634,7 @@ impl AppState {
             let mut i = 0;
             while i < self.groups.len() {
                 if self.groups[i].is_empty() { self.groups.remove(i); self.group_infos.remove(i); if self.current_group_idx >= i && self.current_group_idx > 0 { self.current_group_idx -= 1; } }
-                else { self.group_infos[i] = analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities, self.use_pdqhash); i += 1; }
+                else { self.group_infos[i] = analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities); i += 1; }
             }
             if self.groups.is_empty() { self.current_group_idx = 0; self.current_file_idx = 0; }
             else {
@@ -823,7 +820,7 @@ impl AppState {
                         self.current_group_idx -= 1;
                     }
                 } else {
-                    self.group_infos[i] = analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities, self.use_pdqhash);
+                    self.group_infos[i] = analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities);
                     i += 1;
                 }
             }

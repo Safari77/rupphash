@@ -834,7 +834,7 @@ pub(super) fn handle_dialogs(app: &mut GuiApp, ctx: &egui::Context, force_panel_
                             };
 
                             // Layout: directory name (2/3) + modification time (1/3)
-                            let row_rect = ui.available_rect_before_wrap();
+                            let _row_rect = ui.available_rect_before_wrap();
                             let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
                             let (rect, resp) = ui.allocate_exact_size(
                                 egui::vec2(available_w, row_height),
