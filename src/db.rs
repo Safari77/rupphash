@@ -12,7 +12,6 @@ use chacha20poly1305::{
 };
 
 const CONFIG_FILE_NAME: &str = "phdupes.conf";
-const DB_FILE_NAME_PHASH: &str = "phdupes_phash";
 const DB_FILE_NAME_PDQHASH: &str = "phdupes_pdqhash";
 const DB_FILE_NAME_FEATURES: &str = "phdupes_features";
 const DB_FILE_NAME_PIXELHASH: &str = "phdupes_pixelhash";
@@ -32,7 +31,6 @@ use crate::scanner::RAW_EXTS;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HashAlgorithm {
     #[default]
-    PHash,
     PdqHash,
 }
 
@@ -166,13 +164,11 @@ pub struct AppContext {
     pub meta_key: [u8; 32],
     pub grouping_config: GroupingConfig,
     pub gui_config: GuiConfig,
-    pub hash_algorithm: HashAlgorithm,
     cipher: XChaCha20Poly1305,
 }
 
-/// Database update type - supports both pHash (u64) and PDQ hash ([u8; 32])
+/// Database update type
 pub enum HashValue {
-    PHash(u64),
     PdqHash([u8; 32]),
 }
 
@@ -184,9 +180,45 @@ pub type DbUpdate = (
     Option<([u8; 32], [u8; 32])>          // Pixel Hash
 );
 
+/// Compute the meta_key from file metadata.
+///
+/// The meta_key is derived from:
+/// - mtime_ns: modification time in nanoseconds since UNIX_EPOCH
+/// - size: file size in bytes
+/// - unique_file_id: filesystem identity (dev, inode or equivalent)
+///
+/// This allows cache hits even after file renames (same inode).
+#[inline]
+pub fn compute_meta_key(
+    meta_key_secret: &[u8; 32],
+    mtime_ns: u64,
+    size: u64,
+    unique_file_id: u128,
+) -> [u8; 32] {
+    let mut mh = blake3::Hasher::new_keyed(meta_key_secret);
+    mh.update(&mtime_ns.to_le_bytes());
+    mh.update(&size.to_le_bytes());
+    // Bind to filesystem identity (dev, inode) - survives renames
+    mh.update(&unique_file_id.to_le_bytes());
+    *mh.finalize().as_bytes()
+}
+
+/// Convenience function to compute meta_key from std::fs::Metadata
+#[inline]
+pub fn compute_meta_key_from_metadata(
+    meta_key_secret: &[u8; 32],
+    metadata: &std::fs::Metadata,
+    unique_file_id: u128,
+) -> [u8; 32] {
+    let mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
+    let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let size = metadata.len();
+    compute_meta_key(meta_key_secret, mtime_ns, size, unique_file_id)
+}
+
 impl AppContext {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Self::with_algorithm(HashAlgorithm::PHash)
+        Self::with_algorithm(HashAlgorithm::PdqHash)
     }
 
     pub fn with_algorithm(algorithm: HashAlgorithm) -> Result<Self, Box<dyn std::error::Error>> {
@@ -200,7 +232,6 @@ impl AppContext {
 
         // Select database path based on algorithm
         let db_file_name = match algorithm {
-            HashAlgorithm::PHash => DB_FILE_NAME_PHASH,
             HashAlgorithm::PdqHash => DB_FILE_NAME_PDQHASH,
         };
         let db_path = cache_dir.join(db_file_name);
@@ -332,7 +363,6 @@ impl AppContext {
             meta_key,
             grouping_config: config.grouping,
             gui_config: config.gui,
-            hash_algorithm: algorithm,
             cipher,
         })
     }
@@ -391,24 +421,6 @@ impl AppContext {
     }
 
     // --- DATABASE ACCESS ---
-
-    /// Get pHash (64-bit) from database
-    pub fn get_phash(&self, content_hash: &[u8; 32]) -> Result<Option<u64>, lmdb::Error> {
-        let txn = self.env.begin_ro_txn()?;
-        match txn.get(self.hash_db, content_hash) {
-            Ok(encrypted_bytes) => {
-                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    let arr: [u8; 8] = decrypted.try_into().map_err(|_| lmdb::Error::Corrupted)?;
-                    Ok(Some(u64::from_le_bytes(arr)))
-                } else {
-                    // Decryption failed (integrity check)
-                    Err(lmdb::Error::Corrupted)
-                }
-            },
-            Err(lmdb::Error::NotFound) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
 
     /// Get PDQ hash (256-bit) from database
     pub fn get_pdqhash(&self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, lmdb::Error> {
@@ -488,6 +500,44 @@ impl AppContext {
             Err(lmdb::Error::NotFound) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Look up cached resolution and orientation from the database using file metadata.
+    /// This is the single canonical function for cache lookups, used by both
+    /// the GUI (app.rs) and scanner (scanner.rs).
+    ///
+    /// Returns (resolution, orientation) - defaults to (None, 1) if not cached.
+    pub fn lookup_cached_features(
+        &self,
+        metadata: &std::fs::Metadata,
+        unique_file_id: u128,
+    ) -> (Option<(u32, u32)>, u8) {
+        let meta_key = compute_meta_key_from_metadata(&self.meta_key, metadata, unique_file_id);
+
+        eprintln!("[DEBUG-CACHE] lookup_cached_features: size={}, unique_file_id={}, meta_key={:?}",
+            metadata.len(), unique_file_id, hex::encode(&meta_key[..8]));
+
+        // Look up content_hash from meta_key
+        if let Ok(Some(content_hash)) = self.get_content_hash(&meta_key) {
+            eprintln!("[DEBUG-CACHE]   Found content_hash: {:?}", hex::encode(&content_hash[..8]));
+            // Look up cached features from content_hash
+            if let Ok(Some(features)) = self.get_features(&content_hash) {
+                let resolution = if features.width > 0 && features.height > 0 {
+                    Some((features.width, features.height))
+                } else {
+                    None
+                };
+                eprintln!("[DEBUG-CACHE]   Found features: resolution={:?}, orientation={}",
+                    resolution, features.orientation);
+                return (resolution, features.orientation);
+            } else {
+                eprintln!("[DEBUG-CACHE]   No features found for content_hash");
+            }
+        }
+
+        eprintln!("[DEBUG-CACHE]   Not found in database");
+        // Not cached
+        (None, 1)
     }
 
     /// Prune entries older than `max_age_seconds`.
@@ -679,11 +729,6 @@ impl AppContext {
         // 2. Hash Updates
         for (key, val) in hash_updates {
             match val {
-                HashValue::PHash(phash) => {
-                    let val_bytes = phash.to_le_bytes();
-                    let encrypted = Self::encrypt_value(cipher, key, &val_bytes);
-                    txn.put(hash_db, key, &encrypted, WriteFlags::empty())?;
-                },
                 HashValue::PdqHash(pdqhash) => {
                     let encrypted = Self::encrypt_value(cipher, key, pdqhash);
                     txn.put(hash_db, key, &encrypted, WriteFlags::empty())?;

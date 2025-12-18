@@ -18,9 +18,8 @@ use jpeg_decoder::Decoder as Tier2Decoder;
 use exif::{In, Reader, Tag, Value};
 
 use crate::{FileMetadata, GroupInfo, GroupStatus};
-use crate::phash::DctPhash;
 use crate::hamminghash::{MIHIndex, HammingHash, SparseBitSet};
-use crate::db::{AppContext, HashAlgorithm, HashValue};
+use crate::db::{AppContext, HashValue, compute_meta_key};
 use crate::helper_exif::{parse_gps_coordinate, extract_gps_lat_lon, get_altitude, get_date_str};
 use crate::position;
 use crate::fileops;
@@ -566,7 +565,6 @@ struct ScannedFile {
     pub content_hash: [u8; 32],
     pub orientation: u8,
     pub unique_file_id: u128,
-    pub phash: Option<u64>,
     pub pdqhash: Option<[u8; 32]>,
     pub pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>>,
     pub pixel_hash: Option<[u8; 32]>,
@@ -578,7 +576,6 @@ impl ScannedFile {
             path: self.path.clone(),
             size: self.size,
             modified: self.modified,
-            phash: self.phash.unwrap_or(0),
             pdqhash: self.pdqhash,
             resolution: self.resolution,
             content_hash: self.content_hash,
@@ -598,7 +595,6 @@ pub fn scan_and_group(
 
     let ctx_ref = ctx;
     let force_rehash = config.rehash;
-    let use_pdqhash = ctx.hash_algorithm == HashAlgorithm::PdqHash;
 
     let mut all_files = Vec::new();
     let mut seen_paths = HashSet::new();
@@ -644,15 +640,9 @@ pub fn scan_and_group(
         let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
         let unique_file_id = fileops::get_file_key(&path)?;
 
-        let mut mh = blake3::Hasher::new_keyed(&ctx_ref.meta_key);
-        mh.update(&mtime_ns.to_le_bytes());
-        mh.update(&size.to_le_bytes());
-        // Bind to filesystem identity (dev, inode) - survives renames
-        mh.update(&unique_file_id.to_le_bytes());
-        let meta_key: [u8; 32] = *mh.finalize().as_bytes();
+        let meta_key = compute_meta_key(&ctx_ref.meta_key, mtime_ns, size, unique_file_id);
         eprintln!("[DEBUG] mtime_ns/size/unique_file_id {} = {} {} {}",
             path.display(), mtime_ns, size, unique_file_id);
-        let mut phash: Option<u64> = None;
         let mut pdqhash: Option<[u8; 32]> = None;
         let mut pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>> = None;
         // IMPORTANT: new_meta tracks updates to the file_metadata DB.
@@ -674,24 +664,19 @@ pub fn scan_and_group(
             ck = ch;
             // Refresh timestamp
             new_meta = Some((meta_key, ck));
-            if use_pdqhash {
-                if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
-                    pdqhash = Some(h);
-                    if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
-                        if feats.coefficients.len() == 256 {
-                            resolution = Some((feats.width, feats.height));
-                            orientation = feats.orientation;
-                            let mut coeffs = [0.0; 256];
-                            coeffs.copy_from_slice(&feats.coefficients);
-                            pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures { coefficients: coeffs }));
+            if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
+                pdqhash = Some(h);
+                if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
+                    if feats.coefficients.len() == 256 {
+                        resolution = Some((feats.width, feats.height));
+                        orientation = feats.orientation;
+                        let mut coeffs = [0.0; 256];
+                        coeffs.copy_from_slice(&feats.coefficients);
+                        pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures { coefficients: coeffs }));
 
-                            cache_hit_full = true;
-                        }
+                        cache_hit_full = true;
                     }
                 }
-            } else if let Ok(Some(h)) = ctx_ref.get_phash(&ch) {
-                phash = Some(h);
-                cache_hit_full = true;
             }
             // If user wants pixel hash, try to fetch it from DB.
             if config.calc_pixel_hash {
@@ -725,7 +710,7 @@ pub fn scan_and_group(
 
                 if is_raw_ext(path) {
                     // RAW FILE: Extract Largest JPEG Thumbnail
-                    // We need the image for PDQ/pHash even if pixel_hash is disabled.
+                    // We need the image for PDQ even if pixel_hash is disabled.
                     if let Ok(mut raw) = rsraw::RawImage::open(b) {
                         if let Ok(thumbs) = raw.extract_thumbs() {
                             // Find largest JPEG thumbnail
@@ -774,39 +759,27 @@ pub fn scan_and_group(
                         new_pixel = Some((ck, ph));
                     }
 
-                    // 5. Calculate Visual Hash (PDQ or pHash)
-                    if use_pdqhash {
-                        // Use 'img' directly - do NOT call load_from_memory again
-                        if let Some((features, _)) = crate::pdqhash::generate_pdq_features(img) {
-                            let hash = features.to_hash();
-                            pdqhash = Some(hash);
+                    // Use 'img' directly - do NOT call load_from_memory again
+                    if let Some((features, _)) = crate::pdqhash::generate_pdq_features(img) {
+                        let hash = features.to_hash();
+                        pdqhash = Some(hash);
 
-                            let mut coeffs = [0.0; 256];
-                            coeffs.copy_from_slice(&features.coefficients);
-                            let feats = crate::pdqhash::PdqFeatures { coefficients: coeffs };
-                            pdq_features = Some(Arc::new(feats.clone()));
+                        let mut coeffs = [0.0; 256];
+                        coeffs.copy_from_slice(&features.coefficients);
+                        let feats = crate::pdqhash::PdqFeatures { coefficients: coeffs };
+                        pdq_features = Some(Arc::new(feats.clone()));
 
-                            let cached_feats = crate::db::CachedFeatures {
-                                width: resolution.unwrap_or((0,0)).0,
-                                height: resolution.unwrap_or((0,0)).1,
-                                orientation,
-                                coefficients: features.coefficients.to_vec(),
-                            };
+                        let cached_feats = crate::db::CachedFeatures {
+                            width: resolution.unwrap_or((0,0)).0,
+                            height: resolution.unwrap_or((0,0)).1,
+                            orientation,
+                            coefficients: features.coefficients.to_vec(),
+                        };
 
-                            if new_hash.is_none() { // Don't overwrite if already set (rare)
-                                new_hash = Some((ck, HashValue::PdqHash(hash)));
-                            }
-                            new_features = Some((ck, cached_feats));
+                        if new_hash.is_none() { // Don't overwrite if already set (rare)
+                            new_hash = Some((ck, HashValue::PdqHash(hash)));
                         }
-                    } else {
-                        // pHash Mode
-                        if phash.is_none() {
-                            let hasher = DctPhash::new();
-                            // Use 'img' directly
-                            let hash = hasher.hash_image(img);
-                            phash = Some(hash);
-                            new_hash = Some((ck, HashValue::PHash(hash)));
-                        }
+                        new_features = Some((ck, cached_feats));
                     }
                 } else {
                     // Fallback: If image failed to decode (e.g. corrupt),
@@ -830,7 +803,6 @@ pub fn scan_and_group(
             content_hash: ck,
             orientation,
             unique_file_id,
-            phash,
             pdqhash,
             pdq_features,
             pixel_hash,
@@ -841,35 +813,28 @@ pub fn scan_and_group(
     db_handle.join().expect("DB writer thread panicked");
 
     // Deduplicate PDQ Features for Hardlinks
-    if use_pdqhash {
-        let mut feature_cache: HashMap<u128, Arc<crate::pdqhash::PdqFeatures>> = HashMap::new();
+    let mut feature_cache: HashMap<u128, Arc<crate::pdqhash::PdqFeatures>> = HashMap::new();
 
-        for file in valid_files.iter_mut() {
-            let unique_file_id = file.unique_file_id;
-            if let Some(features) = &file.pdq_features {
-                if let Some(cached) = feature_cache.get(&unique_file_id) {
-                    // Found existing features for this ID, reuse the pointer!
-                    file.pdq_features = Some(cached.clone());
-                } else {
-                    // First time seeing this ID, cache it
-                    feature_cache.insert(unique_file_id, features.clone());
-                }
+    for file in valid_files.iter_mut() {
+        let unique_file_id = file.unique_file_id;
+        if let Some(features) = &file.pdq_features {
+            if let Some(cached) = feature_cache.get(&unique_file_id) {
+                // Found existing features for this ID, reuse the pointer!
+                file.pdq_features = Some(cached.clone());
+            } else {
+                // First time seeing this ID, cache it
+                feature_cache.insert(unique_file_id, features.clone());
             }
         }
-        // feature_cache drops here, freeing the strong references.
-        // Only the unique Arcs held by ScannedFiles remain.
     }
 
     let hash_elapsed = hash_start.elapsed();
-    eprintln!("[DEBUG] Algorithm: {}", if use_pdqhash { "PDQ hash" } else { "pHash" });
+    eprintln!("[DEBUG] Algorithm: PDQ hash");
     eprintln!("[DEBUG] Hashes loaded: {} in {:.2}s", valid_files.len(), hash_elapsed.as_secs_f64());
 
     let group_start = Instant::now();
-    let (processed_groups, processed_infos, comparison_count) = if use_pdqhash {
-        group_with_pdqhash(&valid_files, config)
-    } else {
-        group_with_phash(&valid_files, config)
-    };
+    let (processed_groups, processed_infos, comparison_count) =
+        group_with_pdqhash(&valid_files, config);
     let group_elapsed = group_start.elapsed();
 
     eprintln!("[DEBUG] Grouping: {} groups found in {:.2}s ({} comparisons)",
@@ -895,24 +860,6 @@ trait GroupingStrategy<H>: Sync + Send {
     // Write variants into a fixed-size buffer to avoid Vec allocation.
     // Returns the number of variants written.
     fn generate_variants(&self, file: &ScannedFile, hash: H, out: &mut [H; 8]) -> usize;
-}
-
-struct PhashStrategy;
-impl GroupingStrategy<u64> for PhashStrategy {
-    #[inline(always)]
-    fn extract_hash(&self, file: &ScannedFile) -> Option<u64> {
-        file.phash
-    }
-
-    #[inline(always)]
-    fn generate_variants(&self, _file: &ScannedFile, hash: u64, out: &mut [u64; 8]) -> usize {
-        // pHash always generates 8 dihedral variants
-        let vars = crate::phash::generate_dihedral_hashes(hash);
-        for (i, v) in vars.iter().enumerate().take(8) {
-            out[i] = *v;
-        }
-        vars.len().min(8)
-    }
 }
 
 struct PdqStrategy;
@@ -1080,20 +1027,12 @@ where
     let groups = merge_groups_by_stem(raw_groups, valid_files);
 
     // Process Metadata
-    let is_pdq = std::any::type_name::<H>().contains("u8");
-    let (g, i) = process_raw_groups(groups, valid_files, config, is_pdq);
+    let (g, i) = process_raw_groups(groups, valid_files, config);
 
     (g, i, comparison_count)
 }
 
 // --- 3. Wrapper Functions ---
-
-fn group_with_phash(
-    valid_files: &[ScannedFile],
-    config: &ScanConfig,
-) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
-    group_files_generic(valid_files, config, PhashStrategy)
-}
 
 fn group_with_pdqhash(valid_files: &[ScannedFile], config: &ScanConfig) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
     group_files_generic(valid_files, config, PdqStrategy)
@@ -1103,7 +1042,6 @@ pub fn analyze_group(
     files: &mut Vec<FileMetadata>,
     sort_order: &str,
     #[allow(unused)] ext_priorities: &HashMap<String, usize>,
-    use_pdqhash: bool,
 ) -> GroupInfo {
     if files.is_empty() { return GroupInfo { max_dist: 0, status: GroupStatus::None }; }
 
@@ -1142,14 +1080,10 @@ pub fn analyze_group(
     files.append(&mut duplicates);
     files.append(&mut unique);
 
-    let max_d = if use_pdqhash {
+    let max_d =
         if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
             files.iter().filter_map(|f| f.pdqhash).map(|h| pivot.hamming_distance(&h)).max().unwrap_or(0)
-        } else { 0 }
-    } else if let Some(first) = files.first() {
-        let pivot = first.phash;
-        files.iter().map(|f| pivot.hamming_distance(&f.phash)).max().unwrap_or(0)
-    } else { 0 };
+        } else { 0 };
 
     let has_duplicates = !bit_counts.values().all(|&c| c == 1);
     let all_identical = bit_counts.len() == 1;
@@ -1232,7 +1166,6 @@ fn process_raw_groups(
     raw_groups: Vec<Vec<u32>>,
     valid_files: &[ScannedFile],
     config: &ScanConfig,
-    use_pdqhash: bool,
 ) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>) {
     let ext_priorities: HashMap<String, usize> = config.extensions.iter()
         .enumerate()
@@ -1241,11 +1174,9 @@ fn process_raw_groups(
 
     // Build read-only lookup map
     let mut features_map = HashMap::new();
-    if use_pdqhash {
-        for vf in valid_files {
-            if let Some(feats) = &vf.pdq_features {
-                features_map.insert(&vf.path, &**feats);
-            }
+    for vf in valid_files {
+        if let Some(feats) = &vf.pdq_features {
+            features_map.insert(&vf.path, &**feats);
         }
     }
 
@@ -1256,17 +1187,11 @@ fn process_raw_groups(
                 .map(|&idx| valid_files[idx as usize].to_file_metadata())
                 .collect();
 
-            let info = if use_pdqhash {
-                analyze_group_with_features(
-                    &mut group_data,
-                    &features_map,
-                    &config.group_by.to_lowercase(),
-                    &ext_priorities
-                )
-            } else {
-                analyze_group(&mut group_data, &config.group_by.to_lowercase(), &ext_priorities, false)
-            };
-
+            let info = analyze_group_with_features(
+                &mut group_data,
+                &features_map,
+                &config.group_by.to_lowercase(),
+                &ext_priorities);
             (group_data, info)
         })
         .collect();
@@ -1545,7 +1470,6 @@ pub fn scan_for_view(
                 path: path.clone(),
                 size,
                 modified,
-                phash: 0,
                 pdqhash: None,
                 resolution: None,
                 content_hash: [0u8; 32],

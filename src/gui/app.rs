@@ -127,7 +127,6 @@ impl GuiApp {
     /// Create a new GuiApp for duplicate detection mode
     pub fn new(ctx: AppContext, scan_config: ScanConfig, show_relative_times: bool, use_trash: bool,
         group_by: String, ext_priorities: HashMap<String, usize>, use_raw_thumbnails: bool) -> Self {
-        let use_pdqhash = ctx.hash_algorithm == crate::db::HashAlgorithm::PdqHash;
         let mut state = AppState::new(
             Vec::new(),
             Vec::new(),
@@ -135,7 +134,6 @@ impl GuiApp {
             use_trash,
             group_by,
             ext_priorities,
-            use_pdqhash,
         );
         state.is_loading = true;
 
@@ -150,7 +148,7 @@ impl GuiApp {
             ctx.gui_config.height.unwrap_or(720)
         ));
         eprintln!("[DEBUG-CONFIG] new() - config values: width={:?}, height={:?}, panel_width={:?}",
-            ctx.gui_config.width, ctx.gui_config.height, ctx.gui_config.panel_width);
+        ctx.gui_config.width, ctx.gui_config.height, ctx.gui_config.panel_width);
 
         Self {
             state,
@@ -231,7 +229,6 @@ impl GuiApp {
             use_trash,
             sort_order.clone(),
             HashMap::new(),
-            false, // view mode doesn't use hashing
         );
         // Don't set is_loading = true yet; we'll populate synchronously first
         state.view_mode = true;
@@ -244,7 +241,7 @@ impl GuiApp {
                 let path = std::path::Path::new(p);
                 path.canonicalize().ok().map(|c| c.to_string_lossy().to_string())
             })
-            .collect();
+        .collect();
 
         // Determine initial directory from paths (use canonicalized paths)
         let current_dir = canonical_paths.first()
@@ -274,14 +271,15 @@ impl GuiApp {
         ));
 
         eprintln!("[DEBUG-CONFIG] new_view_mode() - Loaded from config: window={}x{}, panel_width={}",
-            ctx.gui_config.width.unwrap_or(1280),
-            ctx.gui_config.height.unwrap_or(720),
-            panel_width);
+        ctx.gui_config.width.unwrap_or(1280),
+        ctx.gui_config.height.unwrap_or(720),
+        panel_width);
         eprintln!("[DEBUG-CONFIG] new_view_mode() - Raw config values: width={:?}, height={:?}, panel_width={:?}",
-            ctx.gui_config.width, ctx.gui_config.height, ctx.gui_config.panel_width);
+        ctx.gui_config.width, ctx.gui_config.height, ctx.gui_config.panel_width);
 
         // Immediately populate directories and files from the current directory
         // This avoids the spinner on startup and ensures instant display
+        // Resolution/orientation will be loaded from cache if available
         let mut subdirs = Vec::new();
         let mut files = Vec::new();
         if let Some(ref dir) = current_dir {
@@ -297,16 +295,18 @@ impl GuiApp {
                                 let size = meta.len();
                                 let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH).into();
                                 if let Some(unique_file_id) = crate::fileops::get_file_key(&canonical) {
+                                    // Try to load cached resolution/orientation from database
+                                    let (resolution, orientation) = ctx.lookup_cached_features(&meta, unique_file_id);
+
                                     files.push(FileMetadata {
                                         path: canonical,
                                         size,
                                         modified,
-                                        phash: 0,
                                         pdqhash: None,
-                                        resolution: None,
+                                        resolution,
                                         content_hash: [0u8; 32],
                                         pixel_hash: None,
-                                        orientation: 1,
+                                        orientation,
                                         unique_file_id,
                                     });
                                 }
@@ -395,6 +395,66 @@ impl GuiApp {
         self
     }
 
+    /// Look up cached resolution and orientation from the database.
+    /// Uses the same meta_key derivation as scanner.rs to find cached features.
+    /// Returns (resolution, orientation) - defaults to (None, 1) if not cached.
+    fn lookup_cached_features(
+        ctx: &crate::db::AppContext,
+        meta: &std::fs::Metadata,
+        unique_file_id: u128,
+    ) -> (Option<(u32, u32)>, u8) {
+        use std::time::UNIX_EPOCH;
+
+        let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+        let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        let size = meta.len();
+
+        // Compute meta_key using the same derivation as scanner.rs
+        // Note: meta_key is derived from master_key which is shared across all databases
+        let mut mh = blake3::Hasher::new_keyed(&ctx.meta_key);
+        mh.update(&mtime_ns.to_le_bytes());
+        mh.update(&size.to_le_bytes());
+        mh.update(&unique_file_id.to_le_bytes());
+        let meta_key: [u8; 32] = *mh.finalize().as_bytes();
+
+        eprintln!("[DEBUG-CACHE] lookup_cached_features: mtime_ns={}, size={}, unique_file_id={}, meta_key={:?}",
+            mtime_ns, size, unique_file_id, hex::encode(&meta_key[..8]));
+
+        // Try the current context's database first
+        if let Some(result) = Self::try_lookup_features(ctx, &meta_key) {
+            eprintln!("[DEBUG-CACHE]   Found in db: resolution={:?}, orientation={}",
+            result.0, result.1);
+            return result;
+        }
+
+        eprintln!("[DEBUG-CACHE]   Not found in database");
+        // Not cached in either database
+        (None, 1)
+    }
+
+    /// Helper to attempt feature lookup from a specific context
+    fn try_lookup_features(
+        ctx: &crate::db::AppContext,
+        meta_key: &[u8; 32],
+    ) -> Option<(Option<(u32, u32)>, u8)> {
+        // Look up content_hash from meta_key
+        if let Ok(Some(content_hash)) = ctx.get_content_hash(meta_key) {
+            eprintln!("[DEBUG-CACHE]   Found content_hash: {:?}", hex::encode(&content_hash[..8]));
+            // Look up cached features from content_hash
+            if let Ok(Some(features)) = ctx.get_features(&content_hash) {
+                let resolution = if features.width > 0 && features.height > 0 {
+                    Some((features.width, features.height))
+                } else {
+                    None
+                };
+                return Some((resolution, features.orientation));
+            } else {
+                eprintln!("[DEBUG-CACHE]   No features found for content_hash");
+            }
+        }
+        None
+    }
+
     /// Set status message with automatic 5-second timeout
     pub(super) fn set_status(&mut self, msg: String, is_error: bool) {
         self.state.set_status(msg, is_error);
@@ -481,16 +541,20 @@ impl GuiApp {
                                 let size = meta.len();
                                 let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH).into();
                                 if let Some(unique_file_id) = crate::fileops::get_file_key(&entry_canonical) {
+                                    // Try to load cached resolution/orientation from database
+                                    let (resolution, orientation) = Self::lookup_cached_features(
+                                        &self.ctx, &meta, unique_file_id
+                                    );
+
                                     files.push(FileMetadata {
                                         path: entry_canonical,
                                         size,
                                         modified,
-                                        phash: 0,
                                         pdqhash: None,
-                                        resolution: None,
+                                        resolution,
                                         content_hash: [0u8; 32],
                                         pixel_hash: None,
-                                        orientation: 1,
+                                        orientation,
                                         unique_file_id,
                                     });
                                 }
@@ -563,18 +627,20 @@ impl GuiApp {
                                 let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH).into();
                                 if let Some(unique_file_id) = crate::fileops::get_file_key(&canonical) {
                                     if let Some(old) = existing.get(&unique_file_id) {
-                                        // Preserve resolution/hashes, update path/size/modified
+                                        // Preserve resolution/hashes from session, update path/size/modified
                                         let mut recovered = old.clone();
                                         recovered.path = canonical;
                                         recovered.size = size;
                                         recovered.modified = modified;
                                         new_files.push(recovered);
                                     } else {
+                                        // New file not in session - use centralized cache lookup from db.rs
+                                        let (resolution, orientation) = self.ctx.lookup_cached_features(&meta, unique_file_id);
                                         new_files.push(FileMetadata {
                                             path: canonical, size, modified,
-                                            phash: 0, pdqhash: None, resolution: None,
+                                            pdqhash: None, resolution,
                                             content_hash: [0u8; 32], pixel_hash: None,
-                                            orientation: 1, unique_file_id,
+                                            orientation, unique_file_id,
                                         });
                                     }
                                 }
@@ -603,7 +669,6 @@ impl GuiApp {
 
     fn check_fs_events(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.fs_event_rx else { return };
-        let mut got_events = false;
 
         // Helper: Decide if a path name "looks like" an image file or is a directory.
         // Since the file might be gone (Remove event), we can't always stat it.
@@ -620,7 +685,6 @@ impl GuiApp {
 
         while let Ok(res) = rx.try_recv() {
             if let Ok(event) = res {
-                got_events = true;
 
                 // 1. Handle Atomic Rename (source -> dest)
                 if let notify::EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::Both)) = event.kind {
@@ -689,7 +753,7 @@ impl GuiApp {
                 let list_limit = 8;
 
                 // Build status message from buffered events
-                let format_list = |label: &str, items: &mut HashSet<String>| -> Option<String> {
+                let _format_list = |label: &str, items: &mut HashSet<String>| -> Option<String> {
                     if items.is_empty() { return None; }
                     let count = items.len();
                     let mut sorted: Vec<_> = items.drain().collect();
@@ -1393,7 +1457,6 @@ impl eframe::App for GuiApp {
                         }
 
                         let mut dir_to_open: Option<std::path::PathBuf> = None;
-                        let show_relative = self.state.show_relative_times;
 
                         // Calculate offset caused by directories
                         let files_start_offset = if self.state.view_mode && !self.state.is_loading {
