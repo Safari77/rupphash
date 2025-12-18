@@ -552,7 +552,7 @@ pub(super) fn render_exif(app: &mut GuiApp, ui: &mut egui::Ui, available_rect: e
                         "Sun Position: GPS Time missing, using Local.".to_string(),
                         true
                     ));
-                    app.status_set_time = Some(std::time::Instant::now());
+                    app.state.status_set_time = Some(std::time::Instant::now());
                 }
             }
 

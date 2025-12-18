@@ -270,7 +270,7 @@ pub(super) fn handle_input(
         if ctx.input(|i| i.key_pressed(egui::Key::W)) { *intent.borrow_mut() = Some(InputIntent::CycleViewMode); }
         if ctx.input(|i| i.key_pressed(egui::Key::Z)) { *intent.borrow_mut() = Some(InputIntent::CycleZoom); }
         if ctx.input(|i| i.key_pressed(egui::Key::R)) { *intent.borrow_mut() = Some(InputIntent::StartRename); }
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::L)) { *intent.borrow_mut() = Some(InputIntent::ReloadList); }
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::L)) { *intent.borrow_mut() = Some(InputIntent::RefreshDirCache); }
         if ctx.input(|i| i.key_pressed(egui::Key::X)) { *intent.borrow_mut() = Some(InputIntent::ToggleZoomRelative); }
         if ctx.input(|i| i.key_pressed(egui::Key::P)) { *intent.borrow_mut() = Some(InputIntent::TogglePathVisibility); }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) { *intent.borrow_mut() = Some(InputIntent::DeleteImmediate); }
@@ -284,7 +284,7 @@ pub(super) fn handle_input(
             if !has_marked && !has_current {
                 // Nothing to move. Show status immediately.
                 app.state.status_message = Some(("No files marked and no file selected.".to_string(), true));
-                app.status_set_time = Some(std::time::Instant::now());
+                app.state.status_set_time = Some(std::time::Instant::now());
             } else {
                 // Allow Shift+M to force editing the target even if set
                 let force_edit = ctx.input(|i| i.modifiers.shift);
@@ -319,7 +319,7 @@ pub(super) fn handle_input(
             // Show status
             let mode = if app.state.use_gps_utc { "GPS (UTC)" } else { "EXIF (Local)" };
             app.state.status_message = Some((format!("Sun Position Time: {}", mode), false));
-            app.status_set_time = Some(std::time::Instant::now());
+            app.state.status_set_time = Some(std::time::Instant::now());
 
             // Check fallback immediately for current file
             if app.state.use_gps_utc {
@@ -329,7 +329,7 @@ pub(super) fn handle_input(
                                 "Sun Position: GPS Time missing, falling back to Local time.".to_string(),
                                 true // Error color
                         ));
-                        app.status_set_time = Some(std::time::Instant::now());
+                        app.state.status_set_time = Some(std::time::Instant::now());
                     }
                 }
             }
@@ -384,7 +384,7 @@ pub(super) fn handle_dialogs(app: &mut GuiApp, ctx: &egui::Context, force_panel_
             InputIntent::ConfirmMoveMarked |
             InputIntent::ChangeSortOrder(_) |
             InputIntent::SubmitRename(_) |
-            InputIntent::ReloadList
+            InputIntent::RefreshDirCache
         );
 
         if requires_cache_rebuild {
@@ -576,7 +576,15 @@ pub(super) fn handle_dialogs(app: &mut GuiApp, ctx: &egui::Context, force_panel_
             });
 
         if submit {
-            let target_path = std::path::PathBuf::from(&app.move_input);
+            let input_path = std::path::PathBuf::from(&app.move_input);
+            // Resolve relative paths against current_dir (currently displayed directory)
+            let target_path = if input_path.is_absolute() {
+                input_path
+            } else if let Some(ref current) = app.current_dir {
+                current.join(&input_path)
+            } else {
+                input_path
+            };
             if target_path.is_dir() {
                 // Set the target and trigger the standard confirmation flow
                 app.state.move_target = Some(target_path);
@@ -1093,7 +1101,7 @@ fn perform_search_with_cache(app: &mut GuiApp, query: String) {
         app.state.selection_changed = true;
         app.state.status_message = Some((format!("Found {} matches. Match 1/{} in [{}]. (F3/Shift+F3 to nav)",
         app.state.search_results.len(), app.state.search_results.len(), match_source), false));
-        app.status_set_time = Some(std::time::Instant::now());
+        app.state.status_set_time = Some(std::time::Instant::now());
     } else {
         let source = if include_exif { "filenames or EXIF data" } else { "filenames" };
         app.state.error_popup = Some(format!("No matches found in {} for:\n'{}'", source, query));
