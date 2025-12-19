@@ -138,6 +138,10 @@ pub struct GuiApp {
     // --- Background content_hash computation for view mode ---
     // Channel to receive computed hashes and GPS: (path, unique_file_id, content_hash, gps_pos)
     pub(super) hash_rx: Option<Receiver<(std::path::PathBuf, u128, [u8; 32], Option<Point<f64>>)>>,
+
+    // --- Database writer for view mode ---
+    // Channel to send database updates (view mode caches features without coefficients)
+    pub(super) db_tx: Option<Sender<crate::db::DbUpdate>>,
 }
 
 impl GuiApp {
@@ -241,6 +245,7 @@ impl GuiApp {
             last_fs_refresh: Instant::now(),
             gps_map: GpsMapState::new(tile_cache_path, selected_provider, provider_url),
             hash_rx: None,
+            db_tx: None,
         }
     }
 
@@ -383,6 +388,11 @@ impl GuiApp {
         // No need for background scan since we've already loaded everything
         state.is_loading = false;
 
+        // Start database writer for view mode (caches features without PDQ coefficients)
+        let (db_tx_send, db_rx) = unbounded::<crate::db::DbUpdate>();
+        let _db_handle = ctx.start_db_writer(db_rx);
+        let db_tx = Some(db_tx_send);
+
         // Start background enrichment for GPS data and content_hash computation
         // This reads EXIF for GPS and computes blake3 hash for database caching
         let hash_rx = if !files_to_enrich.is_empty() {
@@ -477,6 +487,7 @@ impl GuiApp {
             last_fs_refresh: Instant::now(),
             gps_map: GpsMapState::new(tile_cache_path, selected_provider, provider_url),
             hash_rx,
+            db_tx,
         }
     }
 
@@ -1590,10 +1601,15 @@ impl eframe::App for GuiApp {
 
         // Process background enrichment results (view mode)
         // This updates FileMetadata with computed content_hash and GPS coordinates
+        // and writes to database for caching
         if let Some(ref rx) = self.hash_rx {
             loop {
                 match rx.try_recv() {
                     Ok((path, unique_file_id, content_hash, gps_pos)) => {
+                        // Get file metadata for resolution/orientation
+                        let mut resolution = None;
+                        let mut orientation = 1u8;
+
                         // Update FileMetadata
                         for group in &mut self.state.groups {
                             for file in group.iter_mut() {
@@ -1602,13 +1618,45 @@ impl eframe::App for GuiApp {
                                     if gps_pos.is_some() {
                                         file.gps_pos = gps_pos;
                                     }
+                                    resolution = file.resolution;
+                                    orientation = file.orientation;
                                     break;
                                 }
                             }
                         }
+
                         // Add GPS marker if we found coordinates
                         if let Some(pos) = gps_pos {
-                            self.gps_map.add_marker(path, pos.y(), pos.x(), content_hash);
+                            self.gps_map.add_marker(path.clone(), pos.y(), pos.x(), content_hash);
+                        }
+
+                        // Write to database cache
+                        if let Some(ref tx) = self.db_tx {
+                            // Compute meta_key for this file
+                            if let Ok(metadata) = std::fs::metadata(&path) {
+                                let meta_key = crate::db::compute_meta_key_from_metadata(
+                                    &self.ctx.meta_key,
+                                    &metadata,
+                                    unique_file_id,
+                                );
+
+                                // Create CachedFeatures (without coefficients - stored separately)
+                                let features = crate::db::CachedFeatures {
+                                    width: resolution.map(|(w, _)| w).unwrap_or(0),
+                                    height: resolution.map(|(_, h)| h).unwrap_or(0),
+                                    orientation,
+                                    gps_pos,
+                                };
+
+                                // Send database update: (meta, hash, features, coefficients, pixel)
+                                let _ = tx.send((
+                                    Some((meta_key, content_hash)), // meta_key -> content_hash
+                                    None,                           // No PDQ hash in view mode
+                                    Some((content_hash, features)), // content_hash -> features
+                                    None,                           // No coefficients in view mode
+                                    None,                           // No pixel hash
+                                ));
+                            }
                         }
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,

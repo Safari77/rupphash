@@ -700,6 +700,7 @@ pub fn scan_and_group(
 
             let mut new_hash = None;
             let mut new_features = None;
+            let mut new_coeffs = None; // Coefficients stored separately
             let mut resolution = None;
             let mut ck = [0u8; 32];
             let mut orientation = 1;
@@ -720,17 +721,20 @@ pub fn scan_and_group(
                 if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
                     pdqhash = Some(h);
                     if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
-                        if feats.coefficients.len() == 256 {
-                            resolution = Some((feats.width, feats.height));
-                            orientation = feats.orientation;
-                            gps_pos = feats.gps_pos;
-                            let mut coeffs = [0.0; 256];
-                            coeffs.copy_from_slice(&feats.coefficients);
-                            pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures {
-                                coefficients: coeffs,
-                            }));
+                        resolution = Some((feats.width, feats.height));
+                        orientation = feats.orientation;
+                        gps_pos = feats.gps_pos;
 
-                            cache_hit_full = true;
+                        // Get coefficients from separate db
+                        if let Ok(Some(coeff_vec)) = ctx_ref.get_coefficients(&ch) {
+                            if coeff_vec.len() == 256 {
+                                let mut coeffs = [0.0; 256];
+                                coeffs.copy_from_slice(&coeff_vec);
+                                pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures {
+                                    coefficients: coeffs,
+                                }));
+                                cache_hit_full = true;
+                            }
                         }
                     }
                 }
@@ -846,11 +850,15 @@ pub fn scan_and_group(
                             let feats = crate::pdqhash::PdqFeatures { coefficients: coeffs };
                             pdq_features = Some(Arc::new(feats.clone()));
 
+                            // Split into CachedFeatures and CachedCoefficients
                             let cached_feats = crate::db::CachedFeatures {
                                 width: resolution.unwrap_or((0, 0)).0,
                                 height: resolution.unwrap_or((0, 0)).1,
                                 orientation,
                                 gps_pos,
+                            };
+
+                            let cached_coeffs = crate::db::CachedCoefficients {
                                 coefficients: features.coefficients.to_vec(),
                             };
 
@@ -859,6 +867,7 @@ pub fn scan_and_group(
                                 new_hash = Some((ck, HashValue::PdqHash(hash)));
                             }
                             new_features = Some((ck, cached_feats));
+                            new_coeffs = Some((ck, cached_coeffs));
                         }
                     } else {
                         // Fallback: If image failed to decode (e.g. corrupt),
@@ -873,9 +882,10 @@ pub fn scan_and_group(
             if new_meta.is_some()
                 || new_hash.is_some()
                 || new_features.is_some()
+                || new_coeffs.is_some()
                 || new_pixel.is_some()
             {
-                let _ = tx.send((new_meta, new_hash, new_features, new_pixel));
+                let _ = tx.send((new_meta, new_hash, new_features, new_coeffs, new_pixel));
             }
 
             Some(ScannedFile {

@@ -18,6 +18,7 @@ const CONFIG_FILE_NAME: &str = "phdupes.conf";
 const DB_FILE_NAME_PDQHASH: &str = "phdupes_pdqhash";
 const DB_FILE_NAME_FEATURES: &str = "phdupes_features";
 const DB_FILE_NAME_PIXELHASH: &str = "phdupes_pixelhash";
+const DB_FILE_NAME_COEFFICIENTS: &str = "phdupes_coefficients";
 
 // Encryption overhead: 24-byte nonce + 16-byte Poly1305 tag
 const ENCRYPTION_OVERHEAD: usize = 24 + 16;
@@ -146,16 +147,32 @@ fn default_db_size_mb() -> u32 {
 }
 
 // Struct to hold cached data to avoid file reads
+// NOTE: coefficients are stored separately in coeff_db
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedFeatures {
     pub width: u32,
     pub height: u32,
     pub orientation: u8,
     pub gps_pos: Option<Point<f64>>,
-    pub coefficients: Vec<f32>, // Flat array of coefficients
 }
 
 impl CachedFeatures {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_stdvec(self)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+}
+
+/// PDQ coefficients stored separately (only in duplicate finder mode)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedCoefficients {
+    pub coefficients: Vec<f32>,
+}
+
+impl CachedCoefficients {
     pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
         postcard::to_stdvec(self)
     }
@@ -170,6 +187,7 @@ pub struct AppContext {
     pub hash_db: Database,
     pub meta_db: Database,
     pub feature_db: Database,
+    pub coeff_db: Database, // Separate DB for PDQ coefficients
     pub pixel_db: Database,
     pub content_key: [u8; 32],
     pub meta_key: [u8; 32],
@@ -187,12 +205,13 @@ pub enum HashValue {
     PdqHash([u8; 32]),
 }
 
-// (Meta Update, Hash Update, Feature Update)
+// (Meta Update, Hash Update, Feature Update, Coefficients Update, Pixel Hash)
 pub type DbUpdate = (
-    Option<([u8; 32], [u8; 32])>,       // Meta
-    Option<([u8; 32], HashValue)>,      // Hash
-    Option<([u8; 32], CachedFeatures)>, // Features
-    Option<([u8; 32], [u8; 32])>,       // Pixel Hash
+    Option<([u8; 32], [u8; 32])>,           // Meta: meta_key -> content_hash
+    Option<([u8; 32], HashValue)>,          // Hash: content_hash -> pdqhash
+    Option<([u8; 32], CachedFeatures)>, // Features: content_hash -> width/height/orientation/gps
+    Option<([u8; 32], CachedCoefficients)>, // Coefficients: content_hash -> coefficients (dupe mode only)
+    Option<([u8; 32], [u8; 32])>,           // Pixel Hash
 );
 
 /// Compute the meta_key from file metadata.
@@ -419,6 +438,7 @@ impl AppContext {
         let hash_db = env.open_db(None)?;
         let meta_db = env.create_db(Some("file_metadata"), DatabaseFlags::empty())?;
         let feature_db = env.create_db(Some(DB_FILE_NAME_FEATURES), DatabaseFlags::empty())?;
+        let coeff_db = env.create_db(Some(DB_FILE_NAME_COEFFICIENTS), DatabaseFlags::empty())?;
         let pixel_db = env.create_db(Some(DB_FILE_NAME_PIXELHASH), DatabaseFlags::empty())?;
         // Convert the locations into runtime usable Points
         let locations: HashMap<String, Point<f64>> =
@@ -429,6 +449,7 @@ impl AppContext {
             hash_db,
             meta_db,
             feature_db,
+            coeff_db,
             pixel_db,
             content_key,
             meta_key,
@@ -516,7 +537,7 @@ impl AppContext {
         }
     }
 
-    /// Get cached features (coeffs + metadata)
+    /// Get cached features (width, height, orientation, gps_pos)
     pub fn get_features(
         &self,
         content_hash: &[u8; 32],
@@ -531,10 +552,30 @@ impl AppContext {
                     Err(lmdb::Error::Corrupted)
                 }
             }
-            Err(lmdb::Error::NotFound) => {
-                // eprintln!("[DEBUG-DB] get_features NotFound ch={:x?}", hex::encode(content_hash));
-                Ok(None)
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Get coefficients from the separate coeff_db
+    pub fn get_coefficients(
+        &self,
+        content_hash: &[u8; 32],
+    ) -> Result<Option<Vec<f32>>, lmdb::Error> {
+        let txn = self.env.begin_ro_txn()?;
+        match txn.get(self.coeff_db, content_hash) {
+            Ok(encrypted_bytes) => {
+                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
+                    if let Ok(cached) = CachedCoefficients::from_bytes(&decrypted) {
+                        Ok(Some(cached.coefficients))
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Err(lmdb::Error::Corrupted)
+                }
             }
+            Err(lmdb::Error::NotFound) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -714,7 +755,23 @@ impl AppContext {
             }
         }
 
-        // 4. Sweep PixelDB
+        // 4. Sweep CoeffDB (PDQ coefficients)
+        if txn.stat(self.coeff_db)?.entries() > 0 {
+            let mut cursor = txn.open_rw_cursor(self.coeff_db)?;
+            for iter in cursor.iter_start() {
+                if let Ok((key, _)) = iter {
+                    if key.len() == 32 {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(key);
+                        if !valid_content_hashes.contains(&k) {
+                            cursor.del(WriteFlags::empty())?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Sweep PixelDB
         if txn.stat(self.pixel_db)?.entries() > 0 {
             let mut cursor = txn.open_rw_cursor(self.pixel_db)?;
             for iter in cursor.iter_start() {
@@ -738,6 +795,7 @@ impl AppContext {
         let meta_db = self.meta_db;
         let hash_db = self.hash_db;
         let feature_db = self.feature_db;
+        let coeff_db = self.coeff_db;
         let pixel_db = self.pixel_db;
         let cipher = self.cipher.clone();
 
@@ -745,6 +803,7 @@ impl AppContext {
             let mut meta_updates = Vec::new();
             let mut hash_updates = Vec::new();
             let mut feature_updates = Vec::new();
+            let mut coeff_updates = Vec::new();
             let mut pixel_updates = Vec::new();
 
             let mut last_flush = Instant::now();
@@ -754,7 +813,7 @@ impl AppContext {
             loop {
                 let msg = rx.recv_timeout(Duration::from_millis(100));
                 match msg {
-                    Ok((m, h, f, p)) => {
+                    Ok((m, h, f, c, p)) => {
                         if let Some(up) = m {
                             meta_updates.push(up);
                         }
@@ -763,6 +822,9 @@ impl AppContext {
                         }
                         if let Some(up) = f {
                             feature_updates.push(up);
+                        }
+                        if let Some(up) = c {
+                            coeff_updates.push(up);
                         }
                         if let Some(up) = p {
                             pixel_updates.push(up);
@@ -775,10 +837,12 @@ impl AppContext {
                             meta_db,
                             hash_db,
                             feature_db,
+                            coeff_db,
                             pixel_db,
                             &meta_updates,
                             &hash_updates,
                             &feature_updates,
+                            &coeff_updates,
                             &pixel_updates,
                         ) {
                             eprintln!("[ERROR-DB] Final write_batch failed: {:?}", e);
@@ -792,10 +856,12 @@ impl AppContext {
                     || meta_updates.len() >= max_buffer
                     || hash_updates.len() >= max_buffer
                     || feature_updates.len() >= max_buffer
+                    || coeff_updates.len() >= max_buffer
                     || pixel_updates.len() >= max_buffer)
                     && (!meta_updates.is_empty()
                         || !hash_updates.is_empty()
                         || !feature_updates.is_empty()
+                        || !coeff_updates.is_empty()
                         || !pixel_updates.is_empty())
                 {
                     match Self::write_batch(
@@ -804,16 +870,19 @@ impl AppContext {
                         meta_db,
                         hash_db,
                         feature_db,
+                        coeff_db,
                         pixel_db,
                         &meta_updates,
                         &hash_updates,
                         &feature_updates,
+                        &coeff_updates,
                         &pixel_updates,
                     ) {
                         Ok(()) => {
                             meta_updates.clear();
                             hash_updates.clear();
                             feature_updates.clear();
+                            coeff_updates.clear();
                             pixel_updates.clear();
                         }
                         Err(e) => {
@@ -833,10 +902,12 @@ impl AppContext {
         meta_db: Database,
         hash_db: Database,
         feature_db: Database,
+        coeff_db: Database,
         pixel_db: Database,
         meta_updates: &Vec<([u8; 32], [u8; 32])>,
         hash_updates: &Vec<([u8; 32], HashValue)>,
         feature_updates: &Vec<([u8; 32], CachedFeatures)>,
+        coeff_updates: &Vec<([u8; 32], CachedCoefficients)>,
         pixel_updates: &Vec<([u8; 32], [u8; 32])>,
     ) -> Result<(), lmdb::Error> {
         let mut txn = env.begin_rw_txn()?;
@@ -864,14 +935,21 @@ impl AppContext {
             }
         }
 
-        // 3. Feature Updates
+        // 3. Feature Updates (width, height, orientation, gps_pos)
         for (key, features) in feature_updates {
-            let bytes = features.to_bytes().expect("Features serialization failed");
+            let bytes = features.to_bytes().expect("CachedFeatures serialization failed");
             let encrypted = Self::encrypt_value(cipher, key, &bytes);
             txn.put(feature_db, key, &encrypted, WriteFlags::empty())?;
         }
 
-        // 4. Pixel Updates
+        // 4. Coefficient Updates (PDQ coefficients - duplicate finder mode only)
+        for (key, coeffs) in coeff_updates {
+            let bytes = coeffs.to_bytes().expect("CachedCoefficients serialization failed");
+            let encrypted = Self::encrypt_value(cipher, key, &bytes);
+            txn.put(coeff_db, key, &encrypted, WriteFlags::empty())?;
+        }
+
+        // 5. Pixel Updates
         for (key, val) in pixel_updates {
             let encrypted = Self::encrypt_value(cipher, key, val);
             txn.put(pixel_db, key, &encrypted, WriteFlags::empty())?;
