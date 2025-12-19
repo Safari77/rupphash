@@ -1,5 +1,6 @@
 *~
 .*.sw?
 /target/
+/src/target/
 /Cargo.lock
 tags

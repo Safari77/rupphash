@@ -7,12 +7,12 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 use geo::Point;
 use lmdb::{Cursor, Database, DatabaseFlags, Environment, Transaction, WriteFlags};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{collections::HashMap, path::PathBuf};
 
 const CONFIG_FILE_NAME: &str = "phdupes.conf";
 const DB_FILE_NAME_PDQHASH: &str = "phdupes_pdqhash";
@@ -128,6 +128,10 @@ struct Config {
     gui: GuiConfig,
     #[serde(default)]
     locations: HashMap<String, LocationOption>,
+    #[serde(default)]
+    pub map_providers: HashMap<String, String>, // Name -> URL pattern
+    #[serde(default)]
+    pub selected_provider: Option<String>,
 }
 
 impl Config {
@@ -196,6 +200,9 @@ pub struct AppContext {
     pub grouping_config: GroupingConfig,
     pub gui_config: GuiConfig,
     pub locations: HashMap<String, Point<f64>>,
+    pub map_providers: HashMap<String, String>,
+    pub selected_provider: String,
+    pub tile_cache_path: PathBuf, // Path for walkers to store images
     cipher: XChaCha20Poly1305,
 }
 
@@ -259,7 +266,8 @@ impl AppContext {
 
         fs::create_dir_all(&config_dir)?;
         fs::create_dir_all(&cache_dir)?;
-
+        let tile_cache_path = cache_dir.join("phdupes_tiles");
+        fs::create_dir_all(&tile_cache_path)?;
         let config_path = config_dir.join(CONFIG_FILE_NAME);
 
         let db_file_name = match algorithm {
@@ -271,7 +279,7 @@ impl AppContext {
             let content = fs::read_to_string(&config_path)?;
             eprintln!("[DEBUG-DB] Loading config from {:?}", config_path);
 
-            let cfg: Config = toml::from_str(&content)
+            let mut cfg: Config = toml::from_str(&content)
                 .map_err(|_| "Failed to parse config. Format might have changed.")?;
 
             eprintln!(
@@ -290,6 +298,22 @@ impl AppContext {
             let missing_db_size = raw_value.get("db_size_mb").is_none();
             let missing_locations = raw_value.get("locations").is_none();
 
+            if cfg.map_providers.is_empty() {
+                cfg.map_providers.insert(
+                    "OpenStreetMap".to_string(),
+                    "https://tile.openstreetmap.org/{z}/{x}/{y}.png".to_string(),
+                );
+                cfg.map_providers.insert(
+                    "Local Martin".to_string(),
+                    "http://localhost:3000/rpc/tiles/{z}/{x}/{y}".to_string(),
+                );
+            }
+
+            // Ensure a selection exists
+            if cfg.selected_provider.is_none() {
+                cfg.selected_provider = Some("OpenStreetMap".to_string());
+            }
+
             if missing_grouping || missing_gui || missing_db_size || missing_locations {
                 eprintln!(
                     "[DEBUG-DB] Writing back defaults (grouping={}, gui={}, db_size={}, locations={})",
@@ -307,12 +331,24 @@ impl AppContext {
             let mut random_bytes = [0u8; 32];
             getrandom::fill(&mut random_bytes)?;
 
+            let mut providers = HashMap::new();
+            providers.insert(
+                "OpenStreetMap".to_string(),
+                "https://tile.openstreetmap.org/{z}/{x}/{y}.png".to_string(),
+            );
+            providers.insert(
+                "Local Martin".to_string(),
+                "http://localhost:3000/rpc/tiles/{z}/{x}/{y}".to_string(),
+            );
+
             let cfg = Config {
                 master_key: hex::encode(random_bytes),
                 db_size_mb: DEFAULT_DB_SIZE_MB,
                 grouping: GroupingConfig::default(),
                 gui: GuiConfig::default(),
                 locations: HashMap::new(),
+                map_providers: providers,
+                selected_provider: Some("OpenStreetMap".to_string()),
             };
 
             let toml_str = toml::to_string_pretty(&cfg)?;
@@ -423,6 +459,11 @@ impl AppContext {
             grouping_config: config.grouping,
             gui_config: config.gui,
             locations,
+            map_providers: config.map_providers,
+            selected_provider: config
+                .selected_provider
+                .unwrap_or_else(|| "OpenStreetMap".to_string()),
+            tile_cache_path, // Pass the path to the context
             cipher,
         })
     }
@@ -858,6 +899,29 @@ impl AppContext {
         }
 
         txn.commit()
+    }
+
+    pub fn save_map_selection(
+        &mut self,
+        provider_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Update in-memory
+        self.selected_provider = provider_name.to_string();
+
+        // Update on disk
+        let config_dir = dirs::config_dir().ok_or("No config dir found")?;
+        let config_path = config_dir.join(CONFIG_FILE_NAME);
+
+        if config_path.exists() {
+            let content = fs::read_to_string(&config_path)?;
+            let mut cfg: Config = toml::from_str(&content)?;
+
+            cfg.selected_provider = Some(provider_name.to_string());
+
+            let toml_str = toml::to_string_pretty(&cfg)?;
+            fs::write(&config_path, toml_str)?;
+        }
+        Ok(())
     }
 
     pub fn save_gui_config(
