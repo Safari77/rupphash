@@ -63,4 +63,4 @@ C                    : Open Directory Picker to change folders
 SYSTEM
 ------------------------------------------------------------------------------
 Esc                  : Cancel current action / Close dialogs / Quit app
-Ctrl + Q             : Force Quit application
+Alt+F4               : Quit application and save state
