@@ -1,9 +1,9 @@
+use fast_image_resize as fr;
+use fast_image_resize::ResizeOptions;
+use fast_image_resize::images::Image;
 ///! Compute PDQ hash of an image.
 pub use image;
 use std::f32::consts::PI;
-use fast_image_resize as fr;
-use fast_image_resize::images::Image;
-use fast_image_resize::ResizeOptions;
 
 const MIN_HASHABLE_DIM: u32 = 5;
 const PDQ_NUM_JAROSZ_XY_PASSES: usize = 2;
@@ -106,11 +106,8 @@ pub fn generate_pdq_features(image: &image::DynamicImage) -> Option<(PdqFeatures
 
     // Optimization: Convert to Luma ONCE before resizing.
     // Resizing 1 channel is 3x faster than resizing 3 channels (RGB).
-    let luma_image = if let image::DynamicImage::ImageLuma8(x) = image {
-        x.clone()
-    } else {
-        image.to_luma8()
-    };
+    let luma_image =
+        if let image::DynamicImage::ImageLuma8(x) = image { x.clone() } else { image.to_luma8() };
 
     let w = luma_image.width();
     let h = luma_image.height();
@@ -141,19 +138,11 @@ fn resize_luma_fast(img: &image::GrayImage, w: u32, h: u32) -> image::GrayImage 
     let dst_height = h;
 
     // Create container for source image
-    let src_view = Image::from_vec_u8(
-        src_width,
-        src_height,
-        img.as_raw().clone(),
-        fr::PixelType::U8,
-    ).unwrap();
+    let src_view =
+        Image::from_vec_u8(src_width, src_height, img.as_raw().clone(), fr::PixelType::U8).unwrap();
 
     // Create container for destination
-    let mut dst_view = Image::new(
-        dst_width,
-        dst_height,
-        fr::PixelType::U8
-    );
+    let mut dst_view = Image::new(dst_width, dst_height, fr::PixelType::U8);
 
     let mut resizer = fr::Resizer::new();
     let options = ResizeOptions::default();
@@ -206,9 +195,11 @@ fn get_dct_matrix() -> [[f32; 64]; 16] {
     let inv_sqrt_cols = 1.0 / (num_cols as f32).sqrt();
     let sqrt_2 = 2.0_f32.sqrt();
 
-    for i in 0..16 { // Rows (Frequency)
+    for i in 0..16 {
+        // Rows (Frequency)
         let normalization = if i == 0 { inv_sqrt_cols } else { inv_sqrt_cols * sqrt_2 };
-        for j in 0..64 { // Cols (Space)
+        for j in 0..64 {
+            // Cols (Space)
             let angle = (PI * (i as f32) * (2.0 * (j as f32) + 1.0)) / (2.0 * (num_cols as f32));
             matrix[i][j] = normalization * angle.cos();
         }
@@ -254,31 +245,69 @@ fn dct64_to_16<const OUT_NUM_ROWS: usize, const OUT_NUM_COLS: usize>(
 // --- Filters & Decimation ---
 
 fn transpose(input: &[f32], output: &mut [f32], width: usize, height: usize) {
-    for y in 0..height { for x in 0..width { output[x * height + y] = input[y * width + x]; } }
+    for y in 0..height {
+        for x in 0..width {
+            output[x * height + y] = input[y * width + x];
+        }
+    }
 }
 
 #[inline(always)]
-fn box_one_d_float(invec: &[f32], in_start: usize, outvec: &mut [f32], vec_len: usize, win_size: usize) {
+fn box_one_d_float(
+    invec: &[f32],
+    in_start: usize,
+    outvec: &mut [f32],
+    vec_len: usize,
+    win_size: usize,
+) {
     let half_win = (win_size + 2) / 2;
     let oi_off = half_win - 1;
     let li_off = win_size - half_win + 1;
     let mut sum = 0.0;
     let mut curr_win = 0.0;
     let p1_end = in_start + oi_off;
-    for ri in in_start..p1_end { sum += invec[ri]; curr_win += 1.0; }
+    for ri in in_start..p1_end {
+        sum += invec[ri];
+        curr_win += 1.0;
+    }
     let p2_end = in_start + win_size;
-    for ri in p1_end..p2_end { let oi = ri - oi_off; sum += invec[ri]; curr_win += 1.0; outvec[oi] = sum / curr_win; }
+    for ri in p1_end..p2_end {
+        let oi = ri - oi_off;
+        sum += invec[ri];
+        curr_win += 1.0;
+        outvec[oi] = sum / curr_win;
+    }
     let p3_end = in_start + vec_len;
-    for ri in p2_end..p3_end { let oi = ri - oi_off; let li = oi - li_off; sum += invec[ri]; sum -= invec[li]; outvec[oi] = sum / curr_win; }
+    for ri in p2_end..p3_end {
+        let oi = ri - oi_off;
+        let li = oi - li_off;
+        sum += invec[ri];
+        sum -= invec[li];
+        outvec[oi] = sum / curr_win;
+    }
     let p4_start = in_start + vec_len - half_win + 1;
-    for oi in p4_start..p3_end { let li = oi - li_off; sum -= invec[li]; curr_win -= 1.0; outvec[oi] = sum / curr_win; }
+    for oi in p4_start..p3_end {
+        let li = oi - li_off;
+        sum -= invec[li];
+        curr_win -= 1.0;
+        outvec[oi] = sum / curr_win;
+    }
 }
 
 fn box_along_rows_float(input: &[f32], output: &mut [f32], rows: usize, cols: usize, win: usize) {
-    for i in 0..rows { box_one_d_float(input, i * cols, output, cols, win); }
+    for i in 0..rows {
+        box_one_d_float(input, i * cols, output, cols, win);
+    }
 }
 
-fn jarosz_filter_float(buf: &mut [f32], rows: usize, cols: usize, w_rows: usize, w_cols: usize, nreps: usize) {
+fn jarosz_filter_float(
+    buf: &mut [f32],
+    rows: usize,
+    cols: usize,
+    w_rows: usize,
+    w_cols: usize,
+    nreps: usize,
+) {
     let mut tmp = vec![0.0; buf.len()];
     for _ in 0..nreps {
         box_along_rows_float(buf, &mut tmp, rows, cols, w_rows);
@@ -288,7 +317,11 @@ fn jarosz_filter_float(buf: &mut [f32], rows: usize, cols: usize, w_rows: usize,
     }
 }
 
-fn decimate_float<const R: usize, const C: usize>(input: &[f32], in_r: usize, in_c: usize) -> [[f32; C]; R] {
+fn decimate_float<const R: usize, const C: usize>(
+    input: &[f32],
+    in_r: usize,
+    in_c: usize,
+) -> [[f32; C]; R] {
     let mut out = [[0.0; C]; R];
     for i in 0..R {
         let ini = ((i * 2 + 1) * in_r) / (R * 2);
@@ -302,8 +335,16 @@ fn decimate_float<const R: usize, const C: usize>(input: &[f32], in_r: usize, in
 
 fn pdq_image_domain_quality_metric<const R: usize, const C: usize>(buf: &[[f32; C]; R]) -> f32 {
     let mut sum = 0.0;
-    for i in 0..(R - 1) { for j in 0..C { sum += ((buf[i][j] - buf[i+1][j])/255.0).abs(); } }
-    for i in 0..R { for j in 0..(C - 1) { sum += ((buf[i][j] - buf[i][j+1])/255.0).abs(); } }
+    for i in 0..(R - 1) {
+        for j in 0..C {
+            sum += ((buf[i][j] - buf[i + 1][j]) / 255.0).abs();
+        }
+    }
+    for i in 0..R {
+        for j in 0..(C - 1) {
+            sum += ((buf[i][j] - buf[i][j + 1]) / 255.0).abs();
+        }
+    }
     let q = sum / 90.0;
     if q > 1.0 { 1.0 } else { q }
 }

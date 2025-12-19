@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
-use filetime::FileTime;
 use file_id::FileId;
+use filetime::FileTime;
+use std::path::{Path, PathBuf};
 
 // Standard filename limit for most filesystems
 const MAX_FILENAME_BYTES: usize = 255;
@@ -14,7 +14,7 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
         // 1. Try atomic renameat2 via nix (Linux Only)
         #[cfg(target_os = "linux")]
         {
-            use nix::fcntl::{renameat2, RenameFlags};
+            use nix::fcntl::{RenameFlags, renameat2};
             use std::os::fd::BorrowedFd;
 
             // Safety: AT_FDCWD is a constant valid fd for CWD
@@ -23,7 +23,7 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
             match renameat2(cwd, from, cwd, to, RenameFlags::RENAME_NOREPLACE) {
                 Ok(_) => {
                     return Ok(());
-                },
+                }
                 Err(e) => {
                     // Optimization: If it's a cross-device link, return immediately.
                     // Fallbacks (link/rename) will definitely fail with EXDEV too.
@@ -32,9 +32,12 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
                     }
                     // If the OS explicitly says "File Exists", respect it immediately.
                     if e == nix::errno::Errno::EEXIST {
-                         return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+                        return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
                     }
-                    eprintln!("[DEBUG] renameat2 failed: {} (errno: {}). Checking fallback...", e, e as i32);
+                    eprintln!(
+                        "[DEBUG] renameat2 failed: {} (errno: {}). Checking fallback...",
+                        e, e as i32
+                    );
                 }
             }
         }
@@ -62,7 +65,7 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
             Ok(()) => {
                 std::fs::remove_file(from)?;
                 Ok(())
-            },
+            }
             Err(e) => Err(e),
         }
     }
@@ -74,7 +77,7 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
             Ok(()) => {
                 std::fs::remove_file(from)?;
                 Ok(())
-            },
+            }
             Err(e) => Err(e),
         }
     }
@@ -89,10 +92,7 @@ fn atomic_copy_move(src: &Path, dst: &Path) -> std::io::Result<()> {
     let metadata = reader.metadata()?;
 
     // Open Destination with O_EXCL (Fail if exists)
-    let mut writer = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dst)?;
+    let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
 
     // Copy Data
     std::io::copy(&mut reader, &mut writer)?;
@@ -112,7 +112,7 @@ fn atomic_copy_move(src: &Path, dst: &Path) -> std::io::Result<()> {
     let mtime = FileTime::from_last_modification_time(&metadata);
     let atime = FileTime::from_last_access_time(&metadata);
     if let Err(e) = filetime::set_file_times(dst, atime, mtime) {
-         eprintln!("[WARN] Failed to restore timestamps on {:?}: {}", dst, e);
+        eprintln!("[WARN] Failed to restore timestamps on {:?}: {}", dst, e);
     }
 
     // Restore Extended Attributes (ACLs, SELinux Labels, User xattrs), ignore errors.
@@ -159,8 +159,8 @@ pub fn perform_atomic_move(temp_path: &Path, target_path: &Path) -> std::io::Res
             Err(e) if is_cross_device(&e) => {
                 // Cross-device logic: Copy, Sync, Delete
                 atomic_copy_move(src, dst)
-            },
-            other => other
+            }
+            other => other,
         }
     };
 
@@ -168,33 +168,37 @@ pub fn perform_atomic_move(temp_path: &Path, target_path: &Path) -> std::io::Res
     match try_move(temp_path, target_path) {
         Ok(_) => Ok(target_path.to_path_buf()),
 
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists
-               || e.raw_os_error() == Some(libc::EEXIST) => {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                || e.raw_os_error() == Some(libc::EEXIST) =>
+        {
             Err(e)
-        },
+        }
 
         // Handle "Filename Too Long" logic
         Err(e) if is_name_too_long(&e) => {
             let truncated = resolve_output_path(target_path)?;
             // Safety check: if truncation didn't actually shorten it, stop
             if truncated == target_path {
-                 return Err(e);
+                return Err(e);
             }
             eprintln!("Filename too long, retrying with: {}", truncated.display());
 
             // Attempt 2: Try with truncated name
             match try_move(temp_path, &truncated) {
                 Ok(_) => Ok(truncated),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists
-                       || e.raw_os_error() == Some(libc::EEXIST) => {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            format!("Truncated filename '{}' already exists", truncated.display())
-                        ))
-                    },
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        || e.raw_os_error() == Some(libc::EEXIST) =>
+                {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("Truncated filename '{}' already exists", truncated.display()),
+                    ))
+                }
                 Err(e) => Err(e),
             }
-        },
+        }
 
         // Catch-all
         Err(e) => Err(e),
@@ -203,10 +207,9 @@ pub fn perform_atomic_move(temp_path: &Path, target_path: &Path) -> std::io::Res
 
 /// Resolves the path, truncating the filename if it exceeds limits.
 fn resolve_output_path(original_path: &Path) -> std::io::Result<PathBuf> {
-    let filename = original_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid filename in path"))?;
+    let filename = original_path.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid filename in path")
+    })?;
 
     if filename.len() <= MAX_FILENAME_BYTES {
         return Ok(original_path.to_path_buf());
@@ -279,18 +282,22 @@ pub fn get_file_key(path: &Path) -> Option<u128> {
     {
         let id = {
             #[cfg(unix)]
-            { file_id::get_file_id(path).ok()? }
+            {
+                file_id::get_file_id(path).ok()?
+            }
             #[cfg(windows)]
-            { file_id::get_high_res_file_id(path).ok()? }
+            {
+                file_id::get_high_res_file_id(path).ok()?
+            }
         };
 
         Some(match id {
             FileId::Inode { device_id, inode_number } => {
                 ((device_id as u128) << 64) | (inode_number as u128)
-            },
+            }
             FileId::LowRes { volume_serial_number, file_index } => {
                 ((volume_serial_number as u128) << 64) | (file_index as u128)
-            },
+            }
             FileId::HighRes { volume_serial_number, file_id } => {
                 file_id ^ ((volume_serial_number as u128) << 64)
             }

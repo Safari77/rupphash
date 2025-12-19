@@ -1,10 +1,10 @@
-mod position;
 mod helper_exif;
+mod position;
 
 use clap::Parser;
+use exif::Reader;
 use std::fs::File;
 use std::io::BufReader;
-use exif::{Reader};
 
 /// Simple program to calculate sun position from EXIF data
 #[derive(Parser, Debug)]
@@ -23,7 +23,11 @@ fn main() {
     let loc_helsinki = (60.1699, 24.9384);
     let loc_tampere = (61.4978, 23.7610);
     let (dist, bearing) = position::distance_and_bearing(loc_helsinki, loc_tampere);
-    println!("Helsinki to Tampere Distance: {:.3} km, Compass Bearing: {:.3}°", dist / 1000.0, bearing);
+    println!(
+        "Helsinki to Tampere Distance: {:.3} km, Compass Bearing: {:.3}°",
+        dist / 1000.0,
+        bearing
+    );
 
     // 1. Parse arguments using Clap
     let args = Args::parse();
@@ -55,26 +59,36 @@ fn main() {
             println!("File:       {}", filename);
             println!("Lat/Lon:    {:.5}, {:.5}", latitude, longitude);
             println!("Altitude:   {:.1} m", altitude_val);
-            println!("Date Clean: '{}' {}", clean_date, if args.gpstime { "(GPS UTC)" } else { "" });
+            println!(
+                "Date Clean: '{}' {}",
+                clean_date,
+                if args.gpstime { "(GPS UTC)" } else { "" }
+            );
 
-            match position::sun_alt_and_azimuth(&clean_date, latitude, longitude, alt, args.gpstime) {
+            match position::sun_alt_and_azimuth(&clean_date, latitude, longitude, alt, args.gpstime)
+            {
                 Ok((sun_alt, sun_az, tzstring)) => {
                     println!("\n--- Result ---");
                     println!("Sun Altitude:  {:.4} deg", sun_alt);
                     println!("Sun Azimuth:   {:.4} deg", sun_az);
                     println!("Timezone:      {}", tzstring);
-                },
+                }
                 Err(e) => {
                     println!("\n--- Calculation Error ---");
                     println!("Error: {}", e);
                 }
             }
-        },
+        }
         _ => {
             println!("--- Missing Data ---");
-            if coords.is_none() { println!("Error: GPS coordinates missing"); }
+            if coords.is_none() {
+                println!("Error: GPS coordinates missing");
+            }
             if date_str.is_none() {
-                println!("Error: Date missing (Mode: {})", if args.gpstime { "GPS" } else { "Original" });
+                println!(
+                    "Error: Date missing (Mode: {})",
+                    if args.gpstime { "GPS" } else { "Original" }
+                );
             }
         }
     }

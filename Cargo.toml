@@ -4,6 +4,8 @@ version = "0.4.2"
 edition = "2024"
 license = "GPL-3.0"
 authors = ["Sami Farin"]
+rust-version = "1.88"
+repository = "https://github.com/Safari77/rupphash"
 
 [dependencies]
 anyhow = "1.0"

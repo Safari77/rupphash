@@ -1,4 +1,4 @@
-use image::{DynamicImage};
+use image::DynamicImage;
 use rustdct::{DctPlanner, TransformType2And3};
 use std::sync::Arc;
 
@@ -17,8 +17,8 @@ use std::sync::Arc;
 //     If not, see <https://www.gnu.org/licenses/>.
 
 /// Standard pHash constants
-const DCT_SIZE: usize = 32;     // The standard pHash uses a 32x32 DCT
-const HASH_SIZE: usize = 8;     // The hash is based on the top-left 8x8 low frequencies
+const DCT_SIZE: usize = 32; // The standard pHash uses a 32x32 DCT
+const HASH_SIZE: usize = 8; // The hash is based on the top-left 8x8 low frequencies
 // DCT_SIZE/HASH_SIZE=4: This multiplier (4) is implicit in the standard (32x32 DCT -> 8x8 Hash).
 
 pub struct DctPhash {
@@ -38,34 +38,22 @@ impl DctPhash {
         let col_dct = planner.plan_dct2(DCT_SIZE);
 
         // Calculate required scratch space once
-        let scratch_len = std::cmp::max(
-            row_dct.get_scratch_len(),
-            col_dct.get_scratch_len()
-        );
+        let scratch_len = std::cmp::max(row_dct.get_scratch_len(), col_dct.get_scratch_len());
         let scratch_len = std::cmp::max(scratch_len, DCT_SIZE); // Also needs space for transpose
 
-        Self {
-            row_dct,
-            col_dct,
-            scratch_len,
-        }
+        Self { row_dct, col_dct, scratch_len }
     }
 
     /// Calculates the 64-bit perceptual hash of an image.
     pub fn hash_image(&self, img: &DynamicImage) -> u64 {
         // 1. Resize to 32x32 using Triangle (Bilinear) filter and convert to Grayscale
         //    pHash standard specifically requires 32x32.
-        let gray_img = img.resize_exact(
-            DCT_SIZE as u32,
-            DCT_SIZE as u32,
-            image::imageops::FilterType::Triangle
-        ).to_luma8();
+        let gray_img = img
+            .resize_exact(DCT_SIZE as u32, DCT_SIZE as u32, image::imageops::FilterType::Triangle)
+            .to_luma8();
 
         // 2. Convert to f32 vector for DCT
-        let mut pixels: Vec<f32> = gray_img.as_raw()
-            .iter()
-            .map(|&b| b as f32)
-            .collect();
+        let mut pixels: Vec<f32> = gray_img.as_raw().iter().map(|&b| b as f32).collect();
 
         // 3. Perform 2D DCT (Separable: Rows then Cols)
         self.perform_dct_2d(&mut pixels);

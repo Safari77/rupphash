@@ -1,9 +1,9 @@
+use chrono::Datelike;
 use geo::{Bearing, Distance, Geodesic, Point};
-use jiff::{civil::DateTime as CivilDateTime, Zoned};
-use solar_positioning::{spa, RefractionCorrection};
+use jiff::{Zoned, civil::DateTime as CivilDateTime};
+use solar_positioning::{RefractionCorrection, spa};
 use std::sync::OnceLock;
 use tzf_rs::DefaultFinder;
-use chrono::Datelike;
 
 static TZ_FINDER: OnceLock<DefaultFinder> = OnceLock::new();
 
@@ -18,7 +18,8 @@ fn resolve_timezone(lon: f64, lat: f64) -> String {
         return original_tz.to_string();
     }
     let search_offset = 0.5;
-    let directions = [(0.0, search_offset), (0.0, -search_offset), (search_offset, 0.0), (-search_offset, 0.0)];
+    let directions =
+        [(0.0, search_offset), (0.0, -search_offset), (search_offset, 0.0), (-search_offset, 0.0)];
     for (d_lat, d_lon) in directions {
         let neighbor_tz = finder.get_tz_name(lon + d_lon, lat + d_lat);
         if !neighbor_tz.starts_with("Etc/") {
@@ -45,20 +46,17 @@ pub fn sun_alt_and_azimuth(
     altitude: Option<f64>,
     use_gps_utc: bool,
 ) -> Result<(f64, f64, String), String> {
-
     if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
         return Err(format!("Coordinates out of bounds: {}, {}", lat, lon));
     }
 
-    eprintln!("sun_alt_and_azimuth time={} lat={} lon={} alt={:?} use_utc={}",
-        local_time_str, lat, lon, altitude, use_gps_utc);
+    eprintln!(
+        "sun_alt_and_azimuth time={} lat={} lon={} alt={:?} use_utc={}",
+        local_time_str, lat, lon, altitude, use_gps_utc
+    );
 
     // If using GPS time, we force UTC. Otherwise, we resolve the local timezone.
-    let tz_name = if use_gps_utc {
-        "UTC".to_string()
-    } else {
-        resolve_timezone(lon, lat)
-    };
+    let tz_name = if use_gps_utc { "UTC".to_string() } else { resolve_timezone(lon, lat) };
 
     // Only replace colons if the DATE part actually looks like "YYYY:MM:DD"
     let clean_time = local_time_str.trim().replace(' ', "T");
@@ -71,12 +69,13 @@ pub fn sun_alt_and_azimuth(
         clean_time // Already has hyphens or is invalid in a different way
     };
 
-    let civil_dt = final_time_str.parse::<CivilDateTime>()
+    let civil_dt = final_time_str
+        .parse::<CivilDateTime>()
         .map_err(|e| format!("Date Parse Error: '{}' -> {}", final_time_str, e))?;
 
     // Create Zoned time. Jiff handles "UTC" correctly as a timezone name.
-    let zoned_time: Zoned = civil_dt.in_tz(&tz_name)
-        .map_err(|e| format!("Timezone Error ({}): {}", tz_name, e))?;
+    let zoned_time: Zoned =
+        civil_dt.in_tz(&tz_name).map_err(|e| format!("Timezone Error ({}): {}", tz_name, e))?;
 
     let offset_seconds = zoned_time.offset().seconds();
     let sign = if offset_seconds < 0 { '-' } else { '+' };
@@ -89,16 +88,16 @@ pub fn sun_alt_and_azimuth(
     let timestamp_secs = zoned_time.timestamp().as_second();
     let timestamp_nanos = zoned_time.timestamp().subsec_nanosecond();
 
-    let chrono_time = chrono::DateTime::from_timestamp(
-        timestamp_secs,
-        timestamp_nanos.try_into().unwrap_or(0),
-    ).ok_or("Invalid timestamp conversion")?
-    .with_timezone(&chrono::Utc);
+    let chrono_time =
+        chrono::DateTime::from_timestamp(timestamp_secs, timestamp_nanos.try_into().unwrap_or(0))
+            .ok_or("Invalid timestamp conversion")?
+            .with_timezone(&chrono::Utc);
 
     let delta_t = solar_positioning::time::DeltaT::estimate_from_date(
         chrono_time.year(),
-        chrono_time.month()
-    ).map_err(|_| "solar_positioning DeltaT estimation failed")?;
+        chrono_time.month(),
+    )
+    .map_err(|_| "solar_positioning DeltaT estimation failed")?;
 
     let elev_meters = altitude.unwrap_or(0.0);
 
@@ -125,7 +124,9 @@ pub fn parse_sun_pos_string(s: &str) -> Option<(f64, f64)> {
     // Expected format: "Alt: 12.531°, Az: 123.433°"
     let clean = s.replace('°', "");
     let parts: Vec<&str> = clean.split(',').collect();
-    if parts.len() < 2 { return None; }
+    if parts.len() < 2 {
+        return None;
+    }
 
     let alt_part = parts[0].trim().strip_prefix("Alt:")?.trim();
     let az_part = parts[1].trim().strip_prefix("Az:")?.trim();

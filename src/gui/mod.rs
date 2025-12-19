@@ -1,6 +1,6 @@
 mod app;
-mod image;
 mod dialogs;
+mod image;
 
 pub use app::GuiApp;
 

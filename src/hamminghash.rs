@@ -35,7 +35,9 @@ impl HammingHash for u64 {
         (*self ^ *other).count_ones()
     }
 
-    fn bit_width_per_chunk() -> usize { 8 }
+    fn bit_width_per_chunk() -> usize {
+        8
+    }
 }
 
 // --- Implementation for 256-bit PDQ ---
@@ -47,7 +49,7 @@ impl HammingHash for [u8; 32] {
     #[inline(always)]
     fn get_chunk(&self, chunk_idx: usize) -> u16 {
         let offset = chunk_idx * 2;
-        u16::from_le_bytes([self[offset], self[offset+1]])
+        u16::from_le_bytes([self[offset], self[offset + 1]])
     }
 
     #[inline(always)]
@@ -61,7 +63,9 @@ impl HammingHash for [u8; 32] {
         dist
     }
 
-    fn bit_width_per_chunk() -> usize { 16 }
+    fn bit_width_per_chunk() -> usize {
+        16
+    }
 }
 
 // --- The Index Struct (CSR Memory Layout) ---
@@ -121,10 +125,7 @@ pub struct SparseBitSet {
 }
 impl SparseBitSet {
     pub fn new(size: usize) -> Self {
-        Self {
-            data: vec![0; size.div_ceil(64)],
-            dirty: Vec::with_capacity(512)
-        }
+        Self { data: vec![0; size.div_ceil(64)], dirty: Vec::with_capacity(512) }
     }
     #[inline(always)]
     pub fn set(&mut self, idx: usize) -> bool {
@@ -133,13 +134,19 @@ impl SparseBitSet {
         let word = unsafe { self.data.get_unchecked_mut(word_idx) };
         let is_set = (*word & mask) != 0;
         if !is_set {
-            if *word == 0 { self.dirty.push(word_idx); }
+            if *word == 0 {
+                self.dirty.push(word_idx);
+            }
             *word |= mask;
         }
         is_set
     }
     pub fn clear(&mut self) {
-        for &idx in &self.dirty { unsafe { *self.data.get_unchecked_mut(idx) = 0; } }
+        for &idx in &self.dirty {
+            unsafe {
+                *self.data.get_unchecked_mut(idx) = 0;
+            }
+        }
         self.dirty.clear();
     }
 }
@@ -152,7 +159,8 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
     let bits_per_chunk = H::bit_width_per_chunk();
 
     // Step 1: Parallel Neighbor Discovery
-    let adjacency: Vec<Vec<u32>> = index.db_hashes
+    let adjacency: Vec<Vec<u32>> = index
+        .db_hashes
         .par_iter()
         .enumerate()
         .map_init(
@@ -172,10 +180,13 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
                         let bucket = unsafe { index.values.get_unchecked(start..end) };
 
                         for &cand_id in bucket {
-                            if cand_id as usize == i { continue; }
+                            if cand_id as usize == i {
+                                continue;
+                            }
 
                             if !visited.set(cand_id as usize) {
-                                let cand = unsafe { index.db_hashes.get_unchecked(cand_id as usize) };
+                                let cand =
+                                    unsafe { index.db_hashes.get_unchecked(cand_id as usize) };
 
                                 // --- VALID DISTANCE CHECK IS HERE ---
                                 if query_hash.hamming_distance(cand) <= max_dist {
@@ -194,7 +205,7 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
                     }
                 }
                 results.clone()
-            }
+            },
         )
         .collect();
 
@@ -203,8 +214,12 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
     let mut groups = Vec::new();
 
     for i in 0..n {
-        if visited[i] { continue; }
-        if adjacency[i].is_empty() { continue; }
+        if visited[i] {
+            continue;
+        }
+        if adjacency[i].is_empty() {
+            continue;
+        }
 
         let mut group = vec![i as u32];
         visited[i] = true;
@@ -226,10 +241,10 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::prelude::*;
-    use std::time::Instant;
-    use std::path::Path;
     use crate::pdqhash;
+    use rand::prelude::*;
+    use std::path::Path;
+    use std::time::Instant;
 
     // --- TEST 1: High Similarity Logic (Generics check) ---
     #[test]
@@ -266,7 +281,7 @@ mod tests {
             let mut target = [0u8; 32];
             // Manually set 30 bits to create distance 30
             for i in 0..30 {
-                target[i/8] |= 1 << (i%8);
+                target[i / 8] |= 1 << (i % 8);
             }
 
             let hashes = vec![base, target];
@@ -277,7 +292,10 @@ mod tests {
 
             assert!(!groups.is_empty(), "Failed to find any groups for PDQ");
             let group = &groups[0];
-            assert!(group.contains(&0) && group.contains(&1), "PDQ Group should contain both indices");
+            assert!(
+                group.contains(&0) && group.contains(&1),
+                "PDQ Group should contain both indices"
+            );
         }
     }
 
@@ -298,10 +316,10 @@ mod tests {
         let target = 0xABCD_1234_5678_90EF;
         let cluster_values = vec![
             target,
-            target ^ 1,          // Dist 1
-            target ^ 2,          // Dist 1
-            target ^ 0x8000,     // Dist 1
-            target ^ 0x8001,     // Dist 2 from target
+            target ^ 1,      // Dist 1
+            target ^ 2,      // Dist 1
+            target ^ 0x8000, // Dist 1
+            target ^ 0x8001, // Dist 2 from target
         ];
 
         // 3. Inject them at RANDOM positions
@@ -326,7 +344,11 @@ mod tests {
 
         // 5. Run Grouping (Parallel)
         let max_dist = 5;
-        println!("Grouping (max_dist={}) with {} threads...", max_dist, rayon::current_num_threads());
+        println!(
+            "Grouping (max_dist={}) with {} threads...",
+            max_dist,
+            rayon::current_num_threads()
+        );
 
         let start_group = Instant::now();
         let groups = find_groups(&index, max_dist);
@@ -349,7 +371,11 @@ mod tests {
 
         // Verify that ALL injected indices are present in this group
         for &expected_idx in &injected_indices {
-            assert!(g.contains(&(expected_idx as u32)), "Group missing injected index {}", expected_idx);
+            assert!(
+                g.contains(&(expected_idx as u32)),
+                "Group missing injected index {}",
+                expected_idx
+            );
         }
     }
 
@@ -360,8 +386,8 @@ mod tests {
 
         // 1. Load Image
         let path = Path::new("./tests/bench.jpg");
-        let img = image::open(path)
-            .expect("Failed to open './tests/bench.jpg'. Ensure file exists.");
+        let img =
+            image::open(path).expect("Failed to open './tests/bench.jpg'. Ensure file exists.");
 
         // 2. Generate features and Ground Truth Dihedral Hashes
         let (features, _) = pdqhash::generate_pdq_features(&img)
@@ -386,8 +412,8 @@ mod tests {
         // 4. Test each transformation
         for (name, transformed_img) in transformations {
             // Generate hash for the physically transformed image
-            let (hash_bytes, _) = pdqhash::generate_pdq(&transformed_img)
-                .expect("Failed to hash transformed image");
+            let (hash_bytes, _) =
+                pdqhash::generate_pdq(&transformed_img).expect("Failed to hash transformed image");
 
             // Find best match in the dihedral set
             let mut min_dist = u32::MAX;
@@ -402,18 +428,20 @@ mod tests {
             }
 
             println!(
-                "Transform: {:<25} | Best Match Index: {} | Hamming Distance: {}", 
+                "Transform: {:<25} | Best Match Index: {} | Hamming Distance: {}",
                 name, best_idx, min_dist
             );
 
             // Pixel-domain rotation causes resampling artifacts that can flip bits.
             // A distance of < 20 is still considered a "Match" in PDQ terms (threshold is usually ~30-60).
-            let tolerance = 22; 
+            let tolerance = 22;
 
             assert!(
                 min_dist <= tolerance,
                 "FAIL: Transform '{}' resulted in distance {} (expected <= {})",
-                name, min_dist, tolerance
+                name,
+                min_dist,
+                tolerance
             );
         }
 

@@ -14,18 +14,22 @@ pub fn extract_gps_lat_lon(exif_data: &exif::Exif) -> Option<(f64, f64)> {
     let lat = if let Some(ref_field) = lat_ref {
         let ref_str = ref_field.value.display_as(exif::Tag::GPSLatitudeRef).to_string();
         if ref_str.trim().eq_ignore_ascii_case("S") { -lat } else { lat }
-    } else { lat };
+    } else {
+        lat
+    };
 
     let lon = if let Some(ref_field) = lon_ref {
         let ref_str = ref_field.value.display_as(exif::Tag::GPSLongitudeRef).to_string();
         if ref_str.trim().eq_ignore_ascii_case("W") { -lon } else { lon }
-    } else { lon };
+    } else {
+        lon
+    };
 
     Some((lat, lon))
 }
 
 /// Parse GPS coordinate magnitude from EXIF rational values (DMS -> Decimal).
-/// 
+///
 /// Note: This always returns a positive value. The caller must apply the
 /// sign based on the GPSLatitudeRef (N/S) or GPSLongitudeRef (E/W) tags.
 pub fn parse_gps_coordinate(value: &exif::Value) -> Option<f64> {
@@ -54,20 +58,29 @@ pub fn get_date_str(exif: &exif::Exif, use_gps: bool) -> Option<String> {
         if let (Some(d_field), Some(t_field)) = (date_field, time_field) {
             // Parse Date: "YYYY:MM:DD"
             let date_part = if let Value::Ascii(ref vec) = d_field.value {
-                 if !vec.is_empty() {
-                     std::str::from_utf8(&vec[0]).ok()?.trim().replace(':', "-")
-                 } else { return None; }
-            } else { return None; };
+                if !vec.is_empty() {
+                    std::str::from_utf8(&vec[0]).ok()?.trim().replace(':', "-")
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            };
 
             // Parse Time: 3 Rationals [Hr, Min, Sec]
             let time_part = if let Value::Rational(ref rats) = t_field.value {
-                if rats.len() >= 3 && rats[0].denom != 0 && rats[1].denom != 0 && rats[2].denom != 0 {
+                if rats.len() >= 3 && rats[0].denom != 0 && rats[1].denom != 0 && rats[2].denom != 0
+                {
                     let h = rats[0].num as f64 / rats[0].denom as f64;
                     let m = rats[1].num as f64 / rats[1].denom as f64;
                     let s = rats[2].num as f64 / rats[2].denom as f64;
                     format!("{:02}:{:02}:{:06.3}", h as u32, m as u32, s)
-                } else { return None; }
-            } else { return None; };
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            };
 
             return Some(format!("{} {}", date_part, time_part));
         }
@@ -97,7 +110,9 @@ pub fn get_altitude(exif: &exif::Exif) -> Option<f64> {
     let ref_field = exif.get_field(Tag::GPSAltitudeRef, In::PRIMARY);
 
     if let Value::Rational(ref rats) = val_field.value {
-        if rats.is_empty() || rats[0].denom == 0 { return None; }
+        if rats.is_empty() || rats[0].denom == 0 {
+            return None;
+        }
 
         let mut alt = rats[0].num as f64 / rats[0].denom as f64;
 
@@ -112,5 +127,3 @@ pub fn get_altitude(exif: &exif::Exif) -> Option<f64> {
     }
     None
 }
-
-

@@ -1,29 +1,28 @@
 use chrono::{DateTime, Utc};
 use codes_iso_3166::part_1::CountryCode;
 use codes_iso_3166::part_2::SubdivisionCode;
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::{Sender, unbounded};
+use image::GenericImageView;
+use jpeg_decoder::Decoder as Tier2Decoder;
+use libheif_rs::HeifContext;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path};
+use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
-use libheif_rs::HeifContext;
-use image::GenericImageView;
 use zune_jpeg::JpegDecoder as ZuneDecoder;
-use jpeg_decoder::Decoder as Tier2Decoder;
-use exif::{In, Reader, Tag, Value};
 
-use crate::{FileMetadata, GroupInfo, GroupStatus};
-use crate::hamminghash::{MIHIndex, HammingHash, SparseBitSet};
 use crate::db::{AppContext, HashValue, compute_meta_key};
-use crate::helper_exif::{parse_gps_coordinate, extract_gps_lat_lon, get_altitude, get_date_str};
-use crate::position;
 use crate::fileops;
 use crate::fileops::get_file_key;
+use crate::hamminghash::{HammingHash, MIHIndex, SparseBitSet};
+use crate::helper_exif::{extract_gps_lat_lon, get_altitude, get_date_str, parse_gps_coordinate};
+use crate::position;
+use crate::{FileMetadata, GroupInfo, GroupStatus};
 
 pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf"];
 
@@ -45,9 +44,10 @@ pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exi
 pub fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
     if let Some(exif_data) = read_exif_data(path, preloaded_bytes)
         && let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-            && let Some(v @ 1..=8) = field.value.get_uint(0) {
-                return v as u8;
-            }
+        && let Some(v @ 1..=8) = field.value.get_uint(0)
+    {
+        return v as u8;
+    }
     1
 }
 
@@ -73,7 +73,12 @@ fn format_derived_tag_display_name(name: &str) -> String {
 }
 
 /// Get multiple EXIF tags as a vector of (tag_name, value) pairs
-pub fn get_exif_tags(path: &Path, tag_names: &[String], decimal_coords: bool, use_gps_utc: bool) -> Vec<(String, String)> {
+pub fn get_exif_tags(
+    path: &Path,
+    tag_names: &[String],
+    decimal_coords: bool,
+    use_gps_utc: bool,
+) -> Vec<(String, String)> {
     let Some(exif_data) = read_exif_data(path, None) else {
         return Vec::new();
     };
@@ -82,11 +87,7 @@ pub fn get_exif_tags(path: &Path, tag_names: &[String], decimal_coords: bool, us
 
     // Pre-extract GPS coordinates if needed for derived values
     let needs_gps = tag_names.iter().any(|t| is_derived_tag(t));
-    let gps_coords = if needs_gps {
-        extract_gps_lat_lon(&exif_data)
-    } else {
-        None
-    };
+    let gps_coords = if needs_gps { extract_gps_lat_lon(&exif_data) } else { None };
 
     // Pre-extract Data for Sun Position if needed
     let needs_sun = tag_names.iter().any(|t| t.eq_ignore_ascii_case("DerivedSunPosition"));
@@ -99,12 +100,15 @@ pub fn get_exif_tags(path: &Path, tag_names: &[String], decimal_coords: bool, us
 
     for tag_name in tag_names {
         // Check for derived tags first
-        if let Some(derived_entries) = get_derived_value(tag_name, gps_coords, &sun_inputs, &exif_data, use_gps_utc) {
+        if let Some(derived_entries) =
+            get_derived_value(tag_name, gps_coords, &sun_inputs, &exif_data, use_gps_utc)
+        {
             results.extend(derived_entries);
         } else if let Some((tag, in_value)) = parse_exif_tag_name(tag_name)
-            && let Some(field) = exif_data.get_field(tag, in_value) {
-                let value_str = format_exif_value(&field.value, tag, decimal_coords);
-                results.push((tag_name.clone(), value_str));
+            && let Some(field) = exif_data.get_field(tag, in_value)
+        {
+            let value_str = format_exif_value(&field.value, tag, decimal_coords);
+            results.push((tag_name.clone(), value_str));
         }
     }
 
@@ -118,14 +122,14 @@ fn get_derived_value(
     gps_coords: Option<(f64, f64)>,
     sun_inputs: &Option<Option<f64>>,
     exif_data: &exif::Exif,
-    use_gps_utc: bool
+    use_gps_utc: bool,
 ) -> Option<Vec<(String, String)>> {
     match tag_name.to_lowercase().as_str() {
         "derivedcountry" => {
             let (lat, lon) = gps_coords?;
             let val = derive_country(lat, lon)?;
             Some(vec![("Country".to_string(), val)])
-        },
+        }
         "derivedsunposition" => {
             let (lat, lon) = gps_coords?;
             let alt_m = sun_inputs.as_ref()?.unwrap_or(0.0);
@@ -149,11 +153,13 @@ fn get_derived_value(
             }
 
             if let Some(d) = date_str {
-                if let Ok((elev, az, tz)) = position::sun_alt_and_azimuth(&d, lat, lon, Some(alt_m), final_use_utc) {
+                if let Ok((elev, az, tz)) =
+                    position::sun_alt_and_azimuth(&d, lat, lon, Some(alt_m), final_use_utc)
+                {
                     // Split into two lines as requested
                     Some(vec![
                         ("Sun Position".to_string(), crate::position::format_sun_pos(elev, az)),
-                        ("TZ at GPS pos".to_string(), tz)
+                        ("TZ at GPS pos".to_string(), tz),
                     ])
                 } else {
                     None
@@ -161,16 +167,14 @@ fn get_derived_value(
             } else {
                 None
             }
-        },
+        }
         _ => None,
     }
 }
 
 fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
-    let ext = path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .unwrap_or_default();
+    let ext =
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
 
     // Explicitly reject RAWs here so they are handled by the RAW-specific logic
     if crate::scanner::RAW_EXTS.contains(&ext.as_str()) {
@@ -190,20 +194,35 @@ fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
                     // Robustly handle Grayscale vs RGB based on buffer size
                     if len == (w * h) as usize {
                         // Grayscale
-                        if let Some(buf) = image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels) {
-                            eprintln!("[DEBUG-LOAD] {:?} -> Zune-JPEG (Grayscale)", path.file_name().unwrap_or_default());
+                        if let Some(buf) =
+                            image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels)
+                        {
+                            eprintln!(
+                                "[DEBUG-LOAD] {:?} -> Zune-JPEG (Grayscale)",
+                                path.file_name().unwrap_or_default()
+                            );
                             return Some(image::DynamicImage::ImageLuma8(buf));
                         }
                     } else if len == (w * h * 3) as usize {
                         // RGB
-                        if let Some(buf) = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels) {
-                            eprintln!("[DEBUG-LOAD] {:?} -> Zune-JPEG (RGB)", path.file_name().unwrap_or_default());
+                        if let Some(buf) =
+                            image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels)
+                        {
+                            eprintln!(
+                                "[DEBUG-LOAD] {:?} -> Zune-JPEG (RGB)",
+                                path.file_name().unwrap_or_default()
+                            );
                             return Some(image::DynamicImage::ImageRgb8(buf));
                         }
                     } else if len == (w * h * 4) as usize {
                         // CMYK or RGBA (Zune might output RGBA for CMYK)
-                        if let Some(buf) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, pixels) {
-                            eprintln!("[DEBUG-LOAD] {:?} -> Zune-JPEG (RGBA/CMYK)", path.file_name().unwrap_or_default());
+                        if let Some(buf) =
+                            image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, pixels)
+                        {
+                            eprintln!(
+                                "[DEBUG-LOAD] {:?} -> Zune-JPEG (RGBA/CMYK)",
+                                path.file_name().unwrap_or_default()
+                            );
                             return Some(image::DynamicImage::ImageRgba8(buf));
                         }
                     }
@@ -213,24 +232,34 @@ fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
             // TIER 2: jpeg-decoder (Fallback)
             let mut decoder = Tier2Decoder::new(std::io::Cursor::new(bytes));
             if let Ok(pixels) = decoder.decode() {
-                 let info = decoder.info();
-                 let w = info.unwrap().width as u32;
-                 let h = info.unwrap().height as u32;
-                 let len = pixels.len();
+                let info = decoder.info();
+                let w = info.unwrap().width as u32;
+                let h = info.unwrap().height as u32;
+                let len = pixels.len();
 
-                 if len == (w * h) as usize {
-                     if let Some(buf) = image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels) {
-                         eprintln!("[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback Grayscale)", path.file_name().unwrap_or_default());
-                         return Some(image::DynamicImage::ImageLuma8(buf));
-                     }
-                 } else if len == (w * h * 3) as usize {
-                     if let Some(buf) = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels) {
-                         eprintln!("[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback RGB)", path.file_name().unwrap_or_default());
-                         return Some(image::DynamicImage::ImageRgb8(buf));
-                     }
-                 }
+                if len == (w * h) as usize {
+                    if let Some(buf) =
+                        image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels)
+                    {
+                        eprintln!(
+                            "[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback Grayscale)",
+                            path.file_name().unwrap_or_default()
+                        );
+                        return Some(image::DynamicImage::ImageLuma8(buf));
+                    }
+                } else if len == (w * h * 3) as usize {
+                    if let Some(buf) =
+                        image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels)
+                    {
+                        eprintln!(
+                            "[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback RGB)",
+                            path.file_name().unwrap_or_default()
+                        );
+                        return Some(image::DynamicImage::ImageRgb8(buf));
+                    }
+                }
             }
-        },
+        }
         _ => {}
     }
 
@@ -254,7 +283,7 @@ fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
 
 /// Derive country name from GPS coordinates using country-boundaries
 fn derive_country(lat: f64, lon: f64) -> Option<String> {
-    use country_boundaries::{CountryBoundaries, LatLon, BOUNDARIES_ODBL_360X180};
+    use country_boundaries::{BOUNDARIES_ODBL_360X180, CountryBoundaries, LatLon};
 
     // Create boundaries instance (this is fast after first load as data is static)
     let boundaries = CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).ok()?;
@@ -283,17 +312,12 @@ fn format_location(country_code: Option<&str>, subdivision_code: Option<&str>) -
     let subdivision_name = subdivision_code.and_then(|code| {
         // The crate expects underscores (US_FL) not hyphens (US-FL)
         let formatted_code = code.replace('-', "_");
-        SubdivisionCode::from_str(&formatted_code)
-            .ok()
-            .map(|s| s.name().to_string())
+        SubdivisionCode::from_str(&formatted_code).ok().map(|s| s.name().to_string())
     });
 
     // 2. Get country name (e.g., "FI" -> "Finland")
-    let country_name = country_code.and_then(|code| {
-        CountryCode::from_str(code)
-            .ok()
-            .map(|c| c.short_name().to_string())
-    });
+    let country_name = country_code
+        .and_then(|code| CountryCode::from_str(code).ok().map(|c| c.short_name().to_string()));
 
     match (country_name, subdivision_name) {
         (Some(country), Some(subdivision)) => Some(format!("{}, {}", subdivision, country)),
@@ -414,52 +438,57 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
             }
             // Fallback to default Minutes/Seconds display
             clean_exif_string(&value.display_as(tag).to_string())
-        },
+        }
         exif::Tag::ExposureTime => {
             if let Some(r) = value.get_uint(0) {
                 if let exif::Value::Rational(rats) = value
-                    && !rats.is_empty() {
-                        let num = rats[0].num;
-                        let denom = rats[0].denom;
-                        if denom > num && num > 0 {
-                            return format!("1/{}s", denom / num);
-                        } else if denom > 0 {
-                            return format!("{:.1}s", num as f64 / denom as f64);
-                        }
+                    && !rats.is_empty()
+                {
+                    let num = rats[0].num;
+                    let denom = rats[0].denom;
+                    if denom > num && num > 0 {
+                        return format!("1/{}s", denom / num);
+                    } else if denom > 0 {
+                        return format!("{:.1}s", num as f64 / denom as f64);
                     }
+                }
                 format!("{}s", r)
             } else {
                 clean_exif_string(&value.display_as(tag).to_string())
             }
-        },
+        }
         exif::Tag::FNumber => {
             if let exif::Value::Rational(rats) = value
-                && !rats.is_empty() && rats[0].denom > 0 {
-                    return format!("f/{:.1}", rats[0].num as f64 / rats[0].denom as f64);
-                }
+                && !rats.is_empty()
+                && rats[0].denom > 0
+            {
+                return format!("f/{:.1}", rats[0].num as f64 / rats[0].denom as f64);
+            }
             clean_exif_string(&value.display_as(tag).to_string())
-        },
+        }
         exif::Tag::FocalLength => {
             if let exif::Value::Rational(rats) = value
-                && !rats.is_empty() && rats[0].denom > 0 {
-                    return format!("{}mm", rats[0].num / rats[0].denom);
-                }
+                && !rats.is_empty()
+                && rats[0].denom > 0
+            {
+                return format!("{}mm", rats[0].num / rats[0].denom);
+            }
             clean_exif_string(&value.display_as(tag).to_string())
-        },
+        }
         exif::Tag::PhotographicSensitivity => {
             if let Some(iso) = value.get_uint(0) {
                 format!("ISO {}", iso)
             } else {
                 clean_exif_string(&value.display_as(tag).to_string())
             }
-        },
+        }
         exif::Tag::FocalLengthIn35mmFilm => {
             if let Some(fl) = value.get_uint(0) {
                 format!("{}mm (35mm equiv)", fl)
             } else {
                 clean_exif_string(&value.display_as(tag).to_string())
             }
-        },
+        }
         _ => {
             // Default: use the library's display formatting, then clean it
             clean_exif_string(&value.display_as(tag).to_string())
@@ -476,7 +505,8 @@ fn clean_exif_string(s: &str) -> String {
     // take only the first non-empty meaningful value
     if s.contains("\", \"") || s.contains(", ") {
         // Split by common separators and find first non-empty value
-        let parts: Vec<&str> = s.split([',', '"'])
+        let parts: Vec<&str> = s
+            .split([',', '"'])
             .map(|p| p.trim())
             .filter(|p| !p.is_empty() && *p != "'" && p.len() > 1)
             .collect();
@@ -487,7 +517,9 @@ fn clean_exif_string(s: &str) -> String {
     }
 
     // Remove any trailing garbage (null bytes represented as empty quotes, etc.)
-    let cleaned = s.trim_end_matches(|c: char| c == '"' || c == '\'' || c == ',' || c.is_whitespace() || c == '\0');
+    let cleaned = s.trim_end_matches(|c: char| {
+        c == '"' || c == '\'' || c == ',' || c.is_whitespace() || c == '\0'
+    });
 
     cleaned.to_string()
 }
@@ -589,7 +621,7 @@ impl ScannedFile {
 pub fn scan_and_group(
     config: &ScanConfig,
     ctx: &AppContext,
-    progress_tx: Option<Sender<(usize, usize)>>
+    progress_tx: Option<Sender<(usize, usize)>>,
 ) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>) {
     use std::time::Instant;
 
@@ -604,210 +636,246 @@ pub fn scan_and_group(
             for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
                 if is_image_ext(entry.path())
                     && let Ok(canonical) = entry.path().canonicalize()
-                        && seen_paths.insert(canonical.clone()) {
-                            all_files.push(canonical);
-                        }
-            }
-        } else if path.is_file() && is_image_ext(path)
-            && let Ok(canonical) = path.canonicalize()
-                && seen_paths.insert(canonical.clone()) {
+                    && seen_paths.insert(canonical.clone())
+                {
                     all_files.push(canonical);
                 }
+            }
+        } else if path.is_file()
+            && is_image_ext(path)
+            && let Ok(canonical) = path.canonicalize()
+            && seen_paths.insert(canonical.clone())
+        {
+            all_files.push(canonical);
+        }
     }
 
-    if all_files.is_empty() { return (Vec::new(), Vec::new()); }
+    if all_files.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
 
     let total_files = all_files.len();
-    if let Some(tx) = &progress_tx { let _ = tx.send((0, total_files)); }
+    if let Some(tx) = &progress_tx {
+        let _ = tx.send((0, total_files));
+    }
 
     let hash_start = Instant::now();
     let (tx, rx) = unbounded();
     let db_handle = ctx.start_db_writer(rx);
     let processed_count = AtomicUsize::new(0);
 
-    let mut valid_files: Vec<ScannedFile> = all_files.par_iter().filter_map(|path| {
-        if let Some(prog_tx) = &progress_tx {
-            let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if current.is_multiple_of(10) || current == total_files {
-                let _ = prog_tx.send((current, total_files));
+    let mut valid_files: Vec<ScannedFile> = all_files
+        .par_iter()
+        .filter_map(|path| {
+            if let Some(prog_tx) = &progress_tx {
+                let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if current.is_multiple_of(10) || current == total_files {
+                    let _ = prog_tx.send((current, total_files));
+                }
             }
-        }
 
-        let metadata = fs::metadata(path).ok()?;
-        let size = metadata.len();
-        let mtime = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
-        let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
-        let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-        let unique_file_id = fileops::get_file_key(&path)?;
+            let metadata = fs::metadata(path).ok()?;
+            let size = metadata.len();
+            let mtime = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
+            let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
+            let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+            let unique_file_id = fileops::get_file_key(&path)?;
 
-        let meta_key = compute_meta_key(&ctx_ref.meta_key, mtime_ns, size, unique_file_id);
-        eprintln!("[DEBUG] mtime_ns/size/unique_file_id {} = {} {} {}",
-            path.display(), mtime_ns, size, unique_file_id);
-        let mut pdqhash: Option<[u8; 32]> = None;
-        let mut pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>> = None;
-        // IMPORTANT: new_meta tracks updates to the file_metadata DB.
-        // Even if we hit the cache, we MUST set this to refresh the timestamp.
-        let mut new_meta = None;
+            let meta_key = compute_meta_key(&ctx_ref.meta_key, mtime_ns, size, unique_file_id);
+            eprintln!(
+                "[DEBUG] mtime_ns/size/unique_file_id {} = {} {} {}",
+                path.display(),
+                mtime_ns,
+                size,
+                unique_file_id
+            );
+            let mut pdqhash: Option<[u8; 32]> = None;
+            let mut pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>> = None;
+            // IMPORTANT: new_meta tracks updates to the file_metadata DB.
+            // Even if we hit the cache, we MUST set this to refresh the timestamp.
+            let mut new_meta = None;
 
-        let mut new_hash = None;
-        let mut new_features = None;
-        let mut resolution = None;
-        let mut ck = [0u8; 32];
-        let mut orientation = 1;
-        let mut cache_hit_full = false;
-        let mut pixel_hash: Option<[u8; 32]> = None; // Init
-        let mut new_pixel = None; // For DB update
+            let mut new_hash = None;
+            let mut new_features = None;
+            let mut resolution = None;
+            let mut ck = [0u8; 32];
+            let mut orientation = 1;
+            let mut cache_hit_full = false;
+            let mut pixel_hash: Option<[u8; 32]> = None; // Init
+            let mut new_pixel = None; // For DB update
 
-        if !force_rehash && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
-            eprintln!("Cache HIT  meta_key {:x?} for {:?}",
-                hex::encode(meta_key), path.display());
-            ck = ch;
-            // Refresh timestamp
-            new_meta = Some((meta_key, ck));
-            if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
-                pdqhash = Some(h);
-                if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
-                    if feats.coefficients.len() == 256 {
-                        resolution = Some((feats.width, feats.height));
-                        orientation = feats.orientation;
-                        let mut coeffs = [0.0; 256];
-                        coeffs.copy_from_slice(&feats.coefficients);
-                        pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures { coefficients: coeffs }));
+            if !force_rehash && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
+                eprintln!(
+                    "Cache HIT  meta_key {:x?} for {:?}",
+                    hex::encode(meta_key),
+                    path.display()
+                );
+                ck = ch;
+                // Refresh timestamp
+                new_meta = Some((meta_key, ck));
+                if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
+                    pdqhash = Some(h);
+                    if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
+                        if feats.coefficients.len() == 256 {
+                            resolution = Some((feats.width, feats.height));
+                            orientation = feats.orientation;
+                            let mut coeffs = [0.0; 256];
+                            coeffs.copy_from_slice(&feats.coefficients);
+                            pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures {
+                                coefficients: coeffs,
+                            }));
 
-                        cache_hit_full = true;
+                            cache_hit_full = true;
+                        }
+                    }
+                }
+                // If user wants pixel hash, try to fetch it from DB.
+                if config.calc_pixel_hash {
+                    if let Ok(Some(ph)) = ctx_ref.get_pixel_hash(&ch) {
+                        pixel_hash = Some(ph);
+                    } else {
+                        // Missing in DB! Force load below to calculate it.
+                        cache_hit_full = false;
                     }
                 }
             }
-            // If user wants pixel hash, try to fetch it from DB.
-            if config.calc_pixel_hash {
-                if let Ok(Some(ph)) = ctx_ref.get_pixel_hash(&ch) {
-                    pixel_hash = Some(ph);
-                } else {
-                    // Missing in DB! Force load below to calculate it.
-                    cache_hit_full = false;
-                }
-            }
-        }
 
-        if !cache_hit_full {
-            eprintln!("Cache MISS meta_key {:x?} for {:?}",
-                hex::encode(meta_key), path.display());
-            let bytes = fs::read(path).ok();
+            if !cache_hit_full {
+                eprintln!(
+                    "Cache MISS meta_key {:x?} for {:?}",
+                    hex::encode(meta_key),
+                    path.display()
+                );
+                let bytes = fs::read(path).ok();
 
-            if let Some(ref b) = bytes {
-                // 1. Orientation (Must be done on fresh read)
-                orientation = get_orientation(path, Some(b));
+                if let Some(ref b) = bytes {
+                    // 1. Orientation (Must be done on fresh read)
+                    orientation = get_orientation(path, Some(b));
 
-                // 2. Calculate file hash if needed
-                if ck == [0u8; 32] {
-                    let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
-                    ck = *ch.as_bytes();
-                    new_meta = Some((meta_key, ck));
-                }
+                    // 2. Calculate file hash if needed
+                    if ck == [0u8; 32] {
+                        let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
+                        ck = *ch.as_bytes();
+                        new_meta = Some((meta_key, ck));
+                    }
 
-                // 3. Load Image ONCE using the FAST loader
-                let mut img_for_hashing: Option<image::DynamicImage> = None;
+                    // 3. Load Image ONCE using the FAST loader
+                    let mut img_for_hashing: Option<image::DynamicImage> = None;
 
-                if is_raw_ext(path) {
-                    // RAW FILE: Extract Largest JPEG Thumbnail
-                    // We need the image for PDQ even if pixel_hash is disabled.
-                    if let Ok(mut raw) = rsraw::RawImage::open(b) {
-                        if let Ok(thumbs) = raw.extract_thumbs() {
-                            // Find largest JPEG thumbnail
-                            if let Some(thumb) = thumbs.into_iter()
-                                .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
-                                .max_by_key(|t| t.width * t.height)
-                            {
-                                // Decode using our robust fast loader.
-                                img_for_hashing = load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data);
+                    if is_raw_ext(path) {
+                        // RAW FILE: Extract Largest JPEG Thumbnail
+                        // We need the image for PDQ even if pixel_hash is disabled.
+                        if let Ok(mut raw) = rsraw::RawImage::open(b) {
+                            if let Ok(thumbs) = raw.extract_thumbs() {
+                                // Find largest JPEG thumbnail
+                                if let Some(thumb) = thumbs
+                                    .into_iter()
+                                    .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
+                                    .max_by_key(|t| t.width * t.height)
+                                {
+                                    // Decode using our robust fast loader.
+                                    img_for_hashing =
+                                        load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data);
 
-                                if let Some(img) = &img_for_hashing {
-                                    if resolution.is_none() {
-                                        resolution = Some(img.dimensions());
+                                    if let Some(img) = &img_for_hashing {
+                                        if resolution.is_none() {
+                                            resolution = Some(img.dimensions());
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    // Fallback for resolution if thumbnail extraction failed or we didn't calculate hash
-                    if resolution.is_none() { resolution = get_resolution(path, Some(b)); }
-                } else {
-                    // STANDARD IMAGE: Use fast loader directly
-                    img_for_hashing = load_image_fast(path, b);
-                }
-
-                if let Some(img) = &img_for_hashing {
-                    // Get resolution from the loaded image
-                    if resolution.is_none() {
-                        resolution = Some(img.dimensions());
-                    }
-
-                    // 4. Calculate Pixel Hash of 16bit RGBA (Content Identical Check)
-                    if config.calc_pixel_hash && pixel_hash.is_none() {
-                        // This ensures 16-bit PNGs != 8-bit PNGs unless the extra bits are purely padding.
-                        let rgba16 = img.to_rgba16();
-                        let raw_u16 = rgba16.as_raw();
-                        let raw_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                raw_u16.as_ptr() as *const u8,
-                                raw_u16.len() * 2 // 2 bytes per u16
-                            )
-                        };
-                        let ph = *blake3::hash(raw_bytes).as_bytes();
-                        eprintln!("[DEBUG-PIXEL_HASH 16BIT] {:?} : {}", path.file_name().unwrap_or_default(), hex::encode(ph));
-                        pixel_hash = Some(ph);
-                        new_pixel = Some((ck, ph));
-                    }
-
-                    // Use 'img' directly - do NOT call load_from_memory again
-                    if let Some((features, _)) = crate::pdqhash::generate_pdq_features(img) {
-                        let hash = features.to_hash();
-                        pdqhash = Some(hash);
-
-                        let mut coeffs = [0.0; 256];
-                        coeffs.copy_from_slice(&features.coefficients);
-                        let feats = crate::pdqhash::PdqFeatures { coefficients: coeffs };
-                        pdq_features = Some(Arc::new(feats.clone()));
-
-                        let cached_feats = crate::db::CachedFeatures {
-                            width: resolution.unwrap_or((0,0)).0,
-                            height: resolution.unwrap_or((0,0)).1,
-                            orientation,
-                            coefficients: features.coefficients.to_vec(),
-                        };
-
-                        if new_hash.is_none() { // Don't overwrite if already set (rare)
-                            new_hash = Some((ck, HashValue::PdqHash(hash)));
+                        // Fallback for resolution if thumbnail extraction failed or we didn't calculate hash
+                        if resolution.is_none() {
+                            resolution = get_resolution(path, Some(b));
                         }
-                        new_features = Some((ck, cached_feats));
+                    } else {
+                        // STANDARD IMAGE: Use fast loader directly
+                        img_for_hashing = load_image_fast(path, b);
                     }
-                } else {
-                    // Fallback: If image failed to decode (e.g. corrupt),
-                    // but we might still get resolution from headers for RAWs
-                    if resolution.is_none() {
-                        resolution = get_resolution(path, Some(b));
+
+                    if let Some(img) = &img_for_hashing {
+                        // Get resolution from the loaded image
+                        if resolution.is_none() {
+                            resolution = Some(img.dimensions());
+                        }
+
+                        // 4. Calculate Pixel Hash of 16bit RGBA (Content Identical Check)
+                        if config.calc_pixel_hash && pixel_hash.is_none() {
+                            // This ensures 16-bit PNGs != 8-bit PNGs unless the extra bits are purely padding.
+                            let rgba16 = img.to_rgba16();
+                            let raw_u16 = rgba16.as_raw();
+                            let raw_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    raw_u16.as_ptr() as *const u8,
+                                    raw_u16.len() * 2, // 2 bytes per u16
+                                )
+                            };
+                            let ph = *blake3::hash(raw_bytes).as_bytes();
+                            eprintln!(
+                                "[DEBUG-PIXEL_HASH 16BIT] {:?} : {}",
+                                path.file_name().unwrap_or_default(),
+                                hex::encode(ph)
+                            );
+                            pixel_hash = Some(ph);
+                            new_pixel = Some((ck, ph));
+                        }
+
+                        // Use 'img' directly - do NOT call load_from_memory again
+                        if let Some((features, _)) = crate::pdqhash::generate_pdq_features(img) {
+                            let hash = features.to_hash();
+                            pdqhash = Some(hash);
+
+                            let mut coeffs = [0.0; 256];
+                            coeffs.copy_from_slice(&features.coefficients);
+                            let feats = crate::pdqhash::PdqFeatures { coefficients: coeffs };
+                            pdq_features = Some(Arc::new(feats.clone()));
+
+                            let cached_feats = crate::db::CachedFeatures {
+                                width: resolution.unwrap_or((0, 0)).0,
+                                height: resolution.unwrap_or((0, 0)).1,
+                                orientation,
+                                coefficients: features.coefficients.to_vec(),
+                            };
+
+                            if new_hash.is_none() {
+                                // Don't overwrite if already set (rare)
+                                new_hash = Some((ck, HashValue::PdqHash(hash)));
+                            }
+                            new_features = Some((ck, cached_feats));
+                        }
+                    } else {
+                        // Fallback: If image failed to decode (e.g. corrupt),
+                        // but we might still get resolution from headers for RAWs
+                        if resolution.is_none() {
+                            resolution = get_resolution(path, Some(b));
+                        }
                     }
                 }
             }
-        }
 
-        if new_meta.is_some() || new_hash.is_some() || new_features.is_some() || new_pixel.is_some() {
-            let _ = tx.send((new_meta, new_hash, new_features, new_pixel));
-        }
+            if new_meta.is_some()
+                || new_hash.is_some()
+                || new_features.is_some()
+                || new_pixel.is_some()
+            {
+                let _ = tx.send((new_meta, new_hash, new_features, new_pixel));
+            }
 
-        Some(ScannedFile {
-            path: path.clone(),
-            size,
-            modified: mtime_utc,
-            resolution,
-            content_hash: ck,
-            orientation,
-            unique_file_id,
-            pdqhash,
-            pdq_features,
-            pixel_hash,
+            Some(ScannedFile {
+                path: path.clone(),
+                size,
+                modified: mtime_utc,
+                resolution,
+                content_hash: ck,
+                orientation,
+                unique_file_id,
+                pdqhash,
+                pdq_features,
+                pixel_hash,
+            })
         })
-    }).collect();
+        .collect();
 
     drop(tx);
     db_handle.join().expect("DB writer thread panicked");
@@ -837,15 +905,23 @@ pub fn scan_and_group(
         group_with_pdqhash(&valid_files, config);
     let group_elapsed = group_start.elapsed();
 
-    eprintln!("[DEBUG] Grouping: {} groups found in {:.2}s ({} comparisons)",
-        processed_groups.len(), group_elapsed.as_secs_f64(), comparison_count);
+    eprintln!(
+        "[DEBUG] Grouping: {} groups found in {:.2}s ({} comparisons)",
+        processed_groups.len(),
+        group_elapsed.as_secs_f64(),
+        comparison_count
+    );
 
     let mut combined: Vec<_> = processed_groups.into_iter().zip(processed_infos).collect();
     combined.sort_by(|(g1, info1), (g2, info2)| {
         let has_ident1 = info1.status != GroupStatus::None;
         let has_ident2 = info2.status != GroupStatus::None;
-        if has_ident1 != has_ident2 { return has_ident2.cmp(&has_ident1); }
-        if info1.max_dist != info2.max_dist { return info1.max_dist.cmp(&info2.max_dist); }
+        if has_ident1 != has_ident2 {
+            return has_ident2.cmp(&has_ident1);
+        }
+        if info1.max_dist != info2.max_dist {
+            return info1.max_dist.cmp(&info2.max_dist);
+        }
         let s1 = g1.first().map(|f| f.size).unwrap_or(0);
         let s2 = g2.first().map(|f| f.size).unwrap_or(0);
         s2.cmp(&s1)
@@ -870,7 +946,12 @@ impl GroupingStrategy<[u8; 32]> for PdqStrategy {
     }
 
     #[inline(always)]
-    fn generate_variants(&self, file: &ScannedFile, hash: [u8; 32], out: &mut [[u8; 32]; 8]) -> usize {
+    fn generate_variants(
+        &self,
+        file: &ScannedFile,
+        hash: [u8; 32],
+        out: &mut [[u8; 32]; 8],
+    ) -> usize {
         if let Some(features) = &file.pdq_features {
             let vars = features.generate_dihedral_hashes();
             let count = vars.len().min(8);
@@ -893,15 +974,18 @@ fn group_files_generic<H, S>(
 ) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize)
 where
     H: HammingHash + std::fmt::Debug + Clone + Copy + Default,
-    S: GroupingStrategy<H>
+    S: GroupingStrategy<H>,
 {
     // Collect hashes AND their original indices
-    let valid_entries: Vec<(usize, H)> = valid_files.iter()
+    let valid_entries: Vec<(usize, H)> = valid_files
+        .iter()
         .enumerate()
         .filter_map(|(i, f)| strategy.extract_hash(f).map(|h| (i, h)))
         .collect();
 
-    if valid_entries.is_empty() { return (Vec::new(), Vec::new(), 0); }
+    if valid_entries.is_empty() {
+        return (Vec::new(), Vec::new(), 0);
+    }
 
     let hashes: Vec<H> = valid_entries.iter().map(|(_, h)| *h).collect();
     let dense_to_sparse: Vec<usize> = valid_entries.iter().map(|(i, _)| *i).collect();
@@ -943,8 +1027,10 @@ where
                                 let chunk_base = k * H::NUM_BUCKETS;
 
                                 // Inline the check_neighbors logic:
-                                let check_neighbors = config.similarity / (H::NUM_CHUNKS as u32) >= 1;
-                                let limit = if check_neighbors { 1 + H::bit_width_per_chunk() } else { 1 };
+                                let check_neighbors =
+                                    config.similarity / (H::NUM_CHUNKS as u32) >= 1;
+                                let limit =
+                                    if check_neighbors { 1 + H::bit_width_per_chunk() } else { 1 };
 
                                 for pass in 0..limit {
                                     let query_val = if pass == 0 {
@@ -954,24 +1040,37 @@ where
                                     };
 
                                     let flat_idx = chunk_base + query_val as usize;
-                                    let start = unsafe { *mih.offsets.get_unchecked(flat_idx) } as usize;
-                                    let end = unsafe { *mih.offsets.get_unchecked(flat_idx + 1) } as usize;
+                                    let start =
+                                        unsafe { *mih.offsets.get_unchecked(flat_idx) } as usize;
+                                    let end = unsafe { *mih.offsets.get_unchecked(flat_idx + 1) }
+                                        as usize;
 
                                     // Direct pointer access to avoid bounds checks in tight loop
                                     if start < end {
-                                        let bucket = unsafe { mih.values.get_unchecked(start..end) };
+                                        let bucket =
+                                            unsafe { mih.values.get_unchecked(start..end) };
                                         for &dense_id in bucket {
                                             // dense_id is the index in `hashes` / `dense_to_sparse`
                                             // We need to map it to the real file index `cand_idx`
-                                            let cand_idx = unsafe { *dense_to_sparse.get_unchecked(dense_id as usize) };
+                                            let cand_idx = unsafe {
+                                                *dense_to_sparse.get_unchecked(dense_id as usize)
+                                            };
 
                                             // Only record edges where cand_idx > i
-                                            if cand_idx <= i { continue; }
+                                            if cand_idx <= i {
+                                                continue;
+                                            }
 
-                                            if visited.set(cand_idx) { continue; }
+                                            if visited.set(cand_idx) {
+                                                continue;
+                                            }
 
-                                            let cand_hash = unsafe { mih.db_hashes.get_unchecked(dense_id as usize) };
-                                            if variant.hamming_distance(cand_hash) <= config.similarity {
+                                            let cand_hash = unsafe {
+                                                mih.db_hashes.get_unchecked(dense_id as usize)
+                                            };
+                                            if variant.hamming_distance(cand_hash)
+                                                <= config.similarity
+                                            {
                                                 local_edges.push((i as u32, cand_idx as u32));
                                             }
                                         }
@@ -982,7 +1081,7 @@ where
                     }
                 }
                 local_edges.clone()
-            }
+            },
         )
         .flatten()
         .collect();
@@ -994,16 +1093,24 @@ where
 
     fn find(parent: &mut [usize], i: usize) -> usize {
         let mut root = i;
-        while root != parent[root] { root = parent[root]; }
+        while root != parent[root] {
+            root = parent[root];
+        }
         let mut curr = i;
-        while curr != root { let next = parent[curr]; parent[curr] = root; curr = next; }
+        while curr != root {
+            let next = parent[curr];
+            parent[curr] = root;
+            curr = next;
+        }
         root
     }
 
     fn union(parent: &mut [usize], i: usize, j: usize) {
         let root_i = find(parent, i);
         let root_j = find(parent, j);
-        if root_i != root_j { parent[root_i] = root_j; }
+        if root_i != root_j {
+            parent[root_i] = root_j;
+        }
     }
 
     for (u, v) in edges {
@@ -1019,9 +1126,7 @@ where
         }
     }
 
-    let raw_groups: Vec<Vec<u32>> = groups_map.into_values()
-        .filter(|g| g.len() > 1)
-        .collect();
+    let raw_groups: Vec<Vec<u32>> = groups_map.into_values().filter(|g| g.len() > 1).collect();
 
     // Merge RAW+JPG logic
     let groups = merge_groups_by_stem(raw_groups, valid_files);
@@ -1034,7 +1139,10 @@ where
 
 // --- 3. Wrapper Functions ---
 
-fn group_with_pdqhash(valid_files: &[ScannedFile], config: &ScanConfig) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
+fn group_with_pdqhash(
+    valid_files: &[ScannedFile],
+    config: &ScanConfig,
+) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize) {
     group_files_generic(valid_files, config, PdqStrategy)
 }
 
@@ -1043,25 +1151,30 @@ pub fn analyze_group(
     sort_order: &str,
     #[allow(unused)] ext_priorities: &HashMap<String, usize>,
 ) -> GroupInfo {
-    if files.is_empty() { return GroupInfo { max_dist: 0, status: GroupStatus::None }; }
+    if files.is_empty() {
+        return GroupInfo { max_dist: 0, status: GroupStatus::None };
+    }
 
     // 1. Count Bit-Identical (Content Hash)
     let mut bit_counts = HashMap::new();
-    for f in files.iter() { *bit_counts.entry(f.content_hash).or_insert(0) += 1; }
+    for f in files.iter() {
+        *bit_counts.entry(f.content_hash).or_insert(0) += 1;
+    }
 
     // 2. Count Pixel-Identical (Pixel Hash)
     let mut pixel_counts = HashMap::new();
     for f in files.iter() {
         if let Some(ph) = f.pixel_hash {
-             *pixel_counts.entry(ph).or_insert(0) += 1;
+            *pixel_counts.entry(ph).or_insert(0) += 1;
         }
     }
 
     // 3. Partition: Anything that is a duplicate (Bit OR Pixel) goes to the top
-    let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) = files.drain(..)
-        .partition(|f| {
+    let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) =
+        files.drain(..).partition(|f| {
             let is_bit_dupe = *bit_counts.get(&f.content_hash).unwrap_or(&0) > 1;
-            let is_pixel_dupe = f.pixel_hash.map(|ph| *pixel_counts.get(&ph).unwrap_or(&0) > 1).unwrap_or(false);
+            let is_pixel_dupe =
+                f.pixel_hash.map(|ph| *pixel_counts.get(&ph).unwrap_or(&0) > 1).unwrap_or(false);
             is_bit_dupe || is_pixel_dupe
         });
 
@@ -1069,7 +1182,7 @@ pub fn analyze_group(
         (
             f.pixel_hash,
             f.content_hash,
-            f.path.file_name().unwrap_or_default().to_string_lossy().to_string()
+            f.path.file_name().unwrap_or_default().to_string_lossy().to_string(),
         )
     });
 
@@ -1080,23 +1193,37 @@ pub fn analyze_group(
     files.append(&mut duplicates);
     files.append(&mut unique);
 
-    let max_d =
-        if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
-            files.iter().filter_map(|f| f.pdqhash).map(|h| pivot.hamming_distance(&h)).max().unwrap_or(0)
-        } else { 0 };
+    let max_d = if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
+        files
+            .iter()
+            .filter_map(|f| f.pdqhash)
+            .map(|h| pivot.hamming_distance(&h))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
     let has_duplicates = !bit_counts.values().all(|&c| c == 1);
     let all_identical = bit_counts.len() == 1;
-    let status = if all_identical { GroupStatus::AllIdentical } else if has_duplicates { GroupStatus::SomeIdentical } else { GroupStatus::None };
+    let status = if all_identical {
+        GroupStatus::AllIdentical
+    } else if has_duplicates {
+        GroupStatus::SomeIdentical
+    } else {
+        GroupStatus::None
+    };
 
     GroupInfo { max_dist: max_d, status }
 }
 
 fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> Vec<Vec<u32>> {
-    if groups.len() < 2 { return groups; }
+    if groups.len() < 2 {
+        return groups;
+    }
 
-    use std::hash::{Hash, Hasher};
     use rustc_hash::FxHasher;
+    use std::hash::{Hash, Hasher};
 
     // Helper to hash a path component to u64 quickly
     fn hash_component<T: Hash>(t: T) -> u64 {
@@ -1121,23 +1248,29 @@ fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> V
     }
 
     // Sort by Parent -> Stem (Grouping identical stems together)
-    entries.par_sort_unstable_by(|a, b| {
-        a.0.cmp(&b.0).then(a.1.cmp(&b.1))
-    });
+    entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
     // Union-Find Merge Logic
     let mut parent: Vec<usize> = (0..groups.len()).collect();
     fn find(parent: &mut [usize], i: usize) -> usize {
         let mut root = i;
-        while root != parent[root] { root = parent[root]; }
+        while root != parent[root] {
+            root = parent[root];
+        }
         let mut curr = i;
-        while curr != root { let next = parent[curr]; parent[curr] = root; curr = next; }
+        while curr != root {
+            let next = parent[curr];
+            parent[curr] = root;
+            curr = next;
+        }
         root
     }
     fn union(parent: &mut [usize], i: usize, j: usize) {
         let root_i = find(parent, i);
         let root_j = find(parent, j);
-        if root_i != root_j { parent[root_i] = root_j; }
+        if root_i != root_j {
+            parent[root_i] = root_j;
+        }
     }
 
     // Iterate linearly and merge adjacent identical stems
@@ -1154,11 +1287,14 @@ fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> V
         merged_map.entry(root).or_default().extend(group);
     }
 
-    merged_map.into_values().map(|mut g| {
-        g.sort_unstable();
-        g.dedup();
-        g
-    }).collect()
+    merged_map
+        .into_values()
+        .map(|mut g| {
+            g.sort_unstable();
+            g.dedup();
+            g
+        })
+        .collect()
 }
 
 // PARALLELIZED GROUP PROCESSING
@@ -1167,10 +1303,8 @@ fn process_raw_groups(
     valid_files: &[ScannedFile],
     config: &ScanConfig,
 ) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>) {
-    let ext_priorities: HashMap<String, usize> = config.extensions.iter()
-        .enumerate()
-        .map(|(i, e)| (e.to_lowercase(), i))
-        .collect();
+    let ext_priorities: HashMap<String, usize> =
+        config.extensions.iter().enumerate().map(|(i, e)| (e.to_lowercase(), i)).collect();
 
     // Build read-only lookup map
     let mut features_map = HashMap::new();
@@ -1181,9 +1315,11 @@ fn process_raw_groups(
     }
 
     // Process groups in parallel using Rayon
-    let results: Vec<(Vec<FileMetadata>, GroupInfo)> = raw_groups.into_par_iter()
+    let results: Vec<(Vec<FileMetadata>, GroupInfo)> = raw_groups
+        .into_par_iter()
         .map(|group_indices| {
-            let mut group_data: Vec<FileMetadata> = group_indices.iter()
+            let mut group_data: Vec<FileMetadata> = group_indices
+                .iter()
                 .map(|&idx| valid_files[idx as usize].to_file_metadata())
                 .collect();
 
@@ -1191,7 +1327,8 @@ fn process_raw_groups(
                 &mut group_data,
                 &features_map,
                 &config.group_by.to_lowercase(),
-                &ext_priorities);
+                &ext_priorities,
+            );
             (group_data, info)
         })
         .collect();
@@ -1223,25 +1360,29 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
             files.sort_by_cached_key(|f| {
                 f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
             });
-        },
+        }
         "name-desc" => {
             files.sort_by_cached_key(|f| {
                 f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
             });
             files.reverse();
-        },
+        }
         "name-natural" => {
             // OPTIMIZATION: Use wrapper struct to cache string AND use natural compare
             files.sort_by_cached_key(|f| {
-                NaturalSortKey(f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+                NaturalSortKey(
+                    f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                )
             });
-        },
+        }
         "name-natural-desc" => {
             files.sort_by_cached_key(|f| {
-                NaturalSortKey(f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+                NaturalSortKey(
+                    f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                )
             });
             files.reverse();
-        },
+        }
         "date" => files.sort_by(|a, b| a.modified.cmp(&b.modified)),
         "date-desc" => files.sort_by(|a, b| b.modified.cmp(&a.modified)),
         "size" => files.sort_by(|a, b| a.size.cmp(&b.size)),
@@ -1249,11 +1390,13 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
         "random" => {
             let mut rng = rand::rng();
             files.shuffle(&mut rng);
-        },
+        }
         _ => {
             // Default fallback (Name Natural)
             files.sort_by_cached_key(|f| {
-                NaturalSortKey(f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+                NaturalSortKey(
+                    f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                )
             });
         }
     }
@@ -1267,53 +1410,65 @@ pub fn sort_directories(dirs: &mut Vec<std::path::PathBuf>, sort_order: &str) {
             dirs.sort_by_cached_key(|d| {
                 d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
             });
-        },
+        }
         "name-desc" => {
             dirs.sort_by_cached_key(|d| {
                 d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
             });
             dirs.reverse();
-        },
+        }
         "name-natural" | "" => {
             dirs.sort_by_cached_key(|d| {
-                NaturalSortKey(d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+                NaturalSortKey(
+                    d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                )
             });
-        },
+        }
         "name-natural-desc" => {
             dirs.sort_by_cached_key(|d| {
-                NaturalSortKey(d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+                NaturalSortKey(
+                    d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                )
             });
             dirs.reverse();
-        },
+        }
         "date" => {
             dirs.sort_by_cached_key(|d| {
                 fs::metadata(d).ok().and_then(|m| m.modified().ok()).unwrap_or(UNIX_EPOCH)
             });
-        },
+        }
         "date-desc" => {
             dirs.sort_by_cached_key(|d| {
-                std::cmp::Reverse(fs::metadata(d).ok().and_then(|m| m.modified().ok()).unwrap_or(UNIX_EPOCH))
+                std::cmp::Reverse(
+                    fs::metadata(d).ok().and_then(|m| m.modified().ok()).unwrap_or(UNIX_EPOCH),
+                )
             });
-        },
+        }
         "size" => {
             // For directories, size doesn't make much sense, so sort by name
             dirs.sort_by_cached_key(|d| {
-                NaturalSortKey(d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+                NaturalSortKey(
+                    d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                )
             });
-        },
+        }
         "size-desc" => {
             dirs.sort_by_cached_key(|d| {
-                NaturalSortKey(d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+                NaturalSortKey(
+                    d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                )
             });
-        },
+        }
         "random" => {
             let mut rng = rand::rng();
             dirs.shuffle(&mut rng);
-        },
+        }
         _ => {
             // Default fallback (Name Natural)
             dirs.sort_by_cached_key(|d| {
-                NaturalSortKey(d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+                NaturalSortKey(
+                    d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                )
             });
         }
     }
@@ -1325,19 +1480,23 @@ fn analyze_group_with_features(
     sort_order: &str,
     #[allow(unused)] ext_priorities: &HashMap<String, usize>,
 ) -> GroupInfo {
-    if files.is_empty() { return GroupInfo { max_dist: 0, status: GroupStatus::None }; }
+    if files.is_empty() {
+        return GroupInfo { max_dist: 0, status: GroupStatus::None };
+    }
 
     let mut counts = HashMap::new();
-    for f in files.iter() { *counts.entry(f.content_hash).or_insert(0) += 1; }
+    for f in files.iter() {
+        *counts.entry(f.content_hash).or_insert(0) += 1;
+    }
 
-    let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) = files.drain(..)
-        .partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
+    let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) =
+        files.drain(..).partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
 
     duplicates.sort_by_cached_key(|f| {
         (
             f.pixel_hash,
             f.content_hash,
-            f.path.file_name().unwrap_or_default().to_string_lossy().to_string()
+            f.path.file_name().unwrap_or_default().to_string_lossy().to_string(),
         )
     });
 
@@ -1347,24 +1506,41 @@ fn analyze_group_with_features(
 
     sort_by_stem_then_ext(files);
 
-    let pivot_features = files.first()
-        .and_then(|pivot| features_map.get(&pivot.path))
-        .copied(); // Dereference &&PdqFeatures to &PdqFeatures
+    let pivot_features = files.first().and_then(|pivot| features_map.get(&pivot.path)).copied(); // Dereference &&PdqFeatures to &PdqFeatures
 
     let max_d = if let Some(pivot_feats) = pivot_features {
         let pivot_variants = pivot_feats.generate_dihedral_hashes();
-        files.iter().map(|f| {
-            if let Some(h) = f.pdqhash {
-                pivot_variants.iter().map(|v| v.hamming_distance(&h)).min().unwrap_or(255)
-            } else { 0 }
-        }).max().unwrap_or(0)
+        files
+            .iter()
+            .map(|f| {
+                if let Some(h) = f.pdqhash {
+                    pivot_variants.iter().map(|v| v.hamming_distance(&h)).min().unwrap_or(255)
+                } else {
+                    0
+                }
+            })
+            .max()
+            .unwrap_or(0)
     } else if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
-        files.iter().filter_map(|f| f.pdqhash).map(|h| pivot.hamming_distance(&h)).max().unwrap_or(0)
-    } else { 0 };
+        files
+            .iter()
+            .filter_map(|f| f.pdqhash)
+            .map(|h| pivot.hamming_distance(&h))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
     let has_duplicates = !counts.values().all(|&c| c == 1);
     let all_identical = counts.len() == 1;
-    let status = if all_identical { GroupStatus::AllIdentical } else if has_duplicates { GroupStatus::SomeIdentical } else { GroupStatus::None };
+    let status = if all_identical {
+        GroupStatus::AllIdentical
+    } else if has_duplicates {
+        GroupStatus::SomeIdentical
+    } else {
+        GroupStatus::None
+    };
 
     GroupInfo { max_dist: max_d, status }
 }
@@ -1378,18 +1554,26 @@ fn sort_by_stem_then_ext(files: &mut [FileMetadata]) {
 }
 
 pub fn is_raw_ext(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).map(|e| RAW_EXTS.contains(&e.to_lowercase().as_str())).unwrap_or(false)
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| RAW_EXTS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
 }
 
 pub fn is_image_ext(path: &Path) -> bool {
-    path.extension().and_then(|s| s.to_str()).map(|ext| {
-        let e = ext.to_lowercase();
-        matches!(e.as_str(), "dds"|"exr"|"ff"|"hdr"|"ico"|"pnm"|"qoi"|"gif"|"jpg"|"jpeg"|"png"|"webp"
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| {
+            let e = ext.to_lowercase();
+            matches!(
+                e.as_str(),
+                "dds"|"exr"|"ff"|"hdr"|"ico"|"pnm"|"qoi"|"gif"|"jpg"|"jpeg"|"png"|"webp"
             |"bmp"|"tiff"|"tif"|"avif"|"heic"|"heif"|"tga"
             // image-extras
-            |"xbm"|"xpm"|"ora"|"otb"|"pcx"|"sgi"|"wbmp")
-            || RAW_EXTS.contains(&e.as_str())
-    }).unwrap_or(false)
+            |"xbm"|"xpm"|"ora"|"otb"|"pcx"|"sgi"|"wbmp"
+            ) || RAW_EXTS.contains(&e.as_str())
+        })
+        .unwrap_or(false)
 }
 
 pub fn scan_for_view(
@@ -1410,7 +1594,9 @@ pub fn scan_for_view(
                 for entry in entries.filter_map(|e| e.ok()) {
                     let entry_path = entry.path();
                     if entry_path.is_dir() {
-                        if let Ok(canonical) = entry_path.canonicalize() { subdirs.push(canonical); }
+                        if let Ok(canonical) = entry_path.canonicalize() {
+                            subdirs.push(canonical);
+                        }
                     } else if entry_path.is_file() && is_image_ext(&entry_path) {
                         if let Ok(canonical) = entry_path.canonicalize() {
                             if seen_paths.insert(canonical.clone()) {
@@ -1421,70 +1607,82 @@ pub fn scan_for_view(
                 }
             }
         } else if path.is_file() && is_image_ext(path) {
-             if let Ok(canonical) = path.canonicalize() {
-                 if seen_paths.insert(canonical.clone()) {
-                     raw_paths.push(canonical);
-                 }
-             }
+            if let Ok(canonical) = path.canonicalize() {
+                if seen_paths.insert(canonical.clone()) {
+                    raw_paths.push(canonical);
+                }
+            }
         }
     }
     // Apply same sort order to directories as files
     sort_directories(&mut subdirs, sort_order);
 
     let total_files = raw_paths.len();
-    if let Some(tx) = &progress_tx { let _ = tx.send((0, total_files)); }
+    if let Some(tx) = &progress_tx {
+        let _ = tx.send((0, total_files));
+    }
 
-    if raw_paths.is_empty() { return (Vec::new(), Vec::new(), subdirs); }
+    if raw_paths.is_empty() {
+        return (Vec::new(), Vec::new(), subdirs);
+    }
 
     // 2. Parallel Processing with Streaming
     let chunk_size = 100;
     let processed_count = AtomicUsize::new(0);
 
     // Split into chunks to stream results to UI
-    let chunks: Vec<Vec<std::path::PathBuf>> = raw_paths.chunks(chunk_size).map(|c| c.to_vec()).collect();
+    let chunks: Vec<Vec<std::path::PathBuf>> =
+        raw_paths.chunks(chunk_size).map(|c| c.to_vec()).collect();
     let mut all_files = Vec::new();
 
     for chunk in chunks {
-        let batch_results: Vec<FileMetadata> = chunk.par_iter().filter_map(|path| {
-            if let Some(prog_tx) = &progress_tx {
-                let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                if current % 50 == 0 || current == total_files {
-                    let _ = prog_tx.send((current, total_files));
+        let batch_results: Vec<FileMetadata> = chunk
+            .par_iter()
+            .filter_map(|path| {
+                if let Some(prog_tx) = &progress_tx {
+                    let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if current % 50 == 0 || current == total_files {
+                        let _ = prog_tx.send((current, total_files));
+                    }
                 }
-            }
 
-            let metadata = fs::metadata(path).ok()?;
-            let size = metadata.len();
-            let modified = DateTime::from(metadata.modified().ok().unwrap_or(UNIX_EPOCH));
+                let metadata = fs::metadata(path).ok()?;
+                let size = metadata.len();
+                let modified = DateTime::from(metadata.modified().ok().unwrap_or(UNIX_EPOCH));
 
-            // Required for RAWs to look correct immediately.
-            // Streaming (batch_tx) ensures the UI is still responsive.
-            // Note: For RAW files, the actual orientation used depends on whether thumbnails
-            // or full decode is used. The image loader will return the correct value.
-            let orientation = get_orientation(path, None);
-            eprintln!("[DEBUG-SCAN] scan_for_view get_orientation={} for {:?}", orientation, path.file_name().unwrap_or_default());
+                // Required for RAWs to look correct immediately.
+                // Streaming (batch_tx) ensures the UI is still responsive.
+                // Note: For RAW files, the actual orientation used depends on whether thumbnails
+                // or full decode is used. The image loader will return the correct value.
+                let orientation = get_orientation(path, None);
+                eprintln!(
+                    "[DEBUG-SCAN] scan_for_view get_orientation={} for {:?}",
+                    orientation,
+                    path.file_name().unwrap_or_default()
+                );
 
-            let unique_file_id = get_file_key(path)?;
+                let unique_file_id = get_file_key(path)?;
 
-            Some(FileMetadata {
-                path: path.clone(),
-                size,
-                modified,
-                pdqhash: None,
-                resolution: None,
-                content_hash: [0u8; 32],
-                pixel_hash: None,
-                orientation,
-                unique_file_id,
+                Some(FileMetadata {
+                    path: path.clone(),
+                    size,
+                    modified,
+                    pdqhash: None,
+                    resolution: None,
+                    content_hash: [0u8; 32],
+                    pixel_hash: None,
+                    orientation,
+                    unique_file_id,
+                })
             })
-        }).collect();
+            .collect();
 
         // Stream this batch to the GUI immediately
         if !batch_results.is_empty() {
-             if let Some(tx) = &batch_tx {
-                 let _ = tx.send(batch_results.clone());
-             }
-             all_files.extend(batch_results);
+            if let Some(tx) = &batch_tx {
+                let _ = tx.send(batch_results.clone());
+            }
+            all_files.extend(batch_results);
         }
     }
 
@@ -1505,10 +1703,6 @@ mod tests {
         let lat = 28.68;
         let lon = -81.31;
         let result = derive_country(lat, lon);
-        assert_eq!(
-            result,
-            Some("Florida, United States of America (the)".to_string())
-        );
+        assert_eq!(result, Some("Florida, United States of America (the)".to_string()));
     }
 }
-

@@ -1,11 +1,11 @@
-use std::path::{PathBuf, Path};
+use regex::RegexBuilder;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use regex::RegexBuilder;
+use std::path::{Path, PathBuf};
 
-use crate::{FileMetadata, GroupInfo};
-use crate::scanner::{analyze_group, sort_files};
 use crate::fileops;
+use crate::scanner::{analyze_group, sort_files};
+use crate::{FileMetadata, GroupInfo};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputIntent {
@@ -20,9 +20,9 @@ pub enum InputIntent {
     ToggleMark,
     ConfirmDelete,
     ExecuteDelete,
-    DeleteImmediate,      // Delete current file without marking (for view mode)
+    DeleteImmediate, // Delete current file without marking (for view mode)
     ConfirmDeleteImmediate,
-    MoveMarked,           // Move marked files to target directory
+    MoveMarked, // Move marked files to target directory
     ConfirmMoveMarked,
     Cancel,
     Quit,
@@ -34,12 +34,12 @@ pub enum InputIntent {
     RefreshDirCache,
     ToggleZoomRelative,
     TogglePathVisibility,
-    ToggleSlideshow,      // Pause/resume slideshow
+    ToggleSlideshow, // Pause/resume slideshow
     ToggleFullscreen,
     RotateCW,
-    FlipHorizontal,       // Flip image left-right (Y key)
-    FlipVertical,         // Flip image up-down (U key)
-    ResetTransform,       // Reset rotation and flip state (Backspace key)
+    FlipHorizontal, // Flip image left-right (Y key)
+    FlipVertical,   // Flip image up-down (U key)
+    ResetTransform, // Reset rotation and flip state (Backspace key)
     ShowSortSelection,
     ChangeSortOrder(String),
     NextGroupByDist,
@@ -61,20 +61,21 @@ pub struct RenameState {
 /// Per-file transform state (rotation and flips)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FileTransform {
-    pub rotation: u8,        // 0-3 (90° increments clockwise)
+    pub rotation: u8,          // 0-3 (90° increments clockwise)
     pub flip_horizontal: bool, // Left-right flip
     pub flip_vertical: bool,   // Up-down flip
 }
 
-impl FileTransform {
-}
+impl FileTransform {}
 
 // --- Shared Helpers ---
 
 /// Formats a path to show only the last `depth + 1` components.
 pub fn format_path_depth(path: &Path, depth: usize) -> String {
     let components: Vec<_> = path.components().collect();
-    if components.is_empty() { return "".to_string(); }
+    if components.is_empty() {
+        return "".to_string();
+    }
 
     let take = depth + 1;
     let len = components.len();
@@ -172,8 +173,8 @@ pub struct AppState {
     pub show_search: bool,
     pub search_results: Vec<(usize, usize, String)>, // (group_idx, file_idx, match_source)
     pub current_search_match: usize,
-    pub search_include_exif: bool,  // Include EXIF data in search
-    pub use_gps_utc: bool, // Solar position
+    pub search_include_exif: bool, // Include EXIF data in search
+    pub use_gps_utc: bool,         // Solar position
     // Per-file transform state (rotation and flips)
     pub file_transforms: HashMap<PathBuf, FileTransform>,
 }
@@ -240,7 +241,7 @@ impl AppState {
                 InputIntent::ChangeSortOrder(sort) => {
                     self.show_sort_selection = false;
                     self.perform_sort(sort);
-                },
+                }
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_sort_selection = false;
                 }
@@ -255,7 +256,7 @@ impl AppState {
                 InputIntent::ConfirmDelete => {
                     self.show_confirmation = false;
                     self.perform_deletion();
-                },
+                }
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_confirmation = false;
                 }
@@ -270,7 +271,7 @@ impl AppState {
                 InputIntent::ConfirmMoveMarked => {
                     self.show_move_confirmation = false;
                     self.perform_move_marked();
-                },
+                }
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_move_confirmation = false;
                 }
@@ -285,7 +286,7 @@ impl AppState {
                 InputIntent::ConfirmDeleteImmediate => {
                     self.show_delete_immediate_confirmation = false;
                     self.perform_delete_immediate();
-                },
+                }
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_delete_immediate_confirmation = false;
                 }
@@ -305,14 +306,38 @@ impl AppState {
 
         match intent {
             InputIntent::Quit => self.exit_requested = true,
-            InputIntent::NextItem => { self.next_item(); self.selection_changed = true; },
-            InputIntent::PrevItem => { self.prev_item(); self.selection_changed = true; },
-            InputIntent::NextGroup => { self.next_group(); self.selection_changed = true; },
-            InputIntent::PrevGroup => { self.prev_group(); self.selection_changed = true; },
-            InputIntent::PageDown => { self.move_page(true, 15); self.selection_changed = true; },
-            InputIntent::PageUp => { self.move_page(false, 15); self.selection_changed = true; },
-            InputIntent::Home => { self.go_home(); self.selection_changed = true; },
-            InputIntent::End => { self.go_end(); self.selection_changed = true; },
+            InputIntent::NextItem => {
+                self.next_item();
+                self.selection_changed = true;
+            }
+            InputIntent::PrevItem => {
+                self.prev_item();
+                self.selection_changed = true;
+            }
+            InputIntent::NextGroup => {
+                self.next_group();
+                self.selection_changed = true;
+            }
+            InputIntent::PrevGroup => {
+                self.prev_group();
+                self.selection_changed = true;
+            }
+            InputIntent::PageDown => {
+                self.move_page(true, 15);
+                self.selection_changed = true;
+            }
+            InputIntent::PageUp => {
+                self.move_page(false, 15);
+                self.selection_changed = true;
+            }
+            InputIntent::Home => {
+                self.go_home();
+                self.selection_changed = true;
+            }
+            InputIntent::End => {
+                self.go_end();
+                self.selection_changed = true;
+            }
             InputIntent::ToggleMark => self.toggle_delete(),
             InputIntent::ExecuteDelete => {
                 if !self.marked_for_deletion.is_empty() {
@@ -323,13 +348,13 @@ impl AppState {
                 } else {
                     self.set_status("No files to delete.".to_string(), false);
                 }
-            },
+            }
             InputIntent::DeleteImmediate => {
                 if self.get_current_image_path().is_some() {
                     self.show_delete_immediate_confirmation = true;
                 }
-            },
-            InputIntent::ConfirmDeleteImmediate => {},
+            }
+            InputIntent::ConfirmDeleteImmediate => {}
             InputIntent::MoveMarked => {
                 if self.move_target.is_none() {
                     self.set_status("No move target set (use --move-marked)".to_string(), true);
@@ -338,30 +363,32 @@ impl AppState {
                 } else {
                     self.show_move_confirmation = true;
                 }
-            },
-            InputIntent::ConfirmMoveMarked => {},
+            }
+            InputIntent::ConfirmMoveMarked => {}
             InputIntent::ToggleRelativeTime => {
                 self.show_relative_times = !self.show_relative_times;
                 self.selection_changed = true;
-            },
-            InputIntent::ConfirmDelete => {},
-            InputIntent::Cancel => { self.status_message = None; },
-            InputIntent::CycleViewMode | InputIntent::CycleZoom => {},
+            }
+            InputIntent::ConfirmDelete => {}
+            InputIntent::Cancel => {
+                self.status_message = None;
+            }
+            InputIntent::CycleViewMode | InputIntent::CycleZoom => {}
             InputIntent::StartRename => {
                 if let Some(path) = self.get_current_image_path().cloned() {
                     self.renaming = Some(RenameState {
                         group_idx: self.current_group_idx,
                         file_idx: self.current_file_idx,
-                        original_path: path
+                        original_path: path,
                     });
                 }
-            },
-            InputIntent::SubmitRename(_) => {},
-            InputIntent::RefreshDirCache => {},
+            }
+            InputIntent::SubmitRename(_) => {}
+            InputIntent::RefreshDirCache => {}
             InputIntent::ToggleZoomRelative => {
                 self.zoom_relative = !self.zoom_relative;
                 self.selection_changed = true;
-            },
+            }
             InputIntent::TogglePathVisibility => {
                 if let Some(path) = self.get_current_image_path() {
                     let total_components = path.components().count();
@@ -372,15 +399,16 @@ impl AppState {
                     }
                     self.selection_changed = true;
                 }
-            },
+            }
             InputIntent::ToggleSlideshow => {
                 self.slideshow_paused = !self.slideshow_paused;
-                let status = if self.slideshow_paused { "Slideshow paused" } else { "Slideshow resumed" };
+                let status =
+                    if self.slideshow_paused { "Slideshow paused" } else { "Slideshow resumed" };
                 self.set_status(status.to_string(), false);
-            },
+            }
             InputIntent::ToggleFullscreen => {
                 self.is_fullscreen = !self.is_fullscreen;
-            },
+            }
             InputIntent::RotateCW => {
                 // Per-file rotation
                 if let Some(path) = self.get_current_image_path().cloned() {
@@ -389,56 +417,67 @@ impl AppState {
                 }
                 // Also update legacy manual_rotation for compatibility
                 self.manual_rotation = (self.manual_rotation + 1) % 4;
-            },
+            }
             InputIntent::FlipHorizontal => {
                 // Per-file horizontal flip (left-right)
                 if let Some(path) = self.get_current_image_path().cloned() {
                     let transform = self.file_transforms.entry(path).or_default();
                     transform.flip_horizontal = !transform.flip_horizontal;
                 }
-            },
+            }
             InputIntent::FlipVertical => {
                 // Per-file vertical flip (up-down)
                 if let Some(path) = self.get_current_image_path().cloned() {
                     let transform = self.file_transforms.entry(path).or_default();
                     transform.flip_vertical = !transform.flip_vertical;
                 }
-            },
+            }
             InputIntent::ResetTransform => {
                 // Reset transforms for ALL files
                 self.file_transforms.clear();
                 // Also reset legacy manual_rotation
                 self.manual_rotation = 0;
-            },
+            }
             InputIntent::ShowSortSelection => {
                 self.show_sort_selection = true;
-            },
+            }
             InputIntent::NextGroupByDist => {
-                if self.groups.is_empty() { return; }
+                if self.groups.is_empty() {
+                    return;
+                }
                 let current_dist = self.group_infos[self.current_group_idx].max_dist;
 
                 // Find next group index with strictly greater max_dist
-                if let Some(new_idx) = self.group_infos.iter()
+                if let Some(new_idx) = self
+                    .group_infos
+                    .iter()
                     .enumerate()
-                        .skip(self.current_group_idx + 1)
-                        .find(|(_, info)| info.max_dist > current_dist)
-                        .map(|(i, _)| i)
+                    .skip(self.current_group_idx + 1)
+                    .find(|(_, info)| info.max_dist > current_dist)
+                    .map(|(i, _)| i)
                 {
                     self.current_group_idx = new_idx;
                     self.current_file_idx = 0;
                     self.manual_rotation = 0;
                     self.selection_changed = true;
-                    self.set_status(format!("Jumped to Dist: {}", self.group_infos[new_idx].max_dist), false);
+                    self.set_status(
+                        format!("Jumped to Dist: {}", self.group_infos[new_idx].max_dist),
+                        false,
+                    );
                 } else {
                     self.set_status("No groups with higher distance found.".to_string(), false);
                 }
-            },
+            }
             InputIntent::PreviousGroupByDist => {
-                if self.groups.is_empty() { return; }
+                if self.groups.is_empty() {
+                    return;
+                }
                 let current_dist = self.group_infos[self.current_group_idx].max_dist;
 
                 // Find the last group preceding current one that has strictly smaller max_dist
-                if let Some(new_idx) = self.group_infos.iter()
+                if let Some(new_idx) = self
+                    .group_infos
+                    .iter()
                     .enumerate()
                     .take(self.current_group_idx)
                     .rposition(|(_, info)| info.max_dist < current_dist)
@@ -447,27 +486,30 @@ impl AppState {
                     self.current_file_idx = 0;
                     self.manual_rotation = 0;
                     self.selection_changed = true;
-                    self.set_status(format!("Jumped to Dist: {}", self.group_infos[new_idx].max_dist), false);
+                    self.set_status(
+                        format!("Jumped to Dist: {}", self.group_infos[new_idx].max_dist),
+                        false,
+                    );
                 } else {
                     self.set_status("No groups with smaller distance found.".to_string(), false);
                 }
-            },
+            }
             InputIntent::StartSearch => {
                 self.show_search = true;
-            },
+            }
             InputIntent::SubmitSearch(query) => {
                 self.perform_search(query);
-            },
+            }
             InputIntent::CancelSearch => {
                 self.show_search = false;
-            },
+            }
             InputIntent::NextSearchResult => {
                 self.jump_search(true);
-            },
+            }
             InputIntent::PrevSearchResult => {
                 self.jump_search(false);
-            },
-            InputIntent::ChangeSortOrder(_) => {},
+            }
+            InputIntent::ChangeSortOrder(_) => {}
         }
     }
 
@@ -477,7 +519,9 @@ impl AppState {
     }
 
     pub fn get_current_image_path(&self) -> Option<&PathBuf> {
-        if self.groups.is_empty() { return None; }
+        if self.groups.is_empty() {
+            return None;
+        }
         let group = &self.groups[self.current_group_idx];
         if self.current_file_idx < group.len() {
             Some(&group[self.current_file_idx].path)
@@ -506,21 +550,23 @@ impl AppState {
             let new_path = parent.join(&new_name);
 
             if new_path.exists() {
-                 self.error_popup = Some(format!("Error: Destination already exists:\n{:?}", new_path));
-                 return;
+                self.error_popup =
+                    Some(format!("Error: Destination already exists:\n{:?}", new_path));
+                return;
             }
 
             match fs::rename(&rename_state.original_path, &new_path) {
                 Ok(_) => {
-                     if let Some(group) = self.groups.get_mut(rename_state.group_idx)
-                         && let Some(file) = group.get_mut(rename_state.file_idx) {
-                             file.path = new_path;
-                             self.set_status(format!("Renamed to '{}'", new_name), false);
-                         }
-                     self.selection_changed = true;
-                },
+                    if let Some(group) = self.groups.get_mut(rename_state.group_idx)
+                        && let Some(file) = group.get_mut(rename_state.file_idx)
+                    {
+                        file.path = new_path;
+                        self.set_status(format!("Renamed to '{}'", new_name), false);
+                    }
+                    self.selection_changed = true;
+                }
                 Err(e) => {
-                     self.error_popup = Some(format!("Failed to rename:\n{}", e));
+                    self.error_popup = Some(format!("Failed to rename:\n{}", e));
                 }
             }
         }
@@ -540,8 +586,8 @@ impl AppState {
                 if let Some(new_idx) = group.iter().position(|f| f.path == path) {
                     self.current_file_idx = new_idx;
                 } else {
-                     // Fallback if file not found (unlikely unless list changed concurrently)
-                     self.current_file_idx = 0;
+                    // Fallback if file not found (unlikely unless list changed concurrently)
+                    self.current_file_idx = 0;
                 }
             }
         } else {
@@ -553,52 +599,104 @@ impl AppState {
     }
 
     pub fn next_item(&mut self) {
-        if self.groups.is_empty() { return; }
+        if self.groups.is_empty() {
+            return;
+        }
         self.manual_rotation = 0; // Reset rotation
         let group_len = self.groups[self.current_group_idx].len();
-        if self.current_file_idx + 1 < group_len { self.current_file_idx += 1; }
-        else if self.current_group_idx + 1 < self.groups.len() { self.current_group_idx += 1; self.current_file_idx = 0; }
+        if self.current_file_idx + 1 < group_len {
+            self.current_file_idx += 1;
+        } else if self.current_group_idx + 1 < self.groups.len() {
+            self.current_group_idx += 1;
+            self.current_file_idx = 0;
+        }
     }
     fn prev_item(&mut self) {
-        if self.groups.is_empty() { return; }
+        if self.groups.is_empty() {
+            return;
+        }
         self.manual_rotation = 0; // Reset rotation
-        if self.current_file_idx > 0 { self.current_file_idx -= 1; }
-        else if self.current_group_idx > 0 { self.current_group_idx -= 1; self.current_file_idx = self.groups[self.current_group_idx].len() - 1; }
+        if self.current_file_idx > 0 {
+            self.current_file_idx -= 1;
+        } else if self.current_group_idx > 0 {
+            self.current_group_idx -= 1;
+            self.current_file_idx = self.groups[self.current_group_idx].len() - 1;
+        }
     }
     fn next_group(&mut self) {
-        if self.groups.is_empty() { return; }
+        if self.groups.is_empty() {
+            return;
+        }
         self.manual_rotation = 0;
         self.current_group_idx = (self.current_group_idx + 1) % self.groups.len();
         self.current_file_idx = 0;
     }
     fn prev_group(&mut self) {
-        if self.groups.is_empty() { return; }
+        if self.groups.is_empty() {
+            return;
+        }
         self.manual_rotation = 0;
-        if self.current_group_idx == 0 { self.current_group_idx = self.groups.len() - 1; } else { self.current_group_idx -= 1; }
+        if self.current_group_idx == 0 {
+            self.current_group_idx = self.groups.len() - 1;
+        } else {
+            self.current_group_idx -= 1;
+        }
         self.current_file_idx = 0;
     }
-    fn go_home(&mut self) { if !self.groups.is_empty() { self.current_group_idx = 0; self.current_file_idx = 0; self.manual_rotation = 0; } }
-    fn go_end(&mut self) { if !self.groups.is_empty() { self.current_group_idx = self.groups.len() - 1; self.manual_rotation = 0; if let Some(g) = self.groups.last() { self.current_file_idx = g.len().saturating_sub(1); } } }
+    fn go_home(&mut self) {
+        if !self.groups.is_empty() {
+            self.current_group_idx = 0;
+            self.current_file_idx = 0;
+            self.manual_rotation = 0;
+        }
+    }
+    fn go_end(&mut self) {
+        if !self.groups.is_empty() {
+            self.current_group_idx = self.groups.len() - 1;
+            self.manual_rotation = 0;
+            if let Some(g) = self.groups.last() {
+                self.current_file_idx = g.len().saturating_sub(1);
+            }
+        }
+    }
 
     pub fn move_page(&mut self, down: bool, view_size: usize) {
-        if self.groups.is_empty() { return; }
+        if self.groups.is_empty() {
+            return;
+        }
         self.manual_rotation = 0;
         let mut current_abs = 0;
-        for i in 0..self.current_group_idx { current_abs += 1 + self.groups[i].len(); }
+        for i in 0..self.current_group_idx {
+            current_abs += 1 + self.groups[i].len();
+        }
         current_abs += 1 + self.current_file_idx;
         let total_rows: usize = self.groups.iter().map(|g| 1 + g.len()).sum();
         let scroll_amount = view_size.max(1);
-        let target_abs = if down { current_abs.saturating_add(scroll_amount).min(total_rows - 1) } else { current_abs.saturating_sub(scroll_amount) };
+        let target_abs = if down {
+            current_abs.saturating_add(scroll_amount).min(total_rows - 1)
+        } else {
+            current_abs.saturating_sub(scroll_amount)
+        };
         let mut accum = 0;
         for (g_idx, group) in self.groups.iter().enumerate() {
             let g_len = 1 + group.len();
             if target_abs < accum + g_len {
                 let offset = target_abs - accum;
                 if offset == 0 {
-                    if down { self.current_group_idx = g_idx; self.current_file_idx = 0; }
-                    else if g_idx > 0 { self.current_group_idx = g_idx - 1; self.current_file_idx = self.groups[g_idx - 1].len().saturating_sub(1); }
-                    else { self.current_group_idx = 0; self.current_file_idx = 0; }
-                } else { self.current_group_idx = g_idx; self.current_file_idx = offset - 1; }
+                    if down {
+                        self.current_group_idx = g_idx;
+                        self.current_file_idx = 0;
+                    } else if g_idx > 0 {
+                        self.current_group_idx = g_idx - 1;
+                        self.current_file_idx = self.groups[g_idx - 1].len().saturating_sub(1);
+                    } else {
+                        self.current_group_idx = 0;
+                        self.current_file_idx = 0;
+                    }
+                } else {
+                    self.current_group_idx = g_idx;
+                    self.current_file_idx = offset - 1;
+                }
                 return;
             }
             accum += g_len;
@@ -607,39 +705,71 @@ impl AppState {
 
     fn toggle_delete(&mut self) {
         if let Some(path) = self.get_current_image_path().cloned() {
-            if self.marked_for_deletion.contains(&path) { self.marked_for_deletion.retain(|p| p != &path); } else { self.marked_for_deletion.push(path); }
+            if self.marked_for_deletion.contains(&path) {
+                self.marked_for_deletion.retain(|p| p != &path);
+            } else {
+                self.marked_for_deletion.push(path);
+            }
         }
     }
 
     fn perform_deletion(&mut self) {
-        if self.marked_for_deletion.is_empty() { return; }
+        if self.marked_for_deletion.is_empty() {
+            return;
+        }
         let mut success_count = 0;
         let mut failed_paths = HashSet::new();
         let deleted_paths = self.marked_for_deletion.clone();
         let mut error_details = Vec::new();
 
         for path in &deleted_paths {
-            let res = if self.use_trash { trash::delete(path).map_err(|e| e.to_string()) } else { fs::remove_file(path).map_err(|e| e.to_string()) };
+            let res = if self.use_trash {
+                trash::delete(path).map_err(|e| e.to_string())
+            } else {
+                fs::remove_file(path).map_err(|e| e.to_string())
+            };
             match res {
                 Ok(_) => success_count += 1,
                 Err(e) => {
-                    error_details.push(format!("• {:?}: {}", path.file_name().unwrap_or_default(), e));
+                    error_details.push(format!(
+                        "• {:?}: {}",
+                        path.file_name().unwrap_or_default(),
+                        e
+                    ));
                     failed_paths.insert(path.clone());
-                },
+                }
             }
         }
         self.marked_for_deletion.retain(|p| failed_paths.contains(p));
         if success_count > 0 {
-            for group in &mut self.groups { group.retain(|f| !deleted_paths.contains(&f.path) || failed_paths.contains(&f.path)); }
+            for group in &mut self.groups {
+                group
+                    .retain(|f| !deleted_paths.contains(&f.path) || failed_paths.contains(&f.path));
+            }
             let mut i = 0;
             while i < self.groups.len() {
-                if self.groups[i].is_empty() { self.groups.remove(i); self.group_infos.remove(i); if self.current_group_idx >= i && self.current_group_idx > 0 { self.current_group_idx -= 1; } }
-                else { self.group_infos[i] = analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities); i += 1; }
+                if self.groups[i].is_empty() {
+                    self.groups.remove(i);
+                    self.group_infos.remove(i);
+                    if self.current_group_idx >= i && self.current_group_idx > 0 {
+                        self.current_group_idx -= 1;
+                    }
+                } else {
+                    self.group_infos[i] =
+                        analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities);
+                    i += 1;
+                }
             }
-            if self.groups.is_empty() { self.current_group_idx = 0; self.current_file_idx = 0; }
-            else {
-                if self.current_group_idx >= self.groups.len() { self.current_group_idx = self.groups.len() - 1; }
-                if self.current_file_idx >= self.groups[self.current_group_idx].len() { self.current_file_idx = self.groups[self.current_group_idx].len() - 1; }
+            if self.groups.is_empty() {
+                self.current_group_idx = 0;
+                self.current_file_idx = 0;
+            } else {
+                if self.current_group_idx >= self.groups.len() {
+                    self.current_group_idx = self.groups.len() - 1;
+                }
+                if self.current_file_idx >= self.groups[self.current_group_idx].len() {
+                    self.current_file_idx = self.groups[self.current_group_idx].len() - 1;
+                }
             }
             self.selection_changed = true;
         }
@@ -649,14 +779,18 @@ impl AppState {
         } else {
             let mut full_msg = format!("Failed to delete {} files:\n\n", failed_paths.len());
             full_msg.push_str(&error_details.into_iter().take(5).collect::<Vec<_>>().join("\n"));
-            if failed_paths.len() > 5 { full_msg.push_str("\n...and others."); }
+            if failed_paths.len() > 5 {
+                full_msg.push_str("\n...and others.");
+            }
             full_msg.push_str("\n\n(Press any key to dismiss)");
             self.error_popup = Some(full_msg);
         }
     }
 
     fn perform_delete_immediate(&mut self) {
-        let Some(path) = self.get_current_image_path().cloned() else { return };
+        let Some(path) = self.get_current_image_path().cloned() else {
+            return;
+        };
 
         let res = if self.use_trash {
             trash::delete(&path).map_err(|e| e.to_string())
@@ -688,7 +822,8 @@ impl AppState {
                         self.current_group_idx = self.groups.len() - 1;
                     }
                     if self.current_file_idx >= self.groups[self.current_group_idx].len() {
-                        self.current_file_idx = self.groups[self.current_group_idx].len().saturating_sub(1);
+                        self.current_file_idx =
+                            self.groups[self.current_group_idx].len().saturating_sub(1);
                     }
                 }
 
@@ -698,7 +833,7 @@ impl AppState {
                 let action = if self.use_trash { "Trashed" } else { "Deleted" };
                 self.set_status(format!("{}: {}", action, filename), false);
                 self.selection_changed = true;
-            },
+            }
             Err(e) => {
                 self.error_popup = Some(format!("Failed to delete:\n{}", e));
             }
@@ -739,15 +874,24 @@ impl AppState {
             self.current_group_idx = g;
             self.current_file_idx = f;
             self.selection_changed = true;
-            self.set_status(format!("Found {} matches. Match 1/{} in [{}]. (F3/Shift+F3 to nav)",
-                self.search_results.len(), self.search_results.len(), match_source), false);
+            self.set_status(
+                format!(
+                    "Found {} matches. Match 1/{} in [{}]. (F3/Shift+F3 to nav)",
+                    self.search_results.len(),
+                    self.search_results.len(),
+                    match_source
+                ),
+                false,
+            );
         } else {
             self.error_popup = Some(format!("No matches found for:\n'{}'", query));
         }
     }
 
     fn jump_search(&mut self, next: bool) {
-        if self.search_results.is_empty() { return; }
+        if self.search_results.is_empty() {
+            return;
+        }
 
         if next {
             self.current_search_match = (self.current_search_match + 1) % self.search_results.len();
@@ -763,7 +907,15 @@ impl AppState {
         self.current_group_idx = g;
         self.current_file_idx = f;
         self.selection_changed = true;
-        self.set_status(format!("Match {}/{} in [{}]", self.current_search_match + 1, self.search_results.len(), match_source), false);
+        self.set_status(
+            format!(
+                "Match {}/{} in [{}]",
+                self.current_search_match + 1,
+                self.search_results.len(),
+                match_source
+            ),
+            false,
+        );
     }
 
     fn perform_move_marked(&mut self) {
@@ -782,7 +934,9 @@ impl AppState {
             self.marked_for_deletion.clone()
         };
 
-        if paths_to_move.is_empty() { return; }
+        if paths_to_move.is_empty() {
+            return;
+        }
         let mut success_count = 0;
         let mut failed_paths = HashSet::new();
         let mut error_details = Vec::new();
@@ -794,7 +948,7 @@ impl AppState {
             match fileops::perform_atomic_move(path, &dest) {
                 Ok(_) => {
                     success_count += 1;
-                },
+                }
                 Err(e) => {
                     // e is now a standard std::io::Error with a descriptive message
                     error_details.push(format!("• {:?}: {}", filename, e));
@@ -807,7 +961,8 @@ impl AppState {
         if success_count > 0 {
             // Remove moved files from groups
             for group in &mut self.groups {
-                group.retain(|f| !paths_to_move.contains(&f.path) || failed_paths.contains(&f.path));
+                group
+                    .retain(|f| !paths_to_move.contains(&f.path) || failed_paths.contains(&f.path));
             }
 
             // Clean up empty groups
@@ -820,7 +975,8 @@ impl AppState {
                         self.current_group_idx -= 1;
                     }
                 } else {
-                    self.group_infos[i] = analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities);
+                    self.group_infos[i] =
+                        analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities);
                     i += 1;
                 }
             }
@@ -834,7 +990,8 @@ impl AppState {
                     self.current_group_idx = self.groups.len() - 1;
                 }
                 if self.current_file_idx >= self.groups[self.current_group_idx].len() {
-                    self.current_file_idx = self.groups[self.current_group_idx].len().saturating_sub(1);
+                    self.current_file_idx =
+                        self.groups[self.current_group_idx].len().saturating_sub(1);
                 }
             }
             self.selection_changed = true;
@@ -845,7 +1002,9 @@ impl AppState {
         } else {
             let mut full_msg = format!("Failed to move {} files:\n\n", failed_paths.len());
             full_msg.push_str(&error_details.into_iter().take(5).collect::<Vec<_>>().join("\n"));
-            if failed_paths.len() > 5 { full_msg.push_str("\n...and others."); }
+            if failed_paths.len() > 5 {
+                full_msg.push_str("\n...and others.");
+            }
             if success_count > 0 {
                 full_msg.push_str(&format!("\n\n({} files moved successfully)", success_count));
             }
@@ -855,13 +1014,12 @@ impl AppState {
     }
 }
 
-
 /// Returns a map of (dev, ino) -> Vec<&FileMetadata> for files that are hardlinked
 pub fn get_hardlink_groups(group: &[FileMetadata]) -> HashMap<u128, Vec<usize>> {
     let mut groups: HashMap<u128, Vec<usize>> = HashMap::new();
 
     for (idx, f) in group.iter().enumerate() {
-        groups.entry(f.unique_file_id).or_default().push(idx); 
+        groups.entry(f.unique_file_id).or_default().push(idx);
     }
     // Only keep groups with 2+ files (actual hardlinks)
     groups.retain(|_, v| v.len() > 1);

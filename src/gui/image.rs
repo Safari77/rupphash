@@ -1,22 +1,21 @@
-use eframe::egui;
 use crate::scanner::is_raw_ext;
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use eframe::egui;
+use fast_image_resize::images::Image as FastImage;
+use fast_image_resize::{PixelType, ResizeOptions, Resizer};
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
-use std::thread;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use std::f32::consts::PI;
 use std::fs;
 use std::path::Path;
-use std::f32::consts::PI;
-use fast_image_resize::images::Image as FastImage;
-use fast_image_resize::{Resizer, ResizeOptions, PixelType};
+use std::sync::{Arc, RwLock};
+use std::thread;
 
 use super::app::GuiApp;
 use crate::scanner;
 
 pub const MAX_TEXTURE_SIDE: usize = 8192;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(super) enum ViewMode {
     #[default]
     FitWindow,
@@ -33,16 +32,17 @@ pub(super) struct GroupViewState {
 
 impl Default for GroupViewState {
     fn default() -> Self {
-        Self {
-            mode: ViewMode::FitWindow,
-            pan_center: egui::Pos2::new(0.5, 0.5),
-        }
+        Self { mode: ViewMode::FitWindow, pan_center: egui::Pos2::new(0.5, 0.5) }
     }
 }
 
-pub(super) fn spawn_image_loader_pool(active_window: Arc<RwLock<HashSet<std::path::PathBuf>>>, use_thumbnails: bool)
-    -> (Sender<std::path::PathBuf>, Receiver<(std::path::PathBuf, Option<(egui::ColorImage, (u32, u32), u8)>)>)
-{
+pub(super) fn spawn_image_loader_pool(
+    active_window: Arc<RwLock<HashSet<std::path::PathBuf>>>,
+    use_thumbnails: bool,
+) -> (
+    Sender<std::path::PathBuf>,
+    Receiver<(std::path::PathBuf, Option<(egui::ColorImage, (u32, u32), u8)>)>,
+) {
     let (tx, rx) = unbounded::<std::path::PathBuf>();
     let (result_tx, result_rx) = unbounded();
 
@@ -57,7 +57,9 @@ pub(super) fn spawn_image_loader_pool(active_window: Arc<RwLock<HashSet<std::pat
             while let Ok(path) = rx_clone.recv() {
                 // 1. Skip if no longer in active window
                 {
-                    if let Ok(window) = window_clone.read() && !window.contains(&path) {
+                    if let Ok(window) = window_clone.read()
+                        && !window.contains(&path)
+                    {
                         let _ = tx_clone.send((path, None));
                         continue;
                     }
@@ -73,7 +75,10 @@ pub(super) fn spawn_image_loader_pool(active_window: Arc<RwLock<HashSet<std::pat
     (tx, result_rx)
 }
 
-fn load_and_process_image(path: &std::path::Path, use_thumbnails: bool) -> Option<(egui::ColorImage, (u32, u32), u8)> {
+fn load_and_process_image(
+    path: &std::path::Path,
+    use_thumbnails: bool,
+) -> Option<(egui::ColorImage, (u32, u32), u8)> {
     let (mut color_image, real_dims, orientation) = if is_raw_ext(path) {
         // A. RAW FILES
         // We must read bytes first to safely get orientation from them
@@ -84,15 +89,15 @@ fn load_and_process_image(path: &std::path::Path, use_thumbnails: bool) -> Optio
             if let Ok(mut raw) = rsraw::RawImage::open(&data) {
                 let dims = (raw.width() as u32, raw.height() as u32);
                 // 1. Attempt to get a thumbnail first
-                let maybe_thumb = if use_thumbnails {
-                    extract_best_thumbnail(&mut raw)
-                } else {
-                    None
-                };
+                let maybe_thumb =
+                    if use_thumbnails { extract_best_thumbnail(&mut raw) } else { None };
 
                 // 2. Decide: Use Thumbnail OR Fallback to Full Decode
                 if let Some(thumb) = maybe_thumb {
-                    eprintln!("[DEBUG] RAW using thumbnail, applying exif_orientation={}", exif_orientation);
+                    eprintln!(
+                        "[DEBUG] RAW using thumbnail, applying exif_orientation={}",
+                        exif_orientation
+                    );
                     // SUCCESS (Thumbnail): Return tuple to 'let', falling through to resize
                     (thumb, dims, exif_orientation)
                 } else {
@@ -108,14 +113,24 @@ fn load_and_process_image(path: &std::path::Path, use_thumbnails: bool) -> Optio
                                 (
                                     egui::ColorImage::from_rgb([w, h], &processed),
                                     dims,
-                                    1 // rsraw handles rotation
+                                    1, // rsraw handles rotation
                                 )
-                            } else { return None; }
-                        } else { return None; }
-                    } else { return None; }
+                            } else {
+                                return None;
+                            }
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
                 }
-            } else { return None; }
-        } else { return None; }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
     } else {
         // B. STANDARD FILES (JPG, PNG, HEIC)
         if let Ok(bytes) = fs::read(path) {
@@ -141,11 +156,15 @@ fn load_and_process_image(path: &std::path::Path, use_thumbnails: bool) -> Optio
                 let pixels = buf.as_flat_samples();
                 let img = egui::ColorImage::from_rgba_unmultiplied(
                     [dims.0 as usize, dims.1 as usize],
-                    pixels.as_slice()
+                    pixels.as_slice(),
                 );
                 (img, dims, orientation)
-            } else { return None; }
-        } else { return None; }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
     };
 
     // --- STEP 2: FAST RESIZING (AVX2/SIMD) ---
@@ -167,17 +186,10 @@ fn load_and_process_image(path: &std::path::Path, use_thumbnails: bool) -> Optio
             PixelType::U8x3 // Raw Decode (RGB)
         };
 
-        if let Ok(src_image) = FastImage::from_vec_u8(
-            w as u32,
-            h as u32,
-            color_image.as_raw().to_vec(),
-            pixel_type
-        ) {
-            let mut dst_image = FastImage::new(
-                new_w as u32,
-                new_h as u32,
-                pixel_type
-            );
+        if let Ok(src_image) =
+            FastImage::from_vec_u8(w as u32, h as u32, color_image.as_raw().to_vec(), pixel_type)
+        {
+            let mut dst_image = FastImage::new(new_w as u32, new_h as u32, pixel_type);
 
             // Resize using Lanczos3 for quality or Bilinear for speed
             // FilterType::Bilinear is usually safe and very fast for downscaling
@@ -190,15 +202,13 @@ fn load_and_process_image(path: &std::path::Path, use_thumbnails: bool) -> Optio
                     PixelType::U8x4 => {
                         color_image = egui::ColorImage::from_rgba_unmultiplied(
                             [new_w, new_h],
-                            dst_image.buffer()
+                            dst_image.buffer(),
                         );
-                    },
+                    }
                     PixelType::U8x3 => {
-                        color_image = egui::ColorImage::from_rgb(
-                            [new_w, new_h],
-                            dst_image.buffer()
-                        );
-                    },
+                        color_image =
+                            egui::ColorImage::from_rgb([new_w, new_h], dst_image.buffer());
+                    }
                     _ => {}
                 }
             }
@@ -209,38 +219,54 @@ fn load_and_process_image(path: &std::path::Path, use_thumbnails: bool) -> Optio
 }
 
 pub(super) fn update_file_metadata(app: &mut GuiApp, path: &Path, w: u32, h: u32, orientation: u8) {
-     eprintln!("[DEBUG-UPDATE] update_file_metadata called: path={:?}, orientation={}", path.file_name().unwrap_or_default(), orientation);
+    eprintln!(
+        "[DEBUG-UPDATE] update_file_metadata called: path={:?}, orientation={}",
+        path.file_name().unwrap_or_default(),
+        orientation
+    );
 
-     // Helper to find and update the file in the group list
-     let update_file = |file: &mut crate::FileMetadata| {
-         if file.path == path {
-             eprintln!("[DEBUG-UPDATE]   Found file! current orientation={}, new orientation={}", file.orientation, orientation);
-             if file.resolution.is_none() { file.resolution = Some((w, h)); }
-             // Always update orientation from loader - it knows the correct value
-             // (e.g., for RAW full decode it's 1, for RAW thumbnails it's EXIF value)
-             if file.orientation != orientation {
-                 eprintln!("[DEBUG-UPDATE]   Updated orientation {} -> {}", file.orientation, orientation);
-                 file.orientation = orientation;
-             }
-             return true;
-         }
-         false
-     };
+    // Helper to find and update the file in the group list
+    let update_file = |file: &mut crate::FileMetadata| {
+        if file.path == path {
+            eprintln!(
+                "[DEBUG-UPDATE]   Found file! current orientation={}, new orientation={}",
+                file.orientation, orientation
+            );
+            if file.resolution.is_none() {
+                file.resolution = Some((w, h));
+            }
+            // Always update orientation from loader - it knows the correct value
+            // (e.g., for RAW full decode it's 1, for RAW thumbnails it's EXIF value)
+            if file.orientation != orientation {
+                eprintln!(
+                    "[DEBUG-UPDATE]   Updated orientation {} -> {}",
+                    file.orientation, orientation
+                );
+                file.orientation = orientation;
+            }
+            return true;
+        }
+        false
+    };
 
-     // Check current file first (fast path)
-     if let Some(group) = app.state.groups.get_mut(app.state.current_group_idx) {
-         if let Some(file) = group.get_mut(app.state.current_file_idx) {
-             if update_file(file) { return; }
-         }
-     }
+    // Check current file first (fast path)
+    if let Some(group) = app.state.groups.get_mut(app.state.current_group_idx) {
+        if let Some(file) = group.get_mut(app.state.current_file_idx) {
+            if update_file(file) {
+                return;
+            }
+        }
+    }
 
-     // Fallback search
-     for group in &mut app.state.groups {
-         for file in group {
-             if update_file(file) { return; }
-         }
-     }
-     eprintln!("[DEBUG-UPDATE]   FILE NOT FOUND in any group!");
+    // Fallback search
+    for group in &mut app.state.groups {
+        for file in group {
+            if update_file(file) {
+                return;
+            }
+        }
+    }
+    eprintln!("[DEBUG-UPDATE]   FILE NOT FOUND in any group!");
 }
 
 /// Extract the best (largest) thumbnail from a RAW file
@@ -248,7 +274,8 @@ fn extract_best_thumbnail(raw: &mut rsraw::RawImage) -> Option<egui::ColorImage>
     let thumbs = raw.extract_thumbs().ok()?;
 
     // Find the largest JPEG thumbnail
-    let best_thumb = thumbs.into_iter()
+    let best_thumb = thumbs
+        .into_iter()
         .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
         .max_by_key(|t| t.width * t.height)?;
 
@@ -257,20 +284,24 @@ fn extract_best_thumbnail(raw: &mut rsraw::RawImage) -> Option<egui::ColorImage>
     let rgb = img.to_rgb8();
     let (width, height) = rgb.dimensions();
 
-    Some(egui::ColorImage::from_rgb(
-            [width as usize, height as usize],
-            rgb.as_raw()
-    ))
+    Some(egui::ColorImage::from_rgb([width as usize, height as usize], rgb.as_raw()))
 }
 
 // Helper to render texture with pan/zoom logic
-pub(super) fn render_image_texture(app: &mut GuiApp, ui: &mut egui::Ui, texture_id: egui::TextureId, texture_size: egui::Vec2, available_rect: egui::Rect, current_group_idx: usize) {
+pub(super) fn render_image_texture(
+    app: &mut GuiApp,
+    ui: &mut egui::Ui,
+    texture_id: egui::TextureId,
+    texture_size: egui::Vec2,
+    available_rect: egui::Rect,
+    current_group_idx: usize,
+) {
     // --- 1. Calculate Rotation and Flip ---
     let orientation = if let Some(group) = app.state.groups.get(app.state.current_group_idx) {
-        if let Some(file) = group.get(app.state.current_file_idx) {
-            file.orientation
-        } else { 1 }
-    } else { 1 };
+        if let Some(file) = group.get(app.state.current_file_idx) { file.orientation } else { 1 }
+    } else {
+        1
+    };
 
     // Get per-file transform state
     let file_transform = app.state.get_current_file_transform();
@@ -287,16 +318,18 @@ pub(super) fn render_image_texture(app: &mut GuiApp, ui: &mut egui::Ui, texture_
     let manual_angle = manual_rot as f32 * (PI / 2.0);
     let total_angle = exif_angle + manual_angle;
 
-    let exif_steps = match orientation { 3 => 2, 6 => 1, 8 => 3, _ => 0 };
+    let exif_steps = match orientation {
+        3 => 2,
+        6 => 1,
+        8 => 3,
+        _ => 0,
+    };
     let total_steps = (exif_steps + manual_rot) % 4;
     let is_rotated_90_270 = total_steps == 1 || total_steps == 3;
 
     // --- 2. Determine Visual Size (Swapped if rotated) ---
-    let visual_size = if is_rotated_90_270 {
-        egui::vec2(texture_size.y, texture_size.x)
-    } else {
-        texture_size
-    };
+    let visual_size =
+        if is_rotated_90_270 { egui::vec2(texture_size.y, texture_size.x) } else { texture_size };
 
     // --- 3. Calculate Zoom & Layout ---
     let (screen_w, screen_h) = (available_rect.width(), available_rect.height());
@@ -313,7 +346,7 @@ pub(super) fn render_image_texture(app: &mut GuiApp, ui: &mut egui::Ui, texture_
             } else {
                 z
             }
-        },
+        }
     };
 
     // Size of the image on screen (visually)
@@ -332,7 +365,7 @@ pub(super) fn render_image_texture(app: &mut GuiApp, ui: &mut egui::Ui, texture_
     // If image is smaller than screen, force centering (override pan)
     let final_center = egui::pos2(
         if virtual_visual_size.x <= screen_w { screen_center.x } else { visual_center.x },
-        if virtual_visual_size.y <= screen_h { screen_center.y } else { visual_center.y }
+        if virtual_visual_size.y <= screen_h { screen_center.y } else { visual_center.y },
     );
 
     // The target rect represents the bounds of the ROTATED image on screen.
@@ -356,10 +389,7 @@ pub(super) fn render_image_texture(app: &mut GuiApp, ui: &mut egui::Ui, texture_
     // Calculate UV coordinates for flipping
     let (u_min, u_max) = if file_transform.flip_horizontal { (1.0, 0.0) } else { (0.0, 1.0) };
     let (v_min, v_max) = if file_transform.flip_vertical { (1.0, 0.0) } else { (0.0, 1.0) };
-    let uv = egui::Rect::from_min_max(
-        egui::pos2(u_min, v_min),
-        egui::pos2(u_max, v_max)
-    );
+    let uv = egui::Rect::from_min_max(egui::pos2(u_min, v_min), egui::pos2(u_max, v_max));
 
     // Paint the image into the calculated paint_rect, applying rotation and flips.
     egui::Image::from_texture((texture_id, texture_size))
@@ -376,15 +406,22 @@ pub(super) fn render_image_texture(app: &mut GuiApp, ui: &mut egui::Ui, texture_
         let new_cx = (view_state.pan_center.x + uv_dx).clamp(0.0, 1.0);
         let new_cy = (view_state.pan_center.y + uv_dy).clamp(0.0, 1.0);
 
-        app.group_views.entry(current_group_idx).or_default().pan_center = egui::Pos2::new(new_cx, new_cy);
+        app.group_views.entry(current_group_idx).or_default().pan_center =
+            egui::Pos2::new(new_cx, new_cy);
     }
 }
 
 /// Render greyscale histogram, using cached data if available
-pub(super) fn render_histogram(app: &mut GuiApp, ui: &mut egui::Ui, available_rect: egui::Rect, path: &std::path::Path) {
+pub(super) fn render_histogram(
+    app: &mut GuiApp,
+    ui: &mut egui::Ui,
+    available_rect: egui::Rect,
+    path: &std::path::Path,
+) {
     // Get window width for histogram sizing (10% of window width)
     let window_width = ui.ctx().input(|i| {
-        i.viewport().inner_rect
+        i.viewport()
+            .inner_rect
             .or(i.viewport().outer_rect)
             .map(|r| r.width())
             .unwrap_or(available_rect.width())
@@ -401,11 +438,7 @@ pub(super) fn render_histogram(app: &mut GuiApp, ui: &mut egui::Ui, available_re
 
     // Check cache first
     let histogram = if let Some((cached_path, cached_hist)) = &app.cached_histogram {
-        if cached_path == path {
-            Some(*cached_hist)
-        } else {
-            None
-        }
+        if cached_path == path { Some(*cached_hist) } else { None }
     } else {
         None
     };
@@ -448,7 +481,9 @@ fn draw_histogram(ui: &mut egui::Ui, hist_rect: egui::Rect, hist: &[u32; 256]) {
     let usable_height = hist_height - 4.0; // Small padding
 
     for (i, &count) in hist.iter().enumerate() {
-        if count == 0 { continue; }
+        if count == 0 {
+            continue;
+        }
 
         let normalized = (count as f32 / max_val as f32).min(1.0);
         let bar_height = normalized * usable_height;
@@ -472,7 +507,12 @@ fn draw_histogram(ui: &mut egui::Ui, hist_rect: egui::Rect, hist: &[u32; 256]) {
     }
 
     // Draw border
-    painter.rect_stroke(hist_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Outside);
+    painter.rect_stroke(
+        hist_rect,
+        0.0,
+        egui::Stroke::new(1.0, egui::Color32::GRAY),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// Compute histogram from a standard image file
@@ -493,17 +533,19 @@ fn compute_histogram_from_raw(path: &std::path::Path) -> Option<[u32; 256]> {
 
     // Try to extract thumbnail first (faster)
     if let Ok(thumbs) = raw.extract_thumbs()
-        && let Some(best_thumb) = thumbs.into_iter()
+        && let Some(best_thumb) = thumbs
+            .into_iter()
             .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
             .max_by_key(|t| t.width * t.height)
-            && let Ok(img) = image::load_from_memory(&best_thumb.data) {
-                let grey = img.to_luma8();
-                let mut hist = [0u32; 256];
-                for pixel in grey.pixels() {
-                    hist[pixel.0[0] as usize] += 1;
-                }
-                return Some(hist);
-            }
+        && let Ok(img) = image::load_from_memory(&best_thumb.data)
+    {
+        let grey = img.to_luma8();
+        let mut hist = [0u32; 256];
+        for pixel in grey.pixels() {
+            hist[pixel.0[0] as usize] += 1;
+        }
+        return Some(hist);
+    }
 
     // Fallback: process the full RAW (slower)
     if raw.unpack().is_ok() {
@@ -527,7 +569,12 @@ fn compute_histogram_from_raw(path: &std::path::Path) -> Option<[u32; 256]> {
 
 /// Render EXIF information overlay, using cached data if available
 /// Position: to the right of histogram if shown, otherwise bottom-left corner
-pub(super) fn render_exif(app: &mut GuiApp, ui: &mut egui::Ui, available_rect: egui::Rect, path: &std::path::Path) {
+pub(super) fn render_exif(
+    app: &mut GuiApp,
+    ui: &mut egui::Ui,
+    available_rect: egui::Rect,
+    path: &std::path::Path,
+) {
     let exif_tags = &app.ctx.gui_config.exif_tags;
     if exif_tags.is_empty() {
         return;
@@ -548,10 +595,8 @@ pub(super) fn render_exif(app: &mut GuiApp, ui: &mut egui::Ui, available_rect: e
             if use_gps && !crate::scanner::has_gps_time(path) {
                 // We only warn if the user explicitly wanted Sun Position
                 if exif_tags.iter().any(|t| t.eq_ignore_ascii_case("DerivedSunPosition")) {
-                    app.state.status_message = Some((
-                        "Sun Position: GPS Time missing, using Local.".to_string(),
-                        true
-                    ));
+                    app.state.status_message =
+                        Some(("Sun Position: GPS Time missing, using Local.".to_string(), true));
                     app.state.status_set_time = Some(std::time::Instant::now());
                 }
             }
@@ -570,7 +615,8 @@ pub(super) fn render_exif(app: &mut GuiApp, ui: &mut egui::Ui, available_rect: e
 
     // Get window width for positioning
     let window_width = ui.ctx().input(|i| {
-        i.viewport().inner_rect
+        i.viewport()
+            .inner_rect
             .or(i.viewport().outer_rect)
             .map(|r| r.width())
             .unwrap_or(available_rect.width())
@@ -589,10 +635,9 @@ pub(super) fn render_exif(app: &mut GuiApp, ui: &mut egui::Ui, available_rect: e
     };
 
     // Estimate width based on content
-    let max_label_width = tags.iter()
-        .map(|(name, value)| name.len() + value.len() + 2)
-        .max()
-        .unwrap_or(20) as f32 * 7.0;
+    let max_label_width =
+        tags.iter().map(|(name, value)| name.len() + value.len() + 2).max().unwrap_or(20) as f32
+            * 7.0;
     let exif_width = max_label_width.min(300.0).max(150.0);
 
     let exif_rect = egui::Rect::from_min_size(
@@ -635,5 +680,10 @@ pub(super) fn render_exif(app: &mut GuiApp, ui: &mut egui::Ui, available_rect: e
     }
 
     // Draw border
-    painter.rect_stroke(exif_rect, 4.0, egui::Stroke::new(1.0, egui::Color32::DARK_GRAY), egui::StrokeKind::Outside);
+    painter.rect_stroke(
+        exif_rect,
+        4.0,
+        egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+        egui::StrokeKind::Outside,
+    );
 }

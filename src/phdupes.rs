@@ -1,10 +1,10 @@
-use std::path::{PathBuf};
-use std::fs;
-use std::io::{self, Write};
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use jiff::{Timestamp};
-use std::collections::{HashMap};
+use jiff::Timestamp;
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, Write};
+use std::path::PathBuf;
 
 use crate::db::{AppContext, HashAlgorithm};
 use crate::scanner::ScanConfig;
@@ -18,17 +18,17 @@ use jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-mod pdqhash;
 mod db;
-mod ui;
-mod gui;
-mod state;
-mod scanner;
 mod fileops;
+mod gui;
 mod hamminghash;
 #[allow(unused)]
 mod helper_exif;
+mod pdqhash;
 mod position;
+mod scanner;
+mod state;
+mod ui;
 
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
@@ -39,7 +39,7 @@ pub struct FileMetadata {
     pub resolution: Option<(u32, u32)>,
     pub content_hash: [u8; 32],
     pub pixel_hash: Option<[u8; 32]>,
-    pub orientation: u8, // Added: EXIF orientation (1-8)
+    pub orientation: u8,      // Added: EXIF orientation (1-8)
     pub unique_file_id: u128, // Always has dev+inode
 }
 
@@ -64,15 +64,20 @@ pub fn format_relative_time(ts: Timestamp) -> String {
     let total_secs = raw_span.total(jiff::Unit::Second).unwrap_or(0.0).abs();
 
     if total_secs < 60.0 {
-        if total_secs < 0.001 { return "0s".to_string(); }
+        if total_secs < 0.001 {
+            return "0s".to_string();
+        }
         return format!("{:.3}s", total_secs);
     }
 
-    let span = raw_span.round(jiff::SpanRound::new()
-            .largest(jiff::Unit::Year)
-            .smallest(jiff::Unit::Second)
-            .relative(&zoned_ts)
-        ).unwrap_or_default();
+    let span = raw_span
+        .round(
+            jiff::SpanRound::new()
+                .largest(jiff::Unit::Year)
+                .smallest(jiff::Unit::Second)
+                .relative(&zoned_ts),
+        )
+        .unwrap_or_default();
 
     let mut parts = Vec::new();
     let y = span.get_years().abs();
@@ -83,15 +88,31 @@ pub fn format_relative_time(ts: Timestamp) -> String {
     let m = span.get_minutes().abs();
     let s = span.get_seconds().abs();
 
-    if y > 0 { parts.push(format!("{}y", y)); }
-    if mo > 0 { parts.push(format!("{}mo", mo)); }
-    if w > 0 { parts.push(format!("{}w", w)); }
-    if d > 0 { parts.push(format!("{}d", d)); }
-    if h > 0 { parts.push(format!("{}h", h)); }
-    if m > 0 { parts.push(format!("{}m", m)); }
-    if s > 0 { parts.push(format!("{}s", s)); }
+    if y > 0 {
+        parts.push(format!("{}y", y));
+    }
+    if mo > 0 {
+        parts.push(format!("{}mo", mo));
+    }
+    if w > 0 {
+        parts.push(format!("{}w", w));
+    }
+    if d > 0 {
+        parts.push(format!("{}d", d));
+    }
+    if h > 0 {
+        parts.push(format!("{}h", h));
+    }
+    if m > 0 {
+        parts.push(format!("{}m", m));
+    }
+    if s > 0 {
+        parts.push(format!("{}s", s));
+    }
 
-    if parts.is_empty() { return "0s".to_string(); }
+    if parts.is_empty() {
+        return "0s".to_string();
+    }
     parts.into_iter().take(3).collect::<Vec<_>>().join(" ")
 }
 
@@ -99,7 +120,7 @@ pub fn format_relative_time(ts: Timestamp) -> String {
 pub fn analyze_group(
     files: &mut Vec<FileMetadata>,
     group_by: &str,
-    ext_priorities: &HashMap<String, usize>
+    ext_priorities: &HashMap<String, usize>,
 ) -> GroupInfo {
     // Delegate to scanner's analyze_group with
     scanner::analyze_group(files, group_by, ext_priorities)
@@ -186,14 +207,28 @@ impl Cli {
             ));
         }
 
-        let valid_sorts = ["name", "name-desc", "name-natural", "name-natural-desc", "date", "date-desc", "size", "size-desc", "random"];
+        let valid_sorts = [
+            "name",
+            "name-desc",
+            "name-natural",
+            "name-natural-desc",
+            "date",
+            "date-desc",
+            "size",
+            "size-desc",
+            "random",
+        ];
         let sort_lower = self.sort.to_lowercase();
         if !valid_sorts.contains(&sort_lower.as_str()) {
-            return Err(format!("Invalid sort '{}'. Use one of: {}", self.sort, valid_sorts.join(", ")));
+            return Err(format!(
+                "Invalid sort '{}'. Use one of: {}",
+                self.sort,
+                valid_sorts.join(", ")
+            ));
         }
 
         if self.use_tui && self.use_gui {
-             return Err("Cannot use both --use-tui and --use-gui".to_string());
+            return Err("Cannot use both --use-tui and --use-gui".to_string());
         }
 
         if let Some(ref dir) = self.move_marked {
@@ -206,28 +241,39 @@ impl Cli {
         }
 
         if let Some(secs) = self.slideshow
-            && secs <= 0.0 {
-                return Err("Slideshow interval must be positive".to_string());
-            }
+            && secs <= 0.0
+        {
+            return Err("Slideshow interval must be positive".to_string());
+        }
 
         Ok(())
     }
 
     /// Check if we're in view mode (explicit or implied)
-    fn is_view_mode(&self) -> bool { self.view || self.shuffle || self.slideshow.is_some() }
+    fn is_view_mode(&self) -> bool {
+        self.view || self.shuffle || self.slideshow.is_some()
+    }
 
     /// Get the hash algorithm based on CLI flags
-    fn hash_algorithm(&self) -> HashAlgorithm { HashAlgorithm::PdqHash }
+    fn hash_algorithm(&self) -> HashAlgorithm {
+        HashAlgorithm::PdqHash
+    }
 
     /// Get similarity threshold with algorithm-specific defaults
-    fn get_similarity(&self) -> u32 { self.similarity.unwrap_or(40) }
+    fn get_similarity(&self) -> u32 {
+        self.similarity.unwrap_or(40)
+    }
 }
 
 // --- CLI Helpers ---
 fn format_size(bytes: u64) -> String {
-    if bytes < 1024 { return format!("{} B", bytes); }
+    if bytes < 1024 {
+        return format!("{} B", bytes);
+    }
     let kb = bytes as f64 / 1024.0;
-    if kb < 1024.0 { return format!("{:.1} KB", kb); }
+    if kb < 1024.0 {
+        return format!("{:.1} KB", kb);
+    }
     let mb = kb / 1024.0;
     format!("{:.1} MB", mb)
 }
@@ -236,23 +282,31 @@ fn run_interactive_cli_delete(
     groups: Vec<Vec<FileMetadata>>,
     group_infos: Vec<GroupInfo>,
     show_relative_times: bool,
-    use_trash: bool
+    use_trash: bool,
 ) {
     let mut input_buf = String::new();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
     for (g_idx, group) in groups.iter().enumerate() {
-        if group.len() < 2 { continue; }
+        if group.len() < 2 {
+            continue;
+        }
         let info = &group_infos[g_idx];
         let green = "\x1b[32m";
         let reset = "\x1b[0m";
 
         println!("\n========================================================");
         match info.status {
-            GroupStatus::AllIdentical => println!("Group {} - {}Bit-identical{}", g_idx + 1, green, reset),
-            GroupStatus::SomeIdentical => println!("Group {} - {}Some files Bit-identical{}", g_idx + 1, green, reset),
-            GroupStatus::None => println!("Group {}/{} (Max Dist: {})", g_idx + 1, groups.len(), info.max_dist),
+            GroupStatus::AllIdentical => {
+                println!("Group {} - {}Bit-identical{}", g_idx + 1, green, reset)
+            }
+            GroupStatus::SomeIdentical => {
+                println!("Group {} - {}Some files Bit-identical{}", g_idx + 1, green, reset)
+            }
+            GroupStatus::None => {
+                println!("Group {}/{} (Max Dist: {})", g_idx + 1, groups.len(), info.max_dist)
+            }
         }
         println!("========================================================");
 
@@ -260,17 +314,35 @@ fn run_interactive_cli_delete(
 
         for (i, file) in group.iter().enumerate() {
             let time_str = if show_relative_times {
-                let ts = Timestamp::from_second(file.modified.timestamp()).unwrap()
-                    .checked_add(jiff::SignedDuration::from_nanos(file.modified.timestamp_subsec_nanos() as i64)).unwrap();
+                let ts = Timestamp::from_second(file.modified.timestamp())
+                    .unwrap()
+                    .checked_add(jiff::SignedDuration::from_nanos(
+                        file.modified.timestamp_subsec_nanos() as i64,
+                    ))
+                    .unwrap();
                 format_relative_time(ts)
             } else {
                 file.modified.format("%Y-%m-%d %H:%M:%S").to_string()
             };
-            let res_str = file.resolution.map(|(w,h)| format!("{}x{}", w, h)).unwrap_or("???x???".to_string());
+            let res_str = file
+                .resolution
+                .map(|(w, h)| format!("{}x{}", w, h))
+                .unwrap_or("???x???".to_string());
             let is_identical = *counts.get(&file.content_hash).unwrap_or(&0) > 1;
-            let (color_start, color_end, marker) = if is_identical { (green, reset, "*") } else { ("", "", " ") };
+            let (color_start, color_end, marker) =
+                if is_identical { (green, reset, "*") } else { ("", "", " ") };
 
-            println!("{}[{}] {} {} | {} | {} | {}{}", color_start, i + 1, marker, time_str, format_size(file.size), res_str, file.path.display(), color_end);
+            println!(
+                "{}[{}] {} {} | {} | {} | {}{}",
+                color_start,
+                i + 1,
+                marker,
+                time_str,
+                format_size(file.size),
+                res_str,
+                file.path.display(),
+                color_end
+            );
         }
 
         let action_verb = if use_trash { "TRASH" } else { "PERMANENTLY delete" };
@@ -280,24 +352,37 @@ fn run_interactive_cli_delete(
         input_buf.clear();
         if stdin.read_line(&mut input_buf).is_ok() {
             let line = input_buf.trim();
-            if line.is_empty() { continue; }
-            let indices: Vec<usize> = line.split_whitespace()
+            if line.is_empty() {
+                continue;
+            }
+            let indices: Vec<usize> = line
+                .split_whitespace()
                 .filter_map(|s| s.parse::<usize>().ok())
                 .filter(|&idx| idx >= 1 && idx <= group.len())
                 .map(|idx| idx - 1)
                 .collect();
 
-            if indices.is_empty() { println!("No valid selections."); continue; }
+            if indices.is_empty() {
+                println!("No valid selections.");
+                continue;
+            }
 
             for &idx in &indices {
                 let file = &group[idx];
-                print!("{} {:?} ... ", if use_trash { "Trashing" } else { "Deleting" }, file.path.file_name().unwrap_or_default());
+                print!(
+                    "{} {:?} ... ",
+                    if use_trash { "Trashing" } else { "Deleting" },
+                    file.path.file_name().unwrap_or_default()
+                );
                 let res = if use_trash {
                     trash::delete(&file.path).map_err(|e| io::Error::other(e.to_string()))
                 } else {
                     fs::remove_file(&file.path)
                 };
-                match res { Ok(_) => println!("OK"), Err(e) => println!("FAILED ({})", e), }
+                match res {
+                    Ok(_) => println!("OK"),
+                    Err(e) => println!("FAILED ({})", e),
+                }
             }
         }
     }
@@ -319,7 +404,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("\nExample configuration in phdupes.conf:");
         println!("[gui]");
-        println!("exif_tags = [\"Make\", \"Model\", \"LensModel\", \"ExposureTime\", \"FNumber\", \"ISO\"]");
+        println!(
+            "exif_tags = [\"Make\", \"Model\", \"LensModel\", \"ExposureTime\", \"FNumber\", \"ISO\"]"
+        );
         return Ok(());
     }
 
@@ -343,7 +430,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Success.");
                 println!("  - Removed {} expired file entries.", meta_count);
                 println!("  - Removed {} orphaned hash entries.", hash_count);
-            },
+            }
             Err(e) => eprintln!("Pruning failed: {}", e),
         }
         // Exit immediately after pruning
@@ -399,13 +486,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // For GUI mode (duplicate detection), let the GUI handle scanning with progress display
     if use_gui {
-        let ext_priorities: HashMap<String, usize> = ctx.grouping_config.extensions.iter()
+        let ext_priorities: HashMap<String, usize> = ctx
+            .grouping_config
+            .extensions
+            .iter()
             .enumerate()
             .map(|(i, e)| (e.to_lowercase(), i))
             .collect();
 
-        println!("Launching GUI with PDQ hash algorithm (similarity: {})...",
-            similarity);
+        println!("Launching GUI with PDQ hash algorithm (similarity: {})...", similarity);
         let app = gui::GuiApp::new(
             ctx,
             scan_config,
@@ -414,10 +503,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sort_order,
             ext_priorities,
             args.raw_thumbnails,
-        ).with_move_target(args.move_marked.clone());
+        )
+        .with_move_target(args.move_marked.clone());
 
         if let Err(e) = app.run() {
-             eprintln!("GUI Error: {}", e);
+            eprintln!("GUI Error: {}", e);
         }
         return Ok(());
     }
@@ -427,7 +517,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Found {} duplicate groups using PDQ hash.", final_groups.len());
 
     if args.use_tui {
-        let ext_priorities: HashMap<String, usize> = ctx.grouping_config.extensions.iter()
+        let ext_priorities: HashMap<String, usize> = ctx
+            .grouping_config
+            .extensions
+            .iter()
             .enumerate()
             .map(|(i, e)| (e.to_lowercase(), i))
             .collect();
@@ -445,7 +538,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Launching TUI...");
         let mut app = ui::TuiApp::new(state);
         app.run()?;
-
     } else if args.delete {
         run_interactive_cli_delete(final_groups, final_infos, args.relative_times, args.use_trash);
     } else {
@@ -454,25 +546,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (i, group) in final_groups.iter().enumerate() {
             let info = &final_infos[i];
             match info.status {
-                 GroupStatus::AllIdentical => println!("\n--- Group {} - {}Bit-identical{} ---", i + 1, green, reset),
-                 GroupStatus::SomeIdentical => println!("\n--- Group {} - {}Some files Bit-identical{} ---", i + 1, green, reset),
-                 GroupStatus::None => println!("\n--- Group {} (Max Dist: {}) ---", i + 1, info.max_dist),
+                GroupStatus::AllIdentical => {
+                    println!("\n--- Group {} - {}Bit-identical{} ---", i + 1, green, reset)
+                }
+                GroupStatus::SomeIdentical => {
+                    println!(
+                        "\n--- Group {} - {}Some files Bit-identical{} ---",
+                        i + 1,
+                        green,
+                        reset
+                    )
+                }
+                GroupStatus::None => {
+                    println!("\n--- Group {} (Max Dist: {}) ---", i + 1, info.max_dist)
+                }
             }
 
             let counts = get_bit_identical_counts(group);
 
             for file in group {
                 let time_str = if args.relative_times {
-                     let ts = Timestamp::from_second(file.modified.timestamp()).unwrap()
-                        .checked_add(jiff::SignedDuration::from_nanos(file.modified.timestamp_subsec_nanos() as i64)).unwrap();
-                     format_relative_time(ts)
+                    let ts = Timestamp::from_second(file.modified.timestamp())
+                        .unwrap()
+                        .checked_add(jiff::SignedDuration::from_nanos(
+                            file.modified.timestamp_subsec_nanos() as i64,
+                        ))
+                        .unwrap();
+                    format_relative_time(ts)
                 } else {
-                     file.modified.format("%Y-%m-%d %H:%M:%S.%f").to_string()
+                    file.modified.format("%Y-%m-%d %H:%M:%S.%f").to_string()
                 };
-                let res_str = file.resolution.map(|(w,h)| format!("{}x{}", w, h)).unwrap_or("?".to_string());
+                let res_str =
+                    file.resolution.map(|(w, h)| format!("{}x{}", w, h)).unwrap_or("?".to_string());
                 let is_identical = *counts.get(&file.content_hash).unwrap_or(&0) > 1;
-                let (color_start, color_end, marker) = if is_identical { (green, reset, "*") } else { ("", "", " ") };
-                println!("  {}[{}] {} | {} | {} | {}{}", color_start, marker, time_str, format_size(file.size), res_str, file.path.display(), color_end);
+                let (color_start, color_end, marker) =
+                    if is_identical { (green, reset, "*") } else { ("", "", " ") };
+                println!(
+                    "  {}[{}] {} | {} | {} | {}{}",
+                    color_start,
+                    marker,
+                    time_str,
+                    format_size(file.size),
+                    res_str,
+                    file.path.display(),
+                    color_end
+                );
             }
         }
     }

@@ -1,15 +1,16 @@
-use std::sync::Arc;
-use std::fs;
-use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH, SystemTime};
-use std::collections::HashSet;
-use lmdb::{Environment, Database, Transaction, WriteFlags, DatabaseFlags, Cursor};
-use serde::{Deserialize, Serialize};
-use crossbeam_channel::{Receiver, RecvTimeoutError};
 use chacha20poly1305::{
+    XChaCha20Poly1305,
+    XNonce, // XChaCha20 uses 24-byte nonces
     aead::{Aead, KeyInit, Payload},
-    XChaCha20Poly1305, XNonce // XChaCha20 uses 24-byte nonces
 };
+use crossbeam_channel::{Receiver, RecvTimeoutError};
+use lmdb::{Cursor, Database, DatabaseFlags, Environment, Transaction, WriteFlags};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::fs;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CONFIG_FILE_NAME: &str = "phdupes.conf";
 const DB_FILE_NAME_PDQHASH: &str = "phdupes_pdqhash";
@@ -46,10 +47,7 @@ impl Default for GroupingConfig {
         let mut extensions = vec!["jpg".to_string(), "jpeg".to_string()];
         // Dynamically add all raw extensions from the const list
         extensions.extend(RAW_EXTS.iter().map(|s| s.to_string()));
-        Self {
-            ignore_same_stem: true,
-            extensions,
-        }
+        Self { ignore_same_stem: true, extensions }
     }
 }
 
@@ -136,13 +134,17 @@ impl CachedFeatures {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 9 { return None; }
+        if bytes.len() < 9 {
+            return None;
+        }
         let w = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
         let h = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
         let o = bytes[8];
 
         let coeff_bytes = &bytes[9..];
-        if coeff_bytes.len() % 4 != 0 { return None; }
+        if coeff_bytes.len() % 4 != 0 {
+            return None;
+        }
 
         let count = coeff_bytes.len() / 4;
         let mut coeffs = Vec::with_capacity(count);
@@ -174,10 +176,10 @@ pub enum HashValue {
 
 // (Meta Update, Hash Update, Feature Update)
 pub type DbUpdate = (
-    Option<([u8; 32], [u8; 32])>,         // Meta
-    Option<([u8; 32], HashValue)>,        // Hash
-    Option<([u8; 32], CachedFeatures)>,   // Features
-    Option<([u8; 32], [u8; 32])>          // Pixel Hash
+    Option<([u8; 32], [u8; 32])>,       // Meta
+    Option<([u8; 32], HashValue)>,      // Hash
+    Option<([u8; 32], CachedFeatures)>, // Features
+    Option<([u8; 32], [u8; 32])>,       // Pixel Hash
 );
 
 /// Compute the meta_key from file metadata.
@@ -242,25 +244,33 @@ impl AppContext {
             let cfg: Config = toml::from_str(&content)
                 .map_err(|_| "Failed to parse config. Format might have changed.")?;
 
-            eprintln!("[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}",
-                cfg.gui.width, cfg.gui.height, cfg.gui.panel_width);
+            eprintln!(
+                "[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}",
+                cfg.gui.width, cfg.gui.height, cfg.gui.panel_width
+            );
             eprintln!("[DEBUG-DB] LMDB map size: {} MiB", cfg.db_size_mb);
 
             // Write back defaults if new sections missing
-            let raw_value: toml::Value = toml::from_str(&content).unwrap_or(toml::Value::Integer(0));
+            let raw_value: toml::Value =
+                toml::from_str(&content).unwrap_or(toml::Value::Integer(0));
             let missing_grouping = raw_value.get("grouping").is_none();
             let missing_gui = raw_value.get("gui").is_none();
             let missing_db_size = raw_value.get("db_size_mb").is_none();
 
             if missing_grouping || missing_gui || missing_db_size {
-                eprintln!("[DEBUG-DB] Writing back defaults (missing_grouping={}, missing_gui={}, missing_db_size={})",
-                    missing_grouping, missing_gui, missing_db_size);
-                 let toml_str = toml::to_string_pretty(&cfg)?;
-                 fs::write(&config_path, toml_str)?;
+                eprintln!(
+                    "[DEBUG-DB] Writing back defaults (missing_grouping={}, missing_gui={}, missing_db_size={})",
+                    missing_grouping, missing_gui, missing_db_size
+                );
+                let toml_str = toml::to_string_pretty(&cfg)?;
+                fs::write(&config_path, toml_str)?;
             }
             cfg
         } else {
-            eprintln!("[DEBUG-DB] Config file does not exist, creating new one at {:?}", config_path);
+            eprintln!(
+                "[DEBUG-DB] Config file does not exist, creating new one at {:?}",
+                config_path
+            );
             let mut random_bytes = [0u8; 32];
             getrandom::fill(&mut random_bytes)?;
 
@@ -290,7 +300,9 @@ impl AppContext {
                 // Save updated config with new key
                 let toml_str = toml::to_string_pretty(&config)?;
                 fs::write(&config_path, &toml_str)?;
-                eprintln!("[DEBUG-DB] Saved new master_key to config file. Cache will be invalidated.");
+                eprintln!(
+                    "[DEBUG-DB] Saved new master_key to config file. Cache will be invalidated."
+                );
 
                 new_key
             }
@@ -312,12 +324,12 @@ impl AppContext {
 
         // Calculate map size from config (convert MiB to bytes)
         let map_size = (config.db_size_mb as usize) * 1024 * 1024;
-        eprintln!("[DEBUG-DB] Setting LMDB map size to {} bytes ({} MiB)", map_size, config.db_size_mb);
+        eprintln!(
+            "[DEBUG-DB] Setting LMDB map size to {} bytes ({} MiB)",
+            map_size, config.db_size_mb
+        );
 
-        let env = Environment::new()
-            .set_map_size(map_size)
-            .set_max_dbs(10)
-            .open(&db_path)?;
+        let env = Environment::new().set_map_size(map_size).set_max_dbs(10).open(&db_path)?;
 
         let actual_map_size = match env.info() {
             Ok(info) => info.map_size(),
@@ -334,17 +346,27 @@ impl AppContext {
             let config_mb = config.db_size_mb as usize;
 
             if configured_map_size > actual_map_size {
-                eprintln!("[WARN-DB] Config db_size_mb ({} MiB) differs from current DB map size ({} MiB).",
-                    config_mb, actual_mb);
+                eprintln!(
+                    "[WARN-DB] Config db_size_mb ({} MiB) differs from current DB map size ({} MiB).",
+                    config_mb, actual_mb
+                );
                 eprintln!("[WARN-DB] The database is using its existing size. To increase:");
                 eprintln!("[WARN-DB]   - Delete the database directory ({:?}) and rescan", db_path);
                 eprintln!("[WARN-DB]   - Or use `mdb_copy -c` to compact/resize the database");
             } else {
-                eprintln!("[WARN-DB] Config db_size_mb ({} MiB) is smaller than current DB map size ({} MiB).",
-                    config_mb, actual_mb);
+                eprintln!(
+                    "[WARN-DB] Config db_size_mb ({} MiB) is smaller than current DB map size ({} MiB).",
+                    config_mb, actual_mb
+                );
                 eprintln!("[WARN-DB] LMDB cannot shrink an existing database. Options:");
-                eprintln!("[WARN-DB]   - Update db_size_mb in config to {} to match actual size", actual_mb);
-                eprintln!("[WARN-DB]   - Delete the database directory ({:?}) to start fresh", db_path);
+                eprintln!(
+                    "[WARN-DB]   - Update db_size_mb in config to {} to match actual size",
+                    actual_mb
+                );
+                eprintln!(
+                    "[WARN-DB]   - Delete the database directory ({:?}) to start fresh",
+                    db_path
+                );
             }
         }
 
@@ -371,11 +393,10 @@ impl AppContext {
     fn decode_master_key(hex_str: &str) -> Result<[u8; 32], String> {
         let trimmed = hex_str.trim().trim_start_matches("0x");
 
-        let bytes = hex::decode(trimmed)
-            .map_err(|e| format!("hex decode failed: {}", e))?;
+        let bytes = hex::decode(trimmed).map_err(|e| format!("hex decode failed: {}", e))?;
 
-        let arr: [u8; 32] = bytes.try_into()
-            .map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))?;
+        let arr: [u8; 32] =
+            bytes.try_into().map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))?;
 
         Ok(arr)
     }
@@ -409,7 +430,9 @@ impl AppContext {
     /// Returns None if tag verification fails (e.g., wrong key, tampering) or decryption fails.
     fn decrypt_value(&self, db_key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
         // Minimum size: nonce (24) + tag (16) = 40 bytes (for empty plaintext)
-        if data.len() < TOTAL_OVERHEAD { return None; }
+        if data.len() < TOTAL_OVERHEAD {
+            return None;
+        }
 
         let nonce_bytes = &data[0..24];
         let ciphertext = &data[24..];
@@ -434,14 +457,17 @@ impl AppContext {
                     eprintln!("[ERROR-DB] get_pdqhash Corruped content_hash={:x?}", content_hash);
                     Err(lmdb::Error::Corrupted)
                 }
-            },
+            }
             Err(lmdb::Error::NotFound) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
     /// Get cached features (coeffs + metadata)
-    pub fn get_features(&self, content_hash: &[u8; 32]) -> Result<Option<CachedFeatures>, lmdb::Error> {
+    pub fn get_features(
+        &self,
+        content_hash: &[u8; 32],
+    ) -> Result<Option<CachedFeatures>, lmdb::Error> {
         let txn = self.env.begin_ro_txn()?;
         match txn.get(self.feature_db, content_hash) {
             Ok(encrypted_bytes) => {
@@ -451,7 +477,7 @@ impl AppContext {
                     eprintln!("[ERROR] get_features Corrupted ch={:x?}", content_hash);
                     Err(lmdb::Error::Corrupted)
                 }
-            },
+            }
             Err(lmdb::Error::NotFound) => {
                 eprintln!("[DEBUG-DB] get_features NotFound ch={:x?}", hex::encode(content_hash));
                 Ok(None)
@@ -480,7 +506,7 @@ impl AppContext {
                 } else {
                     Err(lmdb::Error::Corrupted)
                 }
-            },
+            }
             Err(lmdb::Error::NotFound) => Ok(None),
             Err(e) => Err(e),
         }
@@ -496,7 +522,7 @@ impl AppContext {
                 } else {
                     Err(lmdb::Error::Corrupted)
                 }
-            },
+            }
             Err(lmdb::Error::NotFound) => Ok(None),
             Err(e) => Err(e),
         }
@@ -514,8 +540,12 @@ impl AppContext {
     ) -> (Option<(u32, u32)>, u8) {
         let meta_key = compute_meta_key_from_metadata(&self.meta_key, metadata, unique_file_id);
 
-        eprintln!("[DEBUG-CACHE] lookup_cached_features: size={}, unique_file_id={}, meta_key={:?}",
-            metadata.len(), unique_file_id, hex::encode(&meta_key[..8]));
+        eprintln!(
+            "[DEBUG-CACHE] lookup_cached_features: size={}, unique_file_id={}, meta_key={:?}",
+            metadata.len(),
+            unique_file_id,
+            hex::encode(&meta_key[..8])
+        );
 
         // Look up content_hash from meta_key
         if let Ok(Some(content_hash)) = self.get_content_hash(&meta_key) {
@@ -527,8 +557,10 @@ impl AppContext {
                 } else {
                     None
                 };
-                eprintln!("[DEBUG-CACHE]   Found features: resolution={:?}, orientation={}",
-                    resolution, features.orientation);
+                eprintln!(
+                    "[DEBUG-CACHE]   Found features: resolution={:?}, orientation={}",
+                    resolution, features.orientation
+                );
                 return (resolution, features.orientation);
             } else {
                 eprintln!("[DEBUG-CACHE]   No features found for content_hash");
@@ -544,7 +576,10 @@ impl AppContext {
     /// 1. Iterates MetaDB: Removes entries where timestamp < cutoff.
     /// 2. Collects active ContentHashes.
     /// 3. Sweeps HashDB/FeatureDB: Removes entries not in active set.
-    pub fn prune(&self, max_age_seconds: u64) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    pub fn prune(
+        &self,
+        max_age_seconds: u64,
+    ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let cutoff = now.saturating_sub(max_age_seconds);
 
@@ -558,7 +593,8 @@ impl AppContext {
             let mut cursor = txn.open_rw_cursor(self.meta_db)?;
             for iter in cursor.iter_start() {
                 if let Ok((key, val_bytes)) = iter {
-                    let should_delete = if let Some(decrypted) = self.decrypt_value(key, val_bytes) {
+                    let should_delete = if let Some(decrypted) = self.decrypt_value(key, val_bytes)
+                    {
                         if decrypted.len() == 40 {
                             let ts_bytes: [u8; 8] = decrypted[32..40].try_into().unwrap();
                             let last_seen = u64::from_le_bytes(ts_bytes);
@@ -625,7 +661,7 @@ impl AppContext {
             let mut cursor = txn.open_rw_cursor(self.pixel_db)?;
             for iter in cursor.iter_start() {
                 if let Ok((key, _)) = iter {
-                     if key.len() == 32 {
+                    if key.len() == 32 {
                         let mut k = [0u8; 32];
                         k.copy_from_slice(key);
                         if !valid_content_hashes.contains(&k) {
@@ -661,37 +697,73 @@ impl AppContext {
                 let msg = rx.recv_timeout(Duration::from_millis(100));
                 match msg {
                     Ok((m, h, f, p)) => {
-                        if let Some(up) = m { meta_updates.push(up); }
-                        if let Some(up) = h { hash_updates.push(up); }
-                        if let Some(up) = f { feature_updates.push(up); }
-                        if let Some(up) = p { pixel_updates.push(up); }
-                    },
+                        if let Some(up) = m {
+                            meta_updates.push(up);
+                        }
+                        if let Some(up) = h {
+                            hash_updates.push(up);
+                        }
+                        if let Some(up) = f {
+                            feature_updates.push(up);
+                        }
+                        if let Some(up) = p {
+                            pixel_updates.push(up);
+                        }
+                    }
                     Err(RecvTimeoutError::Disconnected) => {
-                        if let Err(e) = Self::write_batch(&cipher, &env, meta_db, hash_db,
-                            feature_db, pixel_db, &meta_updates, &hash_updates, &feature_updates, &pixel_updates) {
+                        if let Err(e) = Self::write_batch(
+                            &cipher,
+                            &env,
+                            meta_db,
+                            hash_db,
+                            feature_db,
+                            pixel_db,
+                            &meta_updates,
+                            &hash_updates,
+                            &feature_updates,
+                            &pixel_updates,
+                        ) {
                             eprintln!("[ERROR-DB] Final write_batch failed: {:?}", e);
                         }
                         break;
-                    },
+                    }
                     _ => {}
                 }
 
-                if (last_flush.elapsed() >= flush_interval || meta_updates.len() >= max_buffer || hash_updates.len() >= max_buffer || feature_updates.len() >= max_buffer || pixel_updates.len() >= max_buffer)
-                    && (!meta_updates.is_empty() || !hash_updates.is_empty()
-                        || !feature_updates.is_empty()) || !pixel_updates.is_empty() {
-                        match Self::write_batch(&cipher, &env, meta_db, hash_db, feature_db, pixel_db, &meta_updates, &hash_updates, &feature_updates, &pixel_updates) {
-                            Ok(()) => {
-                                meta_updates.clear();
-                                hash_updates.clear();
-                                feature_updates.clear();
-                                pixel_updates.clear();
-                            }
-                            Err(e) => {
-                                eprintln!("[ERROR-DB] write_batch failed: {:?}", e);
-                                // Don't clear - will retry on next flush
-                            }
+                if (last_flush.elapsed() >= flush_interval
+                    || meta_updates.len() >= max_buffer
+                    || hash_updates.len() >= max_buffer
+                    || feature_updates.len() >= max_buffer
+                    || pixel_updates.len() >= max_buffer)
+                    && (!meta_updates.is_empty()
+                        || !hash_updates.is_empty()
+                        || !feature_updates.is_empty())
+                    || !pixel_updates.is_empty()
+                {
+                    match Self::write_batch(
+                        &cipher,
+                        &env,
+                        meta_db,
+                        hash_db,
+                        feature_db,
+                        pixel_db,
+                        &meta_updates,
+                        &hash_updates,
+                        &feature_updates,
+                        &pixel_updates,
+                    ) {
+                        Ok(()) => {
+                            meta_updates.clear();
+                            hash_updates.clear();
+                            feature_updates.clear();
+                            pixel_updates.clear();
                         }
-                        last_flush = Instant::now();
+                        Err(e) => {
+                            eprintln!("[ERROR-DB] write_batch failed: {:?}", e);
+                            // Don't clear - will retry on next flush
+                        }
+                    }
+                    last_flush = Instant::now();
                 }
             }
         })
@@ -717,7 +789,7 @@ impl AppContext {
         // 1. Meta Updates: Append Timestamp (8 bytes) to ContentHash (32 bytes)
         for (key, val) in meta_updates {
             let mut data = Vec::with_capacity(32 + 8);
-            data.extend_from_slice(val);      // Content Hash
+            data.extend_from_slice(val); // Content Hash
             data.extend_from_slice(&now_bytes); // Timestamp
 
             let encrypted = Self::encrypt_value(cipher, key, &data);
@@ -730,7 +802,7 @@ impl AppContext {
                 HashValue::PdqHash(pdqhash) => {
                     let encrypted = Self::encrypt_value(cipher, key, pdqhash);
                     txn.put(hash_db, key, &encrypted, WriteFlags::empty())?;
-                },
+                }
             }
         }
 
@@ -750,7 +822,10 @@ impl AppContext {
         txn.commit()
     }
 
-    pub fn save_gui_config(&self, gui_config: &GuiConfig) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save_gui_config(
+        &self,
+        gui_config: &GuiConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir().ok_or("No config dir found")?;
         let config_path = config_dir.join(CONFIG_FILE_NAME);
 
