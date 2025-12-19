@@ -4,8 +4,10 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError};
+use geo::Point;
 use lmdb::{Cursor, Database, DatabaseFlags, Environment, Transaction, WriteFlags};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::sync::Arc;
@@ -97,6 +99,24 @@ impl Default for GuiConfig {
     }
 }
 
+// Allows both [lon, lat] and { lat=..., lon=... } in TOML
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum LocationOption {
+    Named { lat: f64, lon: f64 },
+    Array(f64, f64), // Expects [Lon, Lat]
+}
+
+// Helper to convert directly to geo::Point
+impl From<LocationOption> for Point<f64> {
+    fn from(loc: LocationOption) -> Self {
+        match loc {
+            LocationOption::Named { lat, lon } => Point::new(lon, lat),
+            LocationOption::Array(lon, lat) => Point::new(lon, lat),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Config {
     master_key: String,
@@ -106,6 +126,15 @@ struct Config {
     grouping: GroupingConfig,
     #[serde(default)]
     gui: GuiConfig,
+    #[serde(default)]
+    locations: HashMap<String, LocationOption>,
+}
+
+impl Config {
+    /// Retrieve a location by name as a geo::Point
+    pub fn get_point(&self, name: &str) -> Option<Point<f64>> {
+        self.locations.get(name).cloned().map(Into::into)
+    }
 }
 
 fn default_db_size_mb() -> u32 {
@@ -166,6 +195,7 @@ pub struct AppContext {
     pub meta_key: [u8; 32],
     pub grouping_config: GroupingConfig,
     pub gui_config: GuiConfig,
+    pub locations: HashMap<String, Point<f64>>,
     cipher: XChaCha20Poly1305,
 }
 
@@ -232,7 +262,6 @@ impl AppContext {
 
         let config_path = config_dir.join(CONFIG_FILE_NAME);
 
-        // Select database path based on algorithm
         let db_file_name = match algorithm {
             HashAlgorithm::PdqHash => DB_FILE_NAME_PDQHASH,
         };
@@ -241,6 +270,7 @@ impl AppContext {
         let mut config = if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
             eprintln!("[DEBUG-DB] Loading config from {:?}", config_path);
+
             let cfg: Config = toml::from_str(&content)
                 .map_err(|_| "Failed to parse config. Format might have changed.")?;
 
@@ -249,18 +279,21 @@ impl AppContext {
                 cfg.gui.width, cfg.gui.height, cfg.gui.panel_width
             );
             eprintln!("[DEBUG-DB] LMDB map size: {} MiB", cfg.db_size_mb);
+            eprintln!("[DEBUG-DB] Locations loaded: {}", cfg.locations.len());
 
-            // Write back defaults if new sections missing
+            // Check for missing sections to write back defaults
             let raw_value: toml::Value =
                 toml::from_str(&content).unwrap_or(toml::Value::Integer(0));
+
             let missing_grouping = raw_value.get("grouping").is_none();
             let missing_gui = raw_value.get("gui").is_none();
             let missing_db_size = raw_value.get("db_size_mb").is_none();
+            let missing_locations = raw_value.get("locations").is_none();
 
-            if missing_grouping || missing_gui || missing_db_size {
+            if missing_grouping || missing_gui || missing_db_size || missing_locations {
                 eprintln!(
-                    "[DEBUG-DB] Writing back defaults (missing_grouping={}, missing_gui={}, missing_db_size={})",
-                    missing_grouping, missing_gui, missing_db_size
+                    "[DEBUG-DB] Writing back defaults (grouping={}, gui={}, db_size={}, locations={})",
+                    missing_grouping, missing_gui, missing_db_size, missing_locations
                 );
                 let toml_str = toml::to_string_pretty(&cfg)?;
                 fs::write(&config_path, toml_str)?;
@@ -279,6 +312,7 @@ impl AppContext {
                 db_size_mb: DEFAULT_DB_SIZE_MB,
                 grouping: GroupingConfig::default(),
                 gui: GuiConfig::default(),
+                locations: HashMap::new(),
             };
 
             let toml_str = toml::to_string_pretty(&cfg)?;
@@ -374,6 +408,9 @@ impl AppContext {
         let meta_db = env.create_db(Some("file_metadata"), DatabaseFlags::empty())?;
         let feature_db = env.create_db(Some(DB_FILE_NAME_FEATURES), DatabaseFlags::empty())?;
         let pixel_db = env.create_db(Some(DB_FILE_NAME_PIXELHASH), DatabaseFlags::empty())?;
+        // Convert the locations into runtime usable Points
+        let locations: HashMap<String, Point<f64>> =
+            config.locations.into_iter().map(|(name, option)| (name, option.into())).collect();
 
         Ok(Self {
             env: Arc::new(env),
@@ -385,6 +422,7 @@ impl AppContext {
             meta_key,
             grouping_config: config.grouping,
             gui_config: config.gui,
+            locations,
             cipher,
         })
     }
