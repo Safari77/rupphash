@@ -146,46 +146,22 @@ fn default_db_size_mb() -> u32 {
 }
 
 // Struct to hold cached data to avoid file reads
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedFeatures {
     pub width: u32,
     pub height: u32,
     pub orientation: u8,
+    pub gps_pos: Option<Point<f64>>,
     pub coefficients: Vec<f32>, // Flat array of coefficients
 }
 
 impl CachedFeatures {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(9 + self.coefficients.len() * 4);
-        out.extend_from_slice(&self.width.to_le_bytes());
-        out.extend_from_slice(&self.height.to_le_bytes());
-        out.push(self.orientation);
-        for c in &self.coefficients {
-            out.extend_from_slice(&c.to_le_bytes());
-        }
-        out
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_stdvec(self)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 9 {
-            return None;
-        }
-        let w = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
-        let h = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-        let o = bytes[8];
-
-        let coeff_bytes = &bytes[9..];
-        if coeff_bytes.len() % 4 != 0 {
-            return None;
-        }
-
-        let count = coeff_bytes.len() / 4;
-        let mut coeffs = Vec::with_capacity(count);
-        for chunk in coeff_bytes.chunks_exact(4) {
-            coeffs.push(f32::from_le_bytes(chunk.try_into().ok()?));
-        }
-
-        Some(Self { width: w, height: h, orientation: o, coefficients: coeffs })
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
     }
 }
 
@@ -513,10 +489,8 @@ impl AppContext {
             return None;
         }
 
-        let nonce_bytes = &data[0..24];
+        let nonce = XNonce::from_slice(&data[0..24]);
         let ciphertext = &data[24..];
-        let nonce = XNonce::from_slice(nonce_bytes);
-
         // Decrypt with AAD = db_key
         // This validates that the ciphertext belongs to this specific db_key
         self.cipher.decrypt(nonce, Payload { msg: ciphertext, aad: db_key }).ok()
@@ -551,14 +525,14 @@ impl AppContext {
         match txn.get(self.feature_db, content_hash) {
             Ok(encrypted_bytes) => {
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    Ok(CachedFeatures::from_bytes(&decrypted))
+                    Ok(CachedFeatures::from_bytes(&decrypted).ok())
                 } else {
                     eprintln!("[ERROR] get_features Corrupted ch={:x?}", content_hash);
                     Err(lmdb::Error::Corrupted)
                 }
             }
             Err(lmdb::Error::NotFound) => {
-                eprintln!("[DEBUG-DB] get_features NotFound ch={:x?}", hex::encode(content_hash));
+                // eprintln!("[DEBUG-DB] get_features NotFound ch={:x?}", hex::encode(content_hash));
                 Ok(None)
             }
             Err(e) => Err(e),
@@ -607,16 +581,16 @@ impl AppContext {
         }
     }
 
-    /// Look up cached resolution and orientation from the database using file metadata.
+    /// Look up cached resolution, orientation, and gps_pos from the database using file metadata.
     /// This is the single canonical function for cache lookups, used by both
     /// the GUI (app.rs) and scanner (scanner.rs).
     ///
-    /// Returns (resolution, orientation) - defaults to (None, 1) if not cached.
+    /// Returns (resolution, orientation, gps_pos) - defaults to (None, 1, None) if not cached.
     pub fn lookup_cached_features(
         &self,
         metadata: &std::fs::Metadata,
         unique_file_id: u128,
-    ) -> (Option<(u32, u32)>, u8) {
+    ) -> (Option<(u32, u32)>, u8, Option<Point<f64>>) {
         let meta_key = compute_meta_key_from_metadata(&self.meta_key, metadata, unique_file_id);
 
         eprintln!(
@@ -628,6 +602,11 @@ impl AppContext {
 
         // Look up content_hash from meta_key
         if let Ok(Some(content_hash)) = self.get_content_hash(&meta_key) {
+            // Do not attempt to look up features for a zeroed-out hash placeholder.
+            if content_hash == [0u8; 32] {
+                return (None, 1, None);
+            }
+
             eprintln!("[DEBUG-CACHE]   Found content_hash: {:?}", hex::encode(&content_hash[..8]));
             // Look up cached features from content_hash
             if let Ok(Some(features)) = self.get_features(&content_hash) {
@@ -637,10 +616,10 @@ impl AppContext {
                     None
                 };
                 eprintln!(
-                    "[DEBUG-CACHE]   Found features: resolution={:?}, orientation={}",
-                    resolution, features.orientation
+                    "[DEBUG-CACHE]   Found features: resolution={:?}, orientation={}, gps_pos={:#?}",
+                    resolution, features.orientation, features.gps_pos
                 );
-                return (resolution, features.orientation);
+                return (resolution, features.orientation, features.gps_pos);
             } else {
                 eprintln!("[DEBUG-CACHE]   No features found for content_hash");
             }
@@ -648,7 +627,7 @@ impl AppContext {
 
         eprintln!("[DEBUG-CACHE]   Not found in database");
         // Not cached
-        (None, 1)
+        (None, 1, None)
     }
 
     /// Prune entries older than `max_age_seconds`.
@@ -816,8 +795,8 @@ impl AppContext {
                     || pixel_updates.len() >= max_buffer)
                     && (!meta_updates.is_empty()
                         || !hash_updates.is_empty()
-                        || !feature_updates.is_empty())
-                    || !pixel_updates.is_empty()
+                        || !feature_updates.is_empty()
+                        || !pixel_updates.is_empty())
                 {
                     match Self::write_batch(
                         &cipher,
@@ -887,7 +866,7 @@ impl AppContext {
 
         // 3. Feature Updates
         for (key, features) in feature_updates {
-            let bytes = features.to_bytes();
+            let bytes = features.to_bytes().expect("Features serialization failed");
             let encrypted = Self::encrypt_value(cipher, key, &bytes);
             txn.put(feature_db, key, &encrypted, WriteFlags::empty())?;
         }

@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use codes_iso_3166::part_1::CountryCode;
 use codes_iso_3166::part_2::SubdivisionCode;
 use crossbeam_channel::{Sender, unbounded};
+use geo::Point;
 use image::GenericImageView;
 use jpeg_decoder::Decoder as Tier2Decoder;
 use libheif_rs::HeifContext;
@@ -596,6 +597,7 @@ struct ScannedFile {
     pub resolution: Option<(u32, u32)>,
     pub content_hash: [u8; 32],
     pub orientation: u8,
+    pub gps_pos: Option<Point<f64>>,
     pub unique_file_id: u128,
     pub pdqhash: Option<[u8; 32]>,
     pub pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>>,
@@ -612,6 +614,7 @@ impl ScannedFile {
             resolution: self.resolution,
             content_hash: self.content_hash,
             orientation: self.orientation,
+            gps_pos: self.gps_pos,
             unique_file_id: self.unique_file_id,
             pixel_hash: self.pixel_hash,
         }
@@ -700,6 +703,7 @@ pub fn scan_and_group(
             let mut resolution = None;
             let mut ck = [0u8; 32];
             let mut orientation = 1;
+            let mut gps_pos = None;
             let mut cache_hit_full = false;
             let mut pixel_hash: Option<[u8; 32]> = None; // Init
             let mut new_pixel = None; // For DB update
@@ -719,6 +723,7 @@ pub fn scan_and_group(
                         if feats.coefficients.len() == 256 {
                             resolution = Some((feats.width, feats.height));
                             orientation = feats.orientation;
+                            gps_pos = feats.gps_pos;
                             let mut coeffs = [0.0; 256];
                             coeffs.copy_from_slice(&feats.coefficients);
                             pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures {
@@ -749,9 +754,19 @@ pub fn scan_and_group(
                 let bytes = fs::read(path).ok();
 
                 if let Some(ref b) = bytes {
-                    // 1. Orientation (Must be done on fresh read)
-                    orientation = get_orientation(path, Some(b));
-
+                    // Read Orientation and GPS location
+                    if let Some(exif) = read_exif_data(path, Some(b)) {
+                        if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
+                            gps_pos = Some(Point::new(lon, lat).into()); // Geo uses (x, y) = (lon, lat)
+                        }
+                        if let Some(field) =
+                            exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                        {
+                            if let Some(v @ 1..=8) = field.value.get_uint(0) {
+                                orientation = v as u8;
+                            }
+                        }
+                    }
                     // 2. Calculate file hash if needed
                     if ck == [0u8; 32] {
                         let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
@@ -835,6 +850,7 @@ pub fn scan_and_group(
                                 width: resolution.unwrap_or((0, 0)).0,
                                 height: resolution.unwrap_or((0, 0)).1,
                                 orientation,
+                                gps_pos,
                                 coefficients: features.coefficients.to_vec(),
                             };
 
@@ -869,6 +885,7 @@ pub fn scan_and_group(
                 resolution,
                 content_hash: ck,
                 orientation,
+                gps_pos,
                 unique_file_id,
                 pdqhash,
                 pdq_features,
@@ -1650,6 +1667,12 @@ pub fn scan_for_view(
                 let size = metadata.len();
                 let modified = DateTime::from(metadata.modified().ok().unwrap_or(UNIX_EPOCH));
 
+                let mut gps_pos = None;
+                if let Some(exif) = read_exif_data(path, None) {
+                    if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
+                        gps_pos = Some(Point::new(lon, lat));
+                    }
+                }
                 // Required for RAWs to look correct immediately.
                 // Streaming (batch_tx) ensures the UI is still responsive.
                 // Note: For RAW files, the actual orientation used depends on whether thumbnails
@@ -1672,6 +1695,7 @@ pub fn scan_for_view(
                     content_hash: [0u8; 32],
                     pixel_hash: None,
                     orientation,
+                    gps_pos,
                     unique_file_id,
                 })
             })

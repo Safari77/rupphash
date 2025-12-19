@@ -1,6 +1,8 @@
+use blake3;
 use chrono;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
+use geo::Point;
 use jiff::Timestamp;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
 use std::cell::RefCell;
@@ -11,6 +13,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant}; // Added Duration/Instant
 
+use super::gps_map::GpsMapState;
 use super::image::{GroupViewState, ViewMode};
 
 use crate::GroupStatus;
@@ -18,6 +21,8 @@ use crate::db::AppContext;
 use crate::format_relative_time;
 use crate::gui::APP_TITLE;
 use crate::gui::image::MAX_TEXTURE_SIDE;
+use crate::helper_exif::extract_gps_lat_lon;
+use crate::position;
 use crate::scanner::{self, ScanConfig};
 use crate::state::{
     AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_content_subgroups,
@@ -110,6 +115,9 @@ pub struct GuiApp {
     // EXIF cache for search (persists across searches)
     pub(super) exif_search_cache: HashMap<std::path::PathBuf, Vec<(String, String)>>,
 
+    // GPS Map state
+    pub(super) gps_map: GpsMapState,
+
     // UI Virtualization State
     pub(super) group_y_offsets: Vec<f32>, // Cached Y position of every group
     pub(super) total_content_height: f32, // Total scrollable height
@@ -126,6 +134,10 @@ pub struct GuiApp {
     pub(super) fs_rem_files: HashSet<String>,
     pub(super) fs_rem_dirs: HashSet<String>,
     pub(super) last_fs_refresh: Instant,
+
+    // --- Background content_hash computation for view mode ---
+    // Channel to receive computed hashes and GPS: (path, unique_file_id, content_hash, gps_pos)
+    pub(super) hash_rx: Option<Receiver<(std::path::PathBuf, u128, [u8; 32], Option<Point<f64>>)>>,
 }
 
 impl GuiApp {
@@ -162,6 +174,11 @@ impl GuiApp {
             "[DEBUG-CONFIG] new() - config values: width={:?}, height={:?}, panel_width={:?}",
             ctx.gui_config.width, ctx.gui_config.height, ctx.gui_config.panel_width
         );
+
+        // Extract values before moving ctx to Arc
+        let tile_cache_path = ctx.tile_cache_path.clone();
+        let selected_provider = ctx.selected_provider.clone();
+        let provider_url = ctx.map_providers.get(&selected_provider).cloned().unwrap_or_default();
 
         Self {
             state,
@@ -222,6 +239,8 @@ impl GuiApp {
             fs_rem_files: HashSet::new(),
             fs_rem_dirs: HashSet::new(),
             last_fs_refresh: Instant::now(),
+            gps_map: GpsMapState::new(tile_cache_path, selected_provider, provider_url),
+            hash_rx: None,
         }
     }
 
@@ -317,7 +336,7 @@ impl GuiApp {
                                     crate::fileops::get_file_key(&canonical)
                                 {
                                     // Try to load cached resolution/orientation from database
-                                    let (resolution, orientation) =
+                                    let (resolution, orientation, gps_pos) =
                                         ctx.lookup_cached_features(&meta, unique_file_id);
 
                                     files.push(FileMetadata {
@@ -329,6 +348,7 @@ impl GuiApp {
                                         content_hash: [0u8; 32],
                                         pixel_hash: None,
                                         orientation,
+                                        gps_pos,
                                         unique_file_id,
                                     });
                                 }
@@ -344,6 +364,15 @@ impl GuiApp {
 
         // Set up initial state with the files we found
         let has_files = !files.is_empty();
+
+        // Collect files that need GPS enrichment (gps_pos is None and not from cache)
+        // These will be processed in the background to read EXIF GPS data
+        let files_to_enrich: Vec<(std::path::PathBuf, u128)> = files
+            .iter()
+            .filter(|f| f.gps_pos.is_none())
+            .map(|f| (f.path.clone(), f.unique_file_id))
+            .collect();
+
         state.groups = if has_files { vec![files] } else { Vec::new() };
         state.group_infos = if has_files {
             vec![GroupInfo { max_dist: 0, status: GroupStatus::None }]
@@ -353,6 +382,39 @@ impl GuiApp {
         state.last_file_count = state.groups.first().map_or(0, |g| g.len());
         // No need for background scan since we've already loaded everything
         state.is_loading = false;
+
+        // Start background enrichment for GPS data and content_hash computation
+        // This reads EXIF for GPS and computes blake3 hash for database caching
+        let hash_rx = if !files_to_enrich.is_empty() {
+            let (tx, rx) = unbounded::<(std::path::PathBuf, u128, [u8; 32], Option<Point<f64>>)>();
+            let content_key = ctx.content_key;
+
+            thread::spawn(move || {
+                for (path, unique_file_id) in files_to_enrich {
+                    if let Ok(data) = std::fs::read(&path) {
+                        // Compute content_hash
+                        let mut hasher = blake3::Hasher::new_keyed(&content_key);
+                        hasher.update(&data);
+                        let content_hash = *hasher.finalize().as_bytes();
+
+                        // Read GPS from EXIF
+                        let gps_pos = scanner::read_exif_data(&path, Some(&data))
+                            .and_then(|exif| crate::helper_exif::extract_gps_lat_lon(&exif))
+                            .map(|(lat, lon)| Point::new(lon, lat));
+
+                        let _ = tx.send((path, unique_file_id, content_hash, gps_pos));
+                    }
+                }
+            });
+            Some(rx)
+        } else {
+            None
+        };
+
+        // Extract values before moving ctx to Arc
+        let tile_cache_path = ctx.tile_cache_path.clone();
+        let selected_provider = ctx.selected_provider.clone();
+        let provider_url = ctx.map_providers.get(&selected_provider).cloned().unwrap_or_default();
 
         Self {
             state,
@@ -413,6 +475,8 @@ impl GuiApp {
             fs_rem_files: HashSet::new(),
             fs_rem_dirs: HashSet::new(),
             last_fs_refresh: Instant::now(),
+            gps_map: GpsMapState::new(tile_cache_path, selected_provider, provider_url),
+            hash_rx,
         }
     }
 
@@ -421,76 +485,128 @@ impl GuiApp {
         self
     }
 
-    /// Look up cached resolution and orientation from the database.
-    /// Uses the same meta_key derivation as scanner.rs to find cached features.
-    /// Returns (resolution, orientation) - defaults to (None, 1) if not cached.
-    fn lookup_cached_features(
-        ctx: &crate::db::AppContext,
-        meta: &std::fs::Metadata,
-        unique_file_id: u128,
-    ) -> (Option<(u32, u32)>, u8) {
-        use std::time::UNIX_EPOCH;
-
-        let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-        let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-        let size = meta.len();
-
-        // Compute meta_key using the same derivation as scanner.rs
-        // Note: meta_key is derived from master_key which is shared across all databases
-        let mut mh = blake3::Hasher::new_keyed(&ctx.meta_key);
-        mh.update(&mtime_ns.to_le_bytes());
-        mh.update(&size.to_le_bytes());
-        mh.update(&unique_file_id.to_le_bytes());
-        let meta_key: [u8; 32] = *mh.finalize().as_bytes();
-
-        eprintln!(
-            "[DEBUG-CACHE] lookup_cached_features: mtime_ns={}, size={}, unique_file_id={}, meta_key={:?}",
-            mtime_ns,
-            size,
-            unique_file_id,
-            hex::encode(&meta_key[..8])
-        );
-
-        // Try the current context's database first
-        if let Some(result) = Self::try_lookup_features(ctx, &meta_key) {
-            eprintln!(
-                "[DEBUG-CACHE]   Found in db: resolution={:?}, orientation={}",
-                result.0, result.1
-            );
-            return result;
-        }
-
-        eprintln!("[DEBUG-CACHE]   Not found in database");
-        // Not cached in either database
-        (None, 1)
-    }
-
-    /// Helper to attempt feature lookup from a specific context
-    fn try_lookup_features(
-        ctx: &crate::db::AppContext,
-        meta_key: &[u8; 32],
-    ) -> Option<(Option<(u32, u32)>, u8)> {
-        // Look up content_hash from meta_key
-        if let Ok(Some(content_hash)) = ctx.get_content_hash(meta_key) {
-            eprintln!("[DEBUG-CACHE]   Found content_hash: {:?}", hex::encode(&content_hash[..8]));
-            // Look up cached features from content_hash
-            if let Ok(Some(features)) = ctx.get_features(&content_hash) {
-                let resolution = if features.width > 0 && features.height > 0 {
-                    Some((features.width, features.height))
-                } else {
-                    None
-                };
-                return Some((resolution, features.orientation));
-            } else {
-                eprintln!("[DEBUG-CACHE]   No features found for content_hash");
-            }
-        }
-        None
-    }
-
     /// Set status message with automatic 5-second timeout
     pub(super) fn set_status(&mut self, msg: String, is_error: bool) {
         self.state.set_status(msg, is_error);
+    }
+
+    /// Get GPS coordinates for a file, using cache for O(1) access
+    /// Returns cached result if available, otherwise reads EXIF and caches
+    /// Also updates FileMetadata.gps_pos in memory when reading from EXIF
+    pub(super) fn get_gps_coords(
+        &mut self,
+        path: &std::path::Path,
+        content_hash: &[u8; 32],
+    ) -> Option<(f64, f64)> {
+        // Fast path: query the database using the content hash (only works if content_hash is non-zero)
+        if *content_hash != [0u8; 32] {
+            if let Ok(Some(features)) = self.ctx.get_features(content_hash) {
+                if let Some(coords) = features.gps_pos {
+                    // Keep the GPS map sync logic
+                    self.gps_map.add_marker(
+                        path.to_path_buf(),
+                        coords.y(),
+                        coords.x(),
+                        *content_hash,
+                    );
+                    return Some((coords.y(), coords.x()));
+                }
+            }
+        }
+        // Slow fallback: Read EXIF directly from disk
+        if let Some(exif) = scanner::read_exif_data(path, None) {
+            if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
+                self.gps_map.add_marker(path.to_path_buf(), lat, lon, *content_hash);
+
+                // Update in-memory FileMetadata.gps_pos so we don't need to read EXIF again
+                let gps_point = geo::Point::new(lon, lat);
+                for group in &mut self.state.groups {
+                    for file in group.iter_mut() {
+                        if file.path == path {
+                            file.gps_pos = Some(gps_point);
+                            break;
+                        }
+                    }
+                }
+
+                return Some((lat, lon));
+            }
+        }
+
+        None
+    }
+
+    /// Get distance and bearing string from current image to selected location
+    /// Returns None if no GPS data or no location selected
+    /// Format: "image to home: 1919.99 km @ 88° E" or "home to image: 1919.99 km @ 279° W"
+    pub(super) fn get_distance_to_location(&mut self) -> Option<String> {
+        // Get current file's content_hash
+        let current_path = self.state.get_current_image_path()?.clone();
+        let content_hash = self
+            .state
+            .groups
+            .get(self.state.current_group_idx)?
+            .get(self.state.current_file_idx)?
+            .content_hash;
+
+        // Get GPS coords for current file
+        let (img_lat, img_lon) = self.get_gps_coords(&current_path, &content_hash)?;
+
+        // Get selected location from config
+        let (loc_name, loc_point) = self.gps_map.selected_location.as_ref()?;
+        let loc_lat = loc_point.y();
+        let loc_lon = loc_point.x();
+
+        // Calculate distance and bearing based on direction toggle
+        let (distance, bearing) = if self.gps_map.direction_to_image {
+            // Location to image
+            position::distance_and_bearing((loc_lat, loc_lon), (img_lat, img_lon))
+        } else {
+            // Image to location
+            position::distance_and_bearing((img_lat, img_lon), (loc_lat, loc_lon))
+        };
+
+        // Format the result
+        let dist_str = super::gps_map::format_distance(distance);
+        let bearing_str = super::gps_map::format_bearing(bearing);
+
+        let direction_str = if self.gps_map.direction_to_image {
+            format!("{} to image", loc_name)
+        } else {
+            format!("image to {}", loc_name)
+        };
+
+        Some(format!("{}: {} @ {}", direction_str, dist_str, bearing_str))
+    }
+
+    /// Toggle the direction of distance/bearing display
+    pub(super) fn toggle_distance_direction(&mut self) {
+        self.gps_map.direction_to_image = !self.gps_map.direction_to_image;
+    }
+
+    /// Update GPS markers for all currently loaded files
+    /// Uses gps_pos from FileMetadata directly (works in view mode where content_hash is zeroed)
+    pub(super) fn update_gps_markers(&mut self) {
+        // Collect file data first to avoid borrow conflicts
+        // Use gps_pos from FileMetadata if available (already loaded from cache or EXIF)
+        let files_data: Vec<(std::path::PathBuf, [u8; 32], Option<geo::Point<f64>>)> = self
+            .state
+            .groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .map(|file| (file.path.clone(), file.content_hash, file.gps_pos))
+            .collect();
+
+        // Now we can mutably borrow self
+        for (path, content_hash, gps_pos) in files_data {
+            // Fast path: use gps_pos from FileMetadata if already populated
+            if let Some(pos) = gps_pos {
+                self.gps_map.add_marker(path, pos.y(), pos.x(), content_hash);
+            } else {
+                // Slow path: look up from database or read EXIF
+                let _ = self.get_gps_coords(&path, &content_hash);
+            }
+        }
     }
 
     // 1. Helper to build cache entry (does the stat() call ONCE)
@@ -559,6 +675,7 @@ impl GuiApp {
             self.raw_cache.clear();
             self.raw_loading.clear();
             self.exif_search_cache.clear();
+            self.gps_map.clear_markers(); // Clear GPS markers for new directory
             if let Ok(mut w) = self.active_window.write() {
                 w.clear();
             }
@@ -585,12 +702,8 @@ impl GuiApp {
                                     crate::fileops::get_file_key(&entry_canonical)
                                 {
                                     // Try to load cached resolution/orientation from database
-                                    let (resolution, orientation) = Self::lookup_cached_features(
-                                        &self.ctx,
-                                        &meta,
-                                        unique_file_id,
-                                    );
-
+                                    let (resolution, orientation, gps_pos) =
+                                        self.ctx.lookup_cached_features(&meta, unique_file_id);
                                     files.push(FileMetadata {
                                         path: entry_canonical,
                                         size,
@@ -600,6 +713,7 @@ impl GuiApp {
                                         content_hash: [0u8; 32],
                                         pixel_hash: None,
                                         orientation,
+                                        gps_pos,
                                         unique_file_id,
                                     });
                                 }
@@ -632,6 +746,42 @@ impl GuiApp {
             self.scan_rx = None;
             self.scan_progress_rx = None;
             self.scan_progress = (0, 0);
+
+            // Start background enrichment for GPS data and content_hash computation
+            // Only enrich files where gps_pos is None (not loaded from cache)
+            let files_to_enrich: Vec<(std::path::PathBuf, u128)> = self
+                .state
+                .groups
+                .iter()
+                .flat_map(|g| g.iter())
+                .filter(|f| f.gps_pos.is_none())
+                .map(|f| (f.path.clone(), f.unique_file_id))
+                .collect();
+
+            if !files_to_enrich.is_empty() {
+                let (tx, rx) =
+                    unbounded::<(std::path::PathBuf, u128, [u8; 32], Option<Point<f64>>)>();
+                let content_key = self.ctx.content_key;
+
+                thread::spawn(move || {
+                    for (path, unique_file_id) in files_to_enrich {
+                        if let Ok(data) = std::fs::read(&path) {
+                            // Compute content_hash
+                            let mut hasher = blake3::Hasher::new_keyed(&content_key);
+                            hasher.update(&data);
+                            let content_hash = *hasher.finalize().as_bytes();
+
+                            // Read GPS from EXIF
+                            let gps_pos = scanner::read_exif_data(&path, Some(&data))
+                                .and_then(|exif| crate::helper_exif::extract_gps_lat_lon(&exif))
+                                .map(|(lat, lon)| Point::new(lon, lat));
+
+                            let _ = tx.send((path, unique_file_id, content_hash, gps_pos));
+                        }
+                    }
+                });
+                self.hash_rx = Some(rx);
+            }
 
             // Refresh directory cache for display
             self.refresh_dir_cache(false);
@@ -689,7 +839,7 @@ impl GuiApp {
                                         new_files.push(recovered);
                                     } else {
                                         // New file not in session - use centralized cache lookup from db.rs
-                                        let (resolution, orientation) =
+                                        let (resolution, orientation, gps_pos) =
                                             self.ctx.lookup_cached_features(&meta, unique_file_id);
                                         new_files.push(FileMetadata {
                                             path: canonical,
@@ -700,6 +850,7 @@ impl GuiApp {
                                             content_hash: [0u8; 32],
                                             pixel_hash: None,
                                             orientation,
+                                            gps_pos,
                                             unique_file_id,
                                         });
                                     }
@@ -1437,6 +1588,35 @@ impl eframe::App for GuiApp {
             }
         }
 
+        // Process background enrichment results (view mode)
+        // This updates FileMetadata with computed content_hash and GPS coordinates
+        if let Some(ref rx) = self.hash_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok((path, unique_file_id, content_hash, gps_pos)) => {
+                        // Update FileMetadata
+                        for group in &mut self.state.groups {
+                            for file in group.iter_mut() {
+                                if file.path == path && file.unique_file_id == unique_file_id {
+                                    file.content_hash = content_hash;
+                                    if gps_pos.is_some() {
+                                        file.gps_pos = gps_pos;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        // Add GPS marker if we found coordinates
+                        if let Some(pos) = gps_pos {
+                            self.gps_map.add_marker(path, pos.y(), pos.x(), content_hash);
+                        }
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+
         self.check_reload(ctx);
         self.perform_preload(ctx);
 
@@ -1534,9 +1714,15 @@ impl eframe::App for GuiApp {
                         "".to_string()
                     };
 
+                    // GPS map toggle indicator
+                    let gps_map_str = if self.gps_map.visible { " | [N] Map" } else { "" };
+
+                    // Get distance to selected location (right-justified)
+                    let distance_str = self.get_distance_to_location();
+
                     ui.horizontal(|ui| {
                         ui.label(format!(
-                            "W: {}{} | Z: Zoom{}{}{}{}{}{}{}{}",
+                            "W: {}{} | Z: Zoom{}{}{}{}{}{}{}{}{}",
                             mode_str,
                             extra,
                             rel_tag,
@@ -1546,7 +1732,8 @@ impl eframe::App for GuiApp {
                             sort_str,
                             rot_str,
                             hist_str,
-                            exif_str
+                            exif_str,
+                            gps_map_str
                         ));
                         ui.separator();
                         ui.label(pos_str);
@@ -1557,6 +1744,28 @@ impl eframe::App for GuiApp {
                                     .size(14.0)
                                     .family(egui::FontFamily::Monospace)
                                     .strong(),
+                            );
+                        }
+
+                        // Right-justify the distance/bearing info (clickable to toggle direction)
+                        if let Some(dist) = distance_str {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let response = ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&dist)
+                                                .size(12.0)
+                                                .family(egui::FontFamily::Monospace)
+                                                .color(egui::Color32::LIGHT_BLUE),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    );
+                                    if response.clicked() {
+                                        self.toggle_distance_direction();
+                                    }
+                                    response.on_hover_text("Click to toggle direction");
+                                },
                             );
                         }
                     });
@@ -2259,6 +2468,92 @@ impl eframe::App for GuiApp {
                 }
             }
         }
+
+        // GPS Map Panel (right side, when visible)
+        let mut map_clicked_path: Option<std::path::PathBuf> = None;
+        if self.gps_map.visible {
+            egui::SidePanel::right("gps_map_panel")
+                .resizable(true)
+                .default_width(400.0)
+                .min_width(200.0)
+                .show(ctx, |ui| {
+                    ui.heading("GPS Map");
+                    ui.separator();
+
+                    // Location selector dropdown
+                    ui.horizontal(|ui| {
+                        ui.label("Location:");
+                        let current_loc = self
+                            .gps_map
+                            .selected_location
+                            .as_ref()
+                            .map(|(name, _)| name.clone())
+                            .unwrap_or_else(|| "None".to_string());
+
+                        egui::ComboBox::from_id_salt("location_selector")
+                            .selected_text(&current_loc)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(current_loc == "None", "None").clicked() {
+                                    self.gps_map.selected_location = None;
+                                }
+                                for (name, point) in &self.ctx.locations {
+                                    let is_selected = self
+                                        .gps_map
+                                        .selected_location
+                                        .as_ref()
+                                        .map(|(n, _)| n == name)
+                                        .unwrap_or(false);
+                                    if ui.selectable_label(is_selected, name).clicked() {
+                                        self.gps_map.selected_location =
+                                            Some((name.clone(), *point));
+                                    }
+                                }
+                            });
+                    });
+
+                    ui.separator();
+
+                    // Map area
+                    let map_rect = ui.available_rect_before_wrap();
+
+                    // Get current file's path for highlighting (works in both view mode and duplicate mode)
+                    let current_path = self
+                        .state
+                        .groups
+                        .get(self.state.current_group_idx)
+                        .and_then(|g| g.get(self.state.current_file_idx))
+                        .map(|f| f.path.clone());
+
+                    // Render the map
+                    map_clicked_path = super::gps_map::render_gps_map(
+                        &mut self.gps_map,
+                        ui,
+                        map_rect,
+                        current_path.as_deref(),
+                    );
+
+                    // Statistics
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                        ui.label(format!("Markers: {}", self.gps_map.markers.len()));
+                    });
+                });
+        }
+
+        // Handle map click navigation
+        if let Some(clicked_path) = map_clicked_path {
+            // Find the file in our groups and navigate to it
+            for (g_idx, group) in self.state.groups.iter().enumerate() {
+                for (f_idx, file) in group.iter().enumerate() {
+                    if file.path == clicked_path {
+                        self.state.current_group_idx = g_idx;
+                        self.state.current_file_idx = f_idx;
+                        self.state.selection_changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let available_rect = ui.available_rect_before_wrap();
             if let Some(path) = current_image_path {

@@ -1,15 +1,15 @@
+use crate::db::{AppContext, HashAlgorithm};
+use crate::scanner::ScanConfig;
+use crate::state::get_bit_identical_counts;
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use geo::Point;
 use jiff::Timestamp;
+use libheif_rs::integration::image::register_all_decoding_hooks;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-
-use crate::db::{AppContext, HashAlgorithm};
-use crate::scanner::ScanConfig;
-use crate::state::get_bit_identical_counts;
-use libheif_rs::integration::image::register_all_decoding_hooks;
 
 #[cfg(not(target_env = "msvc"))]
 use jemallocator::Jemalloc;
@@ -39,7 +39,8 @@ pub struct FileMetadata {
     pub resolution: Option<(u32, u32)>,
     pub content_hash: [u8; 32],
     pub pixel_hash: Option<[u8; 32]>,
-    pub orientation: u8,      // Added: EXIF orientation (1-8)
+    pub orientation: u8, // Added: EXIF orientation (1-8)
+    pub gps_pos: Option<Point<f64>>,
     pub unique_file_id: u128, // Always has dev+inode
 }
 
