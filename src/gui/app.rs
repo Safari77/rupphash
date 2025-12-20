@@ -622,7 +622,6 @@ impl GuiApp {
 
     // 1. Helper to build cache entry (does the stat() call ONCE)
     fn create_dir_cache_entry(path: &std::path::Path, show_relative: bool) -> DirCacheEntry {
-        eprintln!("create_dir_cache_entry {}", path.display());
         let modified_display = if let Ok(meta) = fs::metadata(path) {
             if let Ok(modified) = meta.modified() {
                 let dt: chrono::DateTime<chrono::Utc> = modified.into();
@@ -2090,6 +2089,19 @@ impl eframe::App for GuiApp {
                                 ),
                                 Some(egui::Align::Center),
                             );
+
+                            // Center GPS map on new selection if visible
+                            if self.gps_map.visible {
+                                if let Some(file) = self
+                                    .state
+                                    .groups
+                                    .get(self.state.current_group_idx)
+                                    .and_then(|g| g.get(self.state.current_file_idx))
+                                {
+                                    self.gps_map.center_on_path(&file.path);
+                                }
+                            }
+
                             self.state.selection_changed = false;
                         }
                     }
@@ -2527,6 +2539,25 @@ impl eframe::App for GuiApp {
                 .show(ctx, |ui| {
                     ui.heading("GPS Map");
                     ui.separator();
+
+                    // Provider selector dropdown
+                    ui.horizontal(|ui| {
+                        ui.label("Provider:");
+                        let current_provider = self.gps_map.provider_name.clone();
+
+                        egui::ComboBox::from_id_salt("provider_selector")
+                            .selected_text(&current_provider)
+                            .show_ui(ui, |ui| {
+                                for (name, url) in &self.ctx.map_providers {
+                                    let is_selected = current_provider == *name;
+                                    if ui.selectable_label(is_selected, name).clicked() {
+                                        self.gps_map.set_provider(name.clone(), url.clone(), ctx);
+                                        // Save selection to config
+                                        let _ = self.ctx.save_map_selection(name);
+                                    }
+                                }
+                            });
+                    });
 
                     // Location selector dropdown
                     ui.horizontal(|ui| {

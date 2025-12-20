@@ -84,8 +84,6 @@ fn load_and_process_image(
         // We must read bytes first to safely get orientation from them
         if let Ok(data) = fs::read(path) {
             let exif_orientation = crate::scanner::get_orientation(path, Some(&data));
-            eprintln!("[DEBUG] load_and_process_image RAW exif_orientation={}", exif_orientation);
-
             if let Ok(mut raw) = rsraw::RawImage::open(&data) {
                 let dims = (raw.width() as u32, raw.height() as u32);
                 // 1. Attempt to get a thumbnail first
@@ -94,10 +92,6 @@ fn load_and_process_image(
 
                 // 2. Decide: Use Thumbnail OR Fallback to Full Decode
                 if let Some(thumb) = maybe_thumb {
-                    eprintln!(
-                        "[DEBUG] RAW using thumbnail, applying exif_orientation={}",
-                        exif_orientation
-                    );
                     // SUCCESS (Thumbnail): Return tuple to 'let', falling through to resize
                     (thumb, dims, exif_orientation)
                 } else {
@@ -108,7 +102,6 @@ fn load_and_process_image(
                             let w = processed.width() as usize;
                             let h = processed.height() as usize;
                             if processed.len() == w * h * 3 {
-                                eprintln!("[DEBUG] RAW full decode, orientation=1");
                                 // SUCCESS (Full Decode): Return tuple to 'let', falling through to resize
                                 (
                                     egui::ColorImage::from_rgb([w, h], &processed),
@@ -135,8 +128,6 @@ fn load_and_process_image(
         // B. STANDARD FILES (JPG, PNG, HEIC)
         if let Ok(bytes) = fs::read(path) {
             let orientation = crate::scanner::get_orientation(path, Some(&bytes));
-            eprintln!("[DEBUG] load_and_process_image OTHER get_orientation={}", orientation);
-
             // Chain with_guessed_format(). If it fails (IO error), fallback to a fresh reader.
             let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
                 .with_guessed_format()
@@ -611,6 +602,13 @@ pub(super) fn render_exif(
 
     if tags.is_empty() {
         return;
+    }
+
+    // Extract Sun Position if present and update GPS map
+    if let Some((_, val_str)) = tags.iter().find(|(k, _)| k == "Sun Position") {
+        if let Some((elevation, azimuth)) = crate::position::parse_sun_pos_string(val_str) {
+            app.gps_map.set_sun_position(path, elevation, azimuth);
+        }
     }
 
     // Get window width for positioning

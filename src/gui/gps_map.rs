@@ -3,7 +3,37 @@ use eframe::egui;
 use geo::Point;
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
+use walkers::sources::{Attribution, TileSource};
 use walkers::{HttpTiles, Map, MapMemory, Plugin, Position, Projector};
+
+/// Custom tile source that uses a URL pattern
+#[derive(Debug, Clone)]
+pub struct CustomTileSource {
+    pub name: String,
+    pub url_pattern: String,
+}
+
+impl CustomTileSource {
+    pub fn new(name: String, url_pattern: String) -> Self {
+        Self { name, url_pattern }
+    }
+}
+
+impl TileSource for CustomTileSource {
+    fn tile_url(&self, tile_id: walkers::TileId) -> String {
+        self.url_pattern
+            .replace("{z}", &tile_id.zoom.to_string())
+            .replace("{x}", &tile_id.x.to_string())
+            .replace("{y}", &tile_id.y.to_string())
+    }
+
+    fn attribution(&self) -> Attribution {
+        // Attribution requires 'static lifetime, so we leak the string
+        // This is acceptable since providers are rarely changed
+        let text: &'static str = Box::leak(self.name.clone().into_boxed_str());
+        Attribution { text, url: "", logo_light: None, logo_dark: None }
+    }
+}
 
 /// A single GPS position with associated file path
 #[derive(Debug, Clone)]
@@ -12,6 +42,10 @@ pub struct GpsMarker {
     pub lat: f64,
     pub lon: f64,
     pub content_hash: [u8; 32],
+    /// Sun azimuth in degrees (0=North, 90=East, 180=South, 270=West), None if not calculated
+    pub sun_azimuth: Option<f64>,
+    /// Sun elevation in degrees (negative = below horizon)
+    pub sun_elevation: Option<f64>,
 }
 
 impl GpsMarker {
@@ -28,7 +62,7 @@ pub struct GpsMapState {
     pub map_memory: MapMemory,
     /// All GPS markers from loaded images
     pub markers: Vec<GpsMarker>,
-    /// FIX: Map path to marker index instead of content_hash to support View mode
+    /// Map path to marker index
     pub path_to_marker: FxHashMap<PathBuf, usize>,
     /// Currently selected marker index (if any)
     pub selected_marker: Option<usize>,
@@ -48,6 +82,8 @@ pub struct GpsMapState {
     pub initial_center: Option<Position>,
     /// Direction toggle: false = "image to location", true = "location to image"
     pub direction_to_image: bool,
+    /// Error message if tile provider failed to initialize
+    pub tile_error: Option<String>,
 }
 
 impl Default for GpsMapState {
@@ -56,7 +92,7 @@ impl Default for GpsMapState {
             visible: false,
             map_memory: MapMemory::default(),
             markers: Vec::new(),
-            path_to_marker: FxHashMap::default(), // FIX
+            path_to_marker: FxHashMap::default(),
             selected_marker: None,
             tiles: None,
             provider_name: "OpenStreetMap".to_string(),
@@ -66,6 +102,7 @@ impl Default for GpsMapState {
             clicked_marker_idx: None,
             initial_center: None,
             direction_to_image: false,
+            tile_error: None,
         }
     }
 }
@@ -88,16 +125,32 @@ impl GpsMapState {
         lon: f64,
         content_hash: [u8; 32],
     ) -> bool {
-        // FIX: Check uniqueness by path, not content_hash, to allow multiple images
-        // with the same hash (or empty hashes in view mode) to appear.
+        // Check uniqueness by path
         if self.path_to_marker.contains_key(&path) {
             return false;
         }
 
         let idx = self.markers.len();
-        self.markers.push(GpsMarker { path: path.clone(), lat, lon, content_hash });
+        self.markers.push(GpsMarker {
+            path: path.clone(),
+            lat,
+            lon,
+            content_hash,
+            sun_azimuth: None,
+            sun_elevation: None,
+        });
         self.path_to_marker.insert(path, idx);
         true
+    }
+
+    /// Set sun position for a marker by path
+    pub fn set_sun_position(&mut self, path: &Path, elevation: f64, azimuth: f64) {
+        if let Some(&idx) = self.path_to_marker.get(path) {
+            if let Some(marker) = self.markers.get_mut(idx) {
+                marker.sun_elevation = Some(elevation);
+                marker.sun_azimuth = Some(azimuth);
+            }
+        }
     }
 
     /// Get marker by content_hash for highlighting
@@ -135,7 +188,7 @@ impl GpsMapState {
     /// Clear all markers (e.g., when changing directory)
     pub fn clear_markers(&mut self) {
         self.markers.clear();
-        self.path_to_marker.clear(); // FIX
+        self.path_to_marker.clear();
         self.selected_marker = None;
     }
 
@@ -144,6 +197,16 @@ impl GpsMapState {
         if let Some(marker) = self.markers.get(marker_idx) {
             self.map_memory.center_at(marker.position());
             self.selected_marker = Some(marker_idx);
+        }
+    }
+
+    /// Center map on the marker for a specific path
+    pub fn center_on_path(&mut self, path: &Path) {
+        if let Some(&idx) = self.path_to_marker.get(path) {
+            if let Some(marker) = self.markers.get(idx) {
+                self.map_memory.center_at(marker.position());
+                self.selected_marker = Some(idx);
+            }
         }
     }
 
@@ -157,31 +220,59 @@ impl GpsMapState {
         self.initial_center = Some(walkers::lat_lon(lat, lon));
     }
 
+    /// Initialize tiles with the current provider
+    fn init_tiles(&mut self, ctx: &egui::Context) {
+        let source = CustomTileSource::new(self.provider_name.clone(), self.provider_url.clone());
+        self.tiles = Some(HttpTiles::new(source, ctx.clone()));
+        self.tile_error = None;
+    }
+
     /// Initialize tiles if not already done
     pub fn ensure_tiles(&mut self, ctx: &egui::Context) {
         if self.tiles.is_none() {
-            let tiles = HttpTiles::new(walkers::sources::OpenStreetMap, ctx.clone());
-            self.tiles = Some(tiles);
+            self.init_tiles(ctx);
         }
+    }
+
+    /// Change map provider - recreates tiles with new source
+    pub fn set_provider(&mut self, name: String, url: String, ctx: &egui::Context) {
+        self.provider_name = name;
+        self.provider_url = url;
+        self.tile_error = None;
+        // Recreate tiles with new provider
+        self.init_tiles(ctx);
+    }
+
+    /// Set error message for tile loading failure
+    pub fn set_tile_error(&mut self, error: String) {
+        self.tile_error = Some(error);
     }
 }
 
-/// Plugin for drawing GPS markers on the map
+/// Plugin for drawing GPS markers on the map and detecting clicks
 pub struct GpsMarkersPlugin {
-    pub markers: Vec<(Position, egui::Color32, f32, usize)>,
+    pub markers: Vec<(Position, egui::Color32, f32, usize)>, // (pos, color, radius, index)
+    pub clicked_idx: std::sync::Arc<std::sync::atomic::AtomicI32>, // -1 = no click, >= 0 = clicked marker index
+    /// Sun position for current marker: (marker_position, azimuth, elevation)
+    pub current_sun: Option<(Position, f64, f64)>,
+    /// Map rect for clipping sun indicator to edges
+    pub map_rect: egui::Rect,
 }
 
 impl Plugin for GpsMarkersPlugin {
     fn run(
         self: Box<Self>,
         ui: &mut egui::Ui,
-        _response: &egui::Response,
+        response: &egui::Response,
         projector: &Projector,
         _memory: &MapMemory,
     ) {
         let painter = ui.painter();
 
-        for (pos, color, radius, _idx) in &self.markers {
+        // Check for clicks on markers
+        let click_pos = if response.clicked() { response.interact_pointer_pos() } else { None };
+
+        for (pos, color, radius, idx) in &self.markers {
             let screen_vec = projector.project(*pos);
             let screen_pos = egui::pos2(screen_vec.x, screen_vec.y);
 
@@ -191,12 +282,32 @@ impl Plugin for GpsMarkersPlugin {
                 *radius,
                 egui::Stroke::new(1.5, egui::Color32::WHITE),
             );
+
+            // Check if this marker was clicked (within radius + some tolerance)
+            if let Some(click) = click_pos {
+                let dist = screen_pos.distance(click);
+                if dist <= radius + 10.0 {
+                    // Use larger of current or this marker
+                    let current = self.clicked_idx.load(std::sync::atomic::Ordering::Relaxed);
+                    if current < 0 {
+                        self.clicked_idx.store(*idx as i32, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        // Draw sun indicator from current marker if available
+        if let Some((marker_pos, azimuth, elevation)) = self.current_sun {
+            let marker_screen = projector.project(marker_pos);
+            let marker_screen_pos = egui::pos2(marker_screen.x, marker_screen.y);
+            draw_sun_indicator(painter, self.map_rect, marker_screen_pos, azimuth, elevation);
         }
     }
 }
 
 /// Render the GPS map panel
 /// current_path is used for highlighting the current file's marker (works in both view mode and duplicate mode)
+/// Returns the path of a clicked marker if any
 pub fn render_gps_map(
     state: &mut GpsMapState,
     ui: &mut egui::Ui,
@@ -204,6 +315,20 @@ pub fn render_gps_map(
     current_path: Option<&Path>,
 ) -> Option<PathBuf> {
     state.ensure_tiles(ui.ctx());
+
+    // If there's a tile error, display it instead of the map
+    if let Some(ref error) = state.tile_error {
+        ui.vertical_centered(|ui| {
+            ui.add_space(50.0);
+            ui.colored_label(egui::Color32::RED, "⚠ Map Provider Error");
+            ui.add_space(10.0);
+            ui.colored_label(egui::Color32::RED, format!("Provider: {}", state.provider_name));
+            ui.colored_label(egui::Color32::RED, error);
+            ui.add_space(20.0);
+            ui.label("Try selecting a different provider");
+        });
+        return None;
+    }
 
     let default_center = walkers::lat_lon(51.0, 17.0);
 
@@ -214,6 +339,7 @@ pub fn render_gps_map(
         .or_else(|| state.markers.first().map(|m| m.position()))
         .unwrap_or(default_center);
 
+    // Apply initial center if set (from N key press)
     if let Some(pos) = state.initial_center.take() {
         state.map_memory.center_at(pos);
     }
@@ -224,7 +350,7 @@ pub fn render_gps_map(
         .enumerate()
         .map(|(idx, marker)| {
             let is_selected = state.selected_marker == Some(idx);
-            // Use path-based comparison for current marker (works in view mode)
+            // Use path-based comparison for current marker
             let is_current = current_path.map(|p| p == marker.path).unwrap_or(false);
 
             let (color, radius) = if is_current {
@@ -239,15 +365,189 @@ pub fn render_gps_map(
         })
         .collect();
 
+    let mut clicked_path: Option<PathBuf> = None;
+
+    // Shared atomic to communicate clicked marker from plugin
+    let clicked_idx = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1));
+
+    // Get the available rect for the map before adding it
+    let map_rect = ui.available_rect_before_wrap();
+
+    // Get sun position for current marker if available
+    let current_sun = current_path
+        .and_then(|p| state.path_to_marker.get(p))
+        .and_then(|&idx| state.markers.get(idx))
+        .and_then(|marker| match (marker.sun_azimuth, marker.sun_elevation) {
+            (Some(az), Some(el)) => Some((marker.position(), az, el)),
+            _ => None,
+        });
+
     if let Some(ref mut tiles) = state.tiles {
-        let markers_plugin = GpsMarkersPlugin { markers: markers_data };
+        let markers_plugin = GpsMarkersPlugin {
+            markers: markers_data,
+            clicked_idx: clicked_idx.clone(),
+            current_sun,
+            map_rect,
+        };
         let map =
             Map::new(Some(tiles), &mut state.map_memory, my_position).with_plugin(markers_plugin);
         ui.add(map);
+
+        // Check if a marker was clicked
+        let idx = clicked_idx.load(std::sync::atomic::Ordering::Relaxed);
+        if idx >= 0 {
+            let idx = idx as usize;
+            if idx < state.markers.len() {
+                state.selected_marker = Some(idx);
+                clicked_path = Some(state.markers[idx].path.clone());
+            }
+        }
+
+        // Draw attribution at bottom right of the map area
+        let attribution_text = format!("© {}", state.provider_name);
+        let painter = ui.painter();
+        let font_id = egui::FontId::proportional(10.0);
+        let text_color = egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200);
+        let bg_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180);
+
+        let galley = painter.layout_no_wrap(attribution_text, font_id, text_color);
+        let text_size = galley.size();
+        let padding = 4.0;
+
+        // Position at bottom-right of map rect
+        let text_pos = egui::pos2(
+            map_rect.right() - text_size.x - padding - 2.0,
+            map_rect.bottom() - text_size.y - padding - 2.0,
+        );
+
+        // Draw background rect
+        let bg_rect = egui::Rect::from_min_size(
+            egui::pos2(text_pos.x - padding, text_pos.y - padding),
+            egui::vec2(text_size.x + padding * 2.0, text_size.y + padding * 2.0),
+        );
+        painter.rect_filled(bg_rect, 2.0, bg_color);
+
+        // Draw text
+        painter.galley(text_pos, galley, text_color);
     }
 
-    None
+    clicked_path
 }
+
+/// Draw sun indicator from marker position to the edge of the map based on azimuth
+/// marker_pos: screen position of the current marker
+/// azimuth: 0=North, 90=East, 180=South, 270=West
+/// elevation: positive = above horizon, negative = below
+fn draw_sun_indicator(
+    painter: &egui::Painter,
+    map_rect: egui::Rect,
+    marker_pos: egui::Pos2,
+    azimuth: f64,
+    elevation: f64,
+) {
+    // Convert azimuth to radians (0=North=up, clockwise)
+    // In screen coords: up is -Y, right is +X
+    // azimuth 0 (North) -> angle -90° in standard coords
+    // azimuth 90 (East) -> angle 0° in standard coords
+    let angle_rad = (azimuth - 90.0).to_radians();
+
+    // Calculate direction vector
+    let dir_x = angle_rad.cos() as f32;
+    let dir_y = angle_rad.sin() as f32;
+
+    // Find intersection with rectangle edge from marker position
+    // We need to find t such that marker_pos + t*dir hits the edge
+    let margin = 20.0;
+    let left = map_rect.left() + margin;
+    let right = map_rect.right() - margin;
+    let top = map_rect.top() + margin;
+    let bottom = map_rect.bottom() - margin;
+
+    let t_left = if dir_x < -0.001 { (left - marker_pos.x) / dir_x } else { f32::MAX };
+    let t_right = if dir_x > 0.001 { (right - marker_pos.x) / dir_x } else { f32::MAX };
+    let t_top = if dir_y < -0.001 { (top - marker_pos.y) / dir_y } else { f32::MAX };
+    let t_bottom = if dir_y > 0.001 { (bottom - marker_pos.y) / dir_y } else { f32::MAX };
+
+    // Find the smallest positive t (first edge we hit)
+    let t = [t_left, t_right, t_top, t_bottom]
+        .into_iter()
+        .filter(|&t| t > 0.0)
+        .fold(f32::MAX, f32::min);
+
+    if t == f32::MAX || t < 30.0 {
+        // Sun would be too close to marker or no valid intersection
+        return;
+    }
+
+    // Sun position on edge
+    let sun_x = marker_pos.x + dir_x * t;
+    let sun_y = marker_pos.y + dir_y * t;
+    let sun_pos = egui::pos2(sun_x, sun_y);
+
+    // Sun color based on elevation (yellow when high, orange/red when low)
+    let sun_color = if elevation > 20.0 {
+        egui::Color32::from_rgb(255, 220, 50) // Bright yellow
+    } else if elevation > 0.0 {
+        egui::Color32::from_rgb(255, 180, 50) // Orange-yellow
+    } else {
+        egui::Color32::from_rgb(200, 100, 50) // Reddish (below horizon)
+    };
+
+    let sun_radius = 10.0;
+
+    // Draw dotted line from marker to sun
+    let line_color = egui::Color32::from_rgba_unmultiplied(255, 200, 50, 150);
+    let num_dots = ((t / 20.0) as i32).clamp(5, 25);
+    for i in 0..num_dots {
+        let frac = (i as f32 + 0.5) / num_dots as f32;
+        // Start from 15% to avoid cluttering near the marker
+        if frac > 0.15 {
+            let dot_x = marker_pos.x + dir_x * t * frac;
+            let dot_y = marker_pos.y + dir_y * t * frac;
+            painter.circle_filled(egui::pos2(dot_x, dot_y), 2.0, line_color);
+        }
+    }
+
+    // Draw sun circle
+    painter.circle_filled(sun_pos, sun_radius, sun_color);
+    painter.circle_stroke(
+        sun_pos,
+        sun_radius,
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(200, 150, 0)),
+    );
+
+    // Draw sun rays
+    let ray_color = egui::Color32::from_rgba_unmultiplied(255, 220, 50, 180);
+    let num_rays = 12;
+    let inner_radius = sun_radius + 3.0;
+    let outer_radius = sun_radius + 8.0;
+    for i in 0..num_rays {
+        let ray_angle =
+            (i as f32 * std::f32::consts::TAU / num_rays as f32) + std::f32::consts::FRAC_PI_8;
+        let inner_x = sun_pos.x + ray_angle.cos() * inner_radius;
+        let inner_y = sun_pos.y + ray_angle.sin() * inner_radius;
+        let outer_x = sun_pos.x + ray_angle.cos() * outer_radius;
+        let outer_y = sun_pos.y + ray_angle.sin() * outer_radius;
+        painter.line_segment(
+            [egui::pos2(inner_x, inner_y), egui::pos2(outer_x, outer_y)],
+            egui::Stroke::new(2.0, ray_color),
+        );
+    }
+
+    // Draw elevation text near sun
+    let elev_text = format!("{:.2}°", elevation);
+    let font_id = egui::FontId::proportional(10.0);
+    let text_color = egui::Color32::from_rgb(100, 80, 0);
+
+    // Position text slightly offset from sun (toward map center)
+    let center = map_rect.center();
+    let text_offset_x = if sun_x > center.x { -25.0 } else { 15.0 };
+    let text_offset_y = if sun_y > center.y { -15.0 } else { 5.0 };
+    let text_pos = egui::pos2(sun_pos.x + text_offset_x, sun_pos.y + text_offset_y);
+
+    painter.text(text_pos, egui::Align2::LEFT_TOP, elev_text, font_id, text_color);
+}
+
 /// >= 1000m: show as km with 2 decimal places
 pub fn format_distance(meters: f64) -> String {
     if meters < 1000.0 { format!("{:.0} m", meters) } else { format!("{:.2} km", meters / 1000.0) }
@@ -257,7 +557,7 @@ pub fn format_distance(meters: f64) -> String {
 pub fn format_bearing(degrees: f64) -> String {
     let directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
     let idx = ((degrees + 22.5) / 45.0) as usize % 8;
-    format!("{:.0}° {}", degrees, directions[idx])
+    format!("{:.2}° {}", degrees, directions[idx])
 }
 
 /// Get distance and bearing string between two points

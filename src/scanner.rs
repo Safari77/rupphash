@@ -685,13 +685,15 @@ pub fn scan_and_group(
             let unique_file_id = fileops::get_file_key(&path)?;
 
             let meta_key = compute_meta_key(&ctx_ref.meta_key, mtime_ns, size, unique_file_id);
-            eprintln!(
-                "[DEBUG] mtime_ns/size/unique_file_id {} = {} {} {}",
-                path.display(),
-                mtime_ns,
-                size,
-                unique_file_id
-            );
+            if false {
+                eprintln!(
+                    "[DEBUG] mtime_ns/size/unique_file_id {} = {} {} {}",
+                    path.display(),
+                    mtime_ns,
+                    size,
+                    unique_file_id
+                );
+            }
             let mut pdqhash: Option<[u8; 32]> = None;
             let mut pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>> = None;
             // IMPORTANT: new_meta tracks updates to the file_metadata DB.

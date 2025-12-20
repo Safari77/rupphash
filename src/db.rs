@@ -959,13 +959,10 @@ impl AppContext {
     }
 
     pub fn save_map_selection(
-        &mut self,
+        &self,
         provider_name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Update in-memory
-        self.selected_provider = provider_name.to_string();
-
-        // Update on disk
+        // Update on disk only (in-memory state is in GpsMapState)
         let config_dir = dirs::config_dir().ok_or("No config dir found")?;
         let config_path = config_dir.join(CONFIG_FILE_NAME);
 
