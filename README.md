@@ -33,6 +33,17 @@ podman run --rm -it -p 17766:17766 -v "/mydata/tiles:/data:z" maptiler/tileserve
 ```
 Open http://127.0.0.1:17766/ to view supported styles.
 
+## The fonts
+
+Get the latest
+```bash
+curl -s 'https://api.github.com/repos/be5invis/Sarasa-Gothic/releases/latest' | jq -r ".assets[] | .browser_download_url" | pcre2grep "/Sarasa-TTC-Unhinted-.*7z$" | xargs -n 1 curl -L -O --fail --silent --show-error --
+7z e Sarasa-TTC-Unhinted-*.7z
+fc-query --format='%{index}: %{family} %{style}\n' Sarasa-Regular.ttc | pcre2grep "Sarasa (Term|UI) SC"
+7: Sarasa UI SC,更纱黑体 UI SC Regular
+25: Sarasa Term SC Regular
+```
+
 ## Screenshot - View mode
 ![Screenshot view](phdupes-view.webp)
 
