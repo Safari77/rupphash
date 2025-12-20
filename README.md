@@ -17,6 +17,22 @@ Duplicates can be found by content (perceptual), or idendical pixel data
 (--pixel-hash converts data to 16bit values for comparison),
 or whole file comparison (bit-identical, using blake3).
 
+## GPS Map
+Examples:
+```
+[map_providers]
+tileserver = "http://127.0.0.1:17766/styles/basic-preview/{z}/{x}/{y}@2x.png"
+maptiler = "https://api.maptiler.com/maps/topo-v4/{z}/{x}/{y}@2x.png?key=GETYOUROWN"
+```
+
+If you have `/mydata/tiles/finland.mbtiles` generated with
+`java -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=3128 -Xmx4g -jar planetiler.jar --download --area=finland --output=finland.mbtiles`:
+
+```bash
+podman run --rm -it -p 17766:17766 -v "/mydata/tiles:/data:z" maptiler/tileserver-gl --verbose -b 0.0.0.0 -p 17766 --mbtiles /data/finland.mbtiles
+```
+Open http://127.0.0.1:17766/ to view supported styles.
+
 ## Screenshot - View mode
 ![Screenshot view](phdupes-view.webp)
 
