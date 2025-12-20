@@ -38,6 +38,72 @@ pub struct DirCacheEntry {
     pub modified_display: String,
 }
 
+/// Truncate a string to fit within max_width pixels, appending "…" if truncated.
+/// Ensures truncation occurs at a valid UTF-8 char boundary.
+/// Returns (truncated_text, was_truncated).
+fn truncate_to_width(
+    text: &str,
+    max_width: f32,
+    font_id: &egui::FontId,
+    ui: &egui::Ui,
+) -> (String, bool) {
+    // Quick check: if the full text fits, return it as-is
+    let full_galley =
+        ui.painter().layout_no_wrap(text.to_string(), font_id.clone(), egui::Color32::WHITE);
+    if full_galley.rect.width() <= max_width {
+        return (text.to_string(), false);
+    }
+
+    // Measure the ellipsis width
+    let ellipsis = "…";
+    let ellipsis_galley =
+        ui.painter().layout_no_wrap(ellipsis.to_string(), font_id.clone(), egui::Color32::WHITE);
+    let ellipsis_width = ellipsis_galley.rect.width();
+    let target_width = max_width - ellipsis_width;
+
+    if target_width <= 0.0 {
+        // Not enough space for even the ellipsis
+        return (ellipsis.to_string(), true);
+    }
+
+    // Collect character boundaries for UTF-8 safe truncation
+    let char_boundaries: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let num_chars = char_boundaries.len();
+
+    if num_chars == 0 {
+        return (ellipsis.to_string(), true);
+    }
+
+    // Binary search for the longest prefix that fits within target_width
+    let mut low = 0usize;
+    let mut high = num_chars;
+
+    while low < high {
+        let mid = low + (high - low + 1) / 2;
+        let byte_end = if mid >= num_chars { text.len() } else { char_boundaries[mid] };
+        let prefix = &text[..byte_end];
+
+        let galley =
+            ui.painter().layout_no_wrap(prefix.to_string(), font_id.clone(), egui::Color32::WHITE);
+
+        if galley.rect.width() <= target_width {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    // low now contains the maximum number of characters that fit
+    if low == 0 {
+        // Can't fit any characters, just return ellipsis
+        return (ellipsis.to_string(), true);
+    }
+
+    let byte_end = if low >= num_chars { text.len() } else { char_boundaries[low] };
+    let truncated = format!("{}{}", &text[..byte_end], ellipsis);
+    (truncated, true)
+}
+
 pub struct GuiApp {
     pub(super) state: AppState,
     pub(super) group_views: HashMap<usize, GroupViewState>,
@@ -1983,13 +2049,76 @@ impl eframe::App for GuiApp {
                                 );
                             }
 
-                            ui.painter().text(
-                                rect.left_center() + egui::vec2(4.0, 0.0),
-                                egui::Align2::LEFT_CENTER,
-                                &format!("\u{1f4c1} {}", dir_name),
-                                egui::FontId::default(),
-                                egui::Color32::LIGHT_BLUE,
+                            // Calculate available width for directory name
+                            // Account for: folder icon prefix, time suffix, and padding
+                            let font_id = egui::FontId::default();
+                            let time_font = egui::FontId::new(10.0, egui::FontFamily::Monospace);
+                            let folder_prefix = "\u{1f4c1} ";
+                            let prefix_galley = ui.painter().layout_no_wrap(
+                                folder_prefix.to_string(),
+                                font_id.clone(),
+                                egui::Color32::WHITE,
                             );
+                            let time_galley = ui.painter().layout_no_wrap(
+                                mod_time_str.to_string(),
+                                time_font.clone(),
+                                egui::Color32::WHITE,
+                            );
+                            let dir_name_max_width = (rect.width()
+                                - prefix_galley.rect.width()
+                                - time_galley.rect.width()
+                                - 16.0)
+                                .max(20.0);
+
+                            let (display_dir_name, was_truncated) =
+                                truncate_to_width(dir_name, dir_name_max_width, &font_id, ui);
+
+                            // Render directory name with truncation
+                            if was_truncated && display_dir_name.ends_with('…') {
+                                // Draw main part in color, ellipsis in grey
+                                let main_part: String = display_dir_name
+                                    .chars()
+                                    .take(display_dir_name.chars().count() - 1)
+                                    .collect();
+                                let main_galley = ui.painter().layout_no_wrap(
+                                    format!("{}{}", folder_prefix, main_part),
+                                    font_id.clone(),
+                                    egui::Color32::LIGHT_BLUE,
+                                );
+                                ui.painter().galley(
+                                    rect.left_center()
+                                        + egui::vec2(4.0, -main_galley.rect.height() / 2.0),
+                                    main_galley,
+                                    egui::Color32::LIGHT_BLUE,
+                                );
+                                // Draw ellipsis in grey
+                                let ellipsis_x = rect.left()
+                                    + 4.0
+                                    + prefix_galley.rect.width()
+                                    + ui.painter()
+                                        .layout_no_wrap(
+                                            main_part,
+                                            font_id.clone(),
+                                            egui::Color32::WHITE,
+                                        )
+                                        .rect
+                                        .width();
+                                ui.painter().text(
+                                    egui::pos2(ellipsis_x, rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    "…",
+                                    font_id.clone(),
+                                    egui::Color32::GRAY,
+                                );
+                            } else {
+                                ui.painter().text(
+                                    rect.left_center() + egui::vec2(4.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    &format!("{}{}", folder_prefix, display_dir_name),
+                                    font_id,
+                                    egui::Color32::LIGHT_BLUE,
+                                );
+                            }
 
                             ui.painter().text(
                                 rect.right_center() - egui::vec2(4.0, 0.0),
@@ -2274,7 +2403,27 @@ impl eframe::App for GuiApp {
                                     marker_rich = marker_rich.color(col);
                                 }
 
-                                let mut filename_rich = egui::RichText::new(&filename_text)
+                                // Calculate available width for filename (header_rect minus marker width minus padding)
+                                let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+                                let marker_galley = ui.painter().layout_no_wrap(
+                                    marker_text.clone(),
+                                    font_id.clone(),
+                                    egui::Color32::WHITE,
+                                );
+                                let marker_width = marker_galley.rect.width();
+                                let padding = 8.0; // Small padding for scroll bar and margins
+                                let available_filename_width =
+                                    (header_rect.width() - marker_width - padding).max(20.0);
+
+                                // Truncate filename if needed
+                                let (display_filename, was_truncated) = truncate_to_width(
+                                    &filename_text,
+                                    available_filename_width,
+                                    &font_id,
+                                    ui,
+                                );
+
+                                let mut filename_rich = egui::RichText::new(&display_filename)
                                     .family(egui::FontFamily::Monospace);
                                 if let Some(col) = filename_color {
                                     filename_rich = filename_rich.color(col);
@@ -2311,7 +2460,19 @@ impl eframe::App for GuiApp {
 
                                     // Update text color for contrast
                                     marker_rich = marker_rich.color(egui::Color32::WHITE);
-                                    filename_rich = filename_rich.color(egui::Color32::WHITE);
+                                    // For truncated filenames, keep the ellipsis grey even when selected
+                                    if was_truncated && display_filename.ends_with('…') {
+                                        // Split off the ellipsis and make it grey
+                                        let main_part: String = display_filename
+                                            .chars()
+                                            .take(display_filename.chars().count() - 1)
+                                            .collect();
+                                        filename_rich = egui::RichText::new(&main_part)
+                                            .family(egui::FontFamily::Monospace)
+                                            .color(egui::Color32::WHITE);
+                                    } else {
+                                        filename_rich = filename_rich.color(egui::Color32::WHITE);
+                                    }
                                 }
 
                                 // 2. Draw Text Content inside Header Rect
@@ -2322,7 +2483,45 @@ impl eframe::App for GuiApp {
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 0.0;
                                             ui.label(marker_rich);
-                                            ui.label(filename_rich);
+                                            if was_truncated && display_filename.ends_with('…') {
+                                                // Render filename without ellipsis, then ellipsis in grey
+                                                let main_part: String = display_filename
+                                                    .chars()
+                                                    .take(display_filename.chars().count() - 1)
+                                                    .collect();
+                                                let mut main_rich = egui::RichText::new(&main_part)
+                                                    .family(egui::FontFamily::Monospace);
+                                                if let Some(col) = filename_color {
+                                                    main_rich = main_rich.color(col);
+                                                }
+                                                if is_selected {
+                                                    main_rich =
+                                                        main_rich.color(egui::Color32::WHITE);
+                                                }
+                                                // Apply background for peer highlighting
+                                                if let Some(current_file) =
+                                                    group.get(self.state.current_file_idx)
+                                                {
+                                                    if !is_selected
+                                                        && current_file.pixel_hash.is_some()
+                                                        && current_file.pixel_hash
+                                                            == file.pixel_hash
+                                                    {
+                                                        let bg =
+                                                            egui::Color32::from_black_alpha(40);
+                                                        main_rich =
+                                                            main_rich.strong().background_color(bg);
+                                                    }
+                                                }
+                                                ui.label(main_rich);
+                                                ui.label(
+                                                    egui::RichText::new("…")
+                                                        .family(egui::FontFamily::Monospace)
+                                                        .color(egui::Color32::GRAY),
+                                                );
+                                            } else {
+                                                ui.label(filename_rich);
+                                            }
                                         });
                                     },
                                 );
