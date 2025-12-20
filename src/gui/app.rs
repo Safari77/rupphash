@@ -1493,17 +1493,23 @@ impl GuiApp {
             Box::new(move |cc| {
                 egui_extras::install_image_loaders(&cc.egui_ctx);
                 let mut fonts = egui::FontDefinitions::default();
-                const SARASA_TTC: &[u8] = include_bytes!("../../assets/fonts/Sarasa-Regular.ttc");
 
-                // Setup Proportional Font (Sarasa UI SC, Index 7)
-                let mut font_ui = egui::FontData::from_static(SARASA_TTC);
-                font_ui.index = 7;
-                fonts.font_data.insert("Sarasa UI SC".to_owned(), Arc::new(font_ui));
+                #[cfg(feature = "embed-fonts")]
+                {
+                    const SARASA_TTC: &[u8] =
+                        include_bytes!("../../assets/fonts/Sarasa-Regular.ttc");
 
-                // Setup Monospace Font (Sarasa Term SC, Index 25)
-                let mut font_mono = egui::FontData::from_static(SARASA_TTC);
-                font_mono.index = 25;
-                fonts.font_data.insert("Sarasa Term SC".to_owned(), Arc::new(font_mono));
+                    eprintln!("[INFO] Compiling with embedded Sarasa fonts.");
+                    // Setup Proportional Font (Sarasa UI SC, Index 7)
+                    let mut font_ui = egui::FontData::from_static(SARASA_TTC);
+                    font_ui.index = 7;
+                    fonts.font_data.insert("Sarasa UI SC".to_owned(), Arc::new(font_ui));
+
+                    // Setup Monospace Font (Sarasa Term SC, Index 25)
+                    let mut font_mono = egui::FontData::from_static(SARASA_TTC);
+                    font_mono.index = 25;
+                    fonts.font_data.insert("Sarasa Term SC".to_owned(), Arc::new(font_mono));
+                }
 
                 // Insert at 0 to make them the primary font for that family
                 if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {

@@ -48,6 +48,7 @@ Using git-lfs now.  For a smaller clone without LFS files:
 `GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/Safari77/rupphash.git`
 Fetch what you need:
 `git lfs pull --include="assets/fonts"`
+(This is a placeholder notice, I am not currently using LFS.)
 
 ## Screenshot - View mode
 ![Screenshot view](phdupes-view.webp)

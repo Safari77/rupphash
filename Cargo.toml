@@ -84,3 +84,10 @@ path = "src/position_test.rs"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemallocator = "0.5"
 xattr = "1.6"
+
+[features]
+default = []
+# To include the Sarasa font into binary, copy it to assets/fonts/Sarasa-Regular.ttc
+# and run cargo build --release --features embed-fonts
+embed-fonts = []
+
