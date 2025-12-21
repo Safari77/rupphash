@@ -11,13 +11,13 @@ use std::fs;
 use std::sync::mpsc::{Receiver as StdReceiver, channel};
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, Instant}; // Added Duration/Instant
+use std::time::{Duration, Instant};
 
 use super::gps_map::GpsMapState;
 use super::image::{GroupViewState, ViewMode};
 
 use crate::GroupStatus;
-use crate::db::AppContext;
+use crate::db::{AppContext, EnrichmentResult};
 use crate::format_relative_time;
 use crate::gui::APP_TITLE;
 use crate::gui::image::MAX_TEXTURE_SIDE;
@@ -201,13 +201,19 @@ pub struct GuiApp {
     pub(super) fs_rem_dirs: HashSet<String>,
     pub(super) last_fs_refresh: Instant,
 
-    // --- Background content_hash computation for view mode ---
-    // Channel to receive computed hashes and GPS: (path, unique_file_id, content_hash, gps_pos)
-    pub(super) hash_rx: Option<Receiver<(std::path::PathBuf, u128, [u8; 32], Option<Point<f64>>)>>,
+    // View mode: Channel to receive enrichment results (content_hash, GPS, etc.)
+    pub(super) enrichment_rx: Option<Receiver<EnrichmentResult>>,
 
-    // --- Database writer for view mode ---
+    // View mode: Maps unique_file_id -> file_idx within the single group
+    pub(super) file_index: HashMap<u128, usize>,
+
     // Channel to send database updates (view mode caches features without coefficients)
     pub(super) db_tx: Option<Sender<crate::db::DbUpdate>>,
+
+    // Channel to receive file batches from background directory scan
+    pub(super) dir_scan_rx: Option<Receiver<Vec<FileMetadata>>>,
+    // Total file count from directory (for progress display)
+    pub(super) dir_total_count: Option<usize>,
 }
 
 impl GuiApp {
@@ -235,7 +241,6 @@ impl GuiApp {
         let (tx, rx) =
             super::image::spawn_image_loader_pool(active_window.clone(), use_raw_thumbnails);
         // panel_width is saved in logical points (after font_scale applied)
-        // Load it as-is - we'll use it directly once ppp stabilizes
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
         // Initialize with configured size so we have a fallback if window size isn't captured
         let initial_window_size =
@@ -310,8 +315,11 @@ impl GuiApp {
             fs_rem_dirs: HashSet::new(),
             last_fs_refresh: Instant::now(),
             gps_map: GpsMapState::new(tile_cache_path, selected_provider, provider_url),
-            hash_rx: None,
+            enrichment_rx: None,
+            file_index: HashMap::new(),
             db_tx: None,
+            dir_scan_rx: None,
+            dir_total_count: None,
         }
     }
 
@@ -333,7 +341,6 @@ impl GuiApp {
             sort_order.clone(),
             HashMap::new(),
         );
-        // Don't set is_loading = true yet; we'll populate synchronously first
         state.view_mode = true;
         state.move_target = move_target;
         state.slideshow_interval = slideshow_interval;
@@ -367,125 +374,39 @@ impl GuiApp {
         let (tx, rx) =
             super::image::spawn_image_loader_pool(active_window.clone(), use_raw_thumbnails);
         let ctx = crate::db::AppContext::new().expect("Failed to create context");
-        // panel_width is saved in logical points (after font_scale applied)
-        // Load it as-is - we'll use it directly once ppp stabilizes
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
-        // Initialize with configured size so we have a fallback if window size isn't captured
         let initial_window_size =
             Some((ctx.gui_config.width.unwrap_or(1280), ctx.gui_config.height.unwrap_or(720)));
 
-        eprintln!(
-            "[DEBUG-CONFIG] new_view_mode() - Loaded from config: window={}x{}, panel_width={}",
-            ctx.gui_config.width.unwrap_or(1280),
-            ctx.gui_config.height.unwrap_or(720),
-            panel_width
-        );
-        eprintln!(
-            "[DEBUG-CONFIG] new_view_mode() - Raw config values: width={:?}, height={:?}, panel_width={:?}",
-            ctx.gui_config.width, ctx.gui_config.height, ctx.gui_config.panel_width
-        );
-
-        // Immediately populate directories and files from the current directory
-        // This avoids the spinner on startup and ensures instant display
-        // Resolution/orientation will be loaded from cache if available
-        let mut subdirs = Vec::new();
-        let mut files = Vec::new();
-        if let Some(ref dir) = current_dir {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    // Canonicalize each entry path to ensure absolute paths in FileMetadata
-                    if let Ok(canonical) = entry_path.canonicalize() {
-                        if canonical.is_dir() {
-                            subdirs.push(canonical);
-                        } else if scanner::is_image_ext(&canonical) {
-                            if let Ok(meta) = entry.metadata() {
-                                let size = meta.len();
-                                let modified =
-                                    meta.modified().unwrap_or(std::time::UNIX_EPOCH).into();
-                                if let Some(unique_file_id) =
-                                    crate::fileops::get_file_key(&canonical)
-                                {
-                                    // Try to load cached resolution/orientation from database
-                                    let (resolution, orientation, gps_pos) =
-                                        ctx.lookup_cached_features(&meta, unique_file_id);
-
-                                    files.push(FileMetadata {
-                                        path: canonical,
-                                        size,
-                                        modified,
-                                        pdqhash: None,
-                                        resolution,
-                                        content_hash: [0u8; 32],
-                                        pixel_hash: None,
-                                        orientation,
-                                        gps_pos,
-                                        unique_file_id,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // Sort files and directories according to the sort order
-            scanner::sort_files(&mut files, &sort_order);
-            scanner::sort_directories(&mut subdirs, &sort_order);
-        }
-
-        // Set up initial state with the files we found
-        let has_files = !files.is_empty();
-
-        // Collect files that need GPS enrichment (gps_pos is None and not from cache)
-        // These will be processed in the background to read EXIF GPS data
-        let files_to_enrich: Vec<(std::path::PathBuf, u128)> = files
-            .iter()
-            .filter(|f| f.gps_pos.is_none())
-            .map(|f| (f.path.clone(), f.unique_file_id))
-            .collect();
-
-        state.groups = if has_files { vec![files] } else { Vec::new() };
-        state.group_infos = if has_files {
-            vec![GroupInfo { max_dist: 0, status: GroupStatus::None }]
-        } else {
-            Vec::new()
-        };
-        state.last_file_count = state.groups.first().map_or(0, |g| g.len());
-        // No need for background scan since we've already loaded everything
-        state.is_loading = false;
-
-        // Start database writer for view mode (caches features without PDQ coefficients)
+        // Start database writer for view mode
         let (db_tx_send, db_rx) = unbounded::<crate::db::DbUpdate>();
         let _db_handle = ctx.start_db_writer(db_rx);
-        let db_tx = Some(db_tx_send);
+        let db_tx = Some(db_tx_send.clone());
 
-        // Start background enrichment for GPS data and content_hash computation
-        // This reads EXIF for GPS and computes blake3 hash for database caching
-        let hash_rx = if !files_to_enrich.is_empty() {
-            let (tx, rx) = unbounded::<(std::path::PathBuf, u128, [u8; 32], Option<Point<f64>>)>();
-            let content_key = ctx.content_key;
-
-            thread::spawn(move || {
-                for (path, unique_file_id) in files_to_enrich {
-                    if let Ok(data) = std::fs::read(&path) {
-                        // Compute content_hash
-                        let mut hasher = blake3::Hasher::new_keyed(&content_key);
-                        hasher.update(&data);
-                        let content_hash = *hasher.finalize().as_bytes();
-
-                        // Read GPS from EXIF
-                        let gps_pos = scanner::read_exif_data(&path, Some(&data))
-                            .and_then(|exif| crate::helper_exif::extract_gps_lat_lon(&exif))
-                            .map(|(lat, lon)| Point::new(lon, lat));
-
-                        let _ = tx.send((path, unique_file_id, content_hash, gps_pos));
-                    }
-                }
-            });
-            Some(rx)
+        // Background directory scanning with batch database lookups
+        let (subdirs, dir_total_count, dir_scan_rx) = if let Some(ref dir) = current_dir {
+            let (batch_tx, batch_rx) = unbounded::<Vec<FileMetadata>>();
+            let (subdirs, count) =
+                scanner::spawn_background_dir_scan(dir.clone(), sort_order.clone(), &ctx, batch_tx);
+            (subdirs, Some(count), Some(batch_rx))
         } else {
-            None
+            (Vec::new(), None, None)
         };
+
+        // Build subdirs_cache and parent_cache for UI display
+        let subdirs_cache: Vec<DirCacheEntry> = subdirs
+            .iter()
+            .map(|dir| Self::create_dir_cache_entry(dir, show_relative_times))
+            .collect();
+        let parent_cache = current_dir
+            .as_ref()
+            .and_then(|d| d.parent())
+            .map(|p| Self::create_dir_cache_entry(p, show_relative_times));
+
+        // Set up empty initial state - files will stream in from background
+        state.groups = vec![Vec::new()];
+        state.group_infos = vec![GroupInfo { max_dist: 0, status: GroupStatus::None }];
+        state.is_loading = dir_total_count.map_or(false, |c| c > 0);
 
         // Extract values before moving ctx to Arc
         let tile_cache_path = ctx.tile_cache_path.clone();
@@ -544,16 +465,19 @@ impl GuiApp {
             cache_dirty: true,
             watcher: None,
             fs_event_rx: None,
-            subdirs_cache: Vec::new(),
-            parent_cache: None,
+            subdirs_cache,
+            parent_cache,
             fs_mod_files: HashSet::new(),
             fs_mod_dirs: HashSet::new(),
             fs_rem_files: HashSet::new(),
             fs_rem_dirs: HashSet::new(),
             last_fs_refresh: Instant::now(),
             gps_map: GpsMapState::new(tile_cache_path, selected_provider, provider_url),
-            hash_rx,
+            enrichment_rx: None,
+            file_index: HashMap::new(),
             db_tx,
+            dir_scan_rx,
+            dir_total_count,
         }
     }
 
@@ -567,19 +491,19 @@ impl GuiApp {
         self.state.set_status(msg, is_error);
     }
 
-    /// Get GPS coordinates for a file, using cache for O(1) access
-    /// Returns cached result if available, otherwise reads EXIF and caches
-    /// Also updates FileMetadata.gps_pos in memory when reading from EXIF
+    /// Get GPS coordinates for a file, using cache for O(1) access.
+    /// Returns cached result if available, otherwise reads EXIF.
+    /// Uses file_index for O(1) in-memory update when reading from EXIF.
     pub(super) fn get_gps_coords(
         &mut self,
         path: &std::path::Path,
         content_hash: &[u8; 32],
+        unique_file_id: Option<u128>,
     ) -> Option<(f64, f64)> {
         // Fast path: query the database using the content hash (only works if content_hash is non-zero)
         if *content_hash != [0u8; 32] {
             if let Ok(Some(features)) = self.ctx.get_features(content_hash) {
                 if let Some(coords) = features.gps_pos {
-                    // Keep the GPS map sync logic
                     self.gps_map.add_marker(
                         path.to_path_buf(),
                         coords.y(),
@@ -590,18 +514,19 @@ impl GuiApp {
                 }
             }
         }
+
         // Slow fallback: Read EXIF directly from disk
         if let Some(exif) = scanner::read_exif_data(path, None) {
             if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
                 self.gps_map.add_marker(path.to_path_buf(), lat, lon, *content_hash);
 
-                // Update in-memory FileMetadata.gps_pos so we don't need to read EXIF again
-                let gps_point = geo::Point::new(lon, lat);
-                for group in &mut self.state.groups {
-                    for file in group.iter_mut() {
-                        if file.path == path {
-                            file.gps_pos = Some(gps_point);
-                            break;
+                // O(1) update via file_index if unique_file_id provided
+                if let Some(uid) = unique_file_id {
+                    if let Some(&file_idx) = self.file_index.get(&uid) {
+                        if let Some(group) = self.state.groups.first_mut() {
+                            if let Some(file) = group.get_mut(file_idx) {
+                                file.gps_pos = Some(geo::Point::new(lon, lat));
+                            }
                         }
                     }
                 }
@@ -617,17 +542,19 @@ impl GuiApp {
     /// Returns None if no GPS data or no location selected
     /// Format: "image to home: 1919.99 km @ 88° E" or "home to image: 1919.99 km @ 279° W"
     pub(super) fn get_distance_to_location(&mut self) -> Option<String> {
-        // Get current file's content_hash
+        // Get current file's content_hash and unique_file_id
         let current_path = self.state.get_current_image_path()?.clone();
-        let content_hash = self
+        let current_file = self
             .state
             .groups
             .get(self.state.current_group_idx)?
-            .get(self.state.current_file_idx)?
-            .content_hash;
+            .get(self.state.current_file_idx)?;
+        let content_hash = current_file.content_hash;
+        let unique_file_id = current_file.unique_file_id;
 
         // Get GPS coords for current file
-        let (img_lat, img_lon) = self.get_gps_coords(&current_path, &content_hash)?;
+        let (img_lat, img_lon) =
+            self.get_gps_coords(&current_path, &content_hash, Some(unique_file_id))?;
 
         // Get selected location from config
         let (loc_name, loc_point) = self.gps_map.selected_location.as_ref()?;
@@ -659,31 +586,6 @@ impl GuiApp {
     /// Toggle the direction of distance/bearing display
     pub(super) fn toggle_distance_direction(&mut self) {
         self.gps_map.direction_to_image = !self.gps_map.direction_to_image;
-    }
-
-    /// Update GPS markers for all currently loaded files
-    /// Uses gps_pos from FileMetadata directly (works in view mode where content_hash is zeroed)
-    pub(super) fn update_gps_markers(&mut self) {
-        // Collect file data first to avoid borrow conflicts
-        // Use gps_pos from FileMetadata if available (already loaded from cache or EXIF)
-        let files_data: Vec<(std::path::PathBuf, [u8; 32], Option<geo::Point<f64>>)> = self
-            .state
-            .groups
-            .iter()
-            .flat_map(|group| group.iter())
-            .map(|file| (file.path.clone(), file.content_hash, file.gps_pos))
-            .collect();
-
-        // Now we can mutably borrow self
-        for (path, content_hash, gps_pos) in files_data {
-            // Fast path: use gps_pos from FileMetadata if already populated
-            if let Some(pos) = gps_pos {
-                self.gps_map.add_marker(path, pos.y(), pos.x(), content_hash);
-            } else {
-                // Slow path: look up from database or read EXIF
-                let _ = self.get_gps_coords(&path, &content_hash);
-            }
-        }
     }
 
     // 1. Helper to build cache entry (does the stat() call ONCE)
@@ -751,113 +653,34 @@ impl GuiApp {
             self.raw_cache.clear();
             self.raw_loading.clear();
             self.exif_search_cache.clear();
-            self.gps_map.clear_markers(); // Clear GPS markers for new directory
+            self.gps_map.clear_markers();
             if let Ok(mut w) = self.active_window.write() {
                 w.clear();
             }
             self.last_preload_pos = None;
+            self.file_index.clear();
+            self.enrichment_rx = None;
 
-            // Immediately populate directories and files (synchronously)
-            // This ensures instant display without waiting for background scan
-            self.subdirs.clear();
-            let mut files = Vec::new();
+            // Background directory scanning with batch database lookups
+            let sort_order = self.view_mode_sort.clone().unwrap_or_else(|| "name".to_string());
+            let (batch_tx, batch_rx) = unbounded::<Vec<FileMetadata>>();
+            let (subdirs, count) =
+                scanner::spawn_background_dir_scan(canonical, sort_order, &self.ctx, batch_tx);
 
-            if let Ok(entries) = fs::read_dir(&canonical) {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    // Canonicalize each entry path to ensure absolute paths in FileMetadata
-                    if let Ok(entry_canonical) = entry_path.canonicalize() {
-                        if entry_canonical.is_dir() {
-                            self.subdirs.push(entry_canonical);
-                        } else if scanner::is_image_ext(&entry_canonical) {
-                            if let Ok(meta) = entry.metadata() {
-                                let size = meta.len();
-                                let modified =
-                                    meta.modified().unwrap_or(std::time::UNIX_EPOCH).into();
-                                if let Some(unique_file_id) =
-                                    crate::fileops::get_file_key(&entry_canonical)
-                                {
-                                    // Try to load cached resolution/orientation from database
-                                    let (resolution, orientation, gps_pos) =
-                                        self.ctx.lookup_cached_features(&meta, unique_file_id);
-                                    files.push(FileMetadata {
-                                        path: entry_canonical,
-                                        size,
-                                        modified,
-                                        pdqhash: None,
-                                        resolution,
-                                        content_hash: [0u8; 32],
-                                        pixel_hash: None,
-                                        orientation,
-                                        gps_pos,
-                                        unique_file_id,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            self.subdirs = subdirs;
+            self.dir_total_count = Some(count);
+            self.dir_scan_rx = Some(batch_rx);
 
-            // Sort files and directories according to the sort order
-            if let Some(ref sort_order) = self.view_mode_sort {
-                scanner::sort_files(&mut files, sort_order);
-            }
-            scanner::sort_directories(&mut self.subdirs, &self.state.group_by);
-
-            // Update state with the files we found
-            let has_files = !files.is_empty();
-            self.state.groups = if has_files { vec![files] } else { Vec::new() };
-            self.state.group_infos = if has_files {
-                vec![GroupInfo { max_dist: 0, status: GroupStatus::None }]
-            } else {
-                Vec::new()
-            };
+            // Set up empty initial state - files will stream in from background
+            self.state.groups = vec![Vec::new()];
+            self.state.group_infos = vec![GroupInfo { max_dist: 0, status: GroupStatus::None }];
             self.state.current_group_idx = 0;
             self.state.current_file_idx = 0;
-            self.state.last_file_count = self.state.groups.first().map_or(0, |g| g.len());
+            self.state.is_loading = count > 0;
 
-            // No background scan needed - we've already loaded everything synchronously
-            self.state.is_loading = false;
             self.scan_rx = None;
             self.scan_progress_rx = None;
             self.scan_progress = (0, 0);
-
-            // Start background enrichment for GPS data and content_hash computation
-            // Only enrich files where gps_pos is None (not loaded from cache)
-            let files_to_enrich: Vec<(std::path::PathBuf, u128)> = self
-                .state
-                .groups
-                .iter()
-                .flat_map(|g| g.iter())
-                .filter(|f| f.gps_pos.is_none())
-                .map(|f| (f.path.clone(), f.unique_file_id))
-                .collect();
-
-            if !files_to_enrich.is_empty() {
-                let (tx, rx) =
-                    unbounded::<(std::path::PathBuf, u128, [u8; 32], Option<Point<f64>>)>();
-                let content_key = self.ctx.content_key;
-
-                thread::spawn(move || {
-                    for (path, unique_file_id) in files_to_enrich {
-                        if let Ok(data) = std::fs::read(&path) {
-                            // Compute content_hash
-                            let mut hasher = blake3::Hasher::new_keyed(&content_key);
-                            hasher.update(&data);
-                            let content_hash = *hasher.finalize().as_bytes();
-
-                            // Read GPS from EXIF
-                            let gps_pos = scanner::read_exif_data(&path, Some(&data))
-                                .and_then(|exif| crate::helper_exif::extract_gps_lat_lon(&exif))
-                                .map(|(lat, lon)| Point::new(lon, lat));
-
-                            let _ = tx.send((path, unique_file_id, content_hash, gps_pos));
-                        }
-                    }
-                });
-                self.hash_rx = Some(rx);
-            }
 
             // Refresh directory cache for display
             self.refresh_dir_cache(false);
@@ -943,6 +766,11 @@ impl GuiApp {
                 if let Some(sort_order) = &self.view_mode_sort {
                     crate::scanner::sort_files(&mut new_files, sort_order);
                 }
+
+                // Rebuild file_index for O(1) lookup
+                self.file_index =
+                    new_files.iter().enumerate().map(|(idx, f)| (f.unique_file_id, idx)).collect();
+
                 self.state.groups = vec![new_files];
                 self.state.group_infos = vec![GroupInfo { max_dist: 0, status: GroupStatus::None }];
                 self.state.last_file_count = self.state.groups.first().map_or(0, |g| g.len());
@@ -1652,7 +1480,6 @@ impl eframe::App for GuiApp {
 
         // Receive finished raw images from worker thread pool
         // Use try_recv() which returns Err on empty OR disconnected channel
-        // This prevents panic loops if the worker thread pool terminates
         loop {
             match self.image_preload_rx.try_recv() {
                 Ok((path, maybe_result)) => {
@@ -1675,12 +1502,10 @@ impl eframe::App for GuiApp {
                     ctx.request_repaint();
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
-                    // No more messages available right now, exit loop
                     break;
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     // Channel disconnected (worker threads terminated)
-                    // Log warning and exit loop to prevent panic
                     eprintln!(
                         "[WARN] Image preload channel disconnected - worker threads may have terminated"
                     );
@@ -1689,63 +1514,89 @@ impl eframe::App for GuiApp {
             }
         }
 
-        // Process background enrichment results (view mode)
-        // This updates FileMetadata with computed content_hash and GPS coordinates
-        // and writes to database for caching
-        if let Some(ref rx) = self.hash_rx {
+        // Vide mode: Process background directory scan results
+        if let Some(ref rx) = self.dir_scan_rx {
+            let mut received_any = false;
             loop {
                 match rx.try_recv() {
-                    Ok((path, unique_file_id, content_hash, gps_pos)) => {
-                        // Get file metadata for resolution/orientation
-                        let mut resolution = None;
-                        let mut orientation = 1u8;
+                    Ok(batch) => {
+                        received_any = true;
+                        if let Some(group) = self.state.groups.first_mut() {
+                            let start_idx = group.len();
+                            group.extend(batch);
 
-                        // Update FileMetadata
-                        for group in &mut self.state.groups {
-                            for file in group.iter_mut() {
-                                if file.path == path && file.unique_file_id == unique_file_id {
-                                    file.content_hash = content_hash;
-                                    if gps_pos.is_some() {
-                                        file.gps_pos = gps_pos;
-                                    }
-                                    resolution = file.resolution;
-                                    orientation = file.orientation;
-                                    break;
-                                }
+                            // Update file_index for new files
+                            for (i, file) in group[start_idx..].iter().enumerate() {
+                                self.file_index.insert(file.unique_file_id, start_idx + i);
                             }
                         }
+                        self.cache_dirty = true;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        // Scan complete - start enrichment for files missing GPS
+                        self.state.is_loading = false;
+                        self.state.last_file_count =
+                            self.state.groups.first().map_or(0, |g| g.len());
 
-                        // Add GPS marker if we found coordinates
-                        if let Some(pos) = gps_pos {
-                            self.gps_map.add_marker(path.clone(), pos.y(), pos.x(), content_hash);
-                        }
+                        // Collect files needing enrichment
+                        if let Some(group) = self.state.groups.first() {
+                            let files_to_enrich: Vec<_> = group
+                                .iter()
+                                .filter(|f| f.gps_pos.is_none())
+                                .map(|f| {
+                                    (f.path.clone(), f.unique_file_id, f.resolution, f.orientation)
+                                })
+                                .collect();
 
-                        // Write to database cache
-                        if let Some(ref tx) = self.db_tx {
-                            // Compute meta_key for this file
-                            if let Ok(metadata) = std::fs::metadata(&path) {
-                                let meta_key = crate::db::compute_meta_key_from_metadata(
-                                    &self.ctx.meta_key,
-                                    &metadata,
-                                    unique_file_id,
+                            if !files_to_enrich.is_empty() {
+                                let (result_tx, result_rx) = unbounded::<EnrichmentResult>();
+                                scanner::spawn_background_enrichment(
+                                    files_to_enrich,
+                                    self.ctx.content_key,
+                                    self.ctx.meta_key,
+                                    self.db_tx.clone(),
+                                    result_tx,
                                 );
+                                self.enrichment_rx = Some(result_rx);
+                            }
+                        }
+                        self.dir_scan_rx = None;
+                        break;
+                    }
+                }
+            }
+            if received_any {
+                ctx.request_repaint();
+            }
+        }
 
-                                // Create CachedFeatures (without coefficients - stored separately)
-                                let features = crate::db::CachedFeatures {
-                                    width: resolution.map(|(w, _)| w).unwrap_or(0),
-                                    height: resolution.map(|(_, h)| h).unwrap_or(0),
-                                    orientation,
-                                    gps_pos,
-                                };
+        // Process background enrichment results (view mode)
+        // This updates FileMetadata with computed content_hash and GPS coordinates
+        // Database writing is handled by scanner::spawn_background_enrichment
+        if let Some(ref rx) = self.enrichment_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        // O(1) lookup using file_index
+                        if let Some(&file_idx) = self.file_index.get(&result.unique_file_id) {
+                            if let Some(group) = self.state.groups.first_mut() {
+                                if let Some(file) = group.get_mut(file_idx) {
+                                    file.content_hash = result.content_hash;
+                                    if result.gps_pos.is_some() {
+                                        file.gps_pos = result.gps_pos;
+                                    }
 
-                                // Send database update: (meta, hash, features, coefficients, pixel)
-                                let _ = tx.send((
-                                    Some((meta_key, content_hash)), // meta_key -> content_hash
-                                    None,                           // No PDQ hash in view mode
-                                    Some((content_hash, features)), // content_hash -> features
-                                    None,                           // No coefficients in view mode
-                                    None,                           // No pixel hash
-                                ));
+                                    // Add GPS marker if we found coordinates
+                                    if let Some(pos) = result.gps_pos {
+                                        self.gps_map.add_marker(
+                                            file.path.clone(),
+                                            pos.y(),
+                                            pos.x(),
+                                            result.content_hash,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1784,7 +1635,6 @@ impl eframe::App for GuiApp {
             *self.group_views.get(&current_group_idx).unwrap_or(&GroupViewState::default());
 
         if !self.state.is_fullscreen {
-            // Restore Detailed Status Bar
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                 if let Some((msg, is_error)) = &self.state.status_message {
                     ui.colored_label(
@@ -1911,8 +1761,7 @@ impl eframe::App for GuiApp {
             });
 
             // Restore Detailed File List
-            // Get actual window width - try viewport rect first, fall back to used_rect
-            // Note: window_width is in logical points (not physical pixels)
+            // Get actual window width in logical points - try viewport rect first, fall back to used_rect
             let window_width = ctx
                 .input(|i| i.viewport().inner_rect.or(i.viewport().outer_rect).map(|r| r.width()))
                 .unwrap_or_else(|| ctx.used_rect().width());
@@ -1921,8 +1770,7 @@ impl eframe::App for GuiApp {
             // Delay panel width restoration until after font_scale is applied
             let ppp = ctx.pixels_per_point();
 
-            // Ensure window is actually ready (width > 100) before applying the saved width.
-            // This prevents clamping to 0.0 on the first frame if viewport isn't ready.
+            // Check for >100 to prevent clamping to 0.0 on the first frame if viewport isn't ready.
             let window_ready = window_width > 100.0;
             let should_apply_saved_width = !self.initial_panel_width_applied && window_ready;
 
@@ -2116,7 +1964,6 @@ impl eframe::App for GuiApp {
                                     main_galley,
                                     egui::Color32::LIGHT_BLUE,
                                 );
-                                // Draw ellipsis in grey
                                 let ellipsis_x = rect.left()
                                     + 4.0
                                     + prefix_galley.rect.width()
@@ -2509,7 +2356,6 @@ impl eframe::App for GuiApp {
                                             ui.spacing_mut().item_spacing.x = 0.0;
                                             ui.label(marker_rich);
                                             if was_truncated && display_filename.ends_with('…') {
-                                                // Render filename without ellipsis, then ellipsis in grey
                                                 let main_part: String = display_filename
                                                     .chars()
                                                     .take(display_filename.chars().count() - 1)
@@ -2552,14 +2398,12 @@ impl eframe::App for GuiApp {
                                 );
 
                                 // 3. Create Interactions
-                                // We create an invisible interaction layer over the header_rect
                                 let header_resp = ui.interact(
                                     header_rect,
                                     ui.id().with("hdr").with(g_idx).with(f_idx),
                                     egui::Sense::click(),
                                 );
 
-                                // We create interaction for meta_rect
                                 let meta_resp = ui.interact(
                                     meta_rect,
                                     ui.id().with("meta").with(g_idx).with(f_idx),
@@ -2742,7 +2586,6 @@ impl eframe::App for GuiApp {
                 });
             });
             // In Duplicate Mode, groups are empty during the scan.
-            // We must NOT save the width of the "No duplicates found" label (~160px).
             let has_content = !self.state.groups.is_empty();
 
             if window_width > 400.0 && has_content {
@@ -2918,8 +2761,12 @@ impl eframe::App for GuiApp {
 
         // Track window size for saving on exit
         // Use viewport inner_rect or outer_rect for the full window size
-        // available_rect excludes panels so it's not what we want
         let ppp = ctx.pixels_per_point();
+
+        // Check if window is maximized or fullscreen (don't save size in these states)
+        let is_maximized = ctx.input(|i| {
+            i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)
+        });
 
         // Try to get the actual window size from viewport
         let viewport_size = ctx.input(|i| {
@@ -2929,19 +2776,10 @@ impl eframe::App for GuiApp {
                 .map(|r| ((r.width() * ppp) as u32, (r.height() * ppp) as u32))
         });
 
-        // Debug every 60 frames
-        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
-        static FRAME: AtomicU32 = AtomicU32::new(0);
-        let f = FRAME.fetch_add(1, AtomicOrdering::Relaxed);
-
         if let Some(size) = viewport_size {
-            // Detect if window was maximized by comparing to full screen size
-            // Your screen is 3840x2160, so if size is close to that, window was maximized
-            let is_maximized = size.0 >= 3800 || size.1 >= 2100;
-
             // Only save if:
             // - font_scale has been applied (ppp > 1)
-            // - window is not maximized (we want to preserve the user's chosen size)
+            // - window is not maximized/fullscreen (we want to preserve the user's chosen size)
             // - size is reasonable
             if size.0 > 100 && size.1 > 100 && ppp > 1.0 && !is_maximized {
                 self.last_window_size = Some(size);
@@ -2950,16 +2788,6 @@ impl eframe::App for GuiApp {
             // Fallback: use ctx.used_rect() which should include everything drawn
             let used = ctx.used_rect();
             let size = ((used.width() * ppp) as u32, (used.height() * ppp) as u32);
-            let is_maximized = size.0 >= 3800 || size.1 >= 2100;
-
-            if false {
-                if f.is_multiple_of(60) {
-                    eprintln!(
-                        "[DEBUG-WINSIZE] used_rect={:?}, ppp={}, size_physical={:?}, is_maximized={}",
-                        used, ppp, size, is_maximized
-                    );
-                }
-            }
 
             if size.0 > 100 && size.1 > 100 && ppp > 1.0 && !is_maximized {
                 self.last_window_size = Some(size);

@@ -373,9 +373,6 @@ pub(super) fn handle_input(
         {
             app.gps_map.toggle();
             if app.gps_map.visible {
-                // Update GPS markers when map becomes visible
-                app.update_gps_markers();
-
                 // Auto-select first location from config if none selected
                 if app.gps_map.selected_location.is_none() {
                     // AppContext.locations is HashMap<String, Point<f64>>
@@ -386,19 +383,20 @@ pub(super) fn handle_input(
 
                 // Set initial center on current image if it has GPS
                 // Use gps_pos from FileMetadata directly if available (works in view mode)
-                // Clone data first to avoid borrow conflicts with get_gps_coords
                 let current_file_data = app
                     .state
                     .groups
                     .get(app.state.current_group_idx)
                     .and_then(|g| g.get(app.state.current_file_idx))
-                    .map(|f| (f.path.clone(), f.content_hash, f.gps_pos));
+                    .map(|f| (f.path.clone(), f.content_hash, f.gps_pos, f.unique_file_id));
 
-                if let Some((path, content_hash, gps_pos)) = current_file_data {
+                if let Some((path, content_hash, gps_pos, unique_file_id)) = current_file_data {
                     if let Some(pos) = gps_pos {
                         // Fast path: use cached gps_pos
                         app.gps_map.set_initial_center(pos.y(), pos.x());
-                    } else if let Some((lat, lon)) = app.get_gps_coords(&path, &content_hash) {
+                    } else if let Some((lat, lon)) =
+                        app.get_gps_coords(&path, &content_hash, Some(unique_file_id))
+                    {
                         // Slow path: lookup from database or EXIF
                         app.gps_map.set_initial_center(lat, lon);
                     } else if let Some(first_marker) = app.gps_map.markers.first() {

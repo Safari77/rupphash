@@ -183,6 +183,15 @@ impl CachedCoefficients {
     }
 }
 
+/// Result of background enrichment for a file.
+/// This struct is designed to be extensible - add new fields as needed.
+#[derive(Debug, Clone)]
+pub struct EnrichmentResult {
+    pub unique_file_id: u128,
+    pub content_hash: [u8; 32],
+    pub gps_pos: Option<Point<f64>>,
+}
+
 pub struct AppContext {
     pub env: Arc<Environment>,
     pub hash_db: Database,
@@ -249,6 +258,36 @@ pub fn compute_meta_key_from_metadata(
     let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
     let size = metadata.len();
     compute_meta_key(meta_key_secret, mtime_ns, size, unique_file_id)
+}
+
+/// Create a DbUpdate for caching enrichment results (view mode).
+/// This is the canonical way to create database updates for enriched files.
+pub fn create_feature_update(
+    meta_key_secret: &[u8; 32],
+    path: &std::path::Path,
+    unique_file_id: u128,
+    content_hash: [u8; 32],
+    resolution: Option<(u32, u32)>,
+    orientation: u8,
+    gps_pos: Option<Point<f64>>,
+) -> Option<DbUpdate> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let meta_key = compute_meta_key_from_metadata(meta_key_secret, &metadata, unique_file_id);
+
+    let features = CachedFeatures {
+        width: resolution.map(|(w, _)| w).unwrap_or(0),
+        height: resolution.map(|(_, h)| h).unwrap_or(0),
+        orientation,
+        gps_pos,
+    };
+
+    Some((
+        Some((meta_key, content_hash)), // meta_key -> content_hash
+        None,                           // No PDQ hash in view mode
+        Some((content_hash, features)), // content_hash -> features
+        None,                           // No coefficients in view mode
+        None,                           // No pixel hash
+    ))
 }
 
 impl AppContext {
@@ -671,6 +710,64 @@ impl AppContext {
         eprintln!("[DEBUG-CACHE]   Not found in database");
         // Not cached
         (None, 1, None)
+    }
+
+    /// Batch lookup of cached features for multiple files in a single transaction.
+    ///
+    /// Returns a HashMap mapping unique_file_id to (resolution, orientation, gps_pos).
+    /// Files not found in cache are not included in the result.
+    pub fn lookup_cached_features_batch(
+        &self,
+        files: &[(u128, u64, u64)], // (unique_file_id, size, mtime_ns)
+    ) -> HashMap<u128, (Option<(u32, u32)>, u8, Option<Point<f64>>)> {
+        let mut results = HashMap::with_capacity(files.len());
+
+        // Use a single read transaction for all lookups
+        let Ok(txn) = self.env.begin_ro_txn() else {
+            return results;
+        };
+
+        for &(unique_file_id, size, mtime_ns) in files {
+            let meta_key = compute_meta_key(&self.meta_key, mtime_ns, size, unique_file_id);
+
+            // Look up content_hash from meta_key
+            if let Ok(encrypted) = txn.get(self.meta_db, &meta_key) {
+                if let Some(decrypted) = self.decrypt_value(&meta_key, encrypted) {
+                    if decrypted.len() == 40 {
+                        let mut content_hash = [0u8; 32];
+                        content_hash.copy_from_slice(&decrypted[0..32]);
+
+                        // Skip zeroed-out hash placeholder
+                        if content_hash == [0u8; 32] {
+                            continue;
+                        }
+
+                        // Look up features from content_hash
+                        if let Ok(encrypted_features) = txn.get(self.feature_db, &content_hash) {
+                            if let Some(decrypted_features) =
+                                self.decrypt_value(&content_hash, encrypted_features)
+                            {
+                                if let Ok(features) =
+                                    CachedFeatures::from_bytes(&decrypted_features)
+                                {
+                                    let resolution = if features.width > 0 && features.height > 0 {
+                                        Some((features.width, features.height))
+                                    } else {
+                                        None
+                                    };
+                                    results.insert(
+                                        unique_file_id,
+                                        (resolution, features.orientation, features.gps_pos),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        results
     }
 
     /// Prune entries older than `max_age_seconds`.
