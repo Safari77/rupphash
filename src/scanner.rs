@@ -17,7 +17,9 @@ use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 use zune_jpeg::JpegDecoder as ZuneDecoder;
 
-use crate::db::{AppContext, HashValue, compute_meta_key};
+use crate::db::{
+    AppContext, DbUpdate, EnrichmentResult, HashValue, compute_meta_key, create_feature_update,
+};
 use crate::fileops;
 use crate::fileops::get_file_key;
 use crate::hamminghash::{HammingHash, MIHIndex, SparseBitSet};
@@ -1397,7 +1399,7 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
             files.reverse();
         }
         "name-natural" => {
-            // OPTIMIZATION: Use wrapper struct to cache string AND use natural compare
+            // Use wrapper struct to cache string AND use natural compare
             files.sort_by_cached_key(|f| {
                 NaturalSortKey(
                     f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
@@ -1727,6 +1729,171 @@ pub fn scan_for_view(
 
     let info = GroupInfo { max_dist: 0, status: GroupStatus::None };
     (vec![all_files], vec![info], subdirs)
+}
+
+/// Spawn a background thread to enrich files with content_hash and GPS data.
+/// This function handles:
+/// - Computing blake3 content_hash (parallel with rayon)
+/// - Reading GPS coordinates from EXIF
+/// - Writing results to database via db_tx channel
+/// - Sending EnrichmentResult back to GUI via result_tx channel
+///
+/// The GUI can then use unique_file_id for O(1) lookup to update FileMetadata.
+pub fn spawn_background_enrichment(
+    files_to_enrich: Vec<(std::path::PathBuf, u128, Option<(u32, u32)>, u8)>, // (path, unique_file_id, resolution, orientation)
+    content_key: [u8; 32],
+    meta_key_secret: [u8; 32],
+    db_tx: Option<Sender<DbUpdate>>,
+    result_tx: Sender<EnrichmentResult>,
+) {
+    if files_to_enrich.is_empty() {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        // Process files in parallel using rayon
+        files_to_enrich.par_iter().for_each(|(path, unique_file_id, resolution, orientation)| {
+            if let Ok(data) = std::fs::read(path) {
+                // Compute content_hash
+                let mut hasher = blake3::Hasher::new_keyed(&content_key);
+                hasher.update(&data);
+                let content_hash = *hasher.finalize().as_bytes();
+
+                // Read GPS from EXIF
+                let gps_pos = read_exif_data(path, Some(&data))
+                    .and_then(|exif| extract_gps_lat_lon(&exif))
+                    .map(|(lat, lon)| Point::new(lon, lat));
+
+                // Write to database if channel is available
+                if let Some(ref tx) = db_tx {
+                    if let Some(update) = create_feature_update(
+                        &meta_key_secret,
+                        path,
+                        *unique_file_id,
+                        content_hash,
+                        *resolution,
+                        *orientation,
+                        gps_pos,
+                    ) {
+                        let _ = tx.send(update);
+                    }
+                }
+
+                // Send result back to GUI
+                let _ = result_tx.send(EnrichmentResult {
+                    unique_file_id: *unique_file_id,
+                    content_hash,
+                    gps_pos,
+                });
+            }
+        });
+    });
+}
+
+/// Lightweight file entry for initial fast directory scan
+#[derive(Clone)]
+pub struct DirEntry {
+    pub path: std::path::PathBuf,
+    pub size: u64,
+    pub modified: DateTime<Utc>,
+    pub unique_file_id: u128,
+}
+
+/// Spawn background directory scanning with batch database lookups.
+/// This function:
+/// 1. Quickly collects directory entries (paths only) - returns immediately via count_tx
+/// 2. Performs batch database lookup for cached features
+/// 3. Streams FileMetadata results in batches to the GUI
+///
+/// Returns (subdirs, file_count) synchronously for immediate UI setup.
+pub fn spawn_background_dir_scan(
+    dir: std::path::PathBuf,
+    sort_order: String,
+    ctx: &crate::db::AppContext,
+    batch_tx: Sender<Vec<FileMetadata>>,
+) -> (Vec<std::path::PathBuf>, usize) {
+    let mut subdirs = Vec::new();
+    let mut entries: Vec<DirEntry> = Vec::new();
+
+    // Phase 1: Fast directory enumeration (synchronous, no I/O beyond readdir)
+    if let Ok(dir_entries) = fs::read_dir(&dir) {
+        for entry in dir_entries.flatten() {
+            let entry_path = entry.path();
+            if let Ok(canonical) = entry_path.canonicalize() {
+                if canonical.is_dir() {
+                    subdirs.push(canonical);
+                } else if is_image_ext(&canonical) {
+                    if let Ok(meta) = entry.metadata() {
+                        if let Some(unique_file_id) = get_file_key(&canonical) {
+                            entries.push(DirEntry {
+                                path: canonical,
+                                size: meta.len(),
+                                modified: meta.modified().unwrap_or(UNIX_EPOCH).into(),
+                                unique_file_id,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    sort_directories(&mut subdirs, &sort_order);
+    let file_count = entries.len();
+
+    if entries.is_empty() {
+        return (subdirs, 0);
+    }
+
+    // Prepare batch lookup data
+    let lookup_data: Vec<(u128, u64, u64)> = entries
+        .iter()
+        .map(|e| {
+            let mtime_ns = e.modified.timestamp_nanos_opt().unwrap_or(0) as u64;
+            (e.unique_file_id, e.size, mtime_ns)
+        })
+        .collect();
+
+    // Batch database lookup (single transaction)
+    let cached = ctx.lookup_cached_features_batch(&lookup_data);
+
+    // Phase 2: Background processing with batch results
+    let sort_order_clone = sort_order.clone();
+    std::thread::spawn(move || {
+        const BATCH_SIZE: usize = 500;
+
+        // Convert entries to FileMetadata using cached data
+        let mut files: Vec<FileMetadata> = entries
+            .into_iter()
+            .map(|e| {
+                let (resolution, orientation, gps_pos) =
+                    cached.get(&e.unique_file_id).cloned().unwrap_or((None, 1, None));
+
+                FileMetadata {
+                    path: e.path,
+                    size: e.size,
+                    modified: e.modified,
+                    pdqhash: None,
+                    resolution,
+                    content_hash: [0u8; 32],
+                    pixel_hash: None,
+                    orientation,
+                    gps_pos,
+                    unique_file_id: e.unique_file_id,
+                }
+            })
+            .collect();
+
+        // Sort all files
+        sort_files(&mut files, &sort_order_clone);
+
+        // Stream in batches
+        for chunk in files.chunks(BATCH_SIZE) {
+            let _ = batch_tx.send(chunk.to_vec());
+        }
+    });
+
+    (subdirs, file_count)
 }
 
 #[cfg(test)]

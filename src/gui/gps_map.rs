@@ -41,7 +41,6 @@ pub struct GpsMarker {
     pub path: PathBuf,
     pub lat: f64,
     pub lon: f64,
-    pub content_hash: [u8; 32],
     /// Sun azimuth in degrees (0=North, 90=East, 180=South, 270=West), None if not calculated
     pub sun_azimuth: Option<f64>,
     /// Sun elevation in degrees (negative = below horizon)
@@ -72,12 +71,8 @@ pub struct GpsMapState {
     pub provider_name: String,
     /// Provider URL pattern
     pub provider_url: String,
-    /// Tile cache path
-    pub cache_path: PathBuf,
     /// Selected location from config (for distance calculation)
     pub selected_location: Option<(String, Point<f64>)>,
-    /// Clicked marker index
-    pub clicked_marker_idx: Option<usize>,
     /// Initial center position (used when map first opens)
     pub initial_center: Option<Position>,
     /// Direction toggle: false = "image to location", true = "location to image"
@@ -97,9 +92,7 @@ impl Default for GpsMapState {
             tiles: None,
             provider_name: "OpenStreetMap".to_string(),
             provider_url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png".to_string(),
-            cache_path: PathBuf::new(),
             selected_location: None,
-            clicked_marker_idx: None,
             initial_center: None,
             direction_to_image: false,
             tile_error: None,
@@ -108,8 +101,8 @@ impl Default for GpsMapState {
 }
 
 impl GpsMapState {
-    pub fn new(cache_path: PathBuf, provider_name: String, provider_url: String) -> Self {
-        Self { cache_path, provider_name, provider_url, ..Default::default() }
+    pub fn new(_cache_path: PathBuf, provider_name: String, provider_url: String) -> Self {
+        Self { provider_name, provider_url, ..Default::default() }
     }
 
     /// Toggle map visibility
@@ -118,13 +111,7 @@ impl GpsMapState {
     }
 
     /// Add a GPS marker, returns true if this is a new marker
-    pub fn add_marker(
-        &mut self,
-        path: PathBuf,
-        lat: f64,
-        lon: f64,
-        content_hash: [u8; 32],
-    ) -> bool {
+    pub fn add_marker(&mut self, path: PathBuf, lat: f64, lon: f64) -> bool {
         // Check uniqueness by path
         if self.path_to_marker.contains_key(&path) {
             return false;
@@ -135,7 +122,6 @@ impl GpsMapState {
             path: path.clone(),
             lat,
             lon,
-            content_hash,
             sun_azimuth: None,
             sun_elevation: None,
         });
@@ -151,11 +137,6 @@ impl GpsMapState {
                 marker.sun_azimuth = Some(azimuth);
             }
         }
-    }
-
-    /// Get marker by content_hash for highlighting
-    pub fn get_marker_by_hash(&self, content_hash: &[u8; 32]) -> Option<&GpsMarker> {
-        self.markers.iter().find(|m| m.content_hash == *content_hash)
     }
 
     /// Helper to check if we already have a marker for this path
