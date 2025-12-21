@@ -63,6 +63,7 @@ font-loader = "0.11"
 wgpu = "27"
 delaunator = "1.0.2"
 walkers = "0.50"
+zeroize = "1.8.2"
 
 [profile.release]
 opt-level = 3

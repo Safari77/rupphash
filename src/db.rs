@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, path::PathBuf};
+use zeroize::Zeroize;
 
 const CONFIG_FILE_NAME: &str = "phdupes.conf";
 const DB_FILE_NAME_PDQHASH: &str = "phdupes_pdqhash";
@@ -353,7 +354,7 @@ impl AppContext {
         };
 
         // Validate and decode master_key - regenerate if invalid
-        let master_key_bytes = match Self::decode_master_key(&config.master_key) {
+        let mut master_key_bytes = match Self::decode_master_key(&config.master_key) {
             Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!("[DEBUG-DB] Invalid master_key: {}. Generating new key.", e);
@@ -381,6 +382,7 @@ impl AppContext {
 
         // 3. Encryption Key: For ChaCha20Poly1305 database encryption
         let encryption_key = blake3::derive_key("phdupes:encryption_key", &master_key_bytes);
+        master_key_bytes.zeroize();
 
         // Initialize the cipher
         let cipher = XChaCha20Poly1305::new(&encryption_key.into());
