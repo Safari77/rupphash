@@ -58,6 +58,30 @@ Fetch what you need:
 `git lfs pull --include="assets/fonts"`
 (This is a placeholder notice, I am not currently using LFS.)
 
+## Windows
+If you want to use the GNU Toolchain (MinGW):
+
+Install MSYS2: https://www.msys2.org/
+Open "MSYS2 UCRT64" terminal (should be now in Start Menu)
+*Note*: SHIFT-INSERT is paste operation by default
+Run `pacman -S mingw-w64-x86_64-toolchain` (needs about 900 MiB)
+`ls /c/msys64/mingw64/bin/dlltool.exe` show show the execuble.
+Add `C:\msys64\mingw64\bin` into system Path environment.
+
+Then back to rupphash directory!
+```bash
+rustup target add x86_64-pc-windows-gnu
+cargo build --target x86_64-pc-windows-gnu
+```
+
+You might need to disable HEIF and/or rsraw manually, or you could use MSVC target.
+
+*Note*:
+MSVC Target: uses the linker built into Visual Studio (link.exe).
+
+GNU Target: Uses the GNU linker (ld.exe) and tools (dlltool.exe).
+Rust does not bundle these; it expects you to provide them.
+
 ## Screenshot - View mode
 ![Screenshot view](phdupes-view.webp)
 
