@@ -6,6 +6,7 @@ use clap::Parser;
 use geo::Point;
 use jiff::Timestamp;
 use libheif_rs::integration::image::register_all_decoding_hooks;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -17,6 +18,15 @@ use jemallocator::Jemalloc;
 #[cfg(not(target_os = "windows"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
+
+// Define the structure to match what we serialized in build.rs
+#[derive(Debug, Deserialize)]
+struct DepInfo {
+    name: String,
+    version: String,
+    checksum: Option<String>,
+    source: Option<String>,
+}
 
 mod db;
 mod fileops;
@@ -132,6 +142,7 @@ pub fn analyze_group(
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Finds visually similar images.", long_about = None)]
 struct Cli {
+    #[arg(required_unless_present = "show_build_info")]
     #[arg(required_unless_present = "show_exif_tags")]
     #[arg(required_unless_present = "prune")]
     paths: Vec<String>,
@@ -193,6 +204,10 @@ struct Cli {
     /// Prune database entries older than SECONDS (removes stale cache)
     #[arg(long, value_name = "SECONDS")]
     prune: Option<u64>,
+
+    /// Show build info from Cargo.lock at time of building
+    #[arg(long)]
+    show_build_info: bool,
 }
 
 impl Cli {
@@ -408,6 +423,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "exif_tags = [\"Make\", \"Model\", \"LensModel\", \"ExposureTime\", \"FNumber\", \"ISO\"]"
         );
+        return Ok(());
+    }
+
+    if args.show_build_info {
+        println!("Built from Git commit: {}\n", env!("APP_GIT_HASH"));
+        const DEP_INFO_RAW: &str = include_str!(env!("DEPS_INFO_PATH"));
+        let deps: Vec<DepInfo> = serde_json::from_str(DEP_INFO_RAW).unwrap();
+
+        println!("Found {} dependencies.", deps.len());
+        for dep in deps {
+            println!("- {} v{}", dep.name, dep.version);
+            if let Some(sum) = dep.checksum {
+                println!("    Checksum: {}", sum);
+            }
+            if let Some(src) = dep.source {
+                println!("    Source:   {}", src);
+            }
+        }
         return Ok(());
     }
 

@@ -47,6 +47,7 @@ rsraw = { git = "https://github.com/Safari77/rsraw", branch = "process_flags" }
 rustc-hash = "2.1.1"
 rustdct = "0.7"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 solar-positioning = "0.4"
 toml = "0.9"
 transpose = "0.2"
@@ -71,6 +72,11 @@ walkers = "0.50"
 opt-level = 3
 debug = true
 lto = false
+
+[build-dependencies]
+cargo-lock = "11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [[bin]]
 name = "phdupes"
