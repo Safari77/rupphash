@@ -29,6 +29,8 @@ image-extras = { git = "https://github.com/image-rs/image-extras", branch = "mai
 image = { version = "0.25", features = ["avif-native"] }
 jiff = { version = "0.2", features = ["serde"] }
 jpeg-decoder = "0.3.2"
+jpeg2k = { version = "0.10", features = ["image"] }
+jxl-oxide = { version = "0.12", features = ["moxcms", "image" ] }
 kamadak-exif = "0.6.1"
 libc = "0.2"
 libheif-rs = { version = "2.5", features = ["image"] }
@@ -53,6 +55,7 @@ tzf-rs = "1.1"
 unicode-width = "0.2"
 walkdir = "2.5.0"
 zerocopy = "0.8.31"
+zeroize = "1.8.2"
 zune-jpeg = "0.4"
 
 # GUI
@@ -63,7 +66,6 @@ font-loader = "0.11"
 wgpu = "27"
 delaunator = "1.0.2"
 walkers = "0.50"
-zeroize = "1.8.2"
 
 [profile.release]
 opt-level = 3

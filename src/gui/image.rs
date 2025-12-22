@@ -3,10 +3,12 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
 use fast_image_resize::images::Image as FastImage;
 use fast_image_resize::{PixelType, ResizeOptions, Resizer};
+use image::GenericImageView;
+use image::{DynamicImage, ImageBuffer, Rgb};
 use std::collections::HashSet;
 use std::f32::consts::PI;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -30,43 +32,53 @@ pub(super) struct GroupViewState {
     pub(super) pan_center: egui::Pos2,
 }
 
+pub enum ImageLoadResult {
+    Loaded(egui::ColorImage, (u32, u32), u8, [u8; 32]), // image, resolution, orientation, content_hash
+    Failed(String),                                     // Failure with error message
+}
+
 impl Default for GroupViewState {
     fn default() -> Self {
         Self { mode: ViewMode::FitWindow, pan_center: egui::Pos2::new(0.5, 0.5) }
     }
 }
 
+fn is_scanner_only_format(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
+        Some(ref ext) if matches!(ext.as_str(), "jp2" | "j2k" | "jxl")
+    )
+}
+
 pub(super) fn spawn_image_loader_pool(
-    active_window: Arc<RwLock<HashSet<std::path::PathBuf>>>,
     use_thumbnails: bool,
-) -> (
-    Sender<std::path::PathBuf>,
-    Receiver<(std::path::PathBuf, Option<(egui::ColorImage, (u32, u32), u8)>)>,
-) {
-    let (tx, rx) = unbounded::<std::path::PathBuf>();
-    let (result_tx, result_rx) = unbounded();
+    content_key: [u8; 32],
+) -> (Sender<PathBuf>, Receiver<(PathBuf, ImageLoadResult)>) {
+    let (tx, rx) = unbounded::<PathBuf>();
+    let (result_tx, result_rx): (
+        Sender<(PathBuf, ImageLoadResult)>,
+        Receiver<(PathBuf, ImageLoadResult)>,
+    ) = unbounded();
 
     let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
 
     for _ in 0..num_threads {
         let rx_clone = rx.clone();
         let tx_clone = result_tx.clone();
-        let window_clone = active_window.clone();
+        let content_key = content_key; // Copy for each thread
 
         thread::spawn(move || {
             while let Ok(path) = rx_clone.recv() {
-                // 1. Skip if no longer in active window
-                {
-                    if let Ok(window) = window_clone.read()
-                        && !window.contains(&path)
-                    {
-                        let _ = tx_clone.send((path, None));
-                        continue;
-                    }
-                }
-
-                // 2. Load & Process (Resize + Orientation)
-                let result = load_and_process_image(&path, use_thumbnails);
+                // Load & Process (Resize + Orientation)
+                // Note: We removed the "active window" check here because it caused race conditions
+                // where images would fail to load. The cache eviction handles cleanup instead.
+                let result =
+                    match load_and_process_image_with_hash(&path, use_thumbnails, &content_key) {
+                        Ok((img, dims, orientation, content_hash)) => {
+                            ImageLoadResult::Loaded(img, dims, orientation, content_hash)
+                        }
+                        Err(err_msg) => ImageLoadResult::Failed(err_msg),
+                    };
                 let _ = tx_clone.send((path, result));
             }
         });
@@ -75,90 +87,52 @@ pub(super) fn spawn_image_loader_pool(
     (tx, result_rx)
 }
 
-fn load_and_process_image(
-    path: &std::path::Path,
+fn dynamic_image_to_egui(img: image::DynamicImage) -> egui::ColorImage {
+    let rgba = img.to_rgba8();
+    let width = rgba.width() as usize;
+    let height = rgba.height() as usize;
+
+    let pixels = rgba
+        .into_raw()
+        .chunks_exact(4)
+        .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+        .collect();
+
+    egui::ColorImage {
+        size: [width, height],
+        pixels,
+        source_size: egui::vec2(width as f32, height as f32),
+    }
+}
+
+fn load_and_process_image_with_hash(
+    path: &Path,
     use_thumbnails: bool,
-) -> Option<(egui::ColorImage, (u32, u32), u8)> {
-    let (mut color_image, real_dims, orientation) = if is_raw_ext(path) {
-        // A. RAW FILES
-        // We must read bytes first to safely get orientation from them
-        if let Ok(data) = fs::read(path) {
-            let exif_orientation = crate::scanner::get_orientation(path, Some(&data));
-            if let Ok(mut raw) = rsraw::RawImage::open(&data) {
-                let dims = (raw.width() as u32, raw.height() as u32);
-                // 1. Attempt to get a thumbnail first
-                let maybe_thumb =
-                    if use_thumbnails { extract_best_thumbnail(&mut raw) } else { None };
+    content_key: &[u8; 32],
+) -> Result<(egui::ColorImage, (u32, u32), u8, [u8; 32]), String> {
+    // Read file once for both hashing and image processing
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
 
-                // 2. Decide: Use Thumbnail OR Fallback to Full Decode
-                if let Some(thumb) = maybe_thumb {
-                    // SUCCESS (Thumbnail): Return tuple to 'let', falling through to resize
-                    (thumb, dims, exif_orientation)
-                } else {
-                    // FALLBACK: Full Decode
-                    raw.set_use_camera_wb(true);
-                    if raw.unpack().is_ok() {
-                        if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
-                            let w = processed.width() as usize;
-                            let h = processed.height() as usize;
-                            if processed.len() == w * h * 3 {
-                                // SUCCESS (Full Decode): Return tuple to 'let', falling through to resize
-                                (
-                                    egui::ColorImage::from_rgb([w, h], &processed),
-                                    dims,
-                                    1, // rsraw handles rotation
-                                )
-                            } else {
-                                return None;
-                            }
-                        } else {
-                            return None;
-                        }
-                    } else {
-                        return None;
-                    }
-                }
-            } else {
-                return None;
-            }
-        } else {
-            return None;
-        }
-    } else {
-        // B. STANDARD FILES (JPG, PNG, HEIC)
-        if let Ok(bytes) = fs::read(path) {
-            let orientation = crate::scanner::get_orientation(path, Some(&bytes));
-            // Chain with_guessed_format(). If it fails (IO error), fallback to a fresh reader.
-            let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
-                .with_guessed_format()
-                .unwrap_or_else(|_| image::ImageReader::new(std::io::Cursor::new(&bytes)));
-
-            // Fallback to file extension if magic bytes didn't work (common for PCX/TGA)
-            if reader.format().is_none() {
-                if let Ok(fmt) = image::ImageFormat::from_path(path) {
-                    reader.set_format(fmt);
-                }
-            }
-
-            // Decode
-            if let Ok(dyn_img) = reader.decode() {
-                let dims = (dyn_img.width(), dyn_img.height());
-                let buf = dyn_img.to_rgba8();
-                let pixels = buf.as_flat_samples();
-                let img = egui::ColorImage::from_rgba_unmultiplied(
-                    [dims.0 as usize, dims.1 as usize],
-                    pixels.as_slice(),
-                );
-                (img, dims, orientation)
-            } else {
-                return None;
-            }
-        } else {
-            return None;
-        }
+    // Compute content_hash using BLAKE3
+    let content_hash = {
+        let mut hasher = blake3::Hasher::new_keyed(content_key);
+        hasher.update(&bytes);
+        *hasher.finalize().as_bytes()
     };
 
-    // --- STEP 2: FAST RESIZING (AVX2/SIMD) ---
+    // Process the image using existing logic
+    let (img, dims, orientation) = load_and_process_image_from_bytes(path, &bytes, use_thumbnails)?;
+
+    Ok((img, dims, orientation, content_hash))
+}
+
+/// Resize image if it exceeds MAX_TEXTURE_SIDE to prevent egui panics
+fn maybe_resize_image(
+    mut color_image: egui::ColorImage,
+    real_dims: (u32, u32),
+    orientation: u8,
+    path: &Path,
+) -> (egui::ColorImage, (u32, u32), u8) {
     let w = color_image.width();
     let h = color_image.height();
 
@@ -170,7 +144,6 @@ fn load_and_process_image(
         // Convert egui::ColorImage -> fast_image_resize::Image
         // egui uses RGBA or RGB. standard load above is RGBA (4 bytes).
         // RAW load above is RGB (3 bytes). We must handle both.
-
         let pixel_type = if color_image.pixels.len() * 4 == color_image.as_raw().len() {
             PixelType::U8x4 // Standard/Thumbnail (RGBA)
         } else {
@@ -181,13 +154,13 @@ fn load_and_process_image(
             FastImage::from_vec_u8(w as u32, h as u32, color_image.as_raw().to_vec(), pixel_type)
         {
             let mut dst_image = FastImage::new(new_w as u32, new_h as u32, pixel_type);
-
-            // Resize using Lanczos3 for quality or Bilinear for speed
-            // FilterType::Bilinear is usually safe and very fast for downscaling
+            // Resize using default options (Lanczos3 for quality)
             let mut resizer = Resizer::new();
             if resizer.resize(&src_image, &mut dst_image, &ResizeOptions::default()).is_ok() {
-                println!("[DEBUG] Fast-Resized {:?} from {}x{} to {}x{}", path, w, h, new_w, new_h);
-
+                eprintln!(
+                    "[DEBUG] Fast-Resized {:?} from {}x{} to {}x{}",
+                    path, w, h, new_w, new_h
+                );
                 // Convert back to egui
                 match pixel_type {
                     PixelType::U8x4 => {
@@ -206,58 +179,223 @@ fn load_and_process_image(
         }
     }
 
-    Some((color_image, real_dims, orientation))
+    (color_image, real_dims, orientation)
 }
 
-pub(super) fn update_file_metadata(app: &mut GuiApp, path: &Path, w: u32, h: u32, orientation: u8) {
+fn load_and_process_image_from_bytes(
+    path: &Path,
+    bytes: &[u8],
+    use_thumbnails: bool,
+) -> Result<(egui::ColorImage, (u32, u32), u8), String> {
+    // ---------------------------------------------------------------------
+    // RAW FILES
+    // ---------------------------------------------------------------------
+    if is_raw_ext(path) {
+        let exif_orientation = crate::scanner::get_orientation(path, Some(bytes));
+
+        let mut raw =
+            rsraw::RawImage::open(bytes).map_err(|e| format!("Failed to open RAW file: {}", e))?;
+        let dims = (raw.width() as u32, raw.height() as u32);
+
+        // Try thumbnail first
+        if use_thumbnails {
+            if let Some(thumb) = extract_best_thumbnail(&mut raw) {
+                // Thumbnails are typically small, but resize if needed
+                return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
+            }
+        }
+
+        // Full RAW decode
+        raw.set_use_camera_wb(true);
+        raw.unpack().map_err(|e| format!("Failed to unpack RAW: {}", e))?;
+        let processed = raw
+            .process::<{ rsraw::BIT_DEPTH_8 }>()
+            .map_err(|e| format!("Failed to process RAW: {}", e))?;
+
+        let w = processed.width() as usize;
+        let h = processed.height() as usize;
+
+        if processed.len() != w * h * 3 {
+            return Err(format!(
+                "RAW size mismatch: expected {}x{}x3={}, got {}",
+                w,
+                h,
+                w * h * 3,
+                processed.len()
+            ));
+        }
+
+        let img = egui::ColorImage::from_rgb([w, h], &processed);
+        // rsraw handles rotation, orientation=1
+        return Ok(maybe_resize_image(img, dims, 1, path));
+    }
+
+    // ---------------------------------------------------------------------
+    // STANDARD FILES (JPEG, PNG, HEIC, JP2, JXL, etc.)
+    // ---------------------------------------------------------------------
+    let orientation = crate::scanner::get_orientation(path, Some(bytes));
+
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    // ---------------------------------------------------------------------
+    // JP2 / JXL FAST PATH
+    // ---------------------------------------------------------------------
+    if matches!(ext.as_str(), "jp2" | "j2k" | "jxl") {
+        eprintln!("[DEBUG-GUI] attempting scanner decode for {:?}", path);
+
+        if let Some(dyn_img) = crate::scanner::load_image_fast(path, bytes) {
+            let (w, h) = dyn_img.dimensions();
+            let color_image = dynamic_image_to_egui(dyn_img);
+
+            eprintln!("[DEBUG-GUI] scanner decode SUCCESS for {:?}", path);
+            return Ok(maybe_resize_image(color_image, (w, h), orientation, path));
+        } else {
+            eprintln!("[DEBUG-GUI] scanner decode FAILED for {:?} (unsupported or corrupt)", path);
+            return Err(format!(
+                "Failed to decode {} file (unsupported or corrupt)",
+                ext.to_uppercase()
+            ));
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // IMAGE CRATE FALLBACK
+    // ---------------------------------------------------------------------
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .unwrap_or_else(|_| image::ImageReader::new(std::io::Cursor::new(bytes)));
+
+    if reader.format().is_none() {
+        if let Ok(fmt) = image::ImageFormat::from_path(path) {
+            reader.set_format(fmt);
+        }
+    }
+
+    let format_name =
+        reader.format().map(|f| format!("{:?}", f)).unwrap_or_else(|| "unknown".to_string());
+
+    let dyn_img =
+        reader.decode().map_err(|e| format!("Failed to decode {}: {}", format_name, e))?;
+    let dims = (dyn_img.width(), dyn_img.height());
+
+    let rgba = dyn_img.to_rgba8();
+    let img = egui::ColorImage::from_rgba_unmultiplied(
+        [dims.0 as usize, dims.1 as usize],
+        rgba.as_flat_samples().as_slice(),
+    );
+
+    Ok(maybe_resize_image(img, dims, orientation, path))
+}
+
+// Keep the old function for backwards compatibility (used elsewhere)
+fn load_and_process_image(
+    path: &Path,
+    use_thumbnails: bool,
+) -> Result<(egui::ColorImage, (u32, u32), u8), String> {
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
+    load_and_process_image_from_bytes(path, &bytes, use_thumbnails)
+}
+
+pub(super) fn update_file_metadata(
+    app: &mut GuiApp,
+    path: &Path,
+    w: u32,
+    h: u32,
+    orientation: u8,
+    content_hash: [u8; 32],
+) {
     eprintln!(
-        "[DEBUG-UPDATE] update_file_metadata called: path={:?}, orientation={}",
+        "[DEBUG-UPDATE] update_file_metadata called: path={:?}, orientation={}, content_hash={:?}",
         path.file_name().unwrap_or_default(),
-        orientation
+        orientation,
+        &content_hash[..4]
     );
 
     // Helper to find and update the file in the group list
-    let update_file = |file: &mut crate::FileMetadata| {
-        if file.path == path {
-            eprintln!(
-                "[DEBUG-UPDATE]   Found file! current orientation={}, new orientation={}",
-                file.orientation, orientation
-            );
-            if file.resolution.is_none() {
-                file.resolution = Some((w, h));
-            }
-            // Always update orientation from loader - it knows the correct value
-            // (e.g., for RAW full decode it's 1, for RAW thumbnails it's EXIF value)
-            if file.orientation != orientation {
+    // Returns Some((unique_file_id, gps_pos, changed)) if file was found
+    let update_file =
+        |file: &mut crate::FileMetadata| -> Option<(u128, Option<geo::Point<f64>>, bool)> {
+            if file.path == path {
                 eprintln!(
-                    "[DEBUG-UPDATE]   Updated orientation {} -> {}",
+                    "[DEBUG-UPDATE]   Found file! current orientation={}, new orientation={}",
                     file.orientation, orientation
                 );
-                file.orientation = orientation;
+                let mut changed = false;
+                if file.resolution.is_none() {
+                    file.resolution = Some((w, h));
+                    changed = true;
+                }
+                // Always update orientation from loader - it knows the correct value
+                // (e.g., for RAW full decode it's 1, for RAW thumbnails it's EXIF value)
+                if file.orientation != orientation {
+                    eprintln!(
+                        "[DEBUG-UPDATE]   Updated orientation {} -> {}",
+                        file.orientation, orientation
+                    );
+                    file.orientation = orientation;
+                    changed = true;
+                }
+                return Some((file.unique_file_id, file.gps_pos, changed));
             }
-            return true;
-        }
-        false
-    };
+            None
+        };
 
     // Check current file first (fast path)
+    let mut found_info: Option<(u128, Option<geo::Point<f64>>, bool)> = None;
     if let Some(group) = app.state.groups.get_mut(app.state.current_group_idx) {
         if let Some(file) = group.get_mut(app.state.current_file_idx) {
-            if update_file(file) {
-                return;
+            found_info = update_file(file);
+        }
+    }
+
+    // Fallback search if not found
+    if found_info.is_none() {
+        for group in &mut app.state.groups {
+            for file in group {
+                if let Some(info) = update_file(file) {
+                    found_info = Some(info);
+                    break;
+                }
+            }
+            if found_info.is_some() {
+                break;
             }
         }
     }
 
-    // Fallback search
-    for group in &mut app.state.groups {
-        for file in group {
-            if update_file(file) {
-                return;
+    // Persist to database if we found the file and something changed
+    if let Some((unique_file_id, gps_pos, changed)) = found_info {
+        if changed {
+            if let Some(ref db_tx) = app.db_tx {
+                // Use create_feature_update with the real content_hash computed by the image loader
+                // This creates/updates the full database entry on first load
+                if let Some(update) = crate::db::create_feature_update(
+                    &app.ctx.meta_key,
+                    path,
+                    unique_file_id,
+                    content_hash,
+                    Some((w, h)),
+                    orientation,
+                    gps_pos,
+                ) {
+                    let _ = db_tx.send(update);
+                    eprintln!(
+                        "[DEBUG-UPDATE]   Sent DB update for {:?}: resolution={}x{}, orientation={}",
+                        path.file_name().unwrap_or_default(),
+                        w,
+                        h,
+                        orientation
+                    );
+                }
             }
         }
+    } else {
+        eprintln!("[DEBUG-UPDATE]   FILE NOT FOUND in any group!");
     }
-    eprintln!("[DEBUG-UPDATE]   FILE NOT FOUND in any group!");
 }
 
 /// Extract the best (largest) thumbnail from a RAW file
@@ -407,7 +545,7 @@ pub(super) fn render_histogram(
     app: &mut GuiApp,
     ui: &mut egui::Ui,
     available_rect: egui::Rect,
-    path: &std::path::Path,
+    path: &Path,
 ) {
     // Get window width for histogram sizing (10% of window width)
     let window_width = ui.ctx().input(|i| {
@@ -507,7 +645,7 @@ fn draw_histogram(ui: &mut egui::Ui, hist_rect: egui::Rect, hist: &[u32; 256]) {
 }
 
 /// Compute histogram from a standard image file
-fn compute_histogram_from_image(path: &std::path::Path) -> Option<[u32; 256]> {
+fn compute_histogram_from_image(path: &Path) -> Option<[u32; 256]> {
     let img = image::open(path).ok()?;
     let grey = img.to_luma8();
     let mut hist = [0u32; 256];
@@ -518,7 +656,7 @@ fn compute_histogram_from_image(path: &std::path::Path) -> Option<[u32; 256]> {
 }
 
 /// Compute histogram from a RAW file using rsraw
-fn compute_histogram_from_raw(path: &std::path::Path) -> Option<[u32; 256]> {
+fn compute_histogram_from_raw(path: &Path) -> Option<[u32; 256]> {
     let data = fs::read(path).ok()?;
     let mut raw = rsraw::RawImage::open(&data).ok()?;
 
@@ -564,7 +702,7 @@ pub(super) fn render_exif(
     app: &mut GuiApp,
     ui: &mut egui::Ui,
     available_rect: egui::Rect,
-    path: &std::path::Path,
+    path: &Path,
 ) {
     let exif_tags = &app.ctx.gui_config.exif_tags;
     if exif_tags.is_empty() {

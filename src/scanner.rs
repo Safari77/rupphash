@@ -3,7 +3,7 @@ use codes_iso_3166::part_1::CountryCode;
 use codes_iso_3166::part_2::SubdivisionCode;
 use crossbeam_channel::{Sender, unbounded};
 use geo::Point;
-use image::GenericImageView;
+use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb};
 use jpeg_decoder::Decoder as Tier2Decoder;
 use libheif_rs::HeifContext;
 use rayon::prelude::*;
@@ -29,8 +29,17 @@ use crate::{FileMetadata, GroupInfo, GroupStatus};
 
 pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf"];
 
+const JP2_MAX_PIXELS: u64 = 268_435_456;
+
 trait BufReadSeek: std::io::BufRead + std::io::Seek {}
 impl<T: std::io::BufRead + std::io::Seek> BufReadSeek for T {}
+
+macro_rules! img_debug {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        eprintln!($($arg)*);
+    };
+}
 
 pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exif::Exif> {
     let mut reader: Box<dyn BufReadSeek> = match preloaded_bytes {
@@ -175,9 +184,71 @@ fn get_derived_value(
     }
 }
 
-fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
+fn jp2_components_to_rgb(
+    components: &[jpeg2k::ImageComponent],
+    width: u32,
+    height: u32,
+) -> Option<DynamicImage> {
+    if components.len() != 3 {
+        return None;
+    }
+
+    let r = &components[0];
+    let g = &components[1];
+    let b = &components[2];
+
+    let pixels = (width * height) as usize;
+
+    // Decide bit depth from component precision
+    let is_8bit = r.precision() <= 8 && g.precision() <= 8 && b.precision() <= 8;
+
+    let mut out = Vec::with_capacity(pixels * 3);
+
+    if is_8bit {
+        // ---------- 8-bit fast path ----------
+        let mut r_it = r.data_u8();
+        let mut g_it = g.data_u8();
+        let mut b_it = b.data_u8();
+
+        for _ in 0..pixels {
+            out.push(r_it.next()?);
+            out.push(g_it.next()?);
+            out.push(b_it.next()?);
+        }
+    } else {
+        // ---------- 16-bit → normalize to 8-bit ----------
+        let mut r_it = r.data_u16();
+        let mut g_it = g.data_u16();
+        let mut b_it = b.data_u16();
+
+        for _ in 0..pixels {
+            out.push((r_it.next()? >> 8) as u8);
+            out.push((g_it.next()? >> 8) as u8);
+            out.push((b_it.next()? >> 8) as u8);
+        }
+    }
+
+    let img = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, out)?;
+    Some(DynamicImage::ImageRgb8(img))
+}
+
+#[inline]
+fn collect_u8<I: Iterator<Item = u8>>(it: I, expected: usize) -> Option<Vec<u8>> {
+    let v: Vec<u8> = it.collect();
+    (v.len() == expected).then_some(v)
+}
+
+#[inline]
+fn collect_u16_to_u8<I: Iterator<Item = u16>>(it: I, expected: usize) -> Option<Vec<u8>> {
+    let v: Vec<u8> = it.map(|x| (x >> 8) as u8).collect();
+    (v.len() == expected).then_some(v)
+}
+
+pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
     let ext =
         path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
+
+    img_debug!("[load_image_fast] ext={} bytes={}", ext, bytes.len());
 
     // Explicitly reject RAWs here so they are handled by the RAW-specific logic
     if crate::scanner::RAW_EXTS.contains(&ext.as_str()) {
@@ -263,6 +334,110 @@ fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
                 }
             }
         }
+        // TODO: Replace manual component conversion when jpeg2k
+        // gains native support for image 0.25+ DynamicImage conversion.
+        "jp2" | "j2k" => {
+            use jpeg2k::Image;
+
+            img_debug!("[jp2] attempting decode");
+
+            let jp2 = match Image::from_bytes(bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    img_debug!("[jp2] decode failed: {:?}", e);
+                    return None;
+                }
+            };
+
+            let width = jp2.width() as u32;
+            let height = jp2.height() as u32;
+            let components = jp2.components();
+
+            img_debug!("[jp2] decoded: {}x{}, components={}", width, height, components.len());
+
+            if width == 0 || height == 0 {
+                img_debug!("[jp2] invalid dimensions");
+                return None;
+            }
+
+            if (width as u64) * (height as u64) > JP2_MAX_PIXELS {
+                img_debug!("[jp2] image too large");
+                return None;
+            }
+
+            for (i, c) in components.iter().enumerate() {
+                img_debug!(
+                    "[jp2] component {}: len8={}, len16={}",
+                    i,
+                    c.data_u8().count(),
+                    c.data_u16().count()
+                );
+            }
+
+            if components.len() == 4 {
+                img_debug!("[jp2] treating 4 components as RGBA");
+
+                let pixels = (width * height) as usize;
+
+                let r = collect_u8(components[0].data_u8(), pixels)
+                    .or_else(|| collect_u16_to_u8(components[0].data_u16(), pixels))?;
+                let g = collect_u8(components[1].data_u8(), pixels)
+                    .or_else(|| collect_u16_to_u8(components[1].data_u16(), pixels))?;
+                let b = collect_u8(components[2].data_u8(), pixels)
+                    .or_else(|| collect_u16_to_u8(components[2].data_u16(), pixels))?;
+                let a = collect_u8(components[3].data_u8(), pixels)
+                    .or_else(|| collect_u16_to_u8(components[3].data_u16(), pixels))?;
+
+                let mut out = Vec::with_capacity(pixels * 4);
+                for i in 0..pixels {
+                    out.push(r[i]);
+                    out.push(g[i]);
+                    out.push(b[i]);
+                    out.push(a[i]);
+                }
+
+                let img = image::RgbaImage::from_raw(width, height, out)?;
+                return Some(image::DynamicImage::ImageRgba8(img));
+            }
+
+            if components.len() == 3 {
+                return jp2_components_to_rgb(&components, width, height);
+            }
+
+            img_debug!("[jp2] unsupported component layout");
+            return None;
+        }
+
+        "jxl" => {
+            use image::ImageDecoder;
+            use jxl_oxide::integration::JxlDecoder;
+            use std::io::Cursor;
+
+            img_debug!("[jxl] attempting decode");
+
+            let decoder = match JxlDecoder::new(Cursor::new(bytes)) {
+                Ok(d) => d,
+                Err(e) => {
+                    img_debug!("[jxl] decoder init failed: {:?}", e);
+                    return None;
+                }
+            };
+
+            let (w, h) = decoder.dimensions();
+            img_debug!("[jxl] dimensions: {}x{}", w, h);
+
+            match DynamicImage::from_decoder(decoder) {
+                Ok(img) => {
+                    img_debug!("[jxl] decode successful");
+                    return Some(img);
+                }
+                Err(e) => {
+                    img_debug!("[jxl] decode failed: {:?}", e);
+                    return None;
+                }
+            }
+        }
+
         _ => {}
     }
 
@@ -1600,6 +1775,7 @@ pub fn is_image_ext(path: &Path) -> bool {
                 e.as_str(),
                 "dds"|"exr"|"ff"|"hdr"|"ico"|"pnm"|"qoi"|"gif"|"jpg"|"jpeg"|"png"|"webp"
             |"bmp"|"tiff"|"tif"|"avif"|"heic"|"heif"|"tga"
+            |"jp2"|"j2k"|"jxl"
             // image-extras
             |"xbm"|"xpm"|"ora"|"otb"|"pcx"|"sgi"|"wbmp"
             ) || RAW_EXTS.contains(&e.as_str())
@@ -1752,19 +1928,30 @@ pub fn spawn_background_enrichment(
 
     std::thread::spawn(move || {
         // Process files in parallel using rayon
-        files_to_enrich.par_iter().for_each(|(path, unique_file_id, resolution, orientation)| {
+        files_to_enrich.par_iter().for_each(|(path, unique_file_id, resolution, _orientation)| {
             if let Ok(data) = std::fs::read(path) {
                 // Compute content_hash
                 let mut hasher = blake3::Hasher::new_keyed(&content_key);
                 hasher.update(&data);
                 let content_hash = *hasher.finalize().as_bytes();
 
+                // Read EXIF data once for both GPS and orientation
+                let exif_data = read_exif_data(path, Some(&data));
+
                 // Read GPS from EXIF
-                let gps_pos = read_exif_data(path, Some(&data))
-                    .and_then(|exif| extract_gps_lat_lon(&exif))
+                let gps_pos = exif_data
+                    .as_ref()
+                    .and_then(|exif| extract_gps_lat_lon(exif))
                     .map(|(lat, lon)| Point::new(lon, lat));
 
+                // Read orientation from EXIF (fresh, not from stale passed-in value)
+                // This ensures we store the EXIF orientation, which update_file_metadata
+                // will later correct if the image loader determines a different value
+                let orientation = get_orientation(path, Some(&data));
+
                 // Write to database if channel is available
+                // Note: resolution is typically None in view mode; update_file_metadata
+                // will update it later when the image is actually loaded
                 if let Some(ref tx) = db_tx {
                     if let Some(update) = create_feature_update(
                         &meta_key_secret,
@@ -1772,7 +1959,7 @@ pub fn spawn_background_enrichment(
                         *unique_file_id,
                         content_hash,
                         *resolution,
-                        *orientation,
+                        orientation,
                         gps_pos,
                     ) {
                         let _ = tx.send(update);

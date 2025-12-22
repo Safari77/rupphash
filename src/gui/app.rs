@@ -6,6 +6,7 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, W
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver as StdReceiver, channel};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -18,7 +19,7 @@ use crate::GroupStatus;
 use crate::db::{AppContext, EnrichmentResult};
 use crate::format_relative_time;
 use crate::gui::APP_TITLE;
-use crate::gui::image::MAX_TEXTURE_SIDE;
+use crate::gui::image::{ImageLoadResult, MAX_TEXTURE_SIDE};
 use crate::helper_exif::extract_gps_lat_lon;
 use crate::position;
 use crate::scanner::{self, ScanConfig};
@@ -112,8 +113,7 @@ pub struct GuiApp {
     // Channel to send paths to the worker
     pub(super) image_preload_tx: Sender<std::path::PathBuf>,
     // Channel to receive decoded images from the worker.
-    pub(super) image_preload_rx:
-        Receiver<(std::path::PathBuf, Option<(egui::ColorImage, (u32, u32), u8)>)>,
+    pub(super) image_preload_rx: Receiver<(std::path::PathBuf, super::image::ImageLoadResult)>,
     pub(super) scan_batch_rx: Option<Receiver<Vec<FileMetadata>>>,
 
     // Shared state to tell workers which files are still relevant.
@@ -182,6 +182,13 @@ pub struct GuiApp {
 
     // View mode: Maps unique_file_id -> file_idx within the single group
     pub(super) file_index: HashMap<u128, usize>,
+    // View mode: Map of images that failed to load -> error message
+    failed_images: HashMap<PathBuf, String>,
+    // View mode: Track size of failed_images to detect changes
+    last_failed_images_len: usize,
+
+    // View mode: Map of paths to Instant when retry is allowed
+    retry_after: HashMap<PathBuf, Instant>,
 
     // Channel to send database updates (view mode caches features without coefficients)
     pub(super) db_tx: Option<Sender<crate::db::DbUpdate>>,
@@ -214,8 +221,7 @@ impl GuiApp {
         state.is_loading = true;
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
-        let (tx, rx) =
-            super::image::spawn_image_loader_pool(active_window.clone(), use_raw_thumbnails);
+        let (tx, rx) = super::image::spawn_image_loader_pool(use_raw_thumbnails, ctx.content_key);
         // panel_width is saved in logical points (after font_scale applied)
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
         // Initialize with configured size so we have a fallback if window size isn't captured
@@ -293,6 +299,9 @@ impl GuiApp {
             gps_map: GpsMapState::new(tile_cache_path, selected_provider, provider_url),
             enrichment_rx: None,
             file_index: HashMap::new(),
+            failed_images: HashMap::new(),
+            last_failed_images_len: 0,
+            retry_after: HashMap::new(),
             db_tx: None,
             dir_scan_rx: None,
             dir_total_count: None,
@@ -347,9 +356,8 @@ impl GuiApp {
         };
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
-        let (tx, rx) =
-            super::image::spawn_image_loader_pool(active_window.clone(), use_raw_thumbnails);
         let ctx = crate::db::AppContext::new().expect("Failed to create context");
+        let (tx, rx) = super::image::spawn_image_loader_pool(use_raw_thumbnails, ctx.content_key);
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
         let initial_window_size =
             Some((ctx.gui_config.width.unwrap_or(1280), ctx.gui_config.height.unwrap_or(720)));
@@ -451,6 +459,9 @@ impl GuiApp {
             gps_map: GpsMapState::new(tile_cache_path, selected_provider, provider_url),
             enrichment_rx: None,
             file_index: HashMap::new(),
+            failed_images: HashMap::new(),
+            last_failed_images_len: 0,
+            retry_after: HashMap::new(),
             db_tx,
             dir_scan_rx,
             dir_total_count,
@@ -465,6 +476,20 @@ impl GuiApp {
     /// Set status message with automatic 5-second timeout
     pub(super) fn set_status(&mut self, msg: String, is_error: bool) {
         self.state.set_status(msg, is_error);
+    }
+
+    #[inline]
+    fn enqueue_image_load(&mut self, path: &std::path::Path) {
+        if self.failed_images.contains_key(path) {
+            return;
+        }
+        if let Some(until) = self.retry_after.get(path) {
+            if Instant::now() < *until {
+                return;
+            }
+        }
+        eprintln!("[DEBUG] enqueue_image_load sending to preload: {:?}", path);
+        let _ = self.image_preload_tx.send(path.to_path_buf());
     }
 
     /// Get GPS coordinates for a file, using cache for O(1) access.
@@ -753,79 +778,118 @@ impl GuiApp {
         }
     }
 
+    fn clear_failed_under(&mut self, path: &std::path::Path) {
+        self.failed_images.retain(|p, _| !p.starts_with(path));
+    }
+
     fn check_fs_events(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.fs_event_rx else { return };
+        let mut events = Vec::new();
+
+        // ---- Phase 1: drain notify events (immutable borrow only) ----
+        if let Some(rx) = self.fs_event_rx.as_ref() {
+            while let Ok(res) = rx.try_recv() {
+                events.push(res);
+            }
+        } else {
+            return;
+        }
+
+        let current = self.failed_images.len();
+        if current != self.last_failed_images_len {
+            eprintln!("[DEBUG] failed_images size now {}", current);
+            self.last_failed_images_len = current;
+        }
 
         // Helper: Decide if a path name "looks like" an image file or is a directory.
-        // Since the file might be gone (Remove event), we can't always stat it.
-        // We rely on the extension as a heuristic for deleted items.
         let classify = |path: &std::path::Path| -> bool {
-            // If it exists on disk, check the real type
             if path.exists() {
                 if path.is_dir() {
                     return false;
                 }
                 return crate::scanner::is_image_ext(path);
             }
-            // If it was removed, assume it was a file if it had an image extension
             crate::scanner::is_image_ext(path)
         };
 
-        while let Ok(res) = rx.try_recv() {
-            if let Ok(event) = res {
-                // 1. Handle Atomic Rename (source -> dest)
-                if let notify::EventKind::Modify(notify::event::ModifyKind::Name(
-                    notify::event::RenameMode::Both,
-                )) = event.kind
-                {
-                    // event.paths[0] is source (old name), event.paths[1] is dest (new name)
-                    if let (Some(_source), Some(dest)) = (event.paths.first(), event.paths.get(1)) {
-                        if let Some(name) = dest.file_name() {
+        // ---- Phase 2: process events (mutable self allowed) ----
+        for res in events {
+            let Ok(event) = res else { continue };
+
+            // 1. Handle atomic rename (source -> dest)
+            if let notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both,
+            )) = event.kind
+            {
+                if let (Some(_source), Some(dest)) = (event.paths.first(), event.paths.get(1)) {
+                    if let Some(name) = dest.file_name() {
+                        let name_str = name.to_string_lossy().to_string();
+                        if classify(dest) {
+                            self.fs_mod_files.insert(name_str);
+                        } else {
+                            self.fs_mod_dirs.insert(name_str);
+                        }
+                    }
+
+                    // Clear terminal failures under renamed directory or file
+                    self.clear_failed_under(dest);
+                }
+                continue;
+            }
+
+            // 2. Handle other events
+            match event.kind {
+                notify::EventKind::Remove(_) => {
+                    for path in &event.paths {
+                        self.failed_images.remove(path);
+                        self.clear_failed_under(path);
+
+                        if let Some(name) = path.file_name() {
                             let name_str = name.to_string_lossy().to_string();
-                            // We only report the NEW name as "modified/created"
-                            if classify(dest) {
-                                self.fs_mod_files.insert(name_str);
+                            if classify(path) {
+                                self.fs_rem_files.insert(name_str);
+                                self.retry_after.remove(path);
                             } else {
-                                self.fs_mod_dirs.insert(name_str);
+                                self.fs_rem_dirs.insert(name_str);
+                                self.retry_after.retain(|p, _| !p.starts_with(path));
                             }
                         }
                     }
-                    continue;
                 }
 
-                // 2. Handle Specific Events
-                match event.kind {
-                    notify::EventKind::Remove(_) => {
-                        for path in &event.paths {
+                notify::EventKind::Create(_)
+                | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+                | notify::EventKind::Modify(notify::event::ModifyKind::Any) => {
+                    for path in &event.paths {
+                        if classify(path) {
+                            if self.failed_images.remove(path).is_some() {
+                                eprintln!(
+                                    "[DEBUG-NOTIFY] cleared failed_image due to modify/create: {:?}",
+                                    path
+                                );
+                                self.enqueue_image_load(path);
+                            }
+
+                            self.retry_after.remove(path);
+
                             if let Some(name) = path.file_name() {
-                                let name_str = name.to_string_lossy().to_string();
-                                if classify(path) {
-                                    self.fs_rem_files.insert(name_str);
-                                } else {
-                                    self.fs_rem_dirs.insert(name_str);
-                                }
+                                self.fs_mod_files.insert(name.to_string_lossy().to_string());
+                            }
+                        } else {
+                            self.clear_failed_under(path);
+                            self.retry_after.retain(|p, _| !p.starts_with(path));
+
+                            if let Some(name) = path.file_name() {
+                                self.fs_mod_dirs.insert(name.to_string_lossy().to_string());
                             }
                         }
                     }
-                    notify::EventKind::Create(_)
-                    | notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
-                        for path in &event.paths {
-                            if let Some(name) = path.file_name() {
-                                let name_str = name.to_string_lossy().to_string();
-                                if classify(path) {
-                                    self.fs_mod_files.insert(name_str);
-                                } else {
-                                    self.fs_mod_dirs.insert(name_str);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
         }
 
-        // Debounce Logic: Only refresh if we have events AND enough time passed
+        // ---- Phase 3: debounce + refresh ----
         let has_pending = !self.fs_mod_files.is_empty()
             || !self.fs_mod_dirs.is_empty()
             || !self.fs_rem_files.is_empty()
@@ -836,42 +900,13 @@ impl GuiApp {
             let time_since = self.last_fs_refresh.elapsed();
 
             if time_since >= debounce_dur {
-                // Time to refresh!
                 self.refresh_dir_cache(true);
                 self.last_preload_pos = None;
                 self.last_fs_refresh = Instant::now();
 
-                // Set user preference for max list items
                 let list_limit = 8;
-
-                // Build status message from buffered events
-                let _format_list = |label: &str, items: &mut HashSet<String>| -> Option<String> {
-                    if items.is_empty() {
-                        return None;
-                    }
-                    let count = items.len();
-                    let mut sorted: Vec<_> = items.drain().collect();
-                    sorted.sort();
-
-                    // Take top N for display based on config
-                    let display_items: Vec<String> =
-                        sorted.iter().take(list_limit).cloned().collect();
-                    let joined = display_items.join(", ");
-                    let suffix = if count > list_limit { ", ..." } else { "" };
-
-                    Some(format!(
-                        "{} {} {}: {}{}",
-                        label,
-                        count,
-                        if count == 1 { "item" } else { "items" },
-                        joined,
-                        suffix
-                    ))
-                };
-
                 let mut parts = Vec::new();
 
-                // 1. Files
                 if !self.fs_mod_files.is_empty() {
                     let count = self.fs_mod_files.len();
                     let mut sorted: Vec<_> = self.fs_mod_files.drain().collect();
@@ -880,6 +915,7 @@ impl GuiApp {
                     let extra = if count > list_limit { ", ..." } else { "" };
                     parts.push(format!("{} files ({}{})", count, display.join(", "), extra));
                 }
+
                 if !self.fs_rem_files.is_empty() {
                     let count = self.fs_rem_files.len();
                     let mut sorted: Vec<_> = self.fs_rem_files.drain().collect();
@@ -894,7 +930,6 @@ impl GuiApp {
                     ));
                 }
 
-                // 2. Dirs
                 if !self.fs_mod_dirs.is_empty() {
                     let count = self.fs_mod_dirs.len();
                     let mut sorted: Vec<_> = self.fs_mod_dirs.drain().collect();
@@ -903,6 +938,7 @@ impl GuiApp {
                     let extra = if count > list_limit { ", ..." } else { "" };
                     parts.push(format!("{} dirs ({}{})", count, display.join(", "), extra));
                 }
+
                 if !self.fs_rem_dirs.is_empty() {
                     let count = self.fs_rem_dirs.len();
                     let mut sorted: Vec<_> = self.fs_rem_dirs.drain().collect();
@@ -916,7 +952,6 @@ impl GuiApp {
                     self.set_status(format!("FS: {}", parts.join("; ")), false);
                 }
             } else {
-                // Not enough time passed, schedule a repaint soon to check again
                 let remaining = debounce_dur - time_since;
                 ctx.request_repaint_after(remaining);
             }
@@ -1208,7 +1243,7 @@ impl GuiApp {
                 // Load EVERYTHING via the pool, not just RAW
                 if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
                     self.raw_loading.insert(path.clone());
-                    let _ = self.image_preload_tx.send(path.clone());
+                    self.enqueue_image_load(&path);
                 }
                 break;
             }
@@ -1221,7 +1256,7 @@ impl GuiApp {
             }
             if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
                 self.raw_loading.insert(path.clone());
-                let _ = self.image_preload_tx.send(path.clone());
+                self.enqueue_image_load(&path);
             }
         }
 
@@ -1453,25 +1488,39 @@ impl eframe::App for GuiApp {
         // Use try_recv() which returns Err on empty OR disconnected channel
         loop {
             match self.image_preload_rx.try_recv() {
-                Ok((path, maybe_result)) => {
-                    if let Some((color_image, actual_resolution, orientation)) = maybe_result {
-                        // Now 'orientation' is defined and passed correctly
-                        super::image::update_file_metadata(
-                            self,
-                            &path,
-                            actual_resolution.0,
-                            actual_resolution.1,
+                Ok((path, result)) => {
+                    match result {
+                        ImageLoadResult::Loaded(
+                            color_image,
+                            actual_resolution,
                             orientation,
-                        );
+                            content_hash,
+                        ) => {
+                            super::image::update_file_metadata(
+                                self,
+                                &path,
+                                actual_resolution.0,
+                                actual_resolution.1,
+                                orientation,
+                                content_hash,
+                            );
 
-                        let name = format!("img_{}", path.display());
-                        let texture = ctx.load_texture(name, color_image, Default::default());
-                        self.raw_cache.insert(path.clone(), texture);
+                            let name = format!("img_{}", path.display());
+                            let texture = ctx.load_texture(name, color_image, Default::default());
+                            self.raw_cache.insert(path.clone(), texture);
+                        }
+
+                        ImageLoadResult::Failed(err_msg) => {
+                            // Mark permanently failed with error message
+                            self.failed_images.insert(path.clone(), err_msg);
+                        }
                     }
+
                     // Always remove from loading set
                     self.raw_loading.remove(&path);
                     ctx.request_repaint();
                 }
+
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     break;
                 }
@@ -2691,8 +2740,34 @@ impl eframe::App for GuiApp {
                         available_rect,
                         current_group_idx,
                     );
+                } else if let Some(err_msg) = self.failed_images.get(&path) {
+                    // 2. Failed to load - display error message
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(
+                                egui::RichText::new("⚠ Failed to load image")
+                                    .size(18.0)
+                                    .color(egui::Color32::from_rgb(255, 160, 0)),
+                            );
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(err_msg)
+                                    .size(14.0)
+                                    .color(egui::Color32::LIGHT_GRAY),
+                            );
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    path.file_name().unwrap_or_default().to_string_lossy(),
+                                )
+                                .size(12.0)
+                                .color(egui::Color32::DARK_GRAY),
+                            );
+                        });
+                    });
                 } else {
-                    // 2. Not in cache? It's loading.
+                    // 3. Not in cache and not failed? It's loading.
                     ui.centered_and_justified(|ui| {
                         ui.spinner();
                         ui.label("Loading...");
@@ -2701,7 +2776,7 @@ impl eframe::App for GuiApp {
                     // Trigger load if missed (failsafe)
                     if !self.raw_loading.contains(&path) {
                         self.raw_loading.insert(path.clone());
-                        let _ = self.image_preload_tx.send(path.clone());
+                        self.enqueue_image_load(&path);
                     }
                 }
 
