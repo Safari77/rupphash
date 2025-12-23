@@ -73,12 +73,11 @@ impl TuiApp {
         while !self.state.exit_requested {
             tui.draw(|frame| self.render(frame))?;
 
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        self.handle_key(key.code, key.modifiers);
-                    }
-                }
+            if event::poll(Duration::from_millis(100))?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                self.handle_key(key.code, key.modifiers);
             }
 
             // Sync list state with app state
@@ -158,18 +157,18 @@ impl TuiApp {
                             self.move_completion_index = 0;
                             if let Ok(entries) = fs::read_dir(parent_dir) {
                                 for entry in entries.flatten() {
-                                    if let Ok(ft) = entry.file_type() {
-                                        if ft.is_dir() {
-                                            let name = entry.path().to_string_lossy().to_string();
-                                            // Basic prefix check
-                                            if name.starts_with(&self.move_buffer)
-                                                || entry
-                                                    .file_name()
-                                                    .to_string_lossy()
-                                                    .starts_with(&prefix)
-                                            {
-                                                self.move_completion_candidates.push(name);
-                                            }
+                                    if let Ok(ft) = entry.file_type()
+                                        && ft.is_dir()
+                                    {
+                                        let name = entry.path().to_string_lossy().to_string();
+                                        // Basic prefix check
+                                        if name.starts_with(&self.move_buffer)
+                                            || entry
+                                                .file_name()
+                                                .to_string_lossy()
+                                                .starts_with(&prefix)
+                                        {
+                                            self.move_completion_candidates.push(name);
                                         }
                                     }
                                 }

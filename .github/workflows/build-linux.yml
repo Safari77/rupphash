@@ -1,0 +1,105 @@
+name: Build and Release Linux
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install Build Tools & Codecs
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake meson ninja-build build-essential \
+          pkg-config libssl-dev libde265-dev libx265-dev libaom-dev \
+          libjpeg-dev libgtk-3-dev libxkbcommon-dev libwayland-dev nasm libxxhash-dev
+
+    # get gcc specs
+    - name: GCC specs
+      run: |
+        gcc --version
+        gcc -dumpspecs
+        touch /tmp/gcctest.c && gcc -v /tmp/gcctest.c -c
+
+    # Compile libdav1d 1.5.2 from source
+    - name: Build dav1d 1.5.2
+      run: |
+        DAV1D_HASH="c748a3214cf02a6d23bc179a0e8caea9d6ece1e46314ef21f5508ca6b5de6262"
+        DAV1D_VERSION="1.5.2"
+        wget -t 30 --waitretry 20 https://code.videolan.org/videolan/dav1d/-/archive/${DAV1D_VERSION}/dav1d-${DAV1D_VERSION}.tar.bz2
+        echo "${DAV1D_HASH}  dav1d-${DAV1D_VERSION}.tar.bz2" | sha256sum --check
+        echo "EXT_DAV1D_VER=${DAV1D_VERSION}" >> $GITHUB_ENV
+        echo "EXT_DAV1D_HASH=${DAV1D_HASH}" >> $GITHUB_ENV
+
+        tar -xjf dav1d-${DAV1D_VERSION}.tar.bz2
+        cd dav1d-${DAV1D_VERSION}
+        export CFLAGS="-fstack-protector-strong -fstack-clash-protection -fcf-protection=full"
+        export LDFLAGS="-Wl,-z,relro"
+        meson setup build --prefix=/usr --libdir=lib/x86_64-linux-gnu --buildtype=release \
+          -Denable_tests=false -Denable_tools=false
+        ninja -C build
+        sudo ninja install -v -C build
+        sudo ldconfig
+
+    - name: Check dav1d version
+      run: |
+        echo "Checking pkg-config for dav1d..."
+        pkg-config --libs --cflags dav1d 'dav1d == 1.5.2'
+
+    # Compile libheif 1.20.2 from source
+    - name: Build libheif 1.20.2
+      run: |
+        HEIF_HASH="68ac9084243004e0ef3633f184eeae85d615fe7e4444373a0a21cebccae9d12a"
+        HEIF_VERSION="1.20.2"
+        wget -t 30 --waitretry 20 https://github.com/strukturag/libheif/releases/download/v${HEIF_VERSION}/libheif-${HEIF_VERSION}.tar.gz
+        echo "${HEIF_HASH}  libheif-${HEIF_VERSION}.tar.gz" | sha256sum --check
+        echo "EXT_HEIF_VER=${HEIF_VERSION}" >> $GITHUB_ENV
+        echo "EXT_HEIF_HASH=${HEIF_HASH}" >> $GITHUB_ENV
+
+        tar -xzf libheif-${HEIF_VERSION}.tar.gz
+        cd libheif-${HEIF_VERSION}
+        mkdir build
+        cd build
+        # We use /usr to override any system defaults and ensure pkg-config finds it easily
+        cmake -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DWITH_DAV1D=ON ..
+
+        make -j$(nproc)
+        sudo make install
+        sudo ldconfig
+
+    - name: Check libheif version
+      run: |
+        echo "Checking pkg-config for libheif..."
+        pkg-config --libs --cflags libheif 'libheif == 1.20.2'
+
+    - name: Install Rust 1.92.0
+      uses: dtolnay/rust-toolchain@1.92.0
+      with:
+        targets: "x86_64-unknown-linux-gnu"
+
+    - name: Build Binary
+      run: cargo build --release --verbose
+
+    - name: Rename and Stage
+      shell: bash
+      run: |
+        VERSION=$(awk -F '[""]' '/^version/ { print $2; exit }' Cargo.toml)
+        echo "Detected version: $VERSION"
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+        mkdir -p staging
+        cp -v "target/release/phdupes" "staging/phdupes-v${VERSION}-linux"
+
+    - name: Publish Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ env.VERSION }}
+        files: staging/*
+        draft: false
+        prerelease: false

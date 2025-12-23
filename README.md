@@ -76,6 +76,15 @@ cargo build --target x86_64-pc-windows-gnu
 
 You might need to disable HEIF and/or rsraw manually, or you could use MSVC target.
 
+By default a dynamically linked binary is built.
+However, the dll's need to be in the same directory as the executable:
+`Get-ChildItem -Path .\target\release\build -Filter *.dll -Recurse | Copy-Item -Destination .\target\release -Force`
+If you want to build a static binary, check out `.github/workflows/build-windows.yml`.
+
+Microsoft Visual C++ Redistributable latest supported downloads:
+https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist
+https://aka.ms/vc14/vc_redist.x64.exe
+
 *Note*:
 MSVC Target: uses the linker built into Visual Studio (link.exe).
 

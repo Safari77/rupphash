@@ -731,38 +731,33 @@ impl AppContext {
             let meta_key = compute_meta_key(&self.meta_key, mtime_ns, size, unique_file_id);
 
             // Look up content_hash from meta_key
-            if let Ok(encrypted) = txn.get(self.meta_db, &meta_key) {
-                if let Some(decrypted) = self.decrypt_value(&meta_key, encrypted) {
-                    if decrypted.len() == 40 {
-                        let mut content_hash = [0u8; 32];
-                        content_hash.copy_from_slice(&decrypted[0..32]);
+            if let Ok(encrypted) = txn.get(self.meta_db, &meta_key)
+                && let Some(decrypted) = self.decrypt_value(&meta_key, encrypted)
+                && decrypted.len() == 40
+            {
+                let mut content_hash = [0u8; 32];
+                content_hash.copy_from_slice(&decrypted[0..32]);
 
-                        // Skip zeroed-out hash placeholder
-                        if content_hash == [0u8; 32] {
-                            continue;
-                        }
+                // Skip zeroed-out hash placeholder
+                if content_hash == [0u8; 32] {
+                    continue;
+                }
 
-                        // Look up features from content_hash
-                        if let Ok(encrypted_features) = txn.get(self.feature_db, &content_hash) {
-                            if let Some(decrypted_features) =
-                                self.decrypt_value(&content_hash, encrypted_features)
-                            {
-                                if let Ok(features) =
-                                    CachedFeatures::from_bytes(&decrypted_features)
-                                {
-                                    let resolution = if features.width > 0 && features.height > 0 {
-                                        Some((features.width, features.height))
-                                    } else {
-                                        None
-                                    };
-                                    results.insert(
-                                        unique_file_id,
-                                        (resolution, features.orientation, features.gps_pos),
-                                    );
-                                }
-                            }
-                        }
-                    }
+                // Look up features from content_hash
+                if let Ok(encrypted_features) = txn.get(self.feature_db, &content_hash)
+                    && let Some(decrypted_features) =
+                        self.decrypt_value(&content_hash, encrypted_features)
+                    && let Ok(features) = CachedFeatures::from_bytes(&decrypted_features)
+                {
+                    let resolution = if features.width > 0 && features.height > 0 {
+                        Some((features.width, features.height))
+                    } else {
+                        None
+                    };
+                    results.insert(
+                        unique_file_id,
+                        (resolution, features.orientation, features.gps_pos),
+                    );
                 }
             }
         }
@@ -824,15 +819,15 @@ impl AppContext {
         if txn.stat(self.hash_db)?.entries() > 0 {
             let mut cursor = txn.open_rw_cursor(self.hash_db)?;
             for iter in cursor.iter_start() {
-                if let Ok((key, _)) = iter {
-                    if key.len() == 32 {
-                        let mut k = [0u8; 32];
-                        k.copy_from_slice(key);
+                if let Ok((key, _)) = iter
+                    && key.len() == 32
+                {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(key);
 
-                        if !valid_content_hashes.contains(&k) {
-                            cursor.del(WriteFlags::empty())?;
-                            hash_remove_count += 1;
-                        }
+                    if !valid_content_hashes.contains(&k) {
+                        cursor.del(WriteFlags::empty())?;
+                        hash_remove_count += 1;
                     }
                 }
             }
@@ -842,13 +837,13 @@ impl AppContext {
         if txn.stat(self.feature_db)?.entries() > 0 {
             let mut cursor = txn.open_rw_cursor(self.feature_db)?;
             for iter in cursor.iter_start() {
-                if let Ok((key, _)) = iter {
-                    if key.len() == 32 {
-                        let mut k = [0u8; 32];
-                        k.copy_from_slice(key);
-                        if !valid_content_hashes.contains(&k) {
-                            cursor.del(WriteFlags::empty())?;
-                        }
+                if let Ok((key, _)) = iter
+                    && key.len() == 32
+                {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(key);
+                    if !valid_content_hashes.contains(&k) {
+                        cursor.del(WriteFlags::empty())?;
                     }
                 }
             }
@@ -858,13 +853,13 @@ impl AppContext {
         if txn.stat(self.coeff_db)?.entries() > 0 {
             let mut cursor = txn.open_rw_cursor(self.coeff_db)?;
             for iter in cursor.iter_start() {
-                if let Ok((key, _)) = iter {
-                    if key.len() == 32 {
-                        let mut k = [0u8; 32];
-                        k.copy_from_slice(key);
-                        if !valid_content_hashes.contains(&k) {
-                            cursor.del(WriteFlags::empty())?;
-                        }
+                if let Ok((key, _)) = iter
+                    && key.len() == 32
+                {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(key);
+                    if !valid_content_hashes.contains(&k) {
+                        cursor.del(WriteFlags::empty())?;
                     }
                 }
             }
@@ -874,13 +869,13 @@ impl AppContext {
         if txn.stat(self.pixel_db)?.entries() > 0 {
             let mut cursor = txn.open_rw_cursor(self.pixel_db)?;
             for iter in cursor.iter_start() {
-                if let Ok((key, _)) = iter {
-                    if key.len() == 32 {
-                        let mut k = [0u8; 32];
-                        k.copy_from_slice(key);
-                        if !valid_content_hashes.contains(&k) {
-                            cursor.del(WriteFlags::empty())?;
-                        }
+                if let Ok((key, _)) = iter
+                    && key.len() == 32
+                {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(key);
+                    if !valid_content_hashes.contains(&k) {
+                        cursor.del(WriteFlags::empty())?;
                     }
                 }
             }

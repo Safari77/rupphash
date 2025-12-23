@@ -15,7 +15,7 @@ struct DepInfo {
 
 fn main() {
     // 1. Get Git Hash
-    let output = Command::new("git").args(&["rev-parse", "HEAD"]).output();
+    let output = Command::new("git").args(["rev-parse", "HEAD"]).output();
     let git_hash = match output {
         Ok(o) if o.status.success() => String::from_utf8(o.stdout).unwrap().trim().to_string(),
         _ => "unknown".to_string(),
@@ -30,7 +30,7 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.lock");
     let lockfile = Lockfile::load(lock_path).expect("Could not load Cargo.lock");
 
-    let deps: Vec<DepInfo> = lockfile
+    let mut deps: Vec<DepInfo> = lockfile
         .packages
         .into_iter()
         .map(|pkg| DepInfo {
@@ -41,19 +41,31 @@ fn main() {
         })
         .collect();
 
+    // From github actions
+    println!("cargo:rerun-if-env-changed=EXT_DAV1D_VER");
+    println!("cargo:rerun-if-env-changed=EXT_DAV1D_HASH");
+    println!("cargo:rerun-if-env-changed=EXT_HEIF_VER");
+    println!("cargo:rerun-if-env-changed=EXT_HEIF_HASH");
+
+    let mut add_external_lib = |name: &str, ver_key: &str, hash_key: &str| {
+        if let Ok(ver) = env::var(ver_key) {
+            let hash = env::var(hash_key).ok();
+            deps.push(DepInfo {
+                name: name.to_string(),
+                version: ver,
+                checksum: hash,
+                source: Some("GitHub Action Manual Build".to_string()),
+            });
+        }
+    };
+
+    add_external_lib("dav1d (C-Lib)", "EXT_DAV1D_VER", "EXT_DAV1D_HASH");
+    add_external_lib("libheif (C-Lib)", "EXT_HEIF_VER", "EXT_HEIF_HASH");
+
     let json_info = serde_json::to_string(&deps).expect("Failed to serialize deps");
 
-    // --- CHANGE STARTS HERE ---
-
-    // 3. Write to file instead of env var
-    // Grab the build output directory
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("deps_info.json");
-
-    // Write the massive JSON string to disk
     fs::write(&dest_path, json_info).expect("Failed to write info to file");
-
-    // 4. Pass the PATH to the file, not the content
-    // We pass the absolute path so main.rs can find it easily
     println!("cargo:rustc-env=DEPS_INFO_PATH={}", dest_path.display());
 }

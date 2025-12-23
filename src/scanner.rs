@@ -259,46 +259,46 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
         "jpg" | "jpeg" => {
             // TIER 1: Zune-JPEG
             let mut zune = ZuneDecoder::new(bytes);
-            if let Ok(pixels) = zune.decode() {
-                if let Some(info) = zune.info() {
-                    let w = info.width as u32;
-                    let h = info.height as u32;
-                    let len = pixels.len();
+            if let Ok(pixels) = zune.decode()
+                && let Some(info) = zune.info()
+            {
+                let w = info.width as u32;
+                let h = info.height as u32;
+                let len = pixels.len();
 
-                    // Robustly handle Grayscale vs RGB based on buffer size
-                    if len == (w * h) as usize {
-                        // Grayscale
-                        if let Some(buf) =
-                            image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels)
-                        {
-                            eprintln!(
-                                "[DEBUG-LOAD] {:?} -> Zune-JPEG (Grayscale)",
-                                path.file_name().unwrap_or_default()
-                            );
-                            return Some(image::DynamicImage::ImageLuma8(buf));
-                        }
-                    } else if len == (w * h * 3) as usize {
-                        // RGB
-                        if let Some(buf) =
-                            image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels)
-                        {
-                            eprintln!(
-                                "[DEBUG-LOAD] {:?} -> Zune-JPEG (RGB)",
-                                path.file_name().unwrap_or_default()
-                            );
-                            return Some(image::DynamicImage::ImageRgb8(buf));
-                        }
-                    } else if len == (w * h * 4) as usize {
-                        // CMYK or RGBA (Zune might output RGBA for CMYK)
-                        if let Some(buf) =
-                            image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, pixels)
-                        {
-                            eprintln!(
-                                "[DEBUG-LOAD] {:?} -> Zune-JPEG (RGBA/CMYK)",
-                                path.file_name().unwrap_or_default()
-                            );
-                            return Some(image::DynamicImage::ImageRgba8(buf));
-                        }
+                // Robustly handle Grayscale vs RGB based on buffer size
+                if len == (w * h) as usize {
+                    // Grayscale
+                    if let Some(buf) =
+                        image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels)
+                    {
+                        eprintln!(
+                            "[DEBUG-LOAD] {:?} -> Zune-JPEG (Grayscale)",
+                            path.file_name().unwrap_or_default()
+                        );
+                        return Some(image::DynamicImage::ImageLuma8(buf));
+                    }
+                } else if len == (w * h * 3) as usize {
+                    // RGB
+                    if let Some(buf) =
+                        image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels)
+                    {
+                        eprintln!(
+                            "[DEBUG-LOAD] {:?} -> Zune-JPEG (RGB)",
+                            path.file_name().unwrap_or_default()
+                        );
+                        return Some(image::DynamicImage::ImageRgb8(buf));
+                    }
+                } else if len == (w * h * 4) as usize {
+                    // CMYK or RGBA (Zune might output RGBA for CMYK)
+                    if let Some(buf) =
+                        image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, pixels)
+                    {
+                        eprintln!(
+                            "[DEBUG-LOAD] {:?} -> Zune-JPEG (RGBA/CMYK)",
+                            path.file_name().unwrap_or_default()
+                        );
+                        return Some(image::DynamicImage::ImageRgba8(buf));
                     }
                 }
             }
@@ -321,16 +321,15 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                         );
                         return Some(image::DynamicImage::ImageLuma8(buf));
                     }
-                } else if len == (w * h * 3) as usize {
-                    if let Some(buf) =
+                } else if len == (w * h * 3) as usize
+                    && let Some(buf) =
                         image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels)
-                    {
-                        eprintln!(
-                            "[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback RGB)",
-                            path.file_name().unwrap_or_default()
-                        );
-                        return Some(image::DynamicImage::ImageRgb8(buf));
-                    }
+                {
+                    eprintln!(
+                        "[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback RGB)",
+                        path.file_name().unwrap_or_default()
+                    );
+                    return Some(image::DynamicImage::ImageRgb8(buf));
                 }
             }
         }
@@ -349,8 +348,8 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                 }
             };
 
-            let width = jp2.width() as u32;
-            let height = jp2.height() as u32;
+            let width = jp2.width();
+            let height = jp2.height();
             let components = jp2.components();
 
             img_debug!("[jp2] decoded: {}x{}, components={}", width, height, components.len());
@@ -401,7 +400,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
             }
 
             if components.len() == 3 {
-                return jp2_components_to_rgb(&components, width, height);
+                return jp2_components_to_rgb(components, width, height);
             }
 
             img_debug!("[jp2] unsupported component layout");
@@ -450,10 +449,10 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
         .unwrap_or_else(|_| image::ImageReader::new(std::io::Cursor::new(bytes)));
 
     // Fallback to extension if format is still unknown
-    if reader.format().is_none() {
-        if let Ok(fmt) = image::ImageFormat::from_path(path) {
-            reader.set_format(fmt);
-        }
+    if reader.format().is_none()
+        && let Ok(fmt) = image::ImageFormat::from_path(path)
+    {
+        reader.set_format(fmt);
     }
 
     reader.decode().ok()
@@ -715,7 +714,7 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
         };
 
         if let Ok(raw) = rsraw::RawImage::open(data_slice) {
-            return Some((raw.width() as u32, raw.height() as u32));
+            return Some((raw.width(), raw.height()));
         }
         return None;
     }
@@ -746,10 +745,10 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
     };
 
     // Now we create the ImageReader using the unified Box type
-    if let Ok(reader) = image::ImageReader::new(reader_obj).with_guessed_format() {
-        if let Ok(dims) = reader.into_dimensions() {
-            return Some(dims);
-        }
+    if let Ok(reader) = image::ImageReader::new(reader_obj).with_guessed_format()
+        && let Ok(dims) = reader.into_dimensions()
+    {
+        return Some(dims);
     }
 
     None
@@ -859,7 +858,7 @@ pub fn scan_and_group(
             let mtime = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
             let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
             let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-            let unique_file_id = fileops::get_file_key(&path)?;
+            let unique_file_id = fileops::get_file_key(path)?;
 
             let meta_key = compute_meta_key(&ctx_ref.meta_key, mtime_ns, size, unique_file_id);
             if false {
@@ -905,15 +904,15 @@ pub fn scan_and_group(
                         gps_pos = feats.gps_pos;
 
                         // Get coefficients from separate db
-                        if let Ok(Some(coeff_vec)) = ctx_ref.get_coefficients(&ch) {
-                            if coeff_vec.len() == 256 {
-                                let mut coeffs = [0.0; 256];
-                                coeffs.copy_from_slice(&coeff_vec);
-                                pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures {
-                                    coefficients: coeffs,
-                                }));
-                                cache_hit_full = true;
-                            }
+                        if let Ok(Some(coeff_vec)) = ctx_ref.get_coefficients(&ch)
+                            && coeff_vec.len() == 256
+                        {
+                            let mut coeffs = [0.0; 256];
+                            coeffs.copy_from_slice(&coeff_vec);
+                            pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures {
+                                coefficients: coeffs,
+                            }));
+                            cache_hit_full = true;
                         }
                     }
                 }
@@ -940,14 +939,13 @@ pub fn scan_and_group(
                     // Read Orientation and GPS location
                     if let Some(exif) = read_exif_data(path, Some(b)) {
                         if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
-                            gps_pos = Some(Point::new(lon, lat).into()); // Geo uses (x, y) = (lon, lat)
+                            gps_pos = Some(Point::new(lon, lat)); // Geo uses (x, y) = (lon, lat)
                         }
                         if let Some(field) =
                             exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                            && let Some(v @ 1..=8) = field.value.get_uint(0)
                         {
-                            if let Some(v @ 1..=8) = field.value.get_uint(0) {
-                                orientation = v as u8;
-                            }
+                            orientation = v as u8;
                         }
                     }
                     // 2. Calculate file hash if needed
@@ -963,23 +961,23 @@ pub fn scan_and_group(
                     if is_raw_ext(path) {
                         // RAW FILE: Extract Largest JPEG Thumbnail
                         // We need the image for PDQ even if pixel_hash is disabled.
-                        if let Ok(mut raw) = rsraw::RawImage::open(b) {
-                            if let Ok(thumbs) = raw.extract_thumbs() {
-                                // Find largest JPEG thumbnail
-                                if let Some(thumb) = thumbs
-                                    .into_iter()
-                                    .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
-                                    .max_by_key(|t| t.width * t.height)
-                                {
-                                    // Decode using our robust fast loader.
-                                    img_for_hashing =
-                                        load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data);
+                        if let Ok(mut raw) = rsraw::RawImage::open(b)
+                            && let Ok(thumbs) = raw.extract_thumbs()
+                        {
+                            // Find largest JPEG thumbnail
+                            if let Some(thumb) = thumbs
+                                .into_iter()
+                                .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
+                                .max_by_key(|t| t.width * t.height)
+                            {
+                                // Decode using our robust fast loader.
+                                img_for_hashing =
+                                    load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data);
 
-                                    if let Some(img) = &img_for_hashing {
-                                        if resolution.is_none() {
-                                            resolution = Some(img.dimensions());
-                                        }
-                                    }
+                                if let Some(img) = &img_for_hashing
+                                    && resolution.is_none()
+                                {
+                                    resolution = Some(img.dimensions());
                                 }
                             }
                         }
@@ -1609,7 +1607,7 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
 }
 
 /// Sort directories by the given sort order (same options as files)
-pub fn sort_directories(dirs: &mut Vec<std::path::PathBuf>, sort_order: &str) {
+pub fn sort_directories(dirs: &mut [std::path::PathBuf], sort_order: &str) {
     use rand::seq::SliceRandom;
     match sort_order {
         "name" => {
@@ -1804,21 +1802,21 @@ pub fn scan_for_view(
                         if let Ok(canonical) = entry_path.canonicalize() {
                             subdirs.push(canonical);
                         }
-                    } else if entry_path.is_file() && is_image_ext(&entry_path) {
-                        if let Ok(canonical) = entry_path.canonicalize() {
-                            if seen_paths.insert(canonical.clone()) {
-                                raw_paths.push(canonical);
-                            }
-                        }
+                    } else if entry_path.is_file()
+                        && is_image_ext(&entry_path)
+                        && let Ok(canonical) = entry_path.canonicalize()
+                        && seen_paths.insert(canonical.clone())
+                    {
+                        raw_paths.push(canonical);
                     }
                 }
             }
-        } else if path.is_file() && is_image_ext(path) {
-            if let Ok(canonical) = path.canonicalize() {
-                if seen_paths.insert(canonical.clone()) {
-                    raw_paths.push(canonical);
-                }
-            }
+        } else if path.is_file()
+            && is_image_ext(path)
+            && let Ok(canonical) = path.canonicalize()
+            && seen_paths.insert(canonical.clone())
+        {
+            raw_paths.push(canonical);
         }
     }
     // Apply same sort order to directories as files
@@ -1848,7 +1846,7 @@ pub fn scan_for_view(
             .filter_map(|path| {
                 if let Some(prog_tx) = &progress_tx {
                     let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if current % 50 == 0 || current == total_files {
+                    if current.is_multiple_of(50) || current == total_files {
                         let _ = prog_tx.send((current, total_files));
                     }
                 }
@@ -1858,10 +1856,10 @@ pub fn scan_for_view(
                 let modified = DateTime::from(metadata.modified().ok().unwrap_or(UNIX_EPOCH));
 
                 let mut gps_pos = None;
-                if let Some(exif) = read_exif_data(path, None) {
-                    if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
-                        gps_pos = Some(Point::new(lon, lat));
-                    }
+                if let Some(exif) = read_exif_data(path, None)
+                    && let Some((lat, lon)) = extract_gps_lat_lon(&exif)
+                {
+                    gps_pos = Some(Point::new(lon, lat));
                 }
                 // Required for RAWs to look correct immediately.
                 // Streaming (batch_tx) ensures the UI is still responsive.
@@ -1941,7 +1939,7 @@ pub fn spawn_background_enrichment(
                 // Read GPS from EXIF
                 let gps_pos = exif_data
                     .as_ref()
-                    .and_then(|exif| extract_gps_lat_lon(exif))
+                    .and_then(extract_gps_lat_lon)
                     .map(|(lat, lon)| Point::new(lon, lat));
 
                 // Read orientation from EXIF (fresh, not from stale passed-in value)
@@ -1952,8 +1950,8 @@ pub fn spawn_background_enrichment(
                 // Write to database if channel is available
                 // Note: resolution is typically None in view mode; update_file_metadata
                 // will update it later when the image is actually loaded
-                if let Some(ref tx) = db_tx {
-                    if let Some(update) = create_feature_update(
+                if let Some(ref tx) = db_tx
+                    && let Some(update) = create_feature_update(
                         &meta_key_secret,
                         path,
                         *unique_file_id,
@@ -1961,9 +1959,9 @@ pub fn spawn_background_enrichment(
                         *resolution,
                         orientation,
                         gps_pos,
-                    ) {
-                        let _ = tx.send(update);
-                    }
+                    )
+                {
+                    let _ = tx.send(update);
                 }
 
                 // Send result back to GUI
@@ -2009,17 +2007,16 @@ pub fn spawn_background_dir_scan(
             if let Ok(canonical) = entry_path.canonicalize() {
                 if canonical.is_dir() {
                     subdirs.push(canonical);
-                } else if is_image_ext(&canonical) {
-                    if let Ok(meta) = entry.metadata() {
-                        if let Some(unique_file_id) = get_file_key(&canonical) {
-                            entries.push(DirEntry {
-                                path: canonical,
-                                size: meta.len(),
-                                modified: meta.modified().unwrap_or(UNIX_EPOCH).into(),
-                                unique_file_id,
-                            });
-                        }
-                    }
+                } else if is_image_ext(&canonical)
+                    && let Ok(meta) = entry.metadata()
+                    && let Some(unique_file_id) = get_file_key(&canonical)
+                {
+                    entries.push(DirEntry {
+                        path: canonical,
+                        size: meta.len(),
+                        modified: meta.modified().unwrap_or(UNIX_EPOCH).into(),
+                        unique_file_id,
+                    });
                 }
             }
         }

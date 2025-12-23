@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use super::app::GuiApp;
-use super::image::{GroupViewState, ViewMode};
+use super::image::ViewMode;
 
 /// Handle keyboard input
 pub(super) fn handle_input(
@@ -81,7 +81,6 @@ pub(super) fn handle_input(
             app.show_dir_picker = false;
             app.change_directory(selected_dir);
         }
-        return;
     } else if !app.state.is_loading
         && app.state.renaming.is_none()
         && !app.state.show_sort_selection
@@ -143,27 +142,26 @@ pub(super) fn handle_input(
         }
 
         // Handle Enter to open selected directory
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            if app.state.view_mode
-                && let Some(dir_idx) = app.dir_selection_idx
-            {
-                // Determine which directory to open
-                let dir_to_open = if has_parent {
-                    if dir_idx == 0 {
-                        // Parent directory
-                        app.current_dir.as_ref().and_then(|c| c.parent()).map(|p| p.to_path_buf())
-                    } else {
-                        // Subdirectory (index adjusted for parent)
-                        app.subdirs.get(dir_idx - 1).cloned()
-                    }
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter))
+            && app.state.view_mode
+            && let Some(dir_idx) = app.dir_selection_idx
+        {
+            // Determine which directory to open
+            let dir_to_open = if has_parent {
+                if dir_idx == 0 {
+                    // Parent directory
+                    app.current_dir.as_ref().and_then(|c| c.parent()).map(|p| p.to_path_buf())
                 } else {
-                    // No parent, subdirs start at index 0
-                    app.subdirs.get(dir_idx).cloned()
-                };
-                if let Some(dir) = dir_to_open {
-                    app.dir_selection_idx = None;
-                    app.change_directory(dir);
+                    // Subdirectory (index adjusted for parent)
+                    app.subdirs.get(dir_idx - 1).cloned()
                 }
+            } else {
+                // No parent, subdirs start at index 0
+                app.subdirs.get(dir_idx).cloned()
+            };
+            if let Some(dir) = dir_to_open {
+                app.dir_selection_idx = None;
+                app.change_directory(dir);
             }
         }
 
@@ -425,17 +423,15 @@ pub(super) fn handle_input(
             app.state.status_set_time = Some(std::time::Instant::now());
 
             // Check fallback immediately for current file
-            if app.state.use_gps_utc {
-                if let Some(path) = app.state.get_current_image_path() {
-                    if !crate::scanner::has_gps_time(path) {
-                        app.state.status_message = Some((
-                            "Sun Position: GPS Time missing, falling back to Local time."
-                                .to_string(),
-                            true, // Error color
-                        ));
-                        app.state.status_set_time = Some(std::time::Instant::now());
-                    }
-                }
+            if app.state.use_gps_utc
+                && let Some(path) = app.state.get_current_image_path()
+                && !crate::scanner::has_gps_time(path)
+            {
+                app.state.status_message = Some((
+                    "Sun Position: GPS Time missing, falling back to Local time.".to_string(),
+                    true, // Error color
+                ));
+                app.state.status_set_time = Some(std::time::Instant::now());
             }
         }
 
@@ -486,7 +482,7 @@ pub(super) fn handle_input(
 pub(super) fn handle_dialogs(
     app: &mut GuiApp,
     ctx: &egui::Context,
-    force_panel_resize: &mut bool,
+    _force_panel_resize: &mut bool,
     intent: &RefCell<Option<InputIntent>>,
 ) {
     let pending = intent.borrow().clone();
@@ -700,18 +696,15 @@ pub(super) fn handle_dialogs(
                         if let Ok(entries) = fs::read_dir(parent_dir) {
                             for entry in entries.flatten() {
                                 // Filter: ONLY DIRECTORIES
-                                if let Ok(ft) = entry.file_type() {
-                                    if ft.is_dir() {
-                                        let name = entry.path().to_string_lossy().to_string();
-                                        if name.starts_with(&app.move_input)
-                                            || entry
-                                                .file_name()
-                                                .to_string_lossy()
-                                                .starts_with(&prefix)
-                                        {
-                                            // Store full path for convenience
-                                            app.move_completion_candidates.push(name);
-                                        }
+                                if let Ok(ft) = entry.file_type()
+                                    && ft.is_dir()
+                                {
+                                    let name = entry.path().to_string_lossy().to_string();
+                                    if name.starts_with(&app.move_input)
+                                        || entry.file_name().to_string_lossy().starts_with(&prefix)
+                                    {
+                                        // Store full path for convenience
+                                        app.move_completion_candidates.push(name);
                                     }
                                 }
                             }
@@ -1093,10 +1086,10 @@ pub(super) fn handle_dialogs(
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Open (Enter)").clicked() {
-                        if let Some(dir) = app.dir_list.get(app.dir_picker_selection).cloned() {
-                            selected_dir = Some(dir);
-                        }
+                    if ui.button("Open (Enter)").clicked()
+                        && let Some(dir) = app.dir_list.get(app.dir_picker_selection).cloned()
+                    {
+                        selected_dir = Some(dir);
                     }
                     if ui.button("Cancel (Esc)").clicked() {
                         app.show_dir_picker = false;
@@ -1174,10 +1167,10 @@ fn perform_search_with_cache(app: &mut GuiApp, query: String) {
         // Matches: start, optional minus, digits/dots, hyphen, optional minus, digits/dots, end
         let range_re = regex::Regex::new(r"^(-?[\d\.]+)-(-?[\d\.]+)$").unwrap();
 
-        if let Some(caps) = range_re.captures(rest) {
-            if let (Ok(min), Ok(max)) = (caps[1].parse::<f64>(), caps[2].parse::<f64>()) {
-                sun_range_search = Some((is_az, min, max));
-            }
+        if let Some(caps) = range_re.captures(rest)
+            && let (Ok(min), Ok(max)) = (caps[1].parse::<f64>(), caps[2].parse::<f64>())
+        {
+            sun_range_search = Some((is_az, min, max));
         }
     }
 
@@ -1267,17 +1260,13 @@ fn perform_search_with_cache(app: &mut GuiApp, query: String) {
                 };
 
                 // Find Sun Position tag
-                if let Some((_, val_str)) = exif_tags.iter().find(|(k, _)| k == "Sun Position") {
-                    if let Some((alt, az)) = position::parse_sun_pos_string(val_str) {
-                        let val_to_check = if is_azimuth_search { az } else { alt };
-                        if val_to_check >= min_val && val_to_check <= max_val {
-                            let type_str = if is_azimuth_search { "Azimuth" } else { "Altitude" };
-                            app.state.search_results.push((
-                                g_idx,
-                                f_idx,
-                                format!("Sun {}", type_str),
-                            ));
-                        }
+                if let Some((_, val_str)) = exif_tags.iter().find(|(k, _)| k == "Sun Position")
+                    && let Some((alt, az)) = position::parse_sun_pos_string(val_str)
+                {
+                    let val_to_check = if is_azimuth_search { az } else { alt };
+                    if val_to_check >= min_val && val_to_check <= max_val {
+                        let type_str = if is_azimuth_search { "Azimuth" } else { "Altitude" };
+                        app.state.search_results.push((g_idx, f_idx, format!("Sun {}", type_str)));
                     }
                 }
                 continue; // Skip standard regex check for this file if doing range search

@@ -1,7 +1,6 @@
 use fast_image_resize as fr;
 use fast_image_resize::ResizeOptions;
 use fast_image_resize::images::Image;
-///! Compute PDQ hash of an image.
 pub use image;
 use std::f32::consts::PI;
 
@@ -48,15 +47,16 @@ impl PdqFeatures {
     }
 
     pub fn generate_dihedral_hashes(&self) -> Vec<[u8; HASH_LENGTH]> {
-        let mut results = Vec::with_capacity(8);
-        results.push(self.to_hash());
-        results.push(self.transform_transpose().transform_flip_x().to_hash());
-        results.push(self.transform_flip_x().transform_flip_y().to_hash());
-        results.push(self.transform_transpose().transform_flip_y().to_hash());
-        results.push(self.transform_flip_x().to_hash());
-        results.push(self.transform_flip_y().to_hash());
-        results.push(self.transform_transpose().to_hash());
-        results.push(self.transform_transpose().transform_flip_x().transform_flip_y().to_hash());
+        let results = vec![
+            self.to_hash(),
+            self.transform_transpose().transform_flip_x().to_hash(),
+            self.transform_flip_x().transform_flip_y().to_hash(),
+            self.transform_transpose().transform_flip_y().to_hash(),
+            self.transform_flip_x().to_hash(),
+            self.transform_flip_y().to_hash(),
+            self.transform_transpose().to_hash(),
+            self.transform_transpose().transform_flip_x().transform_flip_y().to_hash(),
+        ];
         results
     }
 

@@ -4,12 +4,9 @@ use eframe::egui;
 use fast_image_resize::images::Image as FastImage;
 use fast_image_resize::{PixelType, ResizeOptions, Resizer};
 use image::GenericImageView;
-use image::{DynamicImage, ImageBuffer, Rgb};
-use std::collections::HashSet;
 use std::f32::consts::PI;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
 use std::thread;
 
 use super::app::GuiApp;
@@ -195,14 +192,12 @@ fn load_and_process_image_from_bytes(
 
         let mut raw =
             rsraw::RawImage::open(bytes).map_err(|e| format!("Failed to open RAW file: {}", e))?;
-        let dims = (raw.width() as u32, raw.height() as u32);
+        let dims = (raw.width(), raw.height());
 
         // Try thumbnail first
-        if use_thumbnails {
-            if let Some(thumb) = extract_best_thumbnail(&mut raw) {
-                // Thumbnails are typically small, but resize if needed
-                return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
-            }
+        if use_thumbnails && let Some(thumb) = extract_best_thumbnail(&mut raw) {
+            // Thumbnails are typically small, but resize if needed
+            return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
         }
 
         // Full RAW decode
@@ -269,10 +264,10 @@ fn load_and_process_image_from_bytes(
         .with_guessed_format()
         .unwrap_or_else(|_| image::ImageReader::new(std::io::Cursor::new(bytes)));
 
-    if reader.format().is_none() {
-        if let Ok(fmt) = image::ImageFormat::from_path(path) {
-            reader.set_format(fmt);
-        }
+    if reader.format().is_none()
+        && let Ok(fmt) = image::ImageFormat::from_path(path)
+    {
+        reader.set_format(fmt);
     }
 
     let format_name =
@@ -346,10 +341,10 @@ pub(super) fn update_file_metadata(
 
     // Check current file first (fast path)
     let mut found_info: Option<(u128, Option<geo::Point<f64>>, bool)> = None;
-    if let Some(group) = app.state.groups.get_mut(app.state.current_group_idx) {
-        if let Some(file) = group.get_mut(app.state.current_file_idx) {
-            found_info = update_file(file);
-        }
+    if let Some(group) = app.state.groups.get_mut(app.state.current_group_idx)
+        && let Some(file) = group.get_mut(app.state.current_file_idx)
+    {
+        found_info = update_file(file);
     }
 
     // Fallback search if not found
@@ -369,28 +364,26 @@ pub(super) fn update_file_metadata(
 
     // Persist to database if we found the file and something changed
     if let Some((unique_file_id, gps_pos, changed)) = found_info {
-        if changed {
-            if let Some(ref db_tx) = app.db_tx {
-                // Use create_feature_update with the real content_hash computed by the image loader
-                // This creates/updates the full database entry on first load
-                if let Some(update) = crate::db::create_feature_update(
-                    &app.ctx.meta_key,
-                    path,
-                    unique_file_id,
-                    content_hash,
-                    Some((w, h)),
-                    orientation,
-                    gps_pos,
-                ) {
-                    let _ = db_tx.send(update);
-                    eprintln!(
-                        "[DEBUG-UPDATE]   Sent DB update for {:?}: resolution={}x{}, orientation={}",
-                        path.file_name().unwrap_or_default(),
-                        w,
-                        h,
-                        orientation
-                    );
-                }
+        if changed && let Some(ref db_tx) = app.db_tx {
+            // Use create_feature_update with the real content_hash computed by the image loader
+            // This creates/updates the full database entry on first load
+            if let Some(update) = crate::db::create_feature_update(
+                &app.ctx.meta_key,
+                path,
+                unique_file_id,
+                content_hash,
+                Some((w, h)),
+                orientation,
+                gps_pos,
+            ) {
+                let _ = db_tx.send(update);
+                eprintln!(
+                    "[DEBUG-UPDATE]   Sent DB update for {:?}: resolution={}x{}, orientation={}",
+                    path.file_name().unwrap_or_default(),
+                    w,
+                    h,
+                    orientation
+                );
             }
         }
     } else {
@@ -743,10 +736,10 @@ pub(super) fn render_exif(
     }
 
     // Extract Sun Position if present and update GPS map
-    if let Some((_, val_str)) = tags.iter().find(|(k, _)| k == "Sun Position") {
-        if let Some((elevation, azimuth)) = crate::position::parse_sun_pos_string(val_str) {
-            app.gps_map.set_sun_position(path, elevation, azimuth);
-        }
+    if let Some((_, val_str)) = tags.iter().find(|(k, _)| k == "Sun Position")
+        && let Some((elevation, azimuth)) = crate::position::parse_sun_pos_string(val_str)
+    {
+        app.gps_map.set_sun_position(path, elevation, azimuth);
     }
 
     // Get window width for positioning
@@ -774,7 +767,7 @@ pub(super) fn render_exif(
     let max_label_width =
         tags.iter().map(|(name, value)| name.len() + value.len() + 2).max().unwrap_or(20) as f32
             * 7.0;
-    let exif_width = max_label_width.min(300.0).max(150.0);
+    let exif_width = max_label_width.clamp(150.0, 300.0);
 
     let exif_rect = egui::Rect::from_min_size(
         egui::pos2(exif_x, available_rect.max.y - exif_height - padding),

@@ -1,4 +1,3 @@
-use chrono;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
 use jiff::Timestamp;
@@ -390,7 +389,7 @@ impl GuiApp {
         // Set up empty initial state - files will stream in from background
         state.groups = vec![Vec::new()];
         state.group_infos = vec![GroupInfo { max_dist: 0, status: GroupStatus::None }];
-        state.is_loading = dir_total_count.map_or(false, |c| c > 0);
+        state.is_loading = dir_total_count.is_some_and(|c| c > 0);
 
         // Extract values before moving ctx to Arc
         let tile_cache_path = ctx.tile_cache_path.clone();
@@ -483,10 +482,10 @@ impl GuiApp {
         if self.failed_images.contains_key(path) {
             return;
         }
-        if let Some(until) = self.retry_after.get(path) {
-            if Instant::now() < *until {
-                return;
-            }
+        if let Some(until) = self.retry_after.get(path)
+            && Instant::now() < *until
+        {
+            return;
         }
         eprintln!("[DEBUG] enqueue_image_load sending to preload: {:?}", path);
         let _ = self.image_preload_tx.send(path.to_path_buf());
@@ -502,33 +501,30 @@ impl GuiApp {
         unique_file_id: Option<u128>,
     ) -> Option<(f64, f64)> {
         // Fast path: query the database using the content hash (only works if content_hash is non-zero)
-        if *content_hash != [0u8; 32] {
-            if let Ok(Some(features)) = self.ctx.get_features(content_hash) {
-                if let Some(coords) = features.gps_pos {
-                    self.gps_map.add_marker(path.to_path_buf(), coords.y(), coords.x());
-                    return Some((coords.y(), coords.x()));
-                }
-            }
+        if *content_hash != [0u8; 32]
+            && let Ok(Some(features)) = self.ctx.get_features(content_hash)
+            && let Some(coords) = features.gps_pos
+        {
+            self.gps_map.add_marker(path.to_path_buf(), coords.y(), coords.x());
+            return Some((coords.y(), coords.x()));
         }
 
         // Slow fallback: Read EXIF directly from disk
-        if let Some(exif) = scanner::read_exif_data(path, None) {
-            if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
-                self.gps_map.add_marker(path.to_path_buf(), lat, lon);
+        if let Some(exif) = scanner::read_exif_data(path, None)
+            && let Some((lat, lon)) = extract_gps_lat_lon(&exif)
+        {
+            self.gps_map.add_marker(path.to_path_buf(), lat, lon);
 
-                // O(1) update via file_index if unique_file_id provided
-                if let Some(uid) = unique_file_id {
-                    if let Some(&file_idx) = self.file_index.get(&uid) {
-                        if let Some(group) = self.state.groups.first_mut() {
-                            if let Some(file) = group.get_mut(file_idx) {
-                                file.gps_pos = Some(geo::Point::new(lon, lat));
-                            }
-                        }
-                    }
-                }
-
-                return Some((lat, lon));
+            // O(1) update via file_index if unique_file_id provided
+            if let Some(uid) = unique_file_id
+                && let Some(&file_idx) = self.file_index.get(&uid)
+                && let Some(group) = self.state.groups.first_mut()
+                && let Some(file) = group.get_mut(file_idx)
+            {
+                file.gps_pos = Some(geo::Point::new(lon, lat));
             }
+
+            return Some((lat, lon));
         }
 
         None
@@ -717,38 +713,36 @@ impl GuiApp {
                     if let Ok(canonical) = entry_path.canonicalize() {
                         if canonical.is_dir() {
                             self.subdirs.push(canonical);
-                        } else if self.state.view_mode && crate::scanner::is_image_ext(&canonical) {
-                            if let Ok(meta) = entry.metadata() {
-                                let size = meta.len();
-                                let modified =
-                                    meta.modified().unwrap_or(std::time::UNIX_EPOCH).into();
-                                if let Some(unique_file_id) =
-                                    crate::fileops::get_file_key(&canonical)
-                                {
-                                    if let Some(old) = existing.get(&unique_file_id) {
-                                        // Preserve resolution/hashes from session, update path/size/modified
-                                        let mut recovered = old.clone();
-                                        recovered.path = canonical;
-                                        recovered.size = size;
-                                        recovered.modified = modified;
-                                        new_files.push(recovered);
-                                    } else {
-                                        // New file not in session - use centralized cache lookup from db.rs
-                                        let (resolution, orientation, gps_pos) =
-                                            self.ctx.lookup_cached_features(&meta, unique_file_id);
-                                        new_files.push(FileMetadata {
-                                            path: canonical,
-                                            size,
-                                            modified,
-                                            pdqhash: None,
-                                            resolution,
-                                            content_hash: [0u8; 32],
-                                            pixel_hash: None,
-                                            orientation,
-                                            gps_pos,
-                                            unique_file_id,
-                                        });
-                                    }
+                        } else if self.state.view_mode
+                            && crate::scanner::is_image_ext(&canonical)
+                            && let Ok(meta) = entry.metadata()
+                        {
+                            let size = meta.len();
+                            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH).into();
+                            if let Some(unique_file_id) = crate::fileops::get_file_key(&canonical) {
+                                if let Some(old) = existing.get(&unique_file_id) {
+                                    // Preserve resolution/hashes from session, update path/size/modified
+                                    let mut recovered = old.clone();
+                                    recovered.path = canonical;
+                                    recovered.size = size;
+                                    recovered.modified = modified;
+                                    new_files.push(recovered);
+                                } else {
+                                    // New file not in session - use centralized cache lookup from db.rs
+                                    let (resolution, orientation, gps_pos) =
+                                        self.ctx.lookup_cached_features(&meta, unique_file_id);
+                                    new_files.push(FileMetadata {
+                                        path: canonical,
+                                        size,
+                                        modified,
+                                        pdqhash: None,
+                                        resolution,
+                                        content_hash: [0u8; 32],
+                                        pixel_hash: None,
+                                        orientation,
+                                        gps_pos,
+                                        unique_file_id,
+                                    });
                                 }
                             }
                         }
@@ -1020,86 +1014,82 @@ impl GuiApp {
         }
 
         // 4. Process Final Result
-        if let Some(rx) = &self.scan_rx {
-            if let Ok((mut new_groups, new_infos, new_subdirs)) = rx.try_recv() {
-                eprintln!(
-                    "[DEBUG-RELOAD] Replacing groups! Old groups count: {}, New groups count: {}",
-                    self.state.groups.len(),
-                    new_groups.len()
-                );
+        if let Some(rx) = &self.scan_rx
+            && let Ok((mut new_groups, new_infos, new_subdirs)) = rx.try_recv()
+        {
+            eprintln!(
+                "[DEBUG-RELOAD] Replacing groups! Old groups count: {}, New groups count: {}",
+                self.state.groups.len(),
+                new_groups.len()
+            );
 
-                // SORTING LOGIC: Ensure content subgroups are contiguous.
-                // We sort primarily by pixel_hash, secondarily by path.
-                // This keeps "C1" files together, "C2" together, etc.
-                for group in &mut new_groups {
-                    group.sort_by(|a, b| {
-                        match (a.pixel_hash, b.pixel_hash) {
-                            (Some(ha), Some(hb)) => {
-                                if ha == hb {
-                                    a.path.cmp(&b.path)
-                                } else {
-                                    ha.cmp(&hb)
-                                }
-                            }
-                            // Put files WITH pixel hash (potential content matches) before those without?
-                            // Or standard Option ordering: None < Some.
-                            // Let's use standard Ord which puts None first.
-                            // This means "Unmatched" files might appear at top/bottom,
-                            // but all "Some(hash)" will be grouped.
-                            (h1, h2) => {
-                                let ord = h1.cmp(&h2);
-                                if ord == std::cmp::Ordering::Equal {
-                                    a.path.cmp(&b.path)
-                                } else {
-                                    ord
-                                }
+            // SORTING LOGIC: Ensure content subgroups are contiguous.
+            // We sort primarily by pixel_hash, secondarily by path.
+            // This keeps "C1" files together, "C2" together, etc.
+            for group in &mut new_groups {
+                group.sort_by(|a, b| {
+                    match (a.pixel_hash, b.pixel_hash) {
+                        (Some(ha), Some(hb)) => {
+                            if ha == hb {
+                                a.path.cmp(&b.path)
+                            } else {
+                                ha.cmp(&hb)
                             }
                         }
-                    });
-                }
-
-                if let Some(first_group) = new_groups.first() {
-                    for (i, file) in first_group.iter().enumerate().take(5) {
-                        eprintln!(
-                            "[DEBUG-RELOAD]   new_groups[0][{}]: {:?}, orientation={}",
-                            i,
-                            file.path.file_name().unwrap_or_default(),
-                            file.orientation
-                        );
+                        // Put files WITH pixel hash (potential content matches) before those without?
+                        // Or standard Option ordering: None < Some.
+                        // Let's use standard Ord which puts None first.
+                        // This means "Unmatched" files might appear at top/bottom,
+                        // but all "Some(hash)" will be grouped.
+                        (h1, h2) => {
+                            let ord = h1.cmp(&h2);
+                            if ord == std::cmp::Ordering::Equal { a.path.cmp(&b.path) } else { ord }
+                        }
                     }
-                }
-
-                // Only replace if we have results (duplicate mode) or finished view mode
-                self.state.groups = new_groups;
-                self.cache_dirty = true;
-                self.state.group_infos = new_infos;
-                self.subdirs = new_subdirs;
-                self.refresh_dir_cache(false);
-                self.state.last_file_count = self.state.groups.iter().map(|g| g.len()).sum();
-
-                // Clamp or reset indices to prevent panic if new list is smaller
-                if self.state.groups.is_empty() {
-                    self.state.current_group_idx = 0;
-                    self.state.current_file_idx = 0;
-                } else {
-                    if self.state.current_group_idx >= self.state.groups.len() {
-                        self.state.current_group_idx = self.state.groups.len() - 1;
-                        self.state.current_file_idx = 0; // Reset file index if we jumped groups
-                    }
-                    // Also check file index bounds for the current group
-                    let group_len = self.state.groups[self.state.current_group_idx].len();
-                    if self.state.current_file_idx >= group_len {
-                        self.state.current_file_idx = group_len.saturating_sub(1);
-                    }
-                }
-
-                self.state.is_loading = false;
-                self.scan_rx = None;
-                self.scan_progress_rx = None;
-                self.scan_batch_rx = None;
-
-                needs_repaint = true;
+                });
             }
+
+            if let Some(first_group) = new_groups.first() {
+                for (i, file) in first_group.iter().enumerate().take(5) {
+                    eprintln!(
+                        "[DEBUG-RELOAD]   new_groups[0][{}]: {:?}, orientation={}",
+                        i,
+                        file.path.file_name().unwrap_or_default(),
+                        file.orientation
+                    );
+                }
+            }
+
+            // Only replace if we have results (duplicate mode) or finished view mode
+            self.state.groups = new_groups;
+            self.cache_dirty = true;
+            self.state.group_infos = new_infos;
+            self.subdirs = new_subdirs;
+            self.refresh_dir_cache(false);
+            self.state.last_file_count = self.state.groups.iter().map(|g| g.len()).sum();
+
+            // Clamp or reset indices to prevent panic if new list is smaller
+            if self.state.groups.is_empty() {
+                self.state.current_group_idx = 0;
+                self.state.current_file_idx = 0;
+            } else {
+                if self.state.current_group_idx >= self.state.groups.len() {
+                    self.state.current_group_idx = self.state.groups.len() - 1;
+                    self.state.current_file_idx = 0; // Reset file index if we jumped groups
+                }
+                // Also check file index bounds for the current group
+                let group_len = self.state.groups[self.state.current_group_idx].len();
+                if self.state.current_file_idx >= group_len {
+                    self.state.current_file_idx = group_len.saturating_sub(1);
+                }
+            }
+
+            self.state.is_loading = false;
+            self.scan_rx = None;
+            self.scan_progress_rx = None;
+            self.scan_batch_rx = None;
+
+            needs_repaint = true;
         }
 
         // FORCE UI WAKE-UP
@@ -1243,7 +1233,7 @@ impl GuiApp {
                 // Load EVERYTHING via the pool, not just RAW
                 if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
                     self.raw_loading.insert(path.clone());
-                    self.enqueue_image_load(&path);
+                    self.enqueue_image_load(path);
                 }
                 break;
             }
@@ -1256,7 +1246,7 @@ impl GuiApp {
             }
             if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
                 self.raw_loading.insert(path.clone());
-                self.enqueue_image_load(&path);
+                self.enqueue_image_load(path);
             }
         }
 
@@ -1309,13 +1299,14 @@ impl GuiApp {
             "[DEBUG-RUN] Setting window size to {}x{} (physical pixels = logical points at ppp=1)",
             width, height
         );
-        eprintln!("[DEBUG-RUN] self.panel_width at run() = {}", self.panel_width);
 
+        let is_windows = cfg!(target_os = "windows");
         let options = eframe::NativeOptions {
             renderer: eframe::Renderer::Wgpu,
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([width, height])
-                .with_decorations(false),
+                .with_decorations(is_windows)
+                .with_resizable(true),
             ..Default::default()
         };
 
@@ -1427,7 +1418,7 @@ impl eframe::App for GuiApp {
 
         // Send the title to the OS (updates Alt-Tab / Taskbar name)
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title_text.clone()));
-        if !self.state.is_fullscreen {
+        if !cfg!(target_os = "windows") && !self.state.is_fullscreen {
             egui::TopBottomPanel::top("custom_title_bar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let height = 12.0;
@@ -1599,23 +1590,18 @@ impl eframe::App for GuiApp {
                 match rx.try_recv() {
                     Ok(result) => {
                         // O(1) lookup using file_index
-                        if let Some(&file_idx) = self.file_index.get(&result.unique_file_id) {
-                            if let Some(group) = self.state.groups.first_mut() {
-                                if let Some(file) = group.get_mut(file_idx) {
-                                    file.content_hash = result.content_hash;
-                                    if result.gps_pos.is_some() {
-                                        file.gps_pos = result.gps_pos;
-                                    }
+                        if let Some(&file_idx) = self.file_index.get(&result.unique_file_id)
+                            && let Some(group) = self.state.groups.first_mut()
+                            && let Some(file) = group.get_mut(file_idx)
+                        {
+                            file.content_hash = result.content_hash;
+                            if result.gps_pos.is_some() {
+                                file.gps_pos = result.gps_pos;
+                            }
 
-                                    // Add GPS marker if we found coordinates
-                                    if let Some(pos) = result.gps_pos {
-                                        self.gps_map.add_marker(
-                                            file.path.clone(),
-                                            pos.y(),
-                                            pos.x(),
-                                        );
-                                    }
-                                }
+                            // Add GPS marker if we found coordinates
+                            if let Some(pos) = result.gps_pos {
+                                self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x());
                             }
                         }
                     }
@@ -2005,7 +1991,7 @@ impl eframe::App for GuiApp {
                                 ui.painter().text(
                                     rect.left_center() + egui::vec2(4.0, 0.0),
                                     egui::Align2::LEFT_CENTER,
-                                    &format!("{}{}", folder_prefix, display_dir_name),
+                                    format!("{}{}", folder_prefix, display_dir_name),
                                     font_id,
                                     egui::Color32::LIGHT_BLUE,
                                 );
@@ -2086,44 +2072,42 @@ impl eframe::App for GuiApp {
                     }
 
                     // --- 3. HANDLE AUTO-SCROLL (Keyboard Nav) ---
-                    if self.state.selection_changed {
-                        if let Some(group_start_y) =
+                    if self.state.selection_changed
+                        && let Some(group_start_y) =
                             self.group_y_offsets.get(self.state.current_group_idx)
+                    {
+                        let header_offset = if show_headers { header_height } else { 0.0 };
+                        let file_offset = self.state.current_file_idx as f32 * file_row_total_h;
+
+                        // Offset relative to content top (including directories)
+                        let target_y_offset =
+                            files_start_offset + group_start_y + header_offset + file_offset;
+
+                        // Convert to SCREEN COORDINATES
+                        let scroll_top = ui.min_rect().min;
+                        let target_screen_pos =
+                            egui::pos2(scroll_top.x, scroll_top.y + target_y_offset);
+
+                        ui.scroll_to_rect(
+                            egui::Rect::from_min_size(
+                                target_screen_pos,
+                                egui::vec2(100.0, file_row_total_h),
+                            ),
+                            Some(egui::Align::Center),
+                        );
+
+                        // Center GPS map on new selection if visible
+                        if self.gps_map.visible
+                            && let Some(file) = self
+                                .state
+                                .groups
+                                .get(self.state.current_group_idx)
+                                .and_then(|g| g.get(self.state.current_file_idx))
                         {
-                            let header_offset = if show_headers { header_height } else { 0.0 };
-                            let file_offset = self.state.current_file_idx as f32 * file_row_total_h;
-
-                            // Offset relative to content top (including directories)
-                            let target_y_offset =
-                                files_start_offset + group_start_y + header_offset + file_offset;
-
-                            // Convert to SCREEN COORDINATES
-                            let scroll_top = ui.min_rect().min;
-                            let target_screen_pos =
-                                egui::pos2(scroll_top.x, scroll_top.y + target_y_offset);
-
-                            ui.scroll_to_rect(
-                                egui::Rect::from_min_size(
-                                    target_screen_pos,
-                                    egui::vec2(100.0, file_row_total_h),
-                                ),
-                                Some(egui::Align::Center),
-                            );
-
-                            // Center GPS map on new selection if visible
-                            if self.gps_map.visible {
-                                if let Some(file) = self
-                                    .state
-                                    .groups
-                                    .get(self.state.current_group_idx)
-                                    .and_then(|g| g.get(self.state.current_file_idx))
-                                {
-                                    self.gps_map.center_on_path(&file.path);
-                                }
-                            }
-
-                            self.state.selection_changed = false;
+                            self.gps_map.center_on_path(&file.path);
                         }
+
+                        self.state.selection_changed = false;
                     }
 
                     // --- 4. ALLOCATE SCROLL SPACE ---
@@ -2321,15 +2305,14 @@ impl eframe::App for GuiApp {
                                 }
 
                                 // Highlight peers
-                                if let Some(current_file) = group.get(self.state.current_file_idx) {
-                                    if !is_selected
-                                        && current_file.pixel_hash.is_some()
-                                        && current_file.pixel_hash == file.pixel_hash
-                                    {
-                                        let bg = egui::Color32::from_black_alpha(40);
-                                        marker_rich = marker_rich.strong().background_color(bg);
-                                        filename_rich = filename_rich.strong().background_color(bg);
-                                    }
+                                if let Some(current_file) = group.get(self.state.current_file_idx)
+                                    && !is_selected
+                                    && current_file.pixel_hash.is_some()
+                                    && current_file.pixel_hash == file.pixel_hash
+                                {
+                                    let bg = egui::Color32::from_black_alpha(40);
+                                    marker_rich = marker_rich.strong().background_color(bg);
+                                    filename_rich = filename_rich.strong().background_color(bg);
                                 }
 
                                 // --- RENDER ---
@@ -2391,17 +2374,13 @@ impl eframe::App for GuiApp {
                                                 // Apply background for peer highlighting
                                                 if let Some(current_file) =
                                                     group.get(self.state.current_file_idx)
+                                                    && !is_selected
+                                                    && current_file.pixel_hash.is_some()
+                                                    && current_file.pixel_hash == file.pixel_hash
                                                 {
-                                                    if !is_selected
-                                                        && current_file.pixel_hash.is_some()
-                                                        && current_file.pixel_hash
-                                                            == file.pixel_hash
-                                                    {
-                                                        let bg =
-                                                            egui::Color32::from_black_alpha(40);
-                                                        main_rich =
-                                                            main_rich.strong().background_color(bg);
-                                                    }
+                                                    let bg = egui::Color32::from_black_alpha(40);
+                                                    main_rich =
+                                                        main_rich.strong().background_color(bg);
                                                 }
                                                 ui.label(main_rich);
                                                 ui.label(
@@ -2443,12 +2422,11 @@ impl eframe::App for GuiApp {
                                     self.state.current_file_idx = f_idx;
                                     self.dir_selection_idx = None;
                                     // Center GPS map on clicked file if visible
-                                    if self.gps_map.visible {
-                                        if let Some(file) =
+                                    if self.gps_map.visible
+                                        && let Some(file) =
                                             self.state.groups.get(g_idx).and_then(|g| g.get(f_idx))
-                                        {
-                                            self.gps_map.center_on_path(&file.path);
-                                        }
+                                    {
+                                        self.gps_map.center_on_path(&file.path);
                                     }
                                     ctx.request_repaint();
                                 }

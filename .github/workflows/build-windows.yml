@@ -1,0 +1,110 @@
+name: Build and Release Windows (static binary)
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  VCPKG_ROOT: "C:/vcpkg"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Update vcpkg Portfiles with retry because github is unreliable
+      shell: powershell
+      run: |
+        cd $env:VCPKG_ROOT
+        git pull origin master
+
+        # Retry loop to handle 503 download errors
+        $MaxRetries = 5
+        for ($i=1; $i -le $MaxRetries; $i++) {
+            cmd /c "bootstrap-vcpkg.bat"
+            if ($LASTEXITCODE -eq 0) { break }
+            Start-Sleep -Seconds 10
+        }
+
+    - name: Install Dependencies
+      run: |
+        vcpkg integrate install
+        vcpkg update
+        vcpkg install dav1d:x64-windows-static aom:x64-windows-static libde265:x64-windows-static x265:x64-windows-static libheif:x64-windows-static
+        choco install nasm pkgconfiglite
+
+    - name: Extract Versions for build.rs
+      shell: powershell
+      run: |
+        # 1. Get raw output from vcpkg
+        # Output looks like: "dav1d:x64-windows-static       1.5.1       AV1 decoder..."
+        $Dav1dInfo = vcpkg list dav1d:x64-windows-static
+        $HeifInfo  = vcpkg list libheif:x64-windows-static
+
+        # 2. Parse the version using Regex
+        # We look for the first non-whitespace string after the package name
+        if ($Dav1dInfo -match "dav1d:x64-windows-static\s+([^\s]+)") {
+            $Dav1dVer = $matches[1]
+        } else { 
+            $Dav1dVer = "Unknown"
+        }
+
+        if ($HeifInfo -match "libheif:x64-windows-static\s+([^\s]+)") {
+            $HeifVer = $matches[1]
+        } else { 
+            $HeifVer = "Unknown"
+        }
+
+        Write-Host "Detected dav1d: $Dav1dVer"
+        Write-Host "Detected libheif: $HeifVer"
+
+        echo "EXT_DAV1D_VER=$Dav1dVer" >> $env:GITHUB_ENV
+        echo "EXT_HEIF_VER=$HeifVer" >> $env:GITHUB_ENV
+        echo "EXT_DAV1D_HASH=Managed by vcpkg (x64-windows-static)" >> $env:GITHUB_ENV
+        echo "EXT_HEIF_HASH=Managed by vcpkg (x64-windows-static)" >> $env:GITHUB_ENV
+
+    - name: Install Rust 1.92.0
+      uses: dtolnay/rust-toolchain@1.92.0
+      with:
+        targets: "x86_64-pc-windows-msvc"
+
+    - name: Build Binary
+      shell: powershell
+      env:
+        PKG_CONFIG_PATH: "C:/vcpkg/installed/x64-windows-static/lib/pkgconfig"
+        PKG_CONFIG_ALL_STATIC: "1"
+        RUSTFLAGS: "-C target-feature=+crt-static"
+      run: |
+        if (Test-Path "$env:PKG_CONFIG_PATH/dav1d.pc") {
+            Write-Host "Found static dav1d.pc" -ForegroundColor Green
+        } else {
+            Write-Error "Could not find dav1d.pc in static path!"
+            exit 1
+        }
+        cargo check           --verbose --target x86_64-pc-windows-msvc
+        cargo build --release --verbose --target x86_64-pc-windows-msvc
+
+    - name: Stage Artifacts
+      shell: powershell
+      run: |
+        $Content = Get-Content Cargo.toml
+        $Version = ($Content | Select-String -Pattern '^version\s*=\s*"(.*)"').Matches.Groups[1].Value
+        echo "VERSION=$Version" >> $env:GITHUB_ENV
+
+        New-Item -ItemType Directory -Force -Path "staging"
+        $Src = "target/x86_64-pc-windows-msvc/release/phdupes.exe"
+        $Dest = "staging/phdupes-v$Version-windows-static.exe"
+        Copy-Item $Src $Dest
+        Write-Host "Bundled Static Exe: $Dest"
+        Get-ChildItem "staging/"
+
+    - name: Publish Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ env.VERSION }}
+        files: staging/*
+        draft: false
+        prerelease: false

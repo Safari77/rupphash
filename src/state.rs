@@ -125,11 +125,11 @@ pub fn get_content_subgroups(group: &[FileMetadata]) -> HashMap<[u8; 32], usize>
     for f in group {
         if let Some(ph) = f.pixel_hash {
             // Only assign an ID if this hash appears more than once (is a duplicate)
-            if *counts.get(&ph).unwrap_or(&0) > 1 {
-                if !ids.contains_key(&ph) {
-                    ids.insert(ph, next_id);
-                    next_id += 1;
-                }
+            if *counts.get(&ph).unwrap_or(&0) > 1
+                && let std::collections::hash_map::Entry::Vacant(e) = ids.entry(ph)
+            {
+                e.insert(next_id);
+                next_id += 1;
             }
         }
     }
@@ -895,12 +895,10 @@ impl AppState {
 
         if next {
             self.current_search_match = (self.current_search_match + 1) % self.search_results.len();
+        } else if self.current_search_match == 0 {
+            self.current_search_match = self.search_results.len() - 1;
         } else {
-            if self.current_search_match == 0 {
-                self.current_search_match = self.search_results.len() - 1;
-            } else {
-                self.current_search_match -= 1;
-            }
+            self.current_search_match -= 1;
         }
 
         let (g, f, ref match_source) = self.search_results[self.current_search_match];

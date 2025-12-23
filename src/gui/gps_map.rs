@@ -131,11 +131,11 @@ impl GpsMapState {
 
     /// Set sun position for a marker by path
     pub fn set_sun_position(&mut self, path: &Path, elevation: f64, azimuth: f64) {
-        if let Some(&idx) = self.path_to_marker.get(path) {
-            if let Some(marker) = self.markers.get_mut(idx) {
-                marker.sun_elevation = Some(elevation);
-                marker.sun_azimuth = Some(azimuth);
-            }
+        if let Some(&idx) = self.path_to_marker.get(path)
+            && let Some(marker) = self.markers.get_mut(idx)
+        {
+            marker.sun_elevation = Some(elevation);
+            marker.sun_azimuth = Some(azimuth);
         }
     }
 
@@ -183,11 +183,11 @@ impl GpsMapState {
 
     /// Center map on the marker for a specific path
     pub fn center_on_path(&mut self, path: &Path) {
-        if let Some(&idx) = self.path_to_marker.get(path) {
-            if let Some(marker) = self.markers.get(idx) {
-                self.map_memory.center_at(marker.position());
-                self.selected_marker = Some(idx);
-            }
+        if let Some(&idx) = self.path_to_marker.get(path)
+            && let Some(marker) = self.markers.get(idx)
+        {
+            self.map_memory.center_at(marker.position());
+            self.selected_marker = Some(idx);
         }
     }
 
