@@ -94,6 +94,9 @@ Rust does not bundle these; it expects you to provide them.
 ## Screenshot - View mode
 ![Screenshot view](phdupes-view.webp)
 
+*Connect GPS locations*
+![Screenshot connect the dots](phdupes-connect-lines-1024.webp)
+
 ## Screenshot - Duplicate finding mode
 ![Screenshot dupe1](phdupes-dupe1.webp)
 ![Screenshot dupe2](phdupes-dupe2.webp)

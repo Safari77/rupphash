@@ -35,6 +35,48 @@ impl TileSource for CustomTileSource {
     }
 }
 
+/// Approximate squared distance for sorting (handles Date Line wrapping)
+/// Much faster than Haversine, accurate enough for local neighbor checks.
+fn dist_sq_approx(p1: (f64, f64), p2: (f64, f64)) -> f64 {
+    let dy = p1.0 - p2.0; // Latitude difference
+    let mut dx = (p1.1 - p2.1).abs(); // Longitude difference
+    if dx > 180.0 {
+        dx = 360.0 - dx;
+    } // Handle crossing the 180th meridian
+    dx * dx + dy * dy
+}
+
+/// Greedy Nearest Neighbor Sort (O(N^2))
+/// Best for visual paths (circles, routes) on datasets < 2000 items.
+pub fn sort_nearest_neighbor(markers: &mut Vec<GpsMarker>) {
+    let len = markers.len();
+    if len < 2 {
+        return;
+    }
+
+    // Start from index 0. Find the closest remaining point and swap it to index 1.
+    // Then find closest to 1 and swap to 2, etc.
+    for i in 0..(len - 1) {
+        let current_pos = (markers[i].lat, markers[i].lon);
+        let mut best_dist = f64::MAX;
+        let mut best_idx = i + 1;
+
+        // Scan all subsequent markers
+        for j in (i + 1)..len {
+            let candidate_pos = (markers[j].lat, markers[j].lon);
+            let d2 = dist_sq_approx(current_pos, candidate_pos);
+
+            if d2 < best_dist {
+                best_dist = d2;
+                best_idx = j;
+            }
+        }
+
+        // Move the closest found neighbor to the next position in the chain
+        markers.swap(i + 1, best_idx);
+    }
+}
+
 // Helper to spread bits (Morton Coding)
 // Expands a 16-bit integer into 32 bits by inserting 0s
 fn part1by1(mut n: u32) -> u64 {
@@ -251,9 +293,19 @@ impl GpsMapState {
             self.markers_needs_sort = false;
             return;
         }
-        eprintln!("[GPS] Optimizing path for {} markers...", count);
-        // 1. Sort using Z-Order (Hilbert) Curve
-        sort_by_hilbert_curve(&mut self.markers);
+
+        if count < 2000 {
+            // STRATEGY A: Nearest Neighbor (Greedy TSP)
+            // Perfect for circles, lines, and typical photo routes.
+            eprintln!("[GPS] Sorting {} markers (Nearest Neighbor)...", count);
+            sort_nearest_neighbor(&mut self.markers);
+        } else {
+            // STRATEGY B: Spatial Clustering (Z-Order/Hilbert)
+            // Necessary for massive datasets (10k+) to prevent freezing.
+            // Creates a "clustered" look rather than a continuous line.
+            eprintln!("[GPS] Sorting {} markers (Z-Order Curve)...", count);
+            sort_by_hilbert_curve(&mut self.markers);
+        }
 
         // 2. Rebuild the lookup map
         self.path_to_marker.clear();
