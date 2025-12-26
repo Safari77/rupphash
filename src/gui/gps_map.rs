@@ -4,7 +4,7 @@ use geo::Point;
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use walkers::sources::{Attribution, TileSource};
-use walkers::{HttpTiles, Map, MapMemory, Plugin, Position, Projector}; // Ensure 'rand' crate is in Cargo.toml
+use walkers::{HttpTiles, Map, MapMemory, Plugin, Position, Projector};
 
 /// Custom tile source that uses a URL pattern
 #[derive(Debug, Clone)]
@@ -395,21 +395,25 @@ impl Plugin for GpsMarkersPlugin {
         projector: &Projector,
         _memory: &MapMemory,
     ) {
-        let painter = ui.painter();
+        let painter = ui.painter().with_clip_rect(self.map_rect);
 
         // --- DRAW LINES ---
         if self.draw_lines && self.markers.len() > 1 {
-            let line_color = egui::Color32::from_rgb(255, 0, 0); // Red path
-            let stroke = egui::Stroke::new(2.5, line_color);
+            let line_stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 60, 0));
 
             for pair in self.markers.windows(2) {
-                let pos_a = projector.project(pair[0].0); // pair[0].0 is Position
-                let pos_b = projector.project(pair[1].0);
+                let pos1 = pair[0].0;
+                let pos2 = pair[1].0;
 
-                painter.line_segment(
-                    [egui::pos2(pos_a.x, pos_a.y), egui::pos2(pos_b.x, pos_b.y)],
-                    stroke,
-                );
+                // Naive anti-spiderweb check for world wrapping
+                if (pos1.x() - pos2.x()).abs() > 180.0 {
+                    continue;
+                }
+
+                let p1 = projector.project(pos1);
+                let p2 = projector.project(pos2);
+
+                painter.line_segment([egui::pos2(p1.x, p1.y), egui::pos2(p2.x, p2.y)], line_stroke);
             }
         }
 
@@ -444,7 +448,7 @@ impl Plugin for GpsMarkersPlugin {
         if let Some((marker_pos, azimuth, elevation)) = self.current_sun {
             let marker_screen = projector.project(marker_pos);
             let marker_screen_pos = egui::pos2(marker_screen.x, marker_screen.y);
-            draw_sun_indicator(painter, self.map_rect, marker_screen_pos, azimuth, elevation);
+            draw_sun_indicator(&painter, self.map_rect, marker_screen_pos, azimuth, elevation);
         }
     }
 }
@@ -460,12 +464,6 @@ pub fn render_gps_map(
 ) -> Option<PathBuf> {
     state.ensure_tiles(ui.ctx());
 
-    // Auto-sort if lines are visible and new data came in
-    if state.show_path_lines && state.markers_needs_sort {
-        state.optimize_path();
-        state.markers_needs_sort = false;
-    }
-
     // If there's a tile error, display it instead of the map
     if let Some(ref error) = state.tile_error {
         ui.vertical_centered(|ui| {
@@ -479,7 +477,9 @@ pub fn render_gps_map(
         });
         return None;
     }
-
+    if state.show_path_lines && state.markers_needs_sort {
+        state.optimize_path();
+    }
     let default_center = walkers::lat_lon(51.0, 17.0);
 
     // Use path-based lookup for current marker position (works in view mode where content_hash is zeroed)
@@ -556,32 +556,14 @@ pub fn render_gps_map(
 
         // Draw attribution at bottom right of the map area
         let attribution_text = format!("© {}", state.provider_name);
-        let painter = ui.painter();
-        let font_id = egui::FontId::proportional(10.0);
-        let text_color = egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200);
-        let bg_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180);
-
-        let galley = painter.layout_no_wrap(attribution_text, font_id, text_color);
-        let text_size = galley.size();
-        let padding = 4.0;
-
-        // Position at bottom-right of map rect
-        let text_pos = egui::pos2(
-            map_rect.right() - text_size.x - padding - 2.0,
-            map_rect.bottom() - text_size.y - padding - 2.0,
+        ui.painter().text(
+            map_rect.max - egui::vec2(5.0, 5.0),
+            egui::Align2::RIGHT_BOTTOM,
+            attribution_text,
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_black_alpha(150),
         );
-
-        // Draw background rect
-        let bg_rect = egui::Rect::from_min_size(
-            egui::pos2(text_pos.x - padding, text_pos.y - padding),
-            egui::vec2(text_size.x + padding * 2.0, text_size.y + padding * 2.0),
-        );
-        painter.rect_filled(bg_rect, 2.0, bg_color);
-
-        // Draw text
-        painter.galley(text_pos, galley, text_color);
     }
-
     clicked_path
 }
 
