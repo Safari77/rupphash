@@ -842,6 +842,7 @@ impl GuiApp {
                             if classify(path) {
                                 self.fs_rem_files.insert(name_str);
                                 self.retry_after.remove(path);
+                                self.gps_map.remove_marker(path);
                             } else {
                                 self.fs_rem_dirs.insert(name_str);
                                 self.retry_after.retain(|p, _| !p.starts_with(path));

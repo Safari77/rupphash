@@ -21,7 +21,9 @@ dirs = "6"
 fast_image_resize = "5.4"
 filetime = "0.2.26"
 file-id = "0.2.3"
-flate2 = { version = "1.1", features = ["rust_backend"], default-features = false }
+flate2 = { version = "1.1", features = [
+  "rust_backend",
+], default-features = false }
 geo = { version = "0.32", features = ["serde"] }
 getrandom = "0.3.4"
 hex = "0.4"
@@ -30,7 +32,7 @@ image = { version = "0.25", features = ["avif-native"] }
 jiff = { version = "0.2", features = ["serde"] }
 jpeg-decoder = "0.3.2"
 jpeg2k = { version = "0.10", features = ["image"] }
-jxl-oxide = { version = "0.12", features = ["moxcms", "image" ] }
+jxl-oxide = { version = "0.12", features = ["moxcms", "image"] }
 kamadak-exif = "0.6.1"
 libc = "0.2"
 libheif-rs = { version = "2.5", features = ["image"] }
@@ -60,7 +62,12 @@ zeroize = "1.8.2"
 zune-jpeg = "0.4"
 
 # GUI
-eframe = { version = "0.33", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+eframe = { version = "0.33", default-features = false, features = [
+  "default_fonts",
+  "wgpu",
+  "wayland",
+  "x11",
+] }
 egui = "0.33"
 egui_extras = { version = "0.33", features = ["all_loaders"] }
 font-loader = "0.11"
@@ -105,4 +112,3 @@ default = []
 # To include the Sarasa font into binary, copy it to assets/fonts/Sarasa-Regular.ttc
 # and run cargo build --release --features embed-fonts
 embed-fonts = []
-

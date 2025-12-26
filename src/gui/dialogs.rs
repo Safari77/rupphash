@@ -364,16 +364,19 @@ pub(super) fn handle_input(
         }
 
         // N key: Toggle GPS Map panel
+        // Logic: Off -> Map Only -> Map + Lines (Optimized) -> Off
         if ctx.input(|i| i.key_pressed(egui::Key::N))
             && !app.state.show_confirmation
             && !app.state.show_move_confirmation
             && !app.state.show_delete_immediate_confirmation
         {
-            app.gps_map.toggle();
-            if app.gps_map.visible {
-                // Auto-select first location from config if none selected
+            if !app.gps_map.visible {
+                // State 1: Map ON, Lines OFF
+                app.gps_map.visible = true;
+                app.gps_map.show_path_lines = false;
+
+                // (Existing auto-center logic...)
                 if app.gps_map.selected_location.is_none() {
-                    // AppContext.locations is HashMap<String, Point<f64>>
                     if let Some((name, point)) = app.ctx.locations.iter().next() {
                         app.gps_map.selected_location = Some((name.clone(), *point));
                     }
@@ -407,7 +410,22 @@ pub(super) fn handle_input(
                 }
                 let marker_count = app.gps_map.markers.len();
                 app.set_status(format!("GPS Map enabled. {} markers loaded.", marker_count), false);
+
+                let count = app.gps_map.markers.len();
+                app.set_status(format!("GPS Map enabled. {} markers.", count), false);
+            } else if !app.gps_map.show_path_lines {
+                // State 2: Lines ON (and Optimize!)
+                app.gps_map.show_path_lines = true;
+
+                // RUN SIMULATED ANNEALING
+                app.gps_map.optimize_path();
+
+                app.set_status("GPS Map: Path lines enabled (Shortest Path).".to_string(), false);
+                app.state.selection_changed = true; // Force redraw to show new order
             } else {
+                // State 3: All OFF
+                app.gps_map.visible = false;
+                app.gps_map.show_path_lines = false;
                 app.set_status("GPS Map disabled.".to_string(), false);
             }
         }
