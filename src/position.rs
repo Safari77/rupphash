@@ -38,6 +38,13 @@ pub fn distance_and_bearing(p1: (f64, f64), p2: (f64, f64)) -> (f64, f64) {
     (distance, bearing)
 }
 
+pub fn distance(p1: (f64, f64), p2: (f64, f64)) -> f64 {
+    let start = Point::new(p1.1, p1.0);
+    let end = Point::new(p2.1, p2.0);
+    let distance = Geodesic.distance(start, end);
+    distance
+}
+
 // Returns Result<..., String> for debug info
 pub fn sun_alt_and_azimuth(
     local_time_str: &str,

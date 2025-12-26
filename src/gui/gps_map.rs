@@ -46,41 +46,67 @@ fn part1by1(mut n: u32) -> u64 {
     n as u64
 }
 
-// A fast spatial sort for massive datasets (Hilbert Curve approximation)
+/// Sorts markers spatially using a Z-Order curve.
+/// Includes logic to handle International Date Line wrapping.
 pub fn sort_by_hilbert_curve(markers: &mut Vec<GpsMarker>) {
-    // 1. Find bounding box to normalize coordinates
-    let mut min_lat = 90.0;
-    let mut max_lat = -90.0;
+    if markers.len() < 2 {
+        return;
+    }
+
+    // 1. Analyze bounds to detect Date Line crossing
     let mut min_lon = 180.0;
     let mut max_lon = -180.0;
+    let mut min_lat = 90.0;
+    let mut max_lat = -90.0;
 
     for m in markers.iter() {
-        if m.lat < min_lat {
-            min_lat = m.lat;
-        }
-        if m.lat > max_lat {
-            max_lat = m.lat;
-        }
         if m.lon < min_lon {
             min_lon = m.lon;
         }
         if m.lon > max_lon {
             max_lon = m.lon;
         }
+        if m.lat < min_lat {
+            min_lat = m.lat;
+        }
+        if m.lat > max_lat {
+            max_lat = m.lat;
+        }
     }
 
-    // Avoid division by zero
+    // Heuristic: If markers span > 180 degrees, assume we are crossing the Pacific (Date Line)
+    // and shift negative longitudes (-179) to be positive (> 180) for sorting purposes.
+    let cross_date_line = (max_lon - min_lon) > 180.0;
+
+    // Recalculate bounds if wrapping
+    if cross_date_line {
+        min_lon = 360.0; // reset
+        max_lon = -360.0;
+        for m in markers.iter() {
+            // Shift: -179 becomes 181. 179 stays 179.
+            let eff_lon = if m.lon < 0.0 { m.lon + 360.0 } else { m.lon };
+            if eff_lon < min_lon {
+                min_lon = eff_lon;
+            }
+            if eff_lon > max_lon {
+                max_lon = eff_lon;
+            }
+        }
+    }
+
     let lat_h = (max_lat - min_lat).max(0.000001);
     let lon_h = (max_lon - min_lon).max(0.000001);
 
-    // 2. Sort using a simplified Z-Order / Hilbert approach
-    // We map Lat/Lon to a large integer grid (e.g., 16-bit)
+    // 2. Sort using Z-Order Curve
     markers.sort_by_cached_key(|m| {
-        let x = ((m.lon - min_lon) / lon_h * 65535.0) as u32;
-        let y = ((m.lat - min_lat) / lat_h * 65535.0) as u32;
+        // Calculate effective longitude for sorting
+        let eff_lon = if cross_date_line && m.lon < 0.0 { m.lon + 360.0 } else { m.lon };
 
-        // Interleave bits of X and Y (Morton Code / Z-Order Curve)
-        // This is cheaper than a full Hilbert calculation and 99% as good for vis.
+        // Normalize to 0..65535
+        let x = ((eff_lon - min_lon) / lon_h * 65535.0).clamp(0.0, 65535.0) as u32;
+        let y = ((m.lat - min_lat) / lat_h * 65535.0).clamp(0.0, 65535.0) as u32;
+
+        // Interleave bits to get 1D Morton code
         part1by1(x) | (part1by1(y) << 1)
     });
 }
@@ -222,17 +248,30 @@ impl GpsMapState {
     pub fn optimize_path(&mut self) {
         let count = self.markers.len();
         if count < 3 {
+            self.markers_needs_sort = false;
             return;
         }
-
         eprintln!("[GPS] Optimizing path for {} markers...", count);
-
+        // 1. Sort using Z-Order (Hilbert) Curve
         sort_by_hilbert_curve(&mut self.markers);
+
+        // 2. Rebuild the lookup map
         self.path_to_marker.clear();
         for (i, m) in self.markers.iter().enumerate() {
             self.path_to_marker.insert(m.path.clone(), i);
         }
-        eprintln!("[GPS] Spatial sort complete.");
+
+        // 3. Calculate and log Total Distance using exact geodesic formula
+        let mut total_dist = 0.0;
+        for i in 0..self.markers.len() - 1 {
+            let p1 = (self.markers[i].lat, self.markers[i].lon);
+            let p2 = (self.markers[i + 1].lat, self.markers[i + 1].lon);
+            let dist = crate::position::distance(p1, p2);
+            total_dist += dist;
+        }
+
+        eprintln!("[GPS] Spatial Sort Complete. Path Length: {}", format_distance(total_dist));
+
         self.markers_needs_sort = false;
     }
 
