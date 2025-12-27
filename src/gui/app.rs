@@ -491,6 +491,19 @@ impl GuiApp {
         let _ = self.image_preload_tx.send(path.to_path_buf());
     }
 
+    /// Helper to batch-process files and add them to the GPS map if they have coordinates.
+    fn ingest_gps_markers(&mut self, files: &[FileMetadata]) {
+        let mut _added_any = false;
+        for file in files {
+            if let Some(pos) = file.gps_pos {
+                // add_marker returns true if it was new
+                if self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x()) {
+                    _added_any = true;
+                }
+            }
+        }
+    }
+
     /// Get GPS coordinates for a file, using cache for O(1) access.
     /// Returns cached result if available, otherwise reads EXIF.
     /// Uses file_index for O(1) in-memory update when reading from EXIF.
@@ -989,8 +1002,9 @@ impl GuiApp {
         let mut needs_repaint = false;
 
         // 2. Process Partial Batches (Streaming View)
-        if let Some(batch_rx) = &self.scan_batch_rx {
+        if let Some(batch_rx) = &self.scan_batch_rx.clone() {
             while let Ok(new_files) = batch_rx.try_recv() {
+                self.ingest_gps_markers(&new_files);
                 if self.state.groups.is_empty() {
                     self.state.groups.push(Vec::new());
                     self.state
@@ -1059,6 +1073,11 @@ impl GuiApp {
                         file.orientation
                     );
                 }
+            }
+
+            // Ensure markers are added for non-streaming modes (Duplicate Finder)
+            for group in &new_groups {
+                self.ingest_gps_markers(group);
             }
 
             // Only replace if we have results (duplicate mode) or finished view mode
@@ -1527,12 +1546,14 @@ impl eframe::App for GuiApp {
         }
 
         // View mode: Process background directory scan results
-        if let Some(ref rx) = self.dir_scan_rx {
+        if let Some(ref rx) = self.dir_scan_rx.clone() {
             let mut received_any = false;
             loop {
                 match rx.try_recv() {
                     Ok(batch) => {
                         received_any = true;
+                        self.ingest_gps_markers(&batch);
+
                         if let Some(group) = self.state.groups.first_mut() {
                             let start_idx = group.len();
                             group.extend(batch);
