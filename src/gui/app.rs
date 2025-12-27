@@ -396,6 +396,11 @@ impl GuiApp {
         let selected_provider = ctx.selected_provider.clone();
         let provider_url = ctx.map_providers.get(&selected_provider).cloned().unwrap_or_default();
 
+        // Create GPS map state with appropriate sort mode
+        let mut gps_map = GpsMapState::new(tile_cache_path, selected_provider, provider_url);
+        gps_map.sort_by_exif_timestamp =
+            sort_order == "exif-date" || sort_order == "exif-date-desc";
+
         Self {
             state,
             group_views: HashMap::new(),
@@ -455,7 +460,7 @@ impl GuiApp {
             fs_rem_files: HashSet::new(),
             fs_rem_dirs: HashSet::new(),
             last_fs_refresh: Instant::now(),
-            gps_map: GpsMapState::new(tile_cache_path, selected_provider, provider_url),
+            gps_map,
             enrichment_rx: None,
             file_index: HashMap::new(),
             failed_images: HashMap::new(),
@@ -497,7 +502,8 @@ impl GuiApp {
         for file in files {
             if let Some(pos) = file.gps_pos {
                 // add_marker returns true if it was new
-                if self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x()) {
+                if self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x(), file.exif_timestamp)
+                {
                     _added_any = true;
                 }
             }
@@ -518,7 +524,8 @@ impl GuiApp {
             && let Ok(Some(features)) = self.ctx.get_features(content_hash)
             && let Some(coords) = features.gps_pos
         {
-            self.gps_map.add_marker(path.to_path_buf(), coords.y(), coords.x());
+            // Note: exif_timestamp not available from cached features, will be None
+            self.gps_map.add_marker(path.to_path_buf(), coords.y(), coords.x(), None);
             return Some((coords.y(), coords.x()));
         }
 
@@ -526,7 +533,8 @@ impl GuiApp {
         if let Some(exif) = scanner::read_exif_data(path, None)
             && let Some((lat, lon)) = extract_gps_lat_lon(&exif)
         {
-            self.gps_map.add_marker(path.to_path_buf(), lat, lon);
+            let exif_ts = crate::helper_exif::get_exif_timestamp(&exif);
+            self.gps_map.add_marker(path.to_path_buf(), lat, lon, exif_ts);
 
             // O(1) update via file_index if unique_file_id provided
             if let Some(uid) = unique_file_id
@@ -742,8 +750,9 @@ impl GuiApp {
                                     new_files.push(recovered);
                                 } else {
                                     // New file not in session - use centralized cache lookup from db.rs
-                                    let (resolution, orientation, gps_pos) =
+                                    let (resolution, orientation, gps_pos, exif_timestamp) =
                                         self.ctx.lookup_cached_features(&meta, unique_file_id);
+
                                     new_files.push(FileMetadata {
                                         path: canonical,
                                         size,
@@ -755,6 +764,7 @@ impl GuiApp {
                                         orientation,
                                         gps_pos,
                                         unique_file_id,
+                                        exif_timestamp,
                                     });
                                 }
                             }
@@ -1506,6 +1516,7 @@ impl eframe::App for GuiApp {
                             actual_resolution,
                             orientation,
                             content_hash,
+                            exif_timestamp,
                         ) => {
                             super::image::update_file_metadata(
                                 self,
@@ -1514,6 +1525,7 @@ impl eframe::App for GuiApp {
                                 actual_resolution.1,
                                 orientation,
                                 content_hash,
+                                exif_timestamp,
                             );
 
                             let name = format!("img_{}", path.display());
@@ -1620,10 +1632,18 @@ impl eframe::App for GuiApp {
                             if result.gps_pos.is_some() {
                                 file.gps_pos = result.gps_pos;
                             }
+                            if result.exif_timestamp.is_some() {
+                                file.exif_timestamp = result.exif_timestamp;
+                            }
 
                             // Add GPS marker if we found coordinates
                             if let Some(pos) = result.gps_pos {
-                                self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x());
+                                self.gps_map.add_marker(
+                                    file.path.clone(),
+                                    pos.y(),
+                                    pos.x(),
+                                    result.exif_timestamp,
+                                );
                             }
                         }
                     }
