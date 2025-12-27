@@ -40,13 +40,6 @@ impl Default for GroupViewState {
     }
 }
 
-fn is_scanner_only_format(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()),
-        Some(ref ext) if matches!(ext.as_str(), "jp2" | "j2k" | "jxl")
-    )
-}
-
 pub(super) fn spawn_image_loader_pool(
     use_thumbnails: bool,
     content_key: [u8; 32],
@@ -284,15 +277,6 @@ fn load_and_process_image_from_bytes(
     );
 
     Ok(maybe_resize_image(img, dims, orientation, path))
-}
-
-// Keep the old function for backwards compatibility (used elsewhere)
-fn load_and_process_image(
-    path: &Path,
-    use_thumbnails: bool,
-) -> Result<(egui::ColorImage, (u32, u32), u8), String> {
-    let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
-    load_and_process_image_from_bytes(path, &bytes, use_thumbnails)
 }
 
 pub(super) fn update_file_metadata(

@@ -75,15 +75,6 @@ fn is_derived_tag(name: &str) -> bool {
     matches!(name.to_lowercase().as_str(), "derivedcountry" | "country" | "derivedsunposition")
 }
 
-/// Get the display name for a derived tag
-fn format_derived_tag_display_name(name: &str) -> String {
-    match name.to_lowercase().as_str() {
-        "derivedcountry" => "Country".to_string(),
-        "derivedsunposition" => "Sun Position".to_string(),
-        _ => name.to_string(),
-    }
-}
-
 /// Get multiple EXIF tags as a vector of (tag_name, value) pairs
 pub fn get_exif_tags(
     path: &Path,

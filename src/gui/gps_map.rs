@@ -753,6 +753,7 @@ pub fn format_bearing(degrees: f64) -> String {
 
 /// Get distance and bearing string between two points
 /// Returns None if either point is invalid
+#[allow(dead_code)]
 pub fn get_distance_bearing_string(
     from_lat: f64,
     from_lon: f64,
