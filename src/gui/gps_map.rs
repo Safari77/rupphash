@@ -85,6 +85,46 @@ pub fn sort_nearest_neighbor(markers: &mut Vec<GpsMarker>) {
     }
 }
 
+/// Improves a path by uncrossing lines (2-Opt Algorithm).
+/// This fixes the "stranding" issue where the greedy sort leaves a long jump at the end.
+fn optimize_2opt(markers: &mut Vec<GpsMarker>) {
+    let len = markers.len();
+    if len < 4 {
+        return;
+    } // Need at least 4 points to have crossing lines
+
+    let mut improved = true;
+    let mut passes = 0;
+
+    // Run up to 5 passes (usually converges in 1 or 2 for simple maps)
+    while improved && passes < 5 {
+        improved = false;
+        passes += 1;
+
+        for i in 0..(len - 2) {
+            for j in (i + 2)..(len - 1) {
+                // -1 because we are looking at segments
+                let p1 = (markers[i].lat, markers[i].lon);
+                let p2 = (markers[i + 1].lat, markers[i + 1].lon);
+                let p3 = (markers[j].lat, markers[j].lon);
+                let p4 = (markers[j + 1].lat, markers[j + 1].lon);
+
+                // Current distance: p1->p2 and p3->p4
+                let d_current = dist_sq_approx(p1, p2) + dist_sq_approx(p3, p4);
+
+                // Swapped distance: p1->p3 and p2->p4 (uncrossing)
+                let d_swap = dist_sq_approx(p1, p3) + dist_sq_approx(p2, p4);
+
+                if d_swap < d_current {
+                    // Reverse the segment between i+1 and j to uncross
+                    markers[i + 1..=j].reverse();
+                    improved = true;
+                }
+            }
+        }
+    }
+}
+
 // Helper to spread bits (Morton Coding)
 // Expands a 16-bit integer into 32 bits by inserting 0s
 fn part1by1(mut n: u32) -> u64 {
@@ -237,11 +277,6 @@ impl GpsMapState {
         Self { provider_name, provider_url, ..Default::default() }
     }
 
-    /// Toggle map visibility
-    pub fn toggle(&mut self) {
-        self.visible = !self.visible;
-    }
-
     /// Remove a marker by path and mark the list for sorting
     pub fn remove_marker(&mut self, path: &Path) {
         if let Some(idx) = self.path_to_marker.remove(path) {
@@ -302,15 +337,15 @@ impl GpsMapState {
         }
 
         if count < 2000 {
-            // STRATEGY A: Nearest Neighbor (Greedy TSP)
-            // Perfect for circles, lines, and typical photo routes.
-            eprintln!("[GPS] Sorting {} markers (Nearest Neighbor)...", count);
+            // 1. Initial Guess: Nearest Neighbor (Greedy)
+            // Fast and good, but leaves "stranded" long lines at the end.
             sort_nearest_neighbor(&mut self.markers);
+
+            // 2. Refinement: 2-Opt (Uncrossing)
+            // Fixes the ugly cross-country jumps the greedy sort left behind.
+            optimize_2opt(&mut self.markers);
         } else {
-            // STRATEGY B: Spatial Clustering (Z-Order/Hilbert)
-            // Necessary for massive datasets (10k+) to prevent freezing.
-            // Creates a "clustered" look rather than a continuous line.
-            eprintln!("[GPS] Sorting {} markers (Z-Order Curve)...", count);
+            // For massive datasets, stick to the instant spatial sort
             sort_by_hilbert_curve(&mut self.markers);
         }
 
@@ -453,17 +488,39 @@ impl Plugin for GpsMarkersPlugin {
         projector: &Projector,
         _memory: &MapMemory,
     ) {
+        // 1. Create clipped painter
         let painter = ui.painter().with_clip_rect(self.map_rect);
 
-        // --- DRAW LINES ---
+        // --- VIEWPORT CALCULATIONS ---
+        let top_left = projector.unproject(self.map_rect.min.to_vec2());
+        let bottom_right = projector.unproject(self.map_rect.max.to_vec2());
+
+        let max_lat = top_left.y().max(bottom_right.y());
+        let min_lat = top_left.y().min(bottom_right.y());
+        let left_lon = top_left.x();
+        let right_lon = bottom_right.x();
+        let crosses_date_line = left_lon > right_lon;
+
+        // --- DRAW LINES (Restored) ---
+        // We check 'self.draw_lines' here. If false, this block is skipped.
         if self.draw_lines && self.markers.len() > 1 {
-            let line_stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 60, 0));
+            let line_stroke = egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 60, 0));
 
             for pair in self.markers.windows(2) {
                 let pos1 = pair[0].0;
                 let pos2 = pair[1].0;
 
-                // Naive anti-spiderweb check for world wrapping
+                // Optimization: Skip lines that are completely off-screen (Latitude only for speed)
+                // If both points are too far North or too far South, don't draw.
+                let p1_lat = pos1.y();
+                let p2_lat = pos2.y();
+                if (p1_lat > max_lat + 0.1 && p2_lat > max_lat + 0.1)
+                    || (p1_lat < min_lat - 0.1 && p2_lat < min_lat - 0.1)
+                {
+                    continue;
+                }
+
+                // Naive anti-spiderweb check for world wrapping (Longitude jump > 180)
                 if (pos1.x() - pos2.x()).abs() > 180.0 {
                     continue;
                 }
@@ -475,10 +532,33 @@ impl Plugin for GpsMarkersPlugin {
             }
         }
 
-        // Check for clicks on markers
+        // --- DRAW MARKERS (Optimized) ---
         let click_pos = if response.clicked() { response.interact_pointer_pos() } else { None };
 
+        let mut closest_dist = f32::MAX;
+        let mut closest_idx = -1;
+
         for (pos, color, radius, idx) in &self.markers {
+            let p_lat = pos.y();
+            let p_lon = pos.x();
+
+            // Latitude Culling
+            if p_lat > max_lat + 0.1 || p_lat < min_lat - 0.1 {
+                continue;
+            }
+
+            // Longitude Culling
+            let is_visible_lon = if crosses_date_line {
+                p_lon >= left_lon - 0.1 || p_lon <= right_lon + 0.1
+            } else {
+                p_lon >= left_lon - 0.1 && p_lon <= right_lon + 0.1
+            };
+
+            if !is_visible_lon {
+                continue;
+            }
+
+            // Project & Draw
             let screen_vec = projector.project(*pos);
             let screen_pos = egui::pos2(screen_vec.x, screen_vec.y);
 
@@ -489,20 +569,22 @@ impl Plugin for GpsMarkersPlugin {
                 egui::Stroke::new(1.5, egui::Color32::WHITE),
             );
 
-            // Check if this marker was clicked (within radius + some tolerance)
-            if let Some(click) = click_pos {
-                let dist = screen_pos.distance(click);
-                if dist <= radius + 10.0 {
-                    // Use larger of current or this marker
-                    let current = self.clicked_idx.load(std::sync::atomic::Ordering::Relaxed);
-                    if current < 0 {
-                        self.clicked_idx.store(*idx as i32, std::sync::atomic::Ordering::Relaxed);
-                    }
+            // Magnetic Selection
+            if let Some(c_pos) = click_pos {
+                let dist = screen_pos.distance(c_pos);
+                if dist < closest_dist {
+                    closest_dist = dist;
+                    closest_idx = *idx as i32;
                 }
             }
         }
 
-        // Draw sun indicator from current marker if available
+        // Apply Selection
+        if closest_idx >= 0 && closest_dist < 50.0 {
+            self.clicked_idx.store(closest_idx, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // --- DRAW SUN ---
         if let Some((marker_pos, azimuth, elevation)) = self.current_sun {
             let marker_screen = projector.project(marker_pos);
             let marker_screen_pos = egui::pos2(marker_screen.x, marker_screen.y);
