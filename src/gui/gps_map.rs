@@ -35,15 +35,23 @@ impl TileSource for CustomTileSource {
     }
 }
 
-/// Approximate squared distance for sorting (handles Date Line wrapping)
-/// Much faster than Haversine, accurate enough for local neighbor checks.
+/// Approximate squared distance for sorting (handles Date Line & Latitude distortion)
+/// Still faster than Haversine, but accounts for the fact that longitude shrinks near poles.
 fn dist_sq_approx(p1: (f64, f64), p2: (f64, f64)) -> f64 {
     let dy = p1.0 - p2.0; // Latitude difference
     let mut dx = (p1.1 - p2.1).abs(); // Longitude difference
     if dx > 180.0 {
         dx = 360.0 - dx;
     } // Handle crossing the 180th meridian
-    dx * dx + dy * dy
+
+    // Adjust longitude delta based on latitude.
+    // At 60°N, cos(60°) = 0.5, so 1° lon is only half the distance of 1° lat.
+    // We use the average latitude for a cheap local approximation.
+    let avg_lat_rad = (p1.0 + p2.0).to_radians() * 0.5;
+    let dx_corrected = dx * avg_lat_rad.cos();
+
+    // Euclidean distance on the "squashed" grid
+    dx_corrected * dx_corrected + dy * dy
 }
 
 /// Greedy Nearest Neighbor Sort (O(N^2))
@@ -287,11 +295,10 @@ impl GpsMapState {
     }
 
     /// Reorder markers to minimize total travel distance using Simulated Annealing
-    pub fn optimize_path(&mut self) {
+    pub fn optimize_path(&mut self) -> f64 {
         let count = self.markers.len();
-        if count < 3 {
-            self.markers_needs_sort = false;
-            return;
+        if count < 2 {
+            return 0.0;
         }
 
         if count < 2000 {
@@ -321,10 +328,9 @@ impl GpsMapState {
             let dist = crate::position::distance(p1, p2);
             total_dist += dist;
         }
-
         eprintln!("[GPS] Spatial Sort Complete. Path Length: {}", format_distance(total_dist));
-
         self.markers_needs_sort = false;
+        total_dist
     }
 
     /// Set sun position for a marker by path

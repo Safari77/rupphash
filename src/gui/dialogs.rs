@@ -414,13 +414,14 @@ pub(super) fn handle_input(
                 let count = app.gps_map.markers.len();
                 app.set_status(format!("GPS Map enabled. {} markers.", count), false);
             } else if !app.gps_map.show_path_lines {
-                // State 2: Lines ON (and Optimize!)
+                // State 2: Lines ON
                 app.gps_map.show_path_lines = true;
-
-                // RUN SIMULATED ANNEALING
-                app.gps_map.optimize_path();
-
-                app.set_status("GPS Map: Path lines enabled (Shortest Path).".to_string(), false);
+                let dist = app.gps_map.optimize_path();
+                let dist_str = crate::gui::gps_map::format_distance(dist);
+                app.set_status(
+                    format!("GPS Map: Path lines enabled. Total distance: {}", dist_str),
+                    false,
+                );
                 app.state.selection_changed = true; // Force redraw to show new order
             } else {
                 // State 3: All OFF
