@@ -91,6 +91,13 @@ MSVC Target: uses the linker built into Visual Studio (link.exe).
 GNU Target: Uses the GNU linker (ld.exe) and tools (dlltool.exe).
 Rust does not bundle these; it expects you to provide them.
 
+## Optimizations
+Add to `.cargo/config.toml`:
+```
+[build]
+rustflags = ["-C", "target-cpu=native"]
+```
+
 ## Screenshot - View mode
 ![Screenshot view](phdupes-view.webp)
 

@@ -1,6 +1,7 @@
 // GPS Map widget using walkers crate for displaying image locations on a map
 use eframe::egui;
 use geo::Point;
+use once_cell::sync::Lazy;
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use walkers::sources::{Attribution, TileSource};
@@ -125,9 +126,29 @@ fn optimize_2opt(markers: &mut Vec<GpsMarker>) {
     }
 }
 
-// Helper to spread bits (Morton Coding)
-// Expands a 16-bit integer into 32 bits by inserting 0s
-fn part1by1(mut n: u32) -> u64 {
+type FnTy = fn(u32) -> u64;
+
+static PART1BY1: Lazy<FnTy> = Lazy::new(|| {
+    if std::is_x86_feature_detected!("bmi2") { part1by1_bmi2_safe } else { part1by1_scalar }
+});
+
+#[inline]
+pub fn part1by1(n: u32) -> u64 {
+    (PART1BY1)(n)
+}
+
+#[inline]
+fn part1by1_bmi2_safe(n: u32) -> u64 {
+    unsafe { part1by1_bmi2(n) }
+}
+
+#[inline(never)]
+#[target_feature(enable = "bmi2")]
+unsafe fn part1by1_bmi2(n: u32) -> u64 {
+    core::arch::x86_64::_pdep_u64(n as u64, 0x5555_5555_5555_5555)
+}
+
+fn part1by1_scalar(mut n: u32) -> u64 {
     n &= 0x0000ffff;
     n = (n ^ (n << 8)) & 0x00ff00ff;
     n = (n ^ (n << 4)) & 0x0f0f0f0f;
