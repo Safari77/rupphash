@@ -51,7 +51,8 @@ pub struct FileMetadata {
     pub pixel_hash: Option<[u8; 32]>,
     pub orientation: u8, // Added: EXIF orientation (1-8)
     pub gps_pos: Option<Point<f64>>,
-    pub unique_file_id: u128, // Always has dev+inode
+    pub unique_file_id: u128,        // Always has dev+inode
+    pub exif_timestamp: Option<i64>, // EXIF DateTimeOriginal or DateTimeDigitized (Unix epoch seconds)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,7 +159,7 @@ struct Cli {
     #[arg(long)]
     pixel_hash: bool,
 
-    /// Sort order with --view: name, name-desc, name-natural, name-natural-desc, date, date-desc, size, size-desc, random
+    /// Sort order with --view: name, name-desc, name-natural, name-natural-desc, date, date-desc, size, size-desc, random, exif-date, exif-date-desc
     #[arg(long, default_value = "name")]
     sort: String,
 
@@ -233,6 +234,8 @@ impl Cli {
             "size",
             "size-desc",
             "random",
+            "exif-date",
+            "exif-date-desc",
         ];
         let sort_lower = self.sort.to_lowercase();
         if !valid_sorts.contains(&sort_lower.as_str()) {

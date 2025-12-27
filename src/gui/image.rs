@@ -30,8 +30,8 @@ pub(super) struct GroupViewState {
 }
 
 pub enum ImageLoadResult {
-    Loaded(egui::ColorImage, (u32, u32), u8, [u8; 32]), // image, resolution, orientation, content_hash
-    Failed(String),                                     // Failure with error message
+    Loaded(egui::ColorImage, (u32, u32), u8, [u8; 32], Option<i64>), // image, resolution, orientation, content_hash, exif_timestamp
+    Failed(String),                                                  // Failure with error message
 }
 
 impl Default for GroupViewState {
@@ -64,8 +64,14 @@ pub(super) fn spawn_image_loader_pool(
                 // where images would fail to load. The cache eviction handles cleanup instead.
                 let result =
                     match load_and_process_image_with_hash(&path, use_thumbnails, &content_key) {
-                        Ok((img, dims, orientation, content_hash)) => {
-                            ImageLoadResult::Loaded(img, dims, orientation, content_hash)
+                        Ok((img, dims, orientation, content_hash, exif_timestamp)) => {
+                            ImageLoadResult::Loaded(
+                                img,
+                                dims,
+                                orientation,
+                                content_hash,
+                                exif_timestamp,
+                            )
                         }
                         Err(err_msg) => ImageLoadResult::Failed(err_msg),
                     };
@@ -99,7 +105,7 @@ fn load_and_process_image_with_hash(
     path: &Path,
     use_thumbnails: bool,
     content_key: &[u8; 32],
-) -> Result<(egui::ColorImage, (u32, u32), u8, [u8; 32]), String> {
+) -> Result<(egui::ColorImage, (u32, u32), u8, [u8; 32], Option<i64>), String> {
     // Read file once for both hashing and image processing
     let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
 
@@ -110,10 +116,14 @@ fn load_and_process_image_with_hash(
         *hasher.finalize().as_bytes()
     };
 
+    // Read EXIF timestamp
+    let exif_timestamp = crate::scanner::read_exif_data(path, Some(&bytes))
+        .and_then(|exif| crate::helper_exif::get_exif_timestamp(&exif));
+
     // Process the image using existing logic
     let (img, dims, orientation) = load_and_process_image_from_bytes(path, &bytes, use_thumbnails)?;
 
-    Ok((img, dims, orientation, content_hash))
+    Ok((img, dims, orientation, content_hash, exif_timestamp))
 }
 
 /// Resize image if it exceeds MAX_TEXTURE_SIDE to prevent egui panics
@@ -286,18 +296,20 @@ pub(super) fn update_file_metadata(
     h: u32,
     orientation: u8,
     content_hash: [u8; 32],
+    exif_timestamp: Option<i64>,
 ) {
     eprintln!(
-        "[DEBUG-UPDATE] update_file_metadata called: path={:?}, orientation={}, content_hash={:?}",
+        "[DEBUG-UPDATE] update_file_metadata called: path={:?}, orientation={}, content_hash={:?}, exif_ts={:?}",
         path.file_name().unwrap_or_default(),
         orientation,
-        &content_hash[..4]
+        &content_hash[..4],
+        exif_timestamp,
     );
 
     // Helper to find and update the file in the group list
-    // Returns Some((unique_file_id, gps_pos, changed)) if file was found
+    // Returns Some((unique_file_id, gps_pos, exif_timestamp, changed)) if file was found
     let update_file =
-        |file: &mut crate::FileMetadata| -> Option<(u128, Option<geo::Point<f64>>, bool)> {
+        |file: &mut crate::FileMetadata| -> Option<(u128, Option<geo::Point<f64>>, Option<i64>, bool)> {
             if file.path == path {
                 eprintln!(
                     "[DEBUG-UPDATE]   Found file! current orientation={}, new orientation={}",
@@ -318,13 +330,20 @@ pub(super) fn update_file_metadata(
                     file.orientation = orientation;
                     changed = true;
                 }
-                return Some((file.unique_file_id, file.gps_pos, changed));
+                // Update exif_timestamp if we have a new value and file doesn't have one
+                if exif_timestamp.is_some() && file.exif_timestamp.is_none() {
+                    file.exif_timestamp = exif_timestamp;
+                    changed = true;
+                }
+                // Return the exif_timestamp to store in database (prefer new value if available)
+                let ts_for_db = exif_timestamp.or(file.exif_timestamp);
+                return Some((file.unique_file_id, file.gps_pos, ts_for_db, changed));
             }
             None
         };
 
     // Check current file first (fast path)
-    let mut found_info: Option<(u128, Option<geo::Point<f64>>, bool)> = None;
+    let mut found_info: Option<(u128, Option<geo::Point<f64>>, Option<i64>, bool)> = None;
     if let Some(group) = app.state.groups.get_mut(app.state.current_group_idx)
         && let Some(file) = group.get_mut(app.state.current_file_idx)
     {
@@ -347,7 +366,7 @@ pub(super) fn update_file_metadata(
     }
 
     // Persist to database if we found the file and something changed
-    if let Some((unique_file_id, gps_pos, changed)) = found_info {
+    if let Some((unique_file_id, gps_pos, exif_timestamp, changed)) = found_info {
         if changed && let Some(ref db_tx) = app.db_tx {
             // Use create_feature_update with the real content_hash computed by the image loader
             // This creates/updates the full database entry on first load
@@ -359,6 +378,7 @@ pub(super) fn update_file_metadata(
                 Some((w, h)),
                 orientation,
                 gps_pos,
+                exif_timestamp,
             ) {
                 let _ = db_tx.send(update);
                 eprintln!(

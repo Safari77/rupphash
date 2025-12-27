@@ -155,6 +155,7 @@ pub struct CachedFeatures {
     pub height: u32,
     pub orientation: u8,
     pub gps_pos: Option<Point<f64>>,
+    pub exif_timestamp: Option<i64>,
 }
 
 impl CachedFeatures {
@@ -190,6 +191,7 @@ pub struct EnrichmentResult {
     pub unique_file_id: u128,
     pub content_hash: [u8; 32],
     pub gps_pos: Option<Point<f64>>,
+    pub exif_timestamp: Option<i64>,
 }
 
 pub struct AppContext {
@@ -270,6 +272,7 @@ pub fn create_feature_update(
     resolution: Option<(u32, u32)>,
     orientation: u8,
     gps_pos: Option<Point<f64>>,
+    exif_timestamp: Option<i64>,
 ) -> Option<DbUpdate> {
     let metadata = std::fs::metadata(path).ok()?;
     let meta_key = compute_meta_key_from_metadata(meta_key_secret, &metadata, unique_file_id);
@@ -279,6 +282,7 @@ pub fn create_feature_update(
         height: resolution.map(|(_, h)| h).unwrap_or(0),
         orientation,
         gps_pos,
+        exif_timestamp,
     };
 
     Some((
@@ -672,7 +676,7 @@ impl AppContext {
         &self,
         metadata: &std::fs::Metadata,
         unique_file_id: u128,
-    ) -> (Option<(u32, u32)>, u8, Option<Point<f64>>) {
+    ) -> (Option<(u32, u32)>, u8, Option<Point<f64>>, Option<i64>) {
         let meta_key = compute_meta_key_from_metadata(&self.meta_key, metadata, unique_file_id);
 
         eprintln!(
@@ -686,7 +690,7 @@ impl AppContext {
         if let Ok(Some(content_hash)) = self.get_content_hash(&meta_key) {
             // Do not attempt to look up features for a zeroed-out hash placeholder.
             if content_hash == [0u8; 32] {
-                return (None, 1, None);
+                return (None, 1, None, None);
             }
 
             eprintln!("[DEBUG-CACHE]   Found content_hash: {:?}", hex::encode(&content_hash[..8]));
@@ -698,10 +702,15 @@ impl AppContext {
                     None
                 };
                 eprintln!(
-                    "[DEBUG-CACHE]   Found features: resolution={:?}, orientation={}, gps_pos={:#?}",
-                    resolution, features.orientation, features.gps_pos
+                    "[DEBUG-CACHE]   Found features: resolution={:?}, orientation={}, gps_pos={:#?}, exif_timestamp={:?}",
+                    resolution, features.orientation, features.gps_pos, features.exif_timestamp
                 );
-                return (resolution, features.orientation, features.gps_pos);
+                return (
+                    resolution,
+                    features.orientation,
+                    features.gps_pos,
+                    features.exif_timestamp,
+                );
             } else {
                 eprintln!("[DEBUG-CACHE]   No features found for content_hash");
             }
@@ -709,17 +718,17 @@ impl AppContext {
 
         eprintln!("[DEBUG-CACHE]   Not found in database");
         // Not cached
-        (None, 1, None)
+        (None, 1, None, None)
     }
 
     /// Batch lookup of cached features for multiple files in a single transaction.
     ///
-    /// Returns a HashMap mapping unique_file_id to (resolution, orientation, gps_pos).
+    /// Returns a HashMap mapping unique_file_id to (resolution, orientation, gps_pos, exif_timestamp).
     /// Files not found in cache are not included in the result.
     pub fn lookup_cached_features_batch(
         &self,
         files: &[(u128, u64, u64)], // (unique_file_id, size, mtime_ns)
-    ) -> HashMap<u128, (Option<(u32, u32)>, u8, Option<Point<f64>>)> {
+    ) -> HashMap<u128, (Option<(u32, u32)>, u8, Option<Point<f64>>, Option<i64>)> {
         let mut results = HashMap::with_capacity(files.len());
 
         // Use a single read transaction for all lookups
@@ -756,7 +765,12 @@ impl AppContext {
                     };
                     results.insert(
                         unique_file_id,
-                        (resolution, features.orientation, features.gps_pos),
+                        (
+                            resolution,
+                            features.orientation,
+                            features.gps_pos,
+                            features.exif_timestamp,
+                        ),
                     );
                 }
             }

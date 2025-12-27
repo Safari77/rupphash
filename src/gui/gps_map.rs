@@ -232,6 +232,8 @@ pub struct GpsMarker {
     pub sun_azimuth: Option<f64>,
     /// Sun elevation in degrees (negative = below horizon)
     pub sun_elevation: Option<f64>,
+    /// EXIF timestamp (Unix epoch seconds) for chronological sorting
+    pub exif_timestamp: Option<i64>,
 }
 
 impl GpsMarker {
@@ -270,6 +272,8 @@ pub struct GpsMapState {
     pub direction_to_image: bool,
     /// Error message if tile provider failed to initialize
     pub tile_error: Option<String>,
+    /// Sort mode for markers: true = sort by EXIF timestamp, false = sort by distance
+    pub sort_by_exif_timestamp: bool,
 }
 
 impl Default for GpsMapState {
@@ -289,6 +293,7 @@ impl Default for GpsMapState {
             initial_center: None,
             direction_to_image: false,
             tile_error: None,
+            sort_by_exif_timestamp: false,
         }
     }
 }
@@ -331,7 +336,13 @@ impl GpsMapState {
     }
 
     /// Add a GPS marker, returns true if this is a new marker
-    pub fn add_marker(&mut self, path: PathBuf, lat: f64, lon: f64) -> bool {
+    pub fn add_marker(
+        &mut self,
+        path: PathBuf,
+        lat: f64,
+        lon: f64,
+        exif_timestamp: Option<i64>,
+    ) -> bool {
         // Check uniqueness by path
         if self.path_to_marker.contains_key(&path) {
             return false;
@@ -344,19 +355,61 @@ impl GpsMapState {
             lon,
             sun_azimuth: None,
             sun_elevation: None,
+            exif_timestamp,
         });
         self.path_to_marker.insert(path, idx);
         self.markers_needs_sort = true;
         true
     }
 
-    /// Reorder markers to minimize total travel distance using Simulated Annealing
+    /// Reorder markers based on current sort mode.
+    /// If sort_by_exif_timestamp is true: sort chronologically by EXIF timestamp.
+    /// Otherwise: sort by spatial distance (nearest neighbor + 2-opt optimization).
     pub fn optimize_path(&mut self) -> f64 {
         let count = self.markers.len();
         if count < 2 {
+            self.markers_needs_sort = false;
             return 0.0;
         }
 
+        if self.sort_by_exif_timestamp {
+            // Sort by EXIF timestamp (oldest first), files without timestamp go to the end
+            self.markers.sort_by(|a, b| {
+                match (a.exif_timestamp, b.exif_timestamp) {
+                    (Some(ta), Some(tb)) => ta.cmp(&tb),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.path.cmp(&b.path), // Fallback: sort by path for consistency
+                }
+            });
+
+            // Rebuild the lookup map
+            self.path_to_marker.clear();
+            for (i, m) in self.markers.iter().enumerate() {
+                self.path_to_marker.insert(m.path.clone(), i);
+            }
+
+            // Calculate total distance
+            let mut total_dist = 0.0;
+            for i in 0..self.markers.len() - 1 {
+                let p1 = (self.markers[i].lat, self.markers[i].lon);
+                let p2 = (self.markers[i + 1].lat, self.markers[i + 1].lon);
+                let dist = crate::position::distance(p1, p2);
+                total_dist += dist;
+            }
+
+            let with_ts = self.markers.iter().filter(|m| m.exif_timestamp.is_some()).count();
+            eprintln!(
+                "[GPS] Chronological Sort Complete. {} of {} markers have EXIF timestamps. Path Length: {}",
+                with_ts,
+                count,
+                format_distance(total_dist)
+            );
+            self.markers_needs_sort = false;
+            return total_dist;
+        }
+
+        // Distance-based sorting (default)
         if count < 2000 {
             // 1. Initial Guess: Nearest Neighbor (Greedy)
             // Fast and good, but leaves "stranded" long lines at the end.
@@ -370,13 +423,13 @@ impl GpsMapState {
             sort_by_hilbert_curve(&mut self.markers);
         }
 
-        // 2. Rebuild the lookup map
+        // Rebuild the lookup map
         self.path_to_marker.clear();
         for (i, m) in self.markers.iter().enumerate() {
             self.path_to_marker.insert(m.path.clone(), i);
         }
 
-        // 3. Calculate and log Total Distance using exact geodesic formula
+        // Calculate and log Total Distance using exact geodesic formula
         let mut total_dist = 0.0;
         for i in 0..self.markers.len() - 1 {
             let p1 = (self.markers[i].lat, self.markers[i].lon);

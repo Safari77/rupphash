@@ -23,7 +23,9 @@ use crate::db::{
 use crate::fileops;
 use crate::fileops::get_file_key;
 use crate::hamminghash::{HammingHash, MIHIndex, SparseBitSet};
-use crate::helper_exif::{extract_gps_lat_lon, get_altitude, get_date_str, parse_gps_coordinate};
+use crate::helper_exif::{
+    extract_gps_lat_lon, get_altitude, get_date_str, get_exif_timestamp, parse_gps_coordinate,
+};
 use crate::position;
 use crate::{FileMetadata, GroupInfo, GroupStatus};
 
@@ -769,6 +771,7 @@ struct ScannedFile {
     pub pdqhash: Option<[u8; 32]>,
     pub pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>>,
     pub pixel_hash: Option<[u8; 32]>,
+    pub exif_timestamp: Option<i64>,
 }
 
 impl ScannedFile {
@@ -784,6 +787,7 @@ impl ScannedFile {
             gps_pos: self.gps_pos,
             unique_file_id: self.unique_file_id,
             pixel_hash: self.pixel_hash,
+            exif_timestamp: self.exif_timestamp,
         }
     }
 }
@@ -874,6 +878,7 @@ pub fn scan_and_group(
             let mut ck = [0u8; 32];
             let mut orientation = 1;
             let mut gps_pos = None;
+            let mut exif_timestamp: Option<i64> = None;
             let mut cache_hit_full = false;
             let mut pixel_hash: Option<[u8; 32]> = None; // Init
             let mut new_pixel = None; // For DB update
@@ -927,7 +932,7 @@ pub fn scan_and_group(
                 let bytes = fs::read(path).ok();
 
                 if let Some(ref b) = bytes {
-                    // Read Orientation and GPS location
+                    // Read Orientation, GPS location, and EXIF timestamp
                     if let Some(exif) = read_exif_data(path, Some(b)) {
                         if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
                             gps_pos = Some(Point::new(lon, lat)); // Geo uses (x, y) = (lon, lat)
@@ -938,6 +943,7 @@ pub fn scan_and_group(
                         {
                             orientation = v as u8;
                         }
+                        exif_timestamp = get_exif_timestamp(&exif);
                     }
                     // 2. Calculate file hash if needed
                     if ck == [0u8; 32] {
@@ -1024,6 +1030,7 @@ pub fn scan_and_group(
                                 height: resolution.unwrap_or((0, 0)).1,
                                 orientation,
                                 gps_pos,
+                                exif_timestamp,
                             };
 
                             let cached_coeffs = crate::db::CachedCoefficients {
@@ -1068,6 +1075,7 @@ pub fn scan_and_group(
                 pdqhash,
                 pdq_features,
                 pixel_hash,
+                exif_timestamp,
             })
         })
         .collect();
@@ -1582,6 +1590,26 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
         "date-desc" => files.sort_by(|a, b| b.modified.cmp(&a.modified)),
         "size" => files.sort_by(|a, b| a.size.cmp(&b.size)),
         "size-desc" => files.sort_by(|a, b| b.size.cmp(&a.size)),
+        "exif-date" => {
+            // Sort by EXIF timestamp (oldest first).
+            // Files with EXIF timestamps come first, then files without (sorted by mtime).
+            files.sort_by(|a, b| match (a.exif_timestamp, b.exif_timestamp) {
+                (Some(ta), Some(tb)) => ta.cmp(&tb),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.modified.cmp(&b.modified),
+            });
+        }
+        "exif-date-desc" => {
+            // Sort by EXIF timestamp (newest first).
+            // Files with EXIF timestamps come first, then files without (sorted by mtime desc).
+            files.sort_by(|a, b| match (a.exif_timestamp, b.exif_timestamp) {
+                (Some(ta), Some(tb)) => tb.cmp(&ta),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => b.modified.cmp(&a.modified),
+            });
+        }
         "random" => {
             let mut rng = rand::rng();
             files.shuffle(&mut rng);
@@ -1847,10 +1875,12 @@ pub fn scan_for_view(
                 let modified = DateTime::from(metadata.modified().ok().unwrap_or(UNIX_EPOCH));
 
                 let mut gps_pos = None;
-                if let Some(exif) = read_exif_data(path, None)
-                    && let Some((lat, lon)) = extract_gps_lat_lon(&exif)
-                {
-                    gps_pos = Some(Point::new(lon, lat));
+                let mut exif_timestamp = None;
+                if let Some(exif) = read_exif_data(path, None) {
+                    if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
+                        gps_pos = Some(Point::new(lon, lat));
+                    }
+                    exif_timestamp = get_exif_timestamp(&exif);
                 }
                 // Required for RAWs to look correct immediately.
                 // Streaming (batch_tx) ensures the UI is still responsive.
@@ -1876,6 +1906,7 @@ pub fn scan_for_view(
                     orientation,
                     gps_pos,
                     unique_file_id,
+                    exif_timestamp,
                 })
             })
             .collect();
@@ -1924,7 +1955,7 @@ pub fn spawn_background_enrichment(
                 hasher.update(&data);
                 let content_hash = *hasher.finalize().as_bytes();
 
-                // Read EXIF data once for both GPS and orientation
+                // Read EXIF data once for GPS, orientation, and timestamp
                 let exif_data = read_exif_data(path, Some(&data));
 
                 // Read GPS from EXIF
@@ -1938,6 +1969,9 @@ pub fn spawn_background_enrichment(
                 // will later correct if the image loader determines a different value
                 let orientation = get_orientation(path, Some(&data));
 
+                // Read EXIF timestamp
+                let exif_timestamp = exif_data.as_ref().and_then(get_exif_timestamp);
+
                 // Write to database if channel is available
                 // Note: resolution is typically None in view mode; update_file_metadata
                 // will update it later when the image is actually loaded
@@ -1950,6 +1984,7 @@ pub fn spawn_background_enrichment(
                         *resolution,
                         orientation,
                         gps_pos,
+                        exif_timestamp,
                     )
                 {
                     let _ = tx.send(update);
@@ -1960,6 +1995,7 @@ pub fn spawn_background_enrichment(
                     unique_file_id: *unique_file_id,
                     content_hash,
                     gps_pos,
+                    exif_timestamp,
                 });
             }
         });
@@ -2041,8 +2077,8 @@ pub fn spawn_background_dir_scan(
         let mut files: Vec<FileMetadata> = entries
             .into_iter()
             .map(|e| {
-                let (resolution, orientation, gps_pos) =
-                    cached.get(&e.unique_file_id).cloned().unwrap_or((None, 1, None));
+                let (resolution, orientation, gps_pos, exif_timestamp) =
+                    cached.get(&e.unique_file_id).cloned().unwrap_or((None, 1, None, None));
 
                 FileMetadata {
                     path: e.path,
@@ -2055,6 +2091,7 @@ pub fn spawn_background_dir_scan(
                     orientation,
                     gps_pos,
                     unique_file_id: e.unique_file_id,
+                    exif_timestamp,
                 }
             })
             .collect();

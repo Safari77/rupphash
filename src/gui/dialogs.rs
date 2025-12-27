@@ -934,7 +934,7 @@ pub(super) fn handle_dialogs(
         let mut selected_sort = None;
 
         egui::Window::new("Sort Order").collapsible(false).show(ctx, |ui| {
-            ui.label("Select sort order (or press 1-9):");
+            ui.label("Select sort order (or press 1-9, 0, -):");
             ui.separator();
 
             let options = [
@@ -947,6 +947,8 @@ pub(super) fn handle_dialogs(
                 ("7. Size (Smallest First)", "size", egui::Key::Num7),
                 ("8. Size (Largest First)", "size-desc", egui::Key::Num8),
                 ("9. Random", "random", egui::Key::Num9),
+                ("0. EXIF Date (Oldest First)", "exif-date", egui::Key::Num0),
+                ("-. EXIF Date (Newest First)", "exif-date-desc", egui::Key::Minus),
             ];
 
             for (label, value, key) in options {
@@ -971,6 +973,10 @@ pub(super) fn handle_dialogs(
                 app.view_mode_sort = Some(sort.clone());
                 // Explicitly sort subdirectories (AppState only handles files)
                 scanner::sort_directories(&mut app.subdirs, &sort);
+                // Update GPS map sort mode based on sort order
+                app.gps_map.sort_by_exif_timestamp =
+                    sort == "exif-date" || sort == "exif-date-desc";
+                app.gps_map.markers_needs_sort = true; // Force re-sort with new mode
                 app.state.handle_input(InputIntent::ChangeSortOrder(sort));
                 app.cache_dirty = true;
             }

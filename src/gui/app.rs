@@ -396,6 +396,11 @@ impl GuiApp {
         let selected_provider = ctx.selected_provider.clone();
         let provider_url = ctx.map_providers.get(&selected_provider).cloned().unwrap_or_default();
 
+        // Create GPS map state with appropriate sort mode
+        let mut gps_map = GpsMapState::new(tile_cache_path, selected_provider, provider_url);
+        gps_map.sort_by_exif_timestamp =
+            sort_order == "exif-date" || sort_order == "exif-date-desc";
+
         Self {
             state,
             group_views: HashMap::new(),
@@ -455,7 +460,7 @@ impl GuiApp {
             fs_rem_files: HashSet::new(),
             fs_rem_dirs: HashSet::new(),
             last_fs_refresh: Instant::now(),
-            gps_map: GpsMapState::new(tile_cache_path, selected_provider, provider_url),
+            gps_map,
             enrichment_rx: None,
             file_index: HashMap::new(),
             failed_images: HashMap::new(),
@@ -497,7 +502,8 @@ impl GuiApp {
         for file in files {
             if let Some(pos) = file.gps_pos {
                 // add_marker returns true if it was new
-                if self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x()) {
+                if self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x(), file.exif_timestamp)
+                {
                     _added_any = true;
                 }
             }
@@ -518,7 +524,8 @@ impl GuiApp {
             && let Ok(Some(features)) = self.ctx.get_features(content_hash)
             && let Some(coords) = features.gps_pos
         {
-            self.gps_map.add_marker(path.to_path_buf(), coords.y(), coords.x());
+            // Note: exif_timestamp not available from cached features, will be None
+            self.gps_map.add_marker(path.to_path_buf(), coords.y(), coords.x(), None);
             return Some((coords.y(), coords.x()));
         }
 
@@ -526,7 +533,8 @@ impl GuiApp {
         if let Some(exif) = scanner::read_exif_data(path, None)
             && let Some((lat, lon)) = extract_gps_lat_lon(&exif)
         {
-            self.gps_map.add_marker(path.to_path_buf(), lat, lon);
+            let exif_ts = crate::helper_exif::get_exif_timestamp(&exif);
+            self.gps_map.add_marker(path.to_path_buf(), lat, lon, exif_ts);
 
             // O(1) update via file_index if unique_file_id provided
             if let Some(uid) = unique_file_id
@@ -742,8 +750,9 @@ impl GuiApp {
                                     new_files.push(recovered);
                                 } else {
                                     // New file not in session - use centralized cache lookup from db.rs
-                                    let (resolution, orientation, gps_pos) =
+                                    let (resolution, orientation, gps_pos, exif_timestamp) =
                                         self.ctx.lookup_cached_features(&meta, unique_file_id);
+
                                     new_files.push(FileMetadata {
                                         path: canonical,
                                         size,
@@ -755,6 +764,7 @@ impl GuiApp {
                                         orientation,
                                         gps_pos,
                                         unique_file_id,
+                                        exif_timestamp,
                                     });
                                 }
                             }
@@ -1506,6 +1516,7 @@ impl eframe::App for GuiApp {
                             actual_resolution,
                             orientation,
                             content_hash,
+                            exif_timestamp,
                         ) => {
                             super::image::update_file_metadata(
                                 self,
@@ -1514,6 +1525,7 @@ impl eframe::App for GuiApp {
                                 actual_resolution.1,
                                 orientation,
                                 content_hash,
+                                exif_timestamp,
                             );
 
                             let name = format!("img_{}", path.display());
@@ -1620,10 +1632,18 @@ impl eframe::App for GuiApp {
                             if result.gps_pos.is_some() {
                                 file.gps_pos = result.gps_pos;
                             }
+                            if result.exif_timestamp.is_some() {
+                                file.exif_timestamp = result.exif_timestamp;
+                            }
 
                             // Add GPS marker if we found coordinates
                             if let Some(pos) = result.gps_pos {
-                                self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x());
+                                self.gps_map.add_marker(
+                                    file.path.clone(),
+                                    pos.y(),
+                                    pos.x(),
+                                    result.exif_timestamp,
+                                );
                             }
                         }
                     }
@@ -2457,6 +2477,30 @@ impl eframe::App for GuiApp {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
 
+                                // Show tooltip with file details on filename hover
+                                let header_resp = header_resp.on_hover_ui(|ui| {
+                                    ui.label(format!(
+                                        "unique_file_id: {:032x}",
+                                        file.unique_file_id
+                                    ));
+                                    ui.label(format!(
+                                        "modified: {}",
+                                        file.modified.format("%Y-%m-%d %H:%M:%S")
+                                    ));
+                                    ui.label(format!(
+                                        "exif_timestamp: {}",
+                                        file.exif_timestamp
+                                            .map(|ts| {
+                                                chrono::DateTime::from_timestamp(ts, 0)
+                                                    .map(|dt| {
+                                                        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+                                                    })
+                                                    .unwrap_or_else(|| format!("{}", ts))
+                                            })
+                                            .unwrap_or_else(|| "None".to_string())
+                                    ));
+                                });
+
                                 // Context Menu (Shared)
                                 let context_menu_logic =
                                     |ui: &mut egui::Ui,
@@ -2506,16 +2550,37 @@ impl eframe::App for GuiApp {
                                 } else {
                                     format!("{:.2} MiB", file.size as f32 / 1048576.0)
                                 };
+
+                                // Check if EXIF timestamp sort is in effect
+                                let use_exif_time = self
+                                    .view_mode_sort
+                                    .as_ref()
+                                    .map(|s| s == "exif-date" || s == "exif-date-desc")
+                                    .unwrap_or(false);
+
+                                // Determine which timestamp to display:
+                                // - If EXIF sort is active and file has EXIF timestamp, use it
+                                // - Otherwise use file modification time
+                                let display_time = if use_exif_time {
+                                    file.exif_timestamp
+                                        .and_then(|ts| {
+                                            chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+                                        })
+                                        .unwrap_or(file.modified)
+                                } else {
+                                    file.modified
+                                };
+
                                 let time_str = if self.state.show_relative_times {
-                                    let ts = Timestamp::from_second(file.modified.timestamp())
+                                    let ts = Timestamp::from_second(display_time.timestamp())
                                         .unwrap()
                                         .checked_add(jiff::SignedDuration::from_nanos(
-                                            file.modified.timestamp_subsec_nanos() as i64,
+                                            display_time.timestamp_subsec_nanos() as i64,
                                         ))
                                         .unwrap();
                                     format_relative_time(ts)
                                 } else {
-                                    file.modified.format("%Y-%m-%d %H:%M:%S").to_string()
+                                    display_time.format("%Y-%m-%d %H:%M:%S").to_string()
                                 };
                                 let res_str = file
                                     .resolution

@@ -1,3 +1,4 @@
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use exif::{In, Tag, Value};
 
 /// Extract GPS coordinates from EXIF data as (latitude, longitude)
@@ -100,6 +101,37 @@ pub fn get_date_str(exif: &exif::Exif, use_gps: bool) -> Option<String> {
             }
         }
         _ => {}
+    }
+    None
+}
+
+/// Extract EXIF timestamp as i64 (seconds since Unix epoch).
+/// Tries DateTimeOriginal first, then DateTimeDigitized.
+/// Returns None if neither tag is present or parseable.
+pub fn get_exif_timestamp(exif: &exif::Exif) -> Option<i64> {
+    // Try DateTimeOriginal first
+    if let Some(ts) = parse_exif_datetime_tag(exif, Tag::DateTimeOriginal) {
+        return Some(ts);
+    }
+    // Fallback to DateTimeDigitized
+    parse_exif_datetime_tag(exif, Tag::DateTimeDigitized)
+}
+
+/// Parse an EXIF DateTime tag to Unix timestamp (seconds since epoch).
+/// EXIF DateTime format: "YYYY:MM:DD HH:MM:SS"
+fn parse_exif_datetime_tag(exif: &exif::Exif, tag: Tag) -> Option<i64> {
+    let field = exif.get_field(tag, In::PRIMARY)?;
+    if let Value::Ascii(ref vec) = field.value {
+        if vec.is_empty() {
+            return None;
+        }
+        if let Ok(dt) = exif::DateTime::from_ascii(&vec[0]) {
+            // Convert to Unix timestamp using chrono
+            let date = NaiveDate::from_ymd_opt(dt.year as i32, dt.month as u32, dt.day as u32)?;
+            let time = NaiveTime::from_hms_opt(dt.hour as u32, dt.minute as u32, dt.second as u32)?;
+            let naive_dt = NaiveDateTime::new(date, time);
+            return Some(naive_dt.and_utc().timestamp());
+        }
     }
     None
 }
