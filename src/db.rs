@@ -1,3 +1,6 @@
+use crate::exif_types::ExifValue;
+use crate::image_features::ImageFeatures;
+use crate::scanner::RAW_EXTS;
 use chacha20poly1305::{
     XChaCha20Poly1305,
     XNonce, // XChaCha20 uses 24-byte nonces
@@ -29,8 +32,6 @@ const TOTAL_OVERHEAD: usize = ENCRYPTION_OVERHEAD;
 
 // Default LMDB map size in MiB (2048 MiB = 2 GB)
 const DEFAULT_DB_SIZE_MB: u32 = 2048;
-
-use crate::scanner::RAW_EXTS;
 
 /// Hash algorithm selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -147,27 +148,6 @@ fn default_db_size_mb() -> u32 {
     DEFAULT_DB_SIZE_MB
 }
 
-// Struct to hold cached data to avoid file reads
-// NOTE: coefficients are stored separately in coeff_db
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CachedFeatures {
-    pub width: u32,
-    pub height: u32,
-    pub orientation: u8,
-    pub gps_pos: Option<Point<f64>>,
-    pub exif_timestamp: Option<i64>,
-}
-
-impl CachedFeatures {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
-        postcard::to_stdvec(self)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
-    }
-}
-
 /// PDQ coefficients stored separately (only in duplicate finder mode)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedCoefficients {
@@ -192,6 +172,7 @@ pub struct EnrichmentResult {
     pub content_hash: [u8; 32],
     pub gps_pos: Option<Point<f64>>,
     pub exif_timestamp: Option<i64>,
+    pub features: Option<ImageFeatures>,
 }
 
 pub struct AppContext {
@@ -221,7 +202,7 @@ pub enum HashValue {
 pub type DbUpdate = (
     Option<([u8; 32], [u8; 32])>,           // Meta: meta_key -> content_hash
     Option<([u8; 32], HashValue)>,          // Hash: content_hash -> pdqhash
-    Option<([u8; 32], CachedFeatures)>, // Features: content_hash -> width/height/orientation/gps
+    Option<([u8; 32], ImageFeatures)>,      // Features: content_hash -> ImageFeatures
     Option<([u8; 32], CachedCoefficients)>, // Coefficients: content_hash -> coefficients (dupe mode only)
     Option<([u8; 32], [u8; 32])>,           // Pixel Hash
 );
@@ -263,35 +244,18 @@ pub fn compute_meta_key_from_metadata(
 }
 
 /// Create a DbUpdate for caching enrichment results (view mode).
-/// This is the canonical way to create database updates for enriched files.
+/// This is the canonical way to create database updates.
 pub fn create_feature_update(
     meta_key_secret: &[u8; 32],
     path: &std::path::Path,
     unique_file_id: u128,
     content_hash: [u8; 32],
-    resolution: Option<(u32, u32)>,
-    orientation: u8,
-    gps_pos: Option<Point<f64>>,
-    exif_timestamp: Option<i64>,
+    features: ImageFeatures,
 ) -> Option<DbUpdate> {
     let metadata = std::fs::metadata(path).ok()?;
     let meta_key = compute_meta_key_from_metadata(meta_key_secret, &metadata, unique_file_id);
 
-    let features = CachedFeatures {
-        width: resolution.map(|(w, _)| w).unwrap_or(0),
-        height: resolution.map(|(_, h)| h).unwrap_or(0),
-        orientation,
-        gps_pos,
-        exif_timestamp,
-    };
-
-    Some((
-        Some((meta_key, content_hash)), // meta_key -> content_hash
-        None,                           // No PDQ hash in view mode
-        Some((content_hash, features)), // content_hash -> features
-        None,                           // No coefficients in view mode
-        None,                           // No pixel hash
-    ))
+    Some((Some((meta_key, content_hash)), None, Some((content_hash, features)), None, None))
 }
 
 impl AppContext {
@@ -582,16 +546,16 @@ impl AppContext {
         }
     }
 
-    /// Get cached features (width, height, orientation, gps_pos)
+    /// Get cached features from database
     pub fn get_features(
         &self,
         content_hash: &[u8; 32],
-    ) -> Result<Option<CachedFeatures>, lmdb::Error> {
+    ) -> Result<Option<ImageFeatures>, lmdb::Error> {
         let txn = self.env.begin_ro_txn()?;
         match txn.get(self.feature_db, content_hash) {
             Ok(encrypted_bytes) => {
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    Ok(CachedFeatures::from_bytes(&decrypted).ok())
+                    Ok(ImageFeatures::from_bytes(&decrypted).ok())
                 } else {
                     eprintln!("[ERROR] get_features Corrupted ch={:x?}", content_hash);
                     Err(lmdb::Error::Corrupted)
@@ -667,16 +631,14 @@ impl AppContext {
         }
     }
 
-    /// Look up cached resolution, orientation, and gps_pos from the database using file metadata.
-    /// This is the single canonical function for cache lookups, used by both
-    /// the GUI (app.rs) and scanner (scanner.rs).
-    ///
-    /// Returns (resolution, orientation, gps_pos) - defaults to (None, 1, None) if not cached.
+    /// Look up cached features from the database.
+    /// Returns Option<ImageFeatures> - all fields accessible via methods.
     pub fn lookup_cached_features(
         &self,
         metadata: &std::fs::Metadata,
         unique_file_id: u128,
-    ) -> (Option<(u32, u32)>, u8, Option<Point<f64>>, Option<i64>) {
+    ) -> Option<ImageFeatures> {
+        // CHANGED return type
         let meta_key = compute_meta_key_from_metadata(&self.meta_key, metadata, unique_file_id);
 
         eprintln!(
@@ -688,50 +650,39 @@ impl AppContext {
 
         // Look up content_hash from meta_key
         if let Ok(Some(content_hash)) = self.get_content_hash(&meta_key) {
-            // Do not attempt to look up features for a zeroed-out hash placeholder.
             if content_hash == [0u8; 32] {
-                return (None, 1, None, None);
+                return None;
             }
 
             eprintln!("[DEBUG-CACHE]   Found content_hash: {:?}", hex::encode(&content_hash[..8]));
+
             // Look up cached features from content_hash
             if let Ok(Some(features)) = self.get_features(&content_hash) {
-                let resolution = if features.width > 0 && features.height > 0 {
-                    Some((features.width, features.height))
-                } else {
-                    None
-                };
                 eprintln!(
                     "[DEBUG-CACHE]   Found features: resolution={:?}, orientation={}, gps_pos={:#?}, exif_timestamp={:?}",
-                    resolution, features.orientation, features.gps_pos, features.exif_timestamp
+                    features.resolution(),
+                    features.orientation(),
+                    features.gps_pos(),
+                    features.exif_timestamp()
                 );
-                return (
-                    resolution,
-                    features.orientation,
-                    features.gps_pos,
-                    features.exif_timestamp,
-                );
+                return Some(features);
             } else {
                 eprintln!("[DEBUG-CACHE]   No features found for content_hash");
             }
         }
 
         eprintln!("[DEBUG-CACHE]   Not found in database");
-        // Not cached
-        (None, 1, None, None)
+        None
     }
 
-    /// Batch lookup of cached features for multiple files in a single transaction.
-    ///
-    /// Returns a HashMap mapping unique_file_id to (resolution, orientation, gps_pos, exif_timestamp).
-    /// Files not found in cache are not included in the result.
+    /// Batch lookup of cached features for multiple files.
+    /// Returns HashMap mapping unique_file_id to ImageFeatures.
     pub fn lookup_cached_features_batch(
         &self,
         files: &[(u128, u64, u64)], // (unique_file_id, size, mtime_ns)
-    ) -> HashMap<u128, (Option<(u32, u32)>, u8, Option<Point<f64>>, Option<i64>)> {
+    ) -> HashMap<u128, ImageFeatures> {
         let mut results = HashMap::with_capacity(files.len());
 
-        // Use a single read transaction for all lookups
         let Ok(txn) = self.env.begin_ro_txn() else {
             return results;
         };
@@ -739,7 +690,6 @@ impl AppContext {
         for &(unique_file_id, size, mtime_ns) in files {
             let meta_key = compute_meta_key(&self.meta_key, mtime_ns, size, unique_file_id);
 
-            // Look up content_hash from meta_key
             if let Ok(encrypted) = txn.get(self.meta_db, &meta_key)
                 && let Some(decrypted) = self.decrypt_value(&meta_key, encrypted)
                 && decrypted.len() == 40
@@ -747,31 +697,16 @@ impl AppContext {
                 let mut content_hash = [0u8; 32];
                 content_hash.copy_from_slice(&decrypted[0..32]);
 
-                // Skip zeroed-out hash placeholder
                 if content_hash == [0u8; 32] {
                     continue;
                 }
 
-                // Look up features from content_hash
                 if let Ok(encrypted_features) = txn.get(self.feature_db, &content_hash)
                     && let Some(decrypted_features) =
                         self.decrypt_value(&content_hash, encrypted_features)
-                    && let Ok(features) = CachedFeatures::from_bytes(&decrypted_features)
+                    && let Ok(features) = ImageFeatures::from_bytes(&decrypted_features)
                 {
-                    let resolution = if features.width > 0 && features.height > 0 {
-                        Some((features.width, features.height))
-                    } else {
-                        None
-                    };
-                    results.insert(
-                        unique_file_id,
-                        (
-                            resolution,
-                            features.orientation,
-                            features.gps_pos,
-                            features.exif_timestamp,
-                        ),
-                    );
+                    results.insert(unique_file_id, features);
                 }
             }
         }
@@ -1014,7 +949,7 @@ impl AppContext {
         pixel_db: Database,
         meta_updates: &Vec<([u8; 32], [u8; 32])>,
         hash_updates: &Vec<([u8; 32], HashValue)>,
-        feature_updates: &Vec<([u8; 32], CachedFeatures)>,
+        feature_updates: &Vec<([u8; 32], ImageFeatures)>,
         coeff_updates: &Vec<([u8; 32], CachedCoefficients)>,
         pixel_updates: &Vec<([u8; 32], [u8; 32])>,
     ) -> Result<(), lmdb::Error> {
@@ -1043,9 +978,9 @@ impl AppContext {
             }
         }
 
-        // 3. Feature Updates (width, height, orientation, gps_pos)
+        // 3. Feature Updates
         for (key, features) in feature_updates {
-            let bytes = features.to_bytes().expect("CachedFeatures serialization failed");
+            let bytes = features.to_bytes().expect("ImageFeatures serialization failed");
             let encrypted = Self::encrypt_value(cipher, key, &bytes);
             txn.put(feature_db, key, &encrypted, WriteFlags::empty())?;
         }
@@ -1064,6 +999,37 @@ impl AppContext {
         }
 
         txn.commit()
+    }
+
+    /// Iterate all features in the database for building search index.
+    /// Calls the provided callback for each (content_hash, ImageFeatures) pair.
+    pub fn iterate_all_features<F>(&self, mut callback: F) -> Result<usize, lmdb::Error>
+    where
+        F: FnMut(&[u8; 32], &ImageFeatures),
+    {
+        let txn = self.env.begin_ro_txn()?;
+        let mut count = 0;
+
+        if txn.stat(self.feature_db)?.entries() > 0 {
+            let mut cursor = txn.open_ro_cursor(self.feature_db)?;
+            for result in cursor.iter_start() {
+                if let Ok((key, encrypted)) = result
+                    && key.len() == 32
+                {
+                    let mut content_hash = [0u8; 32];
+                    content_hash.copy_from_slice(key);
+
+                    if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
+                        && let Ok(features) = ImageFeatures::from_bytes(&decrypted)
+                    {
+                        callback(&content_hash, &features);
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(count)
     }
 
     pub fn save_map_selection(

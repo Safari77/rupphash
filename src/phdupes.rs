@@ -29,14 +29,18 @@ struct DepInfo {
 }
 
 mod db;
+mod exif_extract;
+mod exif_types;
 mod fileops;
 mod gui;
 mod hamminghash;
 #[allow(unused)]
 mod helper_exif;
+mod image_features;
 mod pdqhash;
 mod position;
 mod scanner;
+mod search_index;
 mod state;
 mod ui;
 

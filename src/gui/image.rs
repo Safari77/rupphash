@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use super::app::GuiApp;
+use crate::exif_types::{
+    ExifValue, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE, TAG_ORIENTATION,
+};
+use crate::image_features::ImageFeatures;
 use crate::scanner;
 
 pub const MAX_TEXTURE_SIDE: usize = 8192;
@@ -117,8 +121,8 @@ fn load_and_process_image_with_hash(
     };
 
     // Read EXIF timestamp
-    let exif_timestamp = crate::scanner::read_exif_data(path, Some(&bytes))
-        .and_then(|exif| crate::helper_exif::get_exif_timestamp(&exif));
+    let exif_timestamp = crate::exif_extract::read_exif_data(path, Some(&bytes))
+        .and_then(|exif| crate::exif_extract::get_exif_timestamp(&exif));
 
     // Process the image using existing logic
     let (img, dims, orientation) = load_and_process_image_from_bytes(path, &bytes, use_thumbnails)?;
@@ -191,7 +195,7 @@ fn load_and_process_image_from_bytes(
     // RAW FILES
     // ---------------------------------------------------------------------
     if is_raw_ext(path) {
-        let exif_orientation = crate::scanner::get_orientation(path, Some(bytes));
+        let exif_orientation = crate::exif_extract::get_orientation(path, Some(bytes));
 
         let mut raw =
             rsraw::RawImage::open(bytes).map_err(|e| format!("Failed to open RAW file: {}", e))?;
@@ -231,7 +235,7 @@ fn load_and_process_image_from_bytes(
     // ---------------------------------------------------------------------
     // STANDARD FILES (JPEG, PNG, HEIC, JP2, JXL, etc.)
     // ---------------------------------------------------------------------
-    let orientation = crate::scanner::get_orientation(path, Some(bytes));
+    let orientation = crate::exif_extract::get_orientation(path, Some(bytes));
 
     let ext = path
         .extension()
@@ -368,17 +372,32 @@ pub(super) fn update_file_metadata(
     // Persist to database if we found the file and something changed
     if let Some((unique_file_id, gps_pos, exif_timestamp, changed)) = found_info {
         if changed && let Some(ref db_tx) = app.db_tx {
-            // Use create_feature_update with the real content_hash computed by the image loader
-            // This creates/updates the full database entry on first load
+            // Build ImageFeatures from the data we have
+            let mut features = ImageFeatures::new(w, h);
+
+            // Add orientation if not default
+            if orientation != 1 {
+                features.insert_tag(TAG_ORIENTATION, ExifValue::Short(orientation as u16));
+            }
+
+            // Add GPS position if available
+            if let Some(pos) = gps_pos {
+                features.insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y() as f32));
+                features.insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(pos.x() as f32));
+            }
+
+            // Add timestamp if available
+            if let Some(ts) = exif_timestamp {
+                features.insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(ts));
+            }
+
+            // Use create_feature_update with ImageFeatures
             if let Some(update) = crate::db::create_feature_update(
                 &app.ctx.meta_key,
                 path,
                 unique_file_id,
                 content_hash,
-                Some((w, h)),
-                orientation,
-                gps_pos,
-                exif_timestamp,
+                features,
             ) {
                 let _ = db_tx.send(update);
                 eprintln!(
@@ -718,7 +737,7 @@ pub(super) fn render_exif(
             let new_tags = scanner::get_exif_tags(path, exif_tags, *decimal_mode, use_gps);
             app.cached_exif = Some((path.to_path_buf(), new_tags.clone()));
             // Check fallback warning during load
-            if use_gps && !crate::scanner::has_gps_time(path) {
+            if use_gps && !crate::exif_extract::has_gps_time(path) {
                 // We only warn if the user explicitly wanted Sun Position
                 if exif_tags.iter().any(|t| t.eq_ignore_ascii_case("DerivedSunPosition")) {
                     app.state.status_message =

@@ -84,8 +84,8 @@ jobs:
             Write-Error "Could not find dav1d.pc in static path!"
             exit 1
         }
-        cargo check           --verbose --target x86_64-pc-windows-msvc
-        cargo build --release --verbose --target x86_64-pc-windows-msvc
+        cargo check           --verbose --target x86_64-pc-windows-msvc --bin phdupes
+        cargo build --release --verbose --target x86_64-pc-windows-msvc --bin phdupes
 
     - name: Stage Artifacts
       shell: powershell

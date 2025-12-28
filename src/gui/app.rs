@@ -14,12 +14,14 @@ use std::time::{Duration, Instant};
 use super::gps_map::GpsMapState;
 use super::image::{GroupViewState, ViewMode};
 
+use crate::exif_extract::{extract_gps_lat_lon, get_exif_timestamp};
+use crate::image_features::ImageFeatures;
+
 use crate::GroupStatus;
 use crate::db::{AppContext, EnrichmentResult};
 use crate::format_relative_time;
 use crate::gui::APP_TITLE;
 use crate::gui::image::{ImageLoadResult, MAX_TEXTURE_SIDE};
-use crate::helper_exif::extract_gps_lat_lon;
 use crate::position;
 use crate::scanner::{self, ScanConfig};
 use crate::state::{
@@ -147,8 +149,6 @@ pub struct GuiApp {
 
     // EXIF info display
     pub(super) show_exif: bool,
-    pub(super) search_sun_azimuth_enabled: bool,
-    pub(super) search_sun_altitude_enabled: bool,
 
     // Cache for current image's histogram and EXIF data (to avoid reloading on toggle)
     pub(super) cached_histogram: Option<(std::path::PathBuf, [u32; 256])>,
@@ -189,6 +189,12 @@ pub struct GuiApp {
     // View mode: Track size of failed_images to detect changes
     last_failed_images_len: usize,
 
+    // Search index for EXIF-based filtering
+    pub(super) search_filename_input: String,
+    pub(super) search_exif_input: String,
+    pub(super) search_index: crate::search_index::SearchIndex,
+    pub(super) search_index_dirty: bool,
+
     // View mode: Map of paths to Instant when retry is allowed
     retry_after: HashMap<PathBuf, Instant>,
 
@@ -202,6 +208,59 @@ pub struct GuiApp {
 }
 
 impl GuiApp {
+    pub fn build_search_index(&mut self) {
+        use std::time::Instant;
+        let start = Instant::now();
+
+        self.search_index.clear();
+        let mut indexed = 0;
+        let mut missing_features = 0;
+
+        for group in &self.state.groups {
+            for file in group {
+                // Skip files without content hash (not yet scanned)
+                if file.content_hash == [0u8; 32] {
+                    continue;
+                }
+
+                // Try to get features from database
+                match self.ctx.get_features(&file.content_hash) {
+                    Ok(Some(features)) => {
+                        self.search_index.insert(file.unique_file_id, &features);
+                        indexed += 1;
+                    }
+                    Ok(None) => {
+                        missing_features += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[SEARCH] Error getting features for {:?}: {}",
+                            file.path.file_name().unwrap_or_default(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        self.search_index.finalize();
+        self.search_index_dirty = false;
+
+        let elapsed = start.elapsed();
+        eprintln!(
+            "[SEARCH] Index built: {} files indexed, {} missing features, took {:?}",
+            indexed, missing_features, elapsed
+        );
+
+        // Debug: show what tags were indexed
+        #[cfg(debug_assertions)]
+        {
+            let tags = self.search_index.get_indexed_tags();
+            eprintln!("[SEARCH] Indexed {} unique tags", tags.len());
+            // Uncomment for full debug: self.search_index.debug_dump();
+        }
+    }
+
     /// Create a new GuiApp for duplicate detection mode
     pub fn new(
         ctx: AppContext,
@@ -280,8 +339,6 @@ impl GuiApp {
             completion_index: 0,
             show_histogram: false,
             show_exif: false,
-            search_sun_azimuth_enabled: false,
-            search_sun_altitude_enabled: false,
             cached_histogram: None,
             cached_exif: None,
             search_input: String::new(),
@@ -304,6 +361,10 @@ impl GuiApp {
             file_index: HashMap::new(),
             failed_images: HashMap::new(),
             last_failed_images_len: 0,
+            search_filename_input: String::new(),
+            search_exif_input: String::new(),
+            search_index: crate::search_index::SearchIndex::new(),
+            search_index_dirty: true,
             retry_after: HashMap::new(),
             db_tx: None,
             dir_scan_rx: None,
@@ -473,8 +534,6 @@ impl GuiApp {
             completion_index: 0,
             show_histogram: false,
             show_exif: false,
-            search_sun_azimuth_enabled: false,
-            search_sun_altitude_enabled: false,
             cached_histogram: None,
             cached_exif: None,
             search_input: String::new(),
@@ -497,6 +556,10 @@ impl GuiApp {
             file_index: HashMap::new(),
             failed_images: HashMap::new(),
             last_failed_images_len: 0,
+            search_filename_input: String::new(),
+            search_exif_input: String::new(),
+            search_index: crate::search_index::SearchIndex::new(),
+            search_index_dirty: true,
             retry_after: HashMap::new(),
             db_tx,
             dir_scan_rx,
@@ -554,18 +617,20 @@ impl GuiApp {
         // Fast path: query the database using the content hash (only works if content_hash is non-zero)
         if *content_hash != [0u8; 32]
             && let Ok(Some(features)) = self.ctx.get_features(content_hash)
-            && let Some(coords) = features.gps_pos
+            && let Some(coords) = features.gps_pos()
         {
-            // Note: exif_timestamp not available from cached features, will be None
-            self.gps_map.add_marker(path.to_path_buf(), coords.y(), coords.x(), None);
-            return Some((coords.y(), coords.x()));
+            // coords is geo::Point<f64>, y() = lat, x() = lon
+            let lat = coords.y();
+            let lon = coords.x();
+            self.gps_map.add_marker(path.to_path_buf(), lat, lon, None);
+            return Some((lat, lon));
         }
 
         // Slow fallback: Read EXIF directly from disk
-        if let Some(exif) = scanner::read_exif_data(path, None)
-            && let Some((lat, lon)) = extract_gps_lat_lon(&exif)
+        if let Some(exif) = crate::exif_extract::read_exif_data(path, None)
+            && let Some((lat, lon)) = crate::exif_extract::extract_gps_lat_lon(&exif)
         {
-            let exif_ts = crate::helper_exif::get_exif_timestamp(&exif);
+            let exif_ts = crate::exif_extract::get_exif_timestamp(&exif);
             self.gps_map.add_marker(path.to_path_buf(), lat, lon, exif_ts);
 
             // O(1) update via file_index if unique_file_id provided
@@ -781,9 +846,22 @@ impl GuiApp {
                                     recovered.modified = modified;
                                     new_files.push(recovered);
                                 } else {
-                                    // New file not in session - use centralized cache lookup from db.rs
-                                    let (resolution, orientation, gps_pos, exif_timestamp) =
+                                    // lookup_cached_features now returns Option<ImageFeatures>
+                                    let cached =
                                         self.ctx.lookup_cached_features(&meta, unique_file_id);
+
+                                    // Extract fields from ImageFeatures if found
+                                    let (resolution, orientation, gps_pos, exif_timestamp) =
+                                        if let Some(feats) = cached {
+                                            (
+                                                feats.resolution(),
+                                                feats.orientation(),
+                                                feats.gps_pos(),
+                                                feats.exif_timestamp(),
+                                            )
+                                        } else {
+                                            (None, 1, None, None)
+                                        };
 
                                     new_files.push(FileMetadata {
                                         path: canonical,
@@ -1147,6 +1225,7 @@ impl GuiApp {
             }
 
             self.state.is_loading = false;
+            self.build_search_index();
             self.scan_rx = None;
             self.scan_progress_rx = None;
             self.scan_batch_rx = None;
@@ -1620,7 +1699,7 @@ impl eframe::App for GuiApp {
                         if let Some(group) = self.state.groups.first() {
                             let files_to_enrich: Vec<_> = group
                                 .iter()
-                                .filter(|f| f.gps_pos.is_none())
+                                .filter(|f| f.content_hash == [0u8; 32])
                                 .map(|f| {
                                     (f.path.clone(), f.unique_file_id, f.resolution, f.orientation)
                                 })
@@ -1676,6 +1755,16 @@ impl eframe::App for GuiApp {
                                     pos.x(),
                                     result.exif_timestamp,
                                 );
+                            }
+                            // FIX: Use the features passed directly from scanner.
+                            // Do NOT call self.ctx.get_features() here, it is too slow/racy.
+                            if let Some(features) = &result.features {
+                                self.search_index.insert(result.unique_file_id, features);
+                            } else if let Ok(Some(features)) =
+                                self.ctx.get_features(&result.content_hash)
+                            {
+                                // Fallback only if strictly necessary (e.g. legacy logic)
+                                self.search_index.insert(result.unique_file_id, &features);
                             }
                         }
                     }

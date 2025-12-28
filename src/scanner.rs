@@ -18,14 +18,19 @@ use walkdir::WalkDir;
 use zune_jpeg::JpegDecoder as ZuneDecoder;
 
 use crate::db::{
-    AppContext, DbUpdate, EnrichmentResult, HashValue, compute_meta_key, create_feature_update,
+    AppContext, CachedCoefficients, DbUpdate, EnrichmentResult, HashValue, compute_meta_key,
+    create_feature_update,
+};
+use crate::exif_extract::extract_gps_lat_lon;
+use crate::exif_types::{
+    ExifValue, TAG_DERIVED_COUNTRY, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE,
+    TAG_ORIENTATION,
 };
 use crate::fileops;
 use crate::fileops::get_file_key;
 use crate::hamminghash::{HammingHash, MIHIndex, SparseBitSet};
-use crate::helper_exif::{
-    extract_gps_lat_lon, get_altitude, get_date_str, get_exif_timestamp, parse_gps_coordinate,
-};
+use crate::helper_exif::{get_altitude, get_date_str, get_exif_timestamp, parse_gps_coordinate};
+use crate::image_features::ImageFeatures;
 use crate::position;
 use crate::{FileMetadata, GroupInfo, GroupStatus};
 
@@ -138,7 +143,6 @@ fn get_derived_value(
         "derivedsunposition" => {
             let (lat, lon) = gps_coords?;
             let alt_m = sun_inputs.as_ref()?.unwrap_or(0.0);
-
             // Determine which time to use
             let mut date_str = None;
             let mut final_use_utc = false;
@@ -896,8 +900,8 @@ pub fn scan_and_group(
                     pdqhash = Some(h);
                     if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
                         resolution = Some((feats.width, feats.height));
-                        orientation = feats.orientation;
-                        gps_pos = feats.gps_pos;
+                        orientation = feats.orientation();
+                        gps_pos = feats.gps_pos();
 
                         // Get coefficients from separate db
                         if let Ok(Some(coeff_vec)) = ctx_ref.get_coefficients(&ch)
@@ -1024,24 +1028,46 @@ pub fn scan_and_group(
                             let feats = crate::pdqhash::PdqFeatures { coefficients: coeffs };
                             pdq_features = Some(Arc::new(feats.clone()));
 
-                            // Split into CachedFeatures and CachedCoefficients
-                            let cached_feats = crate::db::CachedFeatures {
-                                width: resolution.unwrap_or((0, 0)).0,
-                                height: resolution.unwrap_or((0, 0)).1,
-                                orientation,
-                                gps_pos,
-                                exif_timestamp,
+                            // Build ImageFeatures from the data we have
+                            let (w, h) = resolution.unwrap_or((0, 0));
+                            let mut img_features = if let Some(exif) = read_exif_data(path, Some(b))
+                            {
+                                crate::exif_extract::build_image_features(w, h, &exif, true, false)
+                            } else {
+                                ImageFeatures::new(w, h)
                             };
 
-                            let cached_coeffs = crate::db::CachedCoefficients {
-                                coefficients: features.coefficients.to_vec(),
-                            };
+                            // Add orientation if not default
+                            if orientation != 1 {
+                                img_features.insert_tag(
+                                    TAG_ORIENTATION,
+                                    ExifValue::Short(orientation as u16),
+                                );
+                            }
+
+                            // Add GPS position if available
+                            if let Some(pos) = gps_pos {
+                                img_features
+                                    .insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y() as f32));
+                                img_features.insert_tag(
+                                    TAG_GPS_LONGITUDE,
+                                    ExifValue::Float(pos.x() as f32),
+                                );
+                            }
+
+                            // Add timestamp if available
+                            if let Some(ts) = exif_timestamp {
+                                img_features
+                                    .insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(ts));
+                            }
+
+                            let cached_coeffs =
+                                CachedCoefficients { coefficients: features.coefficients.to_vec() };
 
                             if new_hash.is_none() {
-                                // Don't overwrite if already set (rare)
                                 new_hash = Some((ck, HashValue::PdqHash(hash)));
                             }
-                            new_features = Some((ck, cached_feats));
+                            new_features = Some((ck, img_features));
                             new_coeffs = Some((ck, cached_coeffs));
                         }
                     } else {
@@ -1998,9 +2024,11 @@ pub fn spawn_background_flatten_scan(
         .collect();
 
     // Batch database lookup (single transaction)
-    let cached = ctx.lookup_cached_features_batch(&lookup_data);
+    let cached: std::collections::HashMap<u128, ImageFeatures> =
+        ctx.lookup_cached_features_batch(&lookup_data);
 
     // Phase 2: Background processing with batch results
+    let sort_order_clone = sort_order.clone();
     std::thread::spawn(move || {
         const BATCH_SIZE: usize = 500;
 
@@ -2008,8 +2036,18 @@ pub fn spawn_background_flatten_scan(
         let mut files: Vec<FileMetadata> = entries
             .into_iter()
             .map(|e| {
+                // Extract fields from ImageFeatures if cached
                 let (resolution, orientation, gps_pos, exif_timestamp) =
-                    cached.get(&e.unique_file_id).cloned().unwrap_or((None, 1, None, None));
+                    if let Some(feats) = cached.get(&e.unique_file_id) {
+                        (
+                            feats.resolution(),
+                            feats.orientation(),
+                            feats.gps_pos(),
+                            feats.exif_timestamp(),
+                        )
+                    } else {
+                        (None, 1, None, None)
+                    };
 
                 FileMetadata {
                     path: e.path,
@@ -2028,17 +2066,11 @@ pub fn spawn_background_flatten_scan(
             .collect();
 
         // Sort all files
-        sort_files(&mut files, &sort_order);
+        sort_files(&mut files, &sort_order_clone);
 
         // Stream in batches
-        let total = files.len();
-        let mut sent = 0;
         for chunk in files.chunks(BATCH_SIZE) {
             let _ = batch_tx.send(chunk.to_vec());
-            sent += chunk.len();
-            if let Some(ref tx) = progress_tx {
-                let _ = tx.send((sent, total));
-            }
         }
     });
 
@@ -2083,37 +2115,85 @@ pub fn spawn_background_enrichment(
                     .map(|(lat, lon)| Point::new(lon, lat));
 
                 // Read orientation from EXIF (fresh, not from stale passed-in value)
-                // This ensures we store the EXIF orientation, which update_file_metadata
-                // will later correct if the image loader determines a different value
                 let orientation = get_orientation(path, Some(&data));
 
                 // Read EXIF timestamp
                 let exif_timestamp = exif_data.as_ref().and_then(get_exif_timestamp);
 
-                // Write to database if channel is available
-                // Note: resolution is typically None in view mode; update_file_metadata
-                // will update it later when the image is actually loaded
-                if let Some(ref tx) = db_tx
-                    && let Some(update) = create_feature_update(
+                // --- 1. BUILD FEATURES (Unified Path) ---
+                // We build the features object now so it can be used for BOTH the database
+                // and the immediate GUI update (fixing the race condition).
+                let (w, h) = resolution.unwrap_or((0, 0));
+
+                // Initialize: Use rich EXIF data if available, or blank slate
+                let mut features = if let Some(exif) = exif_data.as_ref() {
+                    // 'true' here enables enrichment (Country, Sun Position, etc.)
+                    crate::exif_extract::build_image_features(w, h, exif, true, false)
+                } else {
+                    crate::image_features::ImageFeatures::new(w, h)
+                };
+
+                // Enforce critical tags (Orientation, GPS) to ensure consistency
+                // (These might be redundant if build_image_features ran, but safe to ensure)
+                if orientation != 1 {
+                    features.insert_tag(
+                        crate::exif_types::TAG_ORIENTATION,
+                        crate::exif_types::ExifValue::Short(orientation as u16),
+                    );
+                }
+
+                if let Some(pos) = gps_pos {
+                    features.insert_tag(
+                        crate::exif_types::TAG_GPS_LATITUDE,
+                        crate::exif_types::ExifValue::Float(pos.y() as f32),
+                    );
+                    features.insert_tag(
+                        crate::exif_types::TAG_GPS_LONGITUDE,
+                        crate::exif_types::ExifValue::Float(pos.x() as f32),
+                    );
+
+                    // Fallback: If build_image_features didn't derive country (or if we had no EXIF object), try manually
+                    if !features.has_tag(crate::exif_types::TAG_DERIVED_COUNTRY) {
+                        if let Some(country) = crate::exif_extract::derive_country(pos.y(), pos.x())
+                        {
+                            features.insert_tag(
+                                crate::exif_types::TAG_DERIVED_COUNTRY,
+                                crate::exif_types::ExifValue::String(country),
+                            );
+                        }
+                    }
+                }
+
+                // Ensure derived timestamp is indexed (critical for range search)
+                if let Some(ts) = exif_timestamp {
+                    features.insert_tag(
+                        crate::exif_types::TAG_DERIVED_TIMESTAMP,
+                        crate::exif_types::ExifValue::Long64(ts),
+                    );
+                }
+
+                // --- 2. SEND TO DATABASE ---
+                // We clone 'features' because the DB update takes ownership
+                if let Some(ref tx) = db_tx {
+                    if let Some(update) = create_feature_update(
                         &meta_key_secret,
                         path,
                         *unique_file_id,
                         content_hash,
-                        *resolution,
-                        orientation,
-                        gps_pos,
-                        exif_timestamp,
-                    )
-                {
-                    let _ = tx.send(update);
+                        features.clone(),
+                    ) {
+                        let _ = tx.send(update);
+                    }
                 }
 
-                // Send result back to GUI
+                // --- 3. SEND TO GUI ---
+                // We pass 'features' directly. The GUI uses this to update the search index immediately.
                 let _ = result_tx.send(EnrichmentResult {
                     unique_file_id: *unique_file_id,
                     content_hash,
                     gps_pos,
                     exif_timestamp,
+                    features: Some(features),
                 });
             }
         });
@@ -2184,7 +2264,8 @@ pub fn spawn_background_dir_scan(
         .collect();
 
     // Batch database lookup (single transaction)
-    let cached = ctx.lookup_cached_features_batch(&lookup_data);
+    let cached: std::collections::HashMap<u128, ImageFeatures> =
+        ctx.lookup_cached_features_batch(&lookup_data);
 
     // Phase 2: Background processing with batch results
     let sort_order_clone = sort_order.clone();
@@ -2195,8 +2276,18 @@ pub fn spawn_background_dir_scan(
         let mut files: Vec<FileMetadata> = entries
             .into_iter()
             .map(|e| {
+                // Extract fields from ImageFeatures if cached
                 let (resolution, orientation, gps_pos, exif_timestamp) =
-                    cached.get(&e.unique_file_id).cloned().unwrap_or((None, 1, None, None));
+                    if let Some(feats) = cached.get(&e.unique_file_id) {
+                        (
+                            feats.resolution(),
+                            feats.orientation(),
+                            feats.gps_pos(),
+                            feats.exif_timestamp(),
+                        )
+                    } else {
+                        (None, 1, None, None)
+                    };
 
                 FileMetadata {
                     path: e.path,

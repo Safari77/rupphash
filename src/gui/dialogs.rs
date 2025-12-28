@@ -794,52 +794,141 @@ pub(super) fn handle_dialogs(
         }
     }
 
-    // Search Dialog with Fixes
+    // Advanced Search Dialog with Filename Regex + EXIF Tag Search
     if app.state.show_search {
         let mut submit = false;
         let mut cancel = false;
 
-        egui::Window::new("Find String (Regex)").collapsible(false).show(ctx, |ui| {
-            ui.label("Search options:");
-            ui.label("• Filename regex (default)");
-            ui.label("• 'sun_az=170-190' (numeric range)");
-            ui.label("• 'sun_alt=-3-3' (numeric range)");
+        egui::Window::new("🔍 Advanced Search").collapsible(false).default_width(450.0).show(
+            ctx,
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
 
-            let res = ui.text_edit_singleline(&mut app.search_input);
+                // --- Filename Regex Input ---
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("📁 Filename Filter (Regex)").strong());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.search_filename_input)
+                            .hint_text("e.g., IMG_.*\\.jpg  or  DSC  (leave empty to search all)")
+                            .desired_width(400.0),
+                    );
+                    ui.small("Leave empty to search all files. Case-insensitive.");
+                });
 
-            if !app.search_focus_requested {
-                res.request_focus();
-                app.search_focus_requested = true;
-            }
+                ui.add_space(4.0);
 
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut app.state.search_include_exif, "Include EXIF");
-                ui.separator();
-                ui.checkbox(&mut app.search_sun_azimuth_enabled, "Calc Azimuth");
-                ui.checkbox(&mut app.search_sun_altitude_enabled, "Calc Altitude");
-            });
+                // --- EXIF Tag Search Input ---
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("🏷️ EXIF Tag Search").strong());
 
-            ui.small("Checking Azimuth/Altitude enables calculation for all files (slower).");
+                    let exif_res = ui.add(
+                        egui::TextEdit::singleline(&mut app.search_exif_input)
+                            .hint_text("e.g., Make:Canon  or  ISO:>:800  or  Country:Florida")
+                            .desired_width(400.0),
+                    );
 
-            // Check both has_focus (typing) and lost_focus (committed via Enter)
-            let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if enter_pressed && (res.has_focus() || res.lost_focus()) {
-                submit = true;
-            }
+                    // Focus on EXIF input by default
+                    if !app.search_focus_requested {
+                        exif_res.request_focus();
+                        app.search_focus_requested = true;
+                    }
 
-            ui.horizontal(|ui| {
-                if ui.button("Find").clicked() {
+                    // Show syntax help
+                    ui.collapsing("📖 Search Syntax Help", |ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+
+                        ui.label(egui::RichText::new("Format: Tag:Operator:Value").code());
+                        ui.add_space(4.0);
+
+                        ui.label(egui::RichText::new("Operators:").strong());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("=  equals");
+                            ui.separator();
+                            ui.label("~  contains");
+                            ui.separator();
+                            ui.label("<  less than");
+                            ui.separator();
+                            ui.label(">  greater than");
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("<=  less or equal");
+                            ui.separator();
+                            ui.label(">=  greater or equal");
+                            ui.separator();
+                            ui.label("X-Y  range (between)");
+                        });
+
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Examples:").strong());
+                        ui.label("  Make:Canon          → Make equals 'Canon'");
+                        ui.label("  Make:~:Nik          → Make contains 'Nik'");
+                        ui.label("  ISO:>:800           → ISO greater than 800");
+                        ui.label("  ISO:400-1600        → ISO between 400 and 1600");
+                        ui.label("  FocalLength:50-85   → Focal length 50-85mm");
+                        ui.label("  Country:Florida     → Derived country");
+                        ui.label("  SunAzimuth:170-190  → Sun azimuth range");
+                        ui.label("  SunAltitude:-3-3    → Sun near horizon (golden hour)");
+
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Available Tags:").strong());
+                        ui.horizontal_wrapped(|ui| {
+                            for tag in &[
+                                "Make",
+                                "Model",
+                                "ISO",
+                                "FNumber",
+                                "ExposureTime",
+                                "FocalLength",
+                                "FocalLength35mm",
+                                "LensModel",
+                            ] {
+                                ui.small(*tag);
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            for tag in &["DateTimeOriginal", "Software", "Artist", "Copyright"] {
+                                ui.small(*tag);
+                            }
+                        });
+                        ui.label(egui::RichText::new("Derived Tags:").italics());
+                        ui.horizontal_wrapped(|ui| {
+                            for tag in
+                                &["Country", "Subdivision", "SunAzimuth", "SunAltitude", "Timezone"]
+                            {
+                                ui.small(*tag);
+                            }
+                        });
+                    });
+                });
+
+                ui.add_space(8.0);
+
+                // --- Submit on Enter ---
+                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if enter_pressed {
                     submit = true;
                 }
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
-            });
-        });
+
+                // --- Buttons ---
+                ui.horizontal(|ui| {
+                    if ui.button("🔍 Search").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("❌ Cancel").clicked() {
+                        cancel = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Clear").clicked() {
+                            app.search_filename_input.clear();
+                            app.search_exif_input.clear();
+                        }
+                    });
+                });
+            },
+        );
 
         if submit {
-            let query = app.search_input.clone();
-            perform_search_with_cache(app, query);
+            perform_advanced_search(app);
         }
         if cancel {
             app.state.handle_input(InputIntent::CancelSearch);
@@ -1174,46 +1263,29 @@ pub(super) fn handle_dialogs(
     }
 }
 
-/// Perform search with EXIF caching and special range queries
-fn perform_search_with_cache(app: &mut GuiApp, query: String) {
+/// Perform advanced search with filename regex + EXIF tag filtering using SearchIndex
+fn perform_advanced_search(app: &mut GuiApp) {
+    use crate::exif_types::*;
+    use crate::search_index::{SearchCriterion, SearchIndex, parse_search_query};
     use regex::RegexBuilder;
 
     app.state.search_results.clear();
-    if query.is_empty() {
+
+    let filename_query = app.search_filename_input.trim().to_string();
+    let exif_query = app.search_exif_input.trim().to_string();
+
+    // If both inputs are empty, close the dialog
+    if filename_query.is_empty() && exif_query.is_empty() {
         app.state.show_search = false;
         return;
     }
 
-    // 1. Check for Special Range Search Syntax (sun_az=X-Y or sun_alt=X-Y)
-    let mut sun_range_search: Option<(bool, f64, f64)> = None; // (is_azimuth, min, max)
-
-    let lower_query = query.to_lowercase();
-    let (is_az, rest) = if let Some(stripped) = lower_query.strip_prefix("sun_az=") {
-        (true, stripped)
-    } else if let Some(stripped) = lower_query.strip_prefix("sun_alt=") {
-        (false, stripped)
-    } else {
-        (false, "")
-    };
-
-    if !rest.is_empty() {
-        // Regex to strictly parse two numbers separated by a hyphen
-        // Matches: start, optional minus, digits/dots, hyphen, optional minus, digits/dots, end
-        let range_re = regex::Regex::new(r"^(-?[\d\.]+)-(-?[\d\.]+)$").unwrap();
-
-        if let Some(caps) = range_re.captures(rest)
-            && let (Ok(min), Ok(max)) = (caps[1].parse::<f64>(), caps[2].parse::<f64>())
-        {
-            sun_range_search = Some((is_az, min, max));
-        }
-    }
-
-    // 2. Compile Regex (Conditionally)
-    let re = if sun_range_search.is_none() {
-        match RegexBuilder::new(&query).case_insensitive(true).build() {
+    // 1. Compile filename regex (if provided)
+    let filename_regex = if !filename_query.is_empty() {
+        match RegexBuilder::new(&filename_query).case_insensitive(true).build() {
             Ok(r) => Some(r),
             Err(e) => {
-                app.state.error_popup = Some(format!("Invalid Regex:\n{}", e));
+                app.state.error_popup = Some(format!("Invalid filename regex:\n{}", e));
                 return;
             }
         }
@@ -1221,48 +1293,41 @@ fn perform_search_with_cache(app: &mut GuiApp, query: String) {
         None
     };
 
-    let include_exif = app.state.search_include_exif;
-    // If range search is active or specific checkboxes enabled, we MUST fetch sun position
-    let include_sun = sun_range_search.is_some()
-        || app.search_sun_azimuth_enabled
-        || app.search_sun_altitude_enabled;
-    let use_gps = app.state.use_gps_utc;
+    // 2. Parse EXIF query into search criteria
+    let exif_criteria: Vec<SearchCriterion> = if !exif_query.is_empty() {
+        match parse_search_query(&exif_query) {
+            Ok(criteria) => criteria,
+            Err(e) => {
+                app.state.error_popup = Some(format!("Invalid EXIF query:\n{}", e));
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
-    // Base tags
-    let mut search_tag_names: Vec<String> = vec![
-        "Make",
-        "Model",
-        "LensModel",
-        "LensMake",
-        "Software",
-        "Artist",
-        "Copyright",
-        "DateTimeOriginal",
-        "DateTimeDigitized",
-        "ExposureTime",
-        "FNumber",
-        "ISO",
-        "FocalLength",
-        "FocalLength35mm",
-        "ExposureProgram",
-        "MeteringMode",
-        "Flash",
-        "WhiteBalance",
-        "ExposureBias",
-        "ColorSpace",
-        "Contrast",
-        "Saturation",
-        "Sharpness",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-
-    // Add DerivedSunPosition if needed
-    if include_sun {
-        search_tag_names.push("DerivedSunPosition".to_string());
+    // 3. Determine if we need to use the search index or fall back to EXIF scanning
+    let use_search_index = !exif_criteria.is_empty() && !app.search_index.is_empty();
+    // Ensure index is finalized (sorted) before searching.
+    if use_search_index {
+        app.search_index.finalize();
+    }
+    // Debug: dump index info on first search (can be removed in production)
+    if use_search_index {
+        eprintln!("[SEARCH] Using search index with {} files", app.search_index.len());
+        app.search_index.debug_dump();
+    }
+    // Build a set of unique_file_ids that match the EXIF criteria (if using index)
+    let mut exif_matching_ids: Option<std::collections::HashSet<u128>> = None;
+    if use_search_index && !exif_criteria.is_empty() {
+        // Use RoaringBitmap search
+        let bitmap = app.search_index.search_and(&exif_criteria);
+        let matching_ids: std::collections::HashSet<u128> =
+            bitmap.iter().filter_map(|idx| app.search_index.index_to_file_id(idx)).collect();
+        exif_matching_ids = Some(matching_ids);
     }
 
+    // 4. Search through all files
     for (g_idx, group) in app.state.groups.iter().enumerate() {
         for (f_idx, file) in group.iter().enumerate() {
             // Skip deleted files
@@ -1271,88 +1336,45 @@ fn perform_search_with_cache(app: &mut GuiApp, query: String) {
                 continue;
             }
 
-            // Handle Range Search (Sun Position)
-            if let Some((is_azimuth_search, min_val, max_val)) = sun_range_search {
-                // We need the EXIF data including derived sun position
-                let exif_tags = if let Some(cached) = app.exif_search_cache.get(&file.path)
-                    && cached.iter().any(|(k, _)| k == "Sun Position")
-                {
-                    cached.clone()
-                } else {
-                    let mut tags =
-                        scanner::get_exif_tags(&file.path, &search_tag_names, false, use_gps);
-                    // Ensure country is also there if we are rebuilding cache
-                    let country_tags = scanner::get_exif_tags(
-                        &file.path,
-                        &["DerivedCountry".to_string()],
-                        false,
-                        use_gps,
-                    );
-                    tags.extend(country_tags);
-                    app.exif_search_cache.insert(file.path.clone(), tags.clone());
-                    tags
-                };
+            let filename = file.path.file_name().unwrap_or_default().to_string_lossy();
 
-                // Find Sun Position tag
-                if let Some((_, val_str)) = exif_tags.iter().find(|(k, _)| k == "Sun Position")
-                    && let Some((alt, az)) = position::parse_sun_pos_string(val_str)
-                {
-                    let val_to_check = if is_azimuth_search { az } else { alt };
-                    if val_to_check >= min_val && val_to_check <= max_val {
-                        let type_str = if is_azimuth_search { "Azimuth" } else { "Altitude" };
-                        app.state.search_results.push((g_idx, f_idx, format!("Sun {}", type_str)));
-                    }
-                }
-                continue; // Skip standard regex check for this file if doing range search
+            // --- Check filename regex first (if provided) ---
+            let filename_matches = if let Some(ref re) = filename_regex {
+                re.is_match(&filename)
+            } else {
+                true // No filename filter = matches all
+            };
+
+            if !filename_matches {
+                continue; // Skip this file - doesn't match filename filter
             }
 
-            // Standard Regex Search
-            let name = file.path.file_name().unwrap_or_default().to_string_lossy();
+            // --- Check EXIF criteria ---
+            let exif_matches = if exif_criteria.is_empty() {
+                true // No EXIF filter = matches all
+            } else if let Some(ref matching_ids) = exif_matching_ids {
+                // Use pre-computed search index results
+                matching_ids.contains(&file.unique_file_id)
+            } else {
+                // Fallback: scan EXIF directly (slower, but works without index)
+                check_exif_criteria_fallback(&mut app.exif_search_cache, file, &exif_criteria)
+            };
 
-            // Only use regex if we have one (i.e., not a range search)
-            if let Some(re_ref) = &re {
-                if re_ref.is_match(&name) {
-                    app.state.search_results.push((g_idx, f_idx, "Filename".to_string()));
-                    continue;
-                }
-
-                if include_exif {
-                    // Get EXIF data
-                    let exif_tags = if let Some(cached) = app.exif_search_cache.get(&file.path) {
-                        cached.clone()
-                    } else {
-                        let mut tags =
-                            scanner::get_exif_tags(&file.path, &search_tag_names, false, use_gps);
-                        let country_tags = scanner::get_exif_tags(
-                            &file.path,
-                            &["DerivedCountry".to_string()],
-                            false,
-                            false,
-                        );
-                        tags.extend(country_tags);
-                        app.exif_search_cache.insert(file.path.clone(), tags.clone());
-                        tags
-                    };
-
-                    for (tag_name, tag_value) in &exif_tags {
-                        if re_ref.is_match(tag_value) {
-                            // Use display name
-                            let display_name = if tag_name == "DerivedCountry" {
-                                "Country"
-                            } else if tag_name == "DerivedSunPosition" {
-                                "Sun Position"
-                            } else {
-                                tag_name
-                            };
-                            app.state.search_results.push((g_idx, f_idx, display_name.to_string()));
-                            break;
-                        }
-                    }
-                }
+            if exif_matches {
+                // Determine match source for display
+                let match_source = if !exif_query.is_empty() && filename_regex.is_some() {
+                    format!("Filename + {}", exif_query)
+                } else if !exif_query.is_empty() {
+                    exif_query.to_string()
+                } else {
+                    "Filename".to_string()
+                };
+                app.state.search_results.push((g_idx, f_idx, match_source));
             }
         }
     }
 
+    // 5. Display results
     if !app.state.search_results.is_empty() {
         app.state.show_search = false;
         app.state.current_search_match = 0;
@@ -1362,7 +1384,7 @@ fn perform_search_with_cache(app: &mut GuiApp, query: String) {
         app.state.selection_changed = true;
         app.state.status_message = Some((
             format!(
-                "Found {} matches. Match 1/{} in [{}]. (F3/Shift+F3 to nav)",
+                "Found {} matches. Match 1/{} [{}]. (F3/Shift+F3 to navigate)",
                 app.state.search_results.len(),
                 app.state.search_results.len(),
                 match_source
@@ -1371,7 +1393,159 @@ fn perform_search_with_cache(app: &mut GuiApp, query: String) {
         ));
         app.state.status_set_time = Some(std::time::Instant::now());
     } else {
-        let source = if include_exif { "filenames or EXIF data" } else { "filenames" };
-        app.state.error_popup = Some(format!("No matches found in {} for:\n'{}'", source, query));
+        let search_desc = match (filename_regex.is_some(), !exif_criteria.is_empty()) {
+            (true, true) => format!("filename '{}' AND EXIF '{}'", filename_query, exif_query),
+            (true, false) => format!("filename '{}'", filename_query),
+            (false, true) => format!("EXIF '{}'", exif_query),
+            (false, false) => "empty query".to_string(),
+        };
+        app.state.error_popup = Some(format!("No matches found for:\n{}", search_desc));
     }
+}
+
+/// Fallback EXIF checking when search index is not available
+fn check_exif_criteria_fallback(
+    exif_cache: &mut std::collections::HashMap<std::path::PathBuf, Vec<(String, String)>>,
+    file: &crate::FileMetadata,
+    criteria: &[crate::search_index::SearchCriterion],
+) -> bool {
+    use crate::exif_types::*;
+    use crate::search_index::SearchOp;
+
+    // Build tag names to fetch
+    let mut tag_names: Vec<String> = vec![
+        "Make",
+        "Model",
+        "LensModel",
+        "LensMake",
+        "Software",
+        "Artist",
+        "Copyright",
+        "DateTimeOriginal",
+        "ExposureTime",
+        "FNumber",
+        "ISO",
+        "FocalLength",
+        "FocalLength35mm",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    // Add derived tags if needed
+    if criteria.iter().any(|c| c.tag_id >= 0xF000) {
+        tag_names.push("DerivedSunPosition".to_string());
+        tag_names.push("DerivedCountry".to_string());
+    }
+
+    // Get or fetch EXIF data
+    let exif_tags = if let Some(cached) = exif_cache.get(&file.path) {
+        cached.clone()
+    } else {
+        let tags = crate::scanner::get_exif_tags(&file.path, &tag_names, false, false);
+        exif_cache.insert(file.path.clone(), tags.clone());
+        tags
+    };
+
+    // Check each criterion
+    for criterion in criteria {
+        if !criterion.enabled {
+            continue;
+        }
+
+        // Map tag_id to tag name for lookup
+        let tag_name = tag_id_to_name(criterion.tag_id).unwrap_or("Unknown");
+
+        // Find the tag value
+        let tag_value = exif_tags
+            .iter()
+            .find(|(name, _)| {
+                name.eq_ignore_ascii_case(tag_name) ||
+                // Handle derived tag aliases
+                (tag_name == "DerivedCountry" && name == "Country") ||
+                (tag_name == "DerivedSunPosition" && name == "Sun Position")
+            })
+            .map(|(_, v)| v.as_str());
+
+        let Some(value_str) = tag_value else {
+            return false; // Tag not found, criterion not met
+        };
+
+        // Evaluate criterion
+        let matches = match &criterion.op {
+            SearchOp::Equals => {
+                // FIX: Try numeric equality first (handles "f/2.8" vs "2.8")
+                if let (Some(f_val), Ok(c_val)) = (
+                    crate::search_index::extract_number_from_string(value_str),
+                    criterion.value.parse::<f32>(),
+                ) {
+                    (f_val - c_val).abs() < f32::EPSILON
+                } else {
+                    value_str.eq_ignore_ascii_case(&criterion.value)
+                }
+            }
+            SearchOp::Contains => {
+                value_str.to_lowercase().contains(&criterion.value.to_lowercase())
+            }
+            SearchOp::LessThan
+            | SearchOp::LessOrEqual
+            | SearchOp::GreaterThan
+            | SearchOp::GreaterOrEqual => {
+                if let (Some(file_val), Ok(crit_val)) = (
+                    crate::search_index::extract_number_from_string(value_str).map(|v| v as f64),
+                    criterion.value.parse::<f64>(),
+                ) {
+                    let eps = f64::EPSILON;
+                    match criterion.op {
+                        // "Strictly Less": Ensure it's definitely smaller (not approx equal)
+                        SearchOp::LessThan => file_val < crit_val - eps,
+
+                        // "Less or Equal": Allow it to be slightly larger (approx equal)
+                        SearchOp::LessOrEqual => file_val < crit_val + eps,
+
+                        // "Strictly Greater": Ensure it's definitely larger
+                        SearchOp::GreaterThan => file_val > crit_val + eps,
+
+                        // "Greater or Equal": Allow it to be slightly smaller
+                        SearchOp::GreaterOrEqual => file_val > crit_val - eps,
+
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            SearchOp::Between => {
+                if let (Some(file_val), Ok(min_val), Some(max_str)) = (
+                    crate::search_index::extract_number_from_string(value_str).map(|v| v as f64),
+                    criterion.value.parse::<f64>(),
+                    &criterion.value2,
+                ) {
+                    if let Ok(max_val) = max_str.parse::<f64>() {
+                        let eps = f64::EPSILON;
+                        file_val > min_val - eps && file_val < max_val + eps
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            SearchOp::Regex => {
+                if let Ok(re) =
+                    regex::RegexBuilder::new(&criterion.value).case_insensitive(true).build()
+                {
+                    re.is_match(value_str)
+                } else {
+                    false
+                }
+            }
+        };
+
+        if !matches {
+            return false; // AND logic - all criteria must match
+        }
+    }
+
+    true // All criteria matched
 }

@@ -1,34 +1,6 @@
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use exif::{In, Tag, Value};
 
-/// Extract GPS coordinates from EXIF data as (latitude, longitude)
-pub fn extract_gps_lat_lon(exif_data: &exif::Exif) -> Option<(f64, f64)> {
-    let lat_field = exif_data.get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY)?;
-    let lon_field = exif_data.get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY)?;
-    let lat_ref = exif_data.get_field(exif::Tag::GPSLatitudeRef, exif::In::PRIMARY);
-    let lon_ref = exif_data.get_field(exif::Tag::GPSLongitudeRef, exif::In::PRIMARY);
-
-    let lat = parse_gps_coordinate(&lat_field.value)?;
-    let lon = parse_gps_coordinate(&lon_field.value)?;
-
-    // Apply reference (N/S for latitude, E/W for longitude)
-    let lat = if let Some(ref_field) = lat_ref {
-        let ref_str = ref_field.value.display_as(exif::Tag::GPSLatitudeRef).to_string();
-        if ref_str.trim().eq_ignore_ascii_case("S") { -lat } else { lat }
-    } else {
-        lat
-    };
-
-    let lon = if let Some(ref_field) = lon_ref {
-        let ref_str = ref_field.value.display_as(exif::Tag::GPSLongitudeRef).to_string();
-        if ref_str.trim().eq_ignore_ascii_case("W") { -lon } else { lon }
-    } else {
-        lon
-    };
-
-    Some((lat, lon))
-}
-
 /// Parse GPS coordinate magnitude from EXIF rational values (DMS -> Decimal).
 ///
 /// Note: This always returns a positive value. The caller must apply the

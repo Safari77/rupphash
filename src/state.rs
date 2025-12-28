@@ -164,8 +164,7 @@ pub struct AppState {
     pub show_search: bool,
     pub search_results: Vec<(usize, usize, String)>, // (group_idx, file_idx, match_source)
     pub current_search_match: usize,
-    pub search_include_exif: bool, // Include EXIF data in search
-    pub use_gps_utc: bool,         // Solar position
+    pub use_gps_utc: bool, // Solar position
     // Per-file transform state (rotation and flips)
     pub file_transforms: HashMap<PathBuf, FileTransform>,
 }
@@ -214,7 +213,6 @@ impl AppState {
             show_search: false,
             search_results: Vec::new(),
             current_search_match: 0,
-            search_include_exif: false,
             use_gps_utc: false,
             file_transforms: HashMap::new(),
         }

@@ -84,7 +84,7 @@ jobs:
         targets: "x86_64-unknown-linux-gnu"
 
     - name: Build Binary
-      run: cargo build --release --verbose
+      run: cargo build --release --verbose --bin phdupes
 
     - name: Rename and Stage
       shell: bash

@@ -1,4 +1,4 @@
-mod helper_exif;
+mod exif_extract;
 mod position;
 
 use clap::Parser;
@@ -45,7 +45,7 @@ fn main() {
         }
     };
 
-    let coords = helper_exif::extract_gps_lat_lon(&exif);
+    let coords = exif_extract::extract_gps_lat_lon(&exif);
     let alt = helper_exif::get_altitude(&exif);
 
     // 2. Pass the gpstime flag to our date parser
