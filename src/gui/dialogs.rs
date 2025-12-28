@@ -1,15 +1,22 @@
 use crate::format_relative_time;
-use crate::position;
 use crate::scanner;
+use crate::search_index::{SearchCriterion, parse_search_query};
 use crate::state::InputIntent;
 use eframe::egui;
 use jiff::Timestamp;
+use regex::RegexBuilder;
 use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
 
 use super::app::GuiApp;
 use super::image::ViewMode;
+
+struct GeoDistanceFilter {
+    target_point: geo::Point<f64>,
+    min_km: f64,
+    max_km: f64,
+}
 
 /// Handle keyboard input
 pub(super) fn handle_input(
@@ -833,6 +840,18 @@ pub(super) fn handle_dialogs(
                         app.search_focus_requested = true;
                     }
 
+                    // Check if Enter was pressed while this input had focus (or just lost it via Enter)
+                    if (exif_res.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        || (exif_res.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    {
+                        perform_advanced_search(app);
+
+                        // If search failed (dialog is still open), grab focus back immediately.
+                        if app.state.show_search {
+                            exif_res.request_focus();
+                        }
+                    }
+
                     // Show syntax help
                     ui.collapsing("📖 Search Syntax Help", |ui| {
                         ui.spacing_mut().item_spacing.y = 4.0;
@@ -859,15 +878,20 @@ pub(super) fn handle_dialogs(
                         });
 
                         ui.add_space(4.0);
-                        ui.label(egui::RichText::new("Examples:").strong());
-                        ui.label("  Make:Canon          → Make equals 'Canon'");
-                        ui.label("  Make:~:Nik          → Make contains 'Nik'");
-                        ui.label("  ISO:>:800           → ISO greater than 800");
-                        ui.label("  ISO:400-1600        → ISO between 400 and 1600");
-                        ui.label("  FocalLength:50-85   → Focal length 50-85mm");
-                        ui.label("  Country:Florida     → Derived country");
-                        ui.label("  SunAzimuth:170-190  → Sun azimuth range");
-                        ui.label("  SunAltitude:-3-3    → Sun near horizon (golden hour)");
+                        ui.label(
+                            egui::RichText::new("Examples (case-insensitive keywords):").strong(),
+                        );
+                        ui.label("  Make:Canon             → Make equals 'Canon'");
+                        ui.label("  Make:~:Nik             → Make contains 'Nik'");
+                        ui.label("  FNumber:<:1.8          → FNumber smaller than 1.8");
+                        ui.label("  ISO:1600-              → ISO >= 1600");
+                        ui.label("  FocalLength:50-85      → Focal length 50-85mm");
+                        ui.label("  DistanceFrom:home:1-5  → Distance from home [km]");
+                        ui.label("    ([locations] [home] in phdupes.conf)");
+                        ui.label("  DistanceLonLat:-3:39:4 → Distance from lon:-3 lat:39 0-4 km");
+                        ui.label("  Country:Sweden         → Derived country");
+                        ui.label("  SunAzimuth:170-190     → Sun azimuth range");
+                        ui.label("  SunAltitude:-3-3       → Sun near horizon (golden hour)");
 
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("Available Tags:").strong());
@@ -1265,24 +1289,99 @@ pub(super) fn handle_dialogs(
 
 /// Perform advanced search with filename regex + EXIF tag filtering using SearchIndex
 fn perform_advanced_search(app: &mut GuiApp) {
-    use crate::exif_types::*;
-    use crate::search_index::{SearchCriterion, SearchIndex, parse_search_query};
-    use regex::RegexBuilder;
-
     app.state.search_results.clear();
+    let filename_query_raw = app.search_filename_input.trim();
+    let exif_query_raw = app.search_exif_input.trim();
 
-    let filename_query = app.search_filename_input.trim().to_string();
-    let exif_query = app.search_exif_input.trim().to_string();
-
-    // If both inputs are empty, close the dialog
-    if filename_query.is_empty() && exif_query.is_empty() {
+    if filename_query_raw.is_empty() && exif_query_raw.is_empty() {
         app.state.show_search = false;
         return;
     }
 
-    // 1. Compile filename regex (if provided)
-    let filename_regex = if !filename_query.is_empty() {
-        match RegexBuilder::new(&filename_query).case_insensitive(true).build() {
+    let mut standard_query_parts = Vec::new();
+    let mut geo_filters: Vec<GeoDistanceFilter> = Vec::new();
+    let mut search_errors = Vec::new(); // General list for all parse errors
+
+    let raw_terms = exif_query_raw.split_whitespace();
+
+    for term in raw_terms {
+        let term_lc = term.to_lowercase();
+
+        if term_lc.starts_with("distancefrom:") {
+            // Parse "DistanceFrom:home:20-50"
+            let parts: Vec<&str> = term.split(':').collect();
+            if parts.len() >= 3 {
+                let location_name = parts[1];
+                let range_str = parts[2];
+
+                if let Some(loc_opt) = app.ctx.locations.get(location_name) {
+                    let target: geo::Point<f64> = loc_opt.clone().into();
+                    if !parse_and_add_geo_filter(&mut geo_filters, target, range_str) {
+                        search_errors
+                            .push(format!("Invalid range '{}' in term '{}'", range_str, term));
+                    }
+                } else {
+                    search_errors.push(format!("Unknown location '{}'", location_name));
+                }
+            } else {
+                search_errors
+                    .push(format!("Invalid format '{}'. Expected DistanceFrom:NAME:RANGE", term));
+            }
+        } else if term_lc.starts_with("distancelonlat:") {
+            // Parse "distancelonlat:LON:LAT:RANGE"
+            let parts: Vec<&str> = term.split(':').collect();
+
+            if parts.len() < 4 {
+                search_errors.push(format!(
+                    "Invalid format '{}'. Expected distancelonlat:LON:LAT:RANGE",
+                    term
+                ));
+                continue;
+            }
+
+            let lon_str = parts[1];
+            let lat_str = parts[2];
+            let range_str = parts[3];
+
+            match (lon_str.parse::<f64>(), lat_str.parse::<f64>()) {
+                (Ok(lon), Ok(lat)) => {
+                    if lat < -90.0 || lat > 90.0 {
+                        search_errors
+                            .push(format!("Invalid Latitude {}. Must be between -90 and 90.", lat));
+                    } else if lon < -180.0 || lon > 180.0 {
+                        search_errors.push(format!(
+                            "Invalid Longitude {}. Must be between -180 and 180.",
+                            lon
+                        ));
+                    } else {
+                        let target = geo::Point::new(lon, lat);
+                        if !parse_and_add_geo_filter(&mut geo_filters, target, range_str) {
+                            search_errors
+                                .push(format!("Invalid range '{}' in term '{}'", range_str, term));
+                        }
+                    }
+                }
+                _ => {
+                    search_errors
+                        .push(format!("Invalid coordinates in '{}'. Expected numbers.", term));
+                }
+            }
+        } else {
+            standard_query_parts.push(term);
+        }
+    }
+
+    // FIX: Report errors immediately
+    if !search_errors.is_empty() {
+        app.state.status_message = Some((format!("Error: {}", search_errors.join("; ")), true));
+        app.state.status_set_time = Some(std::time::Instant::now());
+        return;
+    }
+
+    let clean_exif_query = standard_query_parts.join(" ");
+
+    let filename_regex = if !filename_query_raw.is_empty() {
+        match RegexBuilder::new(filename_query_raw).case_insensitive(true).build() {
             Ok(r) => Some(r),
             Err(e) => {
                 app.state.error_popup = Some(format!("Invalid filename regex:\n{}", e));
@@ -1293,9 +1392,8 @@ fn perform_advanced_search(app: &mut GuiApp) {
         None
     };
 
-    // 2. Parse EXIF query into search criteria
-    let exif_criteria: Vec<SearchCriterion> = if !exif_query.is_empty() {
-        match parse_search_query(&exif_query) {
+    let exif_criteria: Vec<SearchCriterion> = if !clean_exif_query.is_empty() {
+        match parse_search_query(&clean_exif_query) {
             Ok(criteria) => criteria,
             Err(e) => {
                 app.state.error_popup = Some(format!("Invalid EXIF query:\n{}", e));
@@ -1306,66 +1404,71 @@ fn perform_advanced_search(app: &mut GuiApp) {
         Vec::new()
     };
 
-    // 3. Determine if we need to use the search index or fall back to EXIF scanning
+    // 5. Determine Index Usage
     let use_search_index = !exif_criteria.is_empty() && !app.search_index.is_empty();
-    // Ensure index is finalized (sorted) before searching.
+
     if use_search_index {
         app.search_index.finalize();
     }
-    // Debug: dump index info on first search (can be removed in production)
-    if use_search_index {
-        eprintln!("[SEARCH] Using search index with {} files", app.search_index.len());
-        app.search_index.debug_dump();
-    }
-    // Build a set of unique_file_ids that match the EXIF criteria (if using index)
+
     let mut exif_matching_ids: Option<std::collections::HashSet<u128>> = None;
-    if use_search_index && !exif_criteria.is_empty() {
-        // Use RoaringBitmap search
+    if use_search_index {
         let bitmap = app.search_index.search_and(&exif_criteria);
         let matching_ids: std::collections::HashSet<u128> =
             bitmap.iter().filter_map(|idx| app.search_index.index_to_file_id(idx)).collect();
         exif_matching_ids = Some(matching_ids);
     }
 
-    // 4. Search through all files
+    // 6. Search
     for (g_idx, group) in app.state.groups.iter().enumerate() {
         for (f_idx, file) in group.iter().enumerate() {
-            // Skip deleted files
             if !file.path.exists() {
                 app.exif_search_cache.remove(&file.path);
                 continue;
             }
 
-            let filename = file.path.file_name().unwrap_or_default().to_string_lossy();
-
-            // --- Check filename regex first (if provided) ---
             let filename_matches = if let Some(ref re) = filename_regex {
+                let filename = file.path.file_name().unwrap_or_default().to_string_lossy();
                 re.is_match(&filename)
             } else {
-                true // No filename filter = matches all
+                true
             };
 
             if !filename_matches {
-                continue; // Skip this file - doesn't match filename filter
+                continue;
             }
 
-            // --- Check EXIF criteria ---
             let exif_matches = if exif_criteria.is_empty() {
-                true // No EXIF filter = matches all
+                true
             } else if let Some(ref matching_ids) = exif_matching_ids {
-                // Use pre-computed search index results
                 matching_ids.contains(&file.unique_file_id)
             } else {
-                // Fallback: scan EXIF directly (slower, but works without index)
-                check_exif_criteria_fallback(&mut app.exif_search_cache, file, &exif_criteria)
+                super::dialogs::check_exif_criteria_fallback(
+                    &mut app.exif_search_cache,
+                    file,
+                    &exif_criteria,
+                )
             };
 
-            if exif_matches {
-                // Determine match source for display
-                let match_source = if !exif_query.is_empty() && filename_regex.is_some() {
-                    format!("Filename + {}", exif_query)
-                } else if !exif_query.is_empty() {
-                    exif_query.to_string()
+            let matches_geo = if geo_filters.is_empty() {
+                true
+            } else if let Some(gps_pos) = file.gps_pos {
+                geo_filters.iter().all(|filter| {
+                    let dist_km = crate::position::distance(
+                        (gps_pos.y(), gps_pos.x()),
+                        (filter.target_point.y(), filter.target_point.x()),
+                    ) / 1000.0;
+                    dist_km >= filter.min_km && dist_km <= filter.max_km
+                })
+            } else {
+                false
+            };
+
+            if exif_matches && matches_geo {
+                let match_source = if !clean_exif_query.is_empty() && filename_regex.is_some() {
+                    format!("Filename + {}", clean_exif_query)
+                } else if !clean_exif_query.is_empty() {
+                    clean_exif_query.clone()
                 } else {
                     "Filename".to_string()
                 };
@@ -1374,7 +1477,7 @@ fn perform_advanced_search(app: &mut GuiApp) {
         }
     }
 
-    // 5. Display results
+    // 7. Update UI
     if !app.state.search_results.is_empty() {
         app.state.show_search = false;
         app.state.current_search_match = 0;
@@ -1384,22 +1487,49 @@ fn perform_advanced_search(app: &mut GuiApp) {
         app.state.selection_changed = true;
         app.state.status_message = Some((
             format!(
-                "Found {} matches. Match 1/{} [{}]. (F3/Shift+F3 to navigate)",
+                "Found {} matches. Match 1/{} [{}].",
                 app.state.search_results.len(),
                 app.state.search_results.len(),
                 match_source
             ),
             false,
         ));
-        app.state.status_set_time = Some(std::time::Instant::now());
     } else {
-        let search_desc = match (filename_regex.is_some(), !exif_criteria.is_empty()) {
-            (true, true) => format!("filename '{}' AND EXIF '{}'", filename_query, exif_query),
-            (true, false) => format!("filename '{}'", filename_query),
-            (false, true) => format!("EXIF '{}'", exif_query),
+        let has_exif_or_geo = !exif_criteria.is_empty() || !geo_filters.is_empty();
+        let search_desc = match (filename_regex.is_some(), has_exif_or_geo) {
+            (true, true) => {
+                format!("filename '{}' AND EXIF '{}'", filename_query_raw, exif_query_raw)
+            }
+            (true, false) => format!("filename '{}'", filename_query_raw),
+            (false, true) => format!("EXIF '{}'", exif_query_raw),
             (false, false) => "empty query".to_string(),
         };
         app.state.error_popup = Some(format!("No matches found for:\n{}", search_desc));
+    }
+}
+
+// Helper to avoid duplication between DistanceFrom and DistanceLonLat
+// Returns true if filter was successfully added, false if range was invalid
+fn parse_and_add_geo_filter(
+    geo_filters: &mut Vec<GeoDistanceFilter>,
+    target: geo::Point<f64>,
+    range_str: &str,
+) -> bool {
+    if let Some((min_s, max_s)) = crate::search_index::parse_range_value(range_str) {
+        let min_km = min_s.parse::<f64>().unwrap_or(0.0);
+        let max_km = max_s.parse::<f64>().unwrap_or(f64::MAX);
+
+        geo_filters.push(GeoDistanceFilter { target_point: target, min_km, max_km });
+        true
+    } else if let Some(val) = crate::search_index::extract_number_from_string(range_str) {
+        geo_filters.push(GeoDistanceFilter {
+            target_point: target,
+            min_km: 0.0,
+            max_km: val as f64,
+        });
+        true
+    } else {
+        false
     }
 }
 

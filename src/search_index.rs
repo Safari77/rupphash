@@ -696,7 +696,7 @@ fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
 }
 
 /// Parse range value like "24-70" or "1600-" (open ended)
-fn parse_range_value(value: &str) -> Option<(String, String)> {
+pub fn parse_range_value(value: &str) -> Option<(String, String)> {
     let chars: Vec<char> = value.chars().collect();
 
     // Start at 1 to avoid splitting negative numbers at the sign (e.g. "-5")
