@@ -87,9 +87,11 @@ pub(super) fn handle_input(
         && !app.state.show_search
     {
         // Calculate total directory count (parent + subdirs) for view mode navigation
-        let has_parent =
-            app.state.view_mode && app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
-        let total_dirs = if app.state.view_mode {
+        // In flatten mode, there are no directories to navigate
+        let has_parent = app.state.view_mode
+            && !app.state.view_mode_flatten
+            && app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+        let total_dirs = if app.state.view_mode && !app.state.view_mode_flatten {
             (if has_parent { 1 } else { 0 }) + app.subdirs.len()
         } else {
             0
@@ -141,9 +143,10 @@ pub(super) fn handle_input(
             }
         }
 
-        // Handle Enter to open selected directory
+        // Handle Enter to open selected directory (disabled in flatten mode)
         if ctx.input(|i| i.key_pressed(egui::Key::Enter))
             && app.state.view_mode
+            && !app.state.view_mode_flatten
             && let Some(dir_idx) = app.dir_selection_idx
         {
             // Determine which directory to open
@@ -165,9 +168,9 @@ pub(super) fn handle_input(
             }
         }
 
-        // PageDown - in view mode, handle directories too
+        // PageDown - in view mode, handle directories too (disabled in flatten mode)
         if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
-            if app.state.view_mode {
+            if app.state.view_mode && !app.state.view_mode_flatten {
                 let has_parent = app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
                 let total_dirs = (if has_parent { 1 } else { 0 }) + app.subdirs.len();
                 let total_files = app.state.groups.first().map(|g| g.len()).unwrap_or(0);
@@ -202,9 +205,9 @@ pub(super) fn handle_input(
             *intent.borrow_mut() = Some(InputIntent::NextGroupByDist);
         }
 
-        // PageUp - in view mode, handle directories too
+        // PageUp - in view mode, handle directories too (disabled in flatten mode)
         if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
-            if app.state.view_mode {
+            if app.state.view_mode && !app.state.view_mode_flatten {
                 let has_parent = app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
                 let total_dirs = (if has_parent { 1 } else { 0 }) + app.subdirs.len();
                 let page_size = 15;
@@ -240,8 +243,9 @@ pub(super) fn handle_input(
         }
 
         // Home - in view mode, go to first directory (or first file if no dirs)
+        // In flatten mode, just go to first file
         if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
-            if app.state.view_mode {
+            if app.state.view_mode && !app.state.view_mode_flatten {
                 let has_parent = app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
                 let total_dirs = (if has_parent { 1 } else { 0 }) + app.subdirs.len();
                 if total_dirs > 0 {
@@ -256,8 +260,9 @@ pub(super) fn handle_input(
         }
 
         // End - in view mode, go to last file (or last directory if no files)
+        // In flatten mode, just go to last file
         if ctx.input(|i| i.key_pressed(egui::Key::End)) {
-            if app.state.view_mode {
+            if app.state.view_mode && !app.state.view_mode_flatten {
                 let total_files = app.state.groups.first().map(|g| g.len()).unwrap_or(0);
                 if total_files > 0 {
                     app.dir_selection_idx = None;
@@ -455,13 +460,17 @@ pub(super) fn handle_input(
         }
 
         // View Mode Only
-        if app.state.view_mode {
+        // Directory navigation is disabled in flatten mode (--view-flatten)
+        if app.state.view_mode && !app.state.view_mode_flatten {
             if ctx.input(|i| i.key_pressed(egui::Key::C)) {
                 app.open_dir_picker();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Period)) {
                 app.go_up_directory();
             }
+        }
+        // Sort selection is available in all view modes
+        if app.state.view_mode {
             if ctx.input(|i| i.key_pressed(egui::Key::T)) {
                 *intent.borrow_mut() = Some(InputIntent::ShowSortSelection);
             }

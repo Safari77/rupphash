@@ -104,6 +104,9 @@ pub struct GuiApp {
     // View mode: if Some, use scan_for_view with this sort order instead of scan_and_group
     pub(super) view_mode_sort: Option<String>,
 
+    // View mode: if true, recursive scanning is enabled (flatten mode)
+    pub(super) view_mode_flatten: bool,
+
     // --- Raw Preloading ---
     // Cache for raw images (Path -> Texture)
     pub(super) raw_cache: HashMap<std::path::PathBuf, egui::TextureHandle>,
@@ -254,6 +257,7 @@ impl GuiApp {
             last_preload_pos: None,
             slideshow_last_advance: None,
             view_mode_sort: None,
+            view_mode_flatten: false,
             raw_cache: HashMap::new(),
             raw_loading: HashSet::new(),
             scan_batch_rx: None,
@@ -316,6 +320,7 @@ impl GuiApp {
         move_target: Option<std::path::PathBuf>,
         slideshow_interval: Option<f32>,
         use_raw_thumbnails: bool,
+        view_flatten: bool,
     ) -> Self {
         let mut state = AppState::new(
             Vec::new(),
@@ -326,6 +331,7 @@ impl GuiApp {
             HashMap::new(),
         );
         state.view_mode = true;
+        state.view_mode_flatten = view_flatten;
         state.move_target = move_target;
         state.slideshow_interval = slideshow_interval;
 
@@ -343,6 +349,9 @@ impl GuiApp {
             .first()
             .map(std::path::PathBuf::from)
             .and_then(|p| if p.is_dir() { Some(p) } else { p.parent().map(|p| p.to_path_buf()) });
+
+        // Clone paths for use in flatten mode before moving into scan_config
+        let paths_for_flatten = canonical_paths.clone();
 
         let scan_config = ScanConfig {
             paths: canonical_paths,
@@ -367,29 +376,51 @@ impl GuiApp {
         let db_tx = Some(db_tx_send.clone());
 
         // Background directory scanning with batch database lookups
-        let (subdirs, dir_total_count, dir_scan_rx) = if let Some(ref dir) = current_dir {
+        // In flatten mode, use recursive scanning instead of single-directory scan
+        let (subdirs, dir_total_count, dir_scan_rx, scan_progress_rx) = if view_flatten {
+            // Flatten mode: recursive scan using spawn_background_flatten_scan
+            // This uses database cache just like spawn_background_dir_scan
+            let (progress_tx, progress_rx) = unbounded::<(usize, usize)>();
+            let (batch_tx, batch_rx) = unbounded::<Vec<FileMetadata>>();
+
+            let count = scanner::spawn_background_flatten_scan(
+                &paths_for_flatten,
+                sort_order.clone(),
+                &ctx,
+                batch_tx,
+                Some(progress_tx),
+            );
+
+            // In flatten mode, subdirs is empty and directory navigation is disabled
+            (Vec::new(), Some(count), Some(batch_rx), Some(progress_rx))
+        } else if let Some(ref dir) = current_dir {
             let (batch_tx, batch_rx) = unbounded::<Vec<FileMetadata>>();
             let (subdirs, count) =
                 scanner::spawn_background_dir_scan(dir.clone(), sort_order.clone(), &ctx, batch_tx);
-            (subdirs, Some(count), Some(batch_rx))
+            (subdirs, Some(count), Some(batch_rx), None)
         } else {
-            (Vec::new(), None, None)
+            (Vec::new(), None, None, None)
         };
 
         // Build subdirs_cache and parent_cache for UI display
+        // In flatten mode, these will be empty
         let subdirs_cache: Vec<DirCacheEntry> = subdirs
             .iter()
             .map(|dir| Self::create_dir_cache_entry(dir, show_relative_times))
             .collect();
-        let parent_cache = current_dir
-            .as_ref()
-            .and_then(|d| d.parent())
-            .map(|p| Self::create_dir_cache_entry(p, show_relative_times));
+        let parent_cache = if view_flatten {
+            None
+        } else {
+            current_dir
+                .as_ref()
+                .and_then(|d| d.parent())
+                .map(|p| Self::create_dir_cache_entry(p, show_relative_times))
+        };
 
         // Set up empty initial state - files will stream in from background
         state.groups = vec![Vec::new()];
         state.group_infos = vec![GroupInfo { max_dist: 0, status: GroupStatus::None }];
-        state.is_loading = dir_total_count.is_some_and(|c| c > 0);
+        state.is_loading = view_flatten || dir_total_count.is_some_and(|c| c > 0);
 
         // Extract values before moving ctx to Arc
         let tile_cache_path = ctx.tile_cache_path.clone();
@@ -409,7 +440,7 @@ impl GuiApp {
             ctx: Arc::new(ctx),
             scan_config,
             scan_rx: None,
-            scan_progress_rx: None,
+            scan_progress_rx,
             scan_progress: (0, 0),
             rename_input: String::new(),
             show_move_input: false,
@@ -419,6 +450,7 @@ impl GuiApp {
             last_preload_pos: None,
             slideshow_last_advance: None,
             view_mode_sort: Some(sort_order),
+            view_mode_flatten: view_flatten,
             raw_cache: HashMap::new(),
             raw_loading: HashSet::new(),
             scan_batch_rx: None,
@@ -1862,13 +1894,16 @@ impl eframe::App for GuiApp {
                             .wrap_mode(egui::TextWrapMode::Truncate),
                         );
                     });
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("[C] Change dir  [.] Go down")
-                                .size(10.0)
-                                .color(egui::Color32::GRAY),
-                        );
-                    });
+                    // Only show directory navigation hints when not in flatten mode
+                    if !self.state.view_mode_flatten {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("[C] Change dir  [.] Go down")
+                                    .size(10.0)
+                                    .color(egui::Color32::GRAY),
+                            );
+                        });
+                    }
                     ui.separator();
                 }
 
@@ -1897,7 +1932,11 @@ impl eframe::App for GuiApp {
                     let mut dir_to_open: Option<std::path::PathBuf> = None;
 
                     // Calculate offset caused by directories
-                    let files_start_offset = if self.state.view_mode && !self.state.is_loading {
+                    // In flatten mode, skip directory rendering entirely
+                    let files_start_offset = if self.state.view_mode
+                        && !self.state.is_loading
+                        && !self.state.view_mode_flatten
+                    {
                         let start_cursor_y = ui.cursor().min.y;
                         let mut dir_idx: usize = 0;
                         let available_w = ui.available_width();

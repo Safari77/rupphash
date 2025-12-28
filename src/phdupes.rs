@@ -182,6 +182,10 @@ struct Cli {
     #[arg(long)]
     view: bool,
 
+    /// View mode with recursive directory scanning (flatten all subdirectories)
+    #[arg(long)]
+    view_flatten: bool,
+
     /// Shuffle images randomly (implies --view)
     #[arg(long)]
     shuffle: bool,
@@ -270,7 +274,7 @@ impl Cli {
 
     /// Check if we're in view mode (explicit or implied)
     fn is_view_mode(&self) -> bool {
-        self.view || self.shuffle || self.slideshow.is_some()
+        self.view || self.view_flatten || self.shuffle || self.slideshow.is_some()
     }
 
     /// Get the hash algorithm based on CLI flags
@@ -495,6 +499,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.move_marked.clone(),
             args.slideshow,
             args.raw_thumbnails,
+            args.view_flatten,
         );
         if let Err(e) = app.run() {
             eprintln!("GUI Error: {}", e);

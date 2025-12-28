@@ -155,6 +155,7 @@ pub struct AppState {
 
     // View mode features
     pub view_mode: bool,
+    pub view_mode_flatten: bool,
     pub move_target: Option<PathBuf>,
     pub slideshow_interval: Option<f32>,
     pub slideshow_paused: bool,
@@ -204,6 +205,7 @@ impl AppState {
             zoom_relative: false,
             path_display_depth: 0,
             view_mode: false,
+            view_mode_flatten: false,
             move_target: None,
             slideshow_interval: None,
             slideshow_paused: false,

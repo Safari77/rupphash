@@ -1927,6 +1927,124 @@ pub fn scan_for_view(
     (vec![all_files], vec![info], subdirs)
 }
 
+/// Scan for view mode with recursive directory traversal (flatten mode).
+/// Unlike scan_for_view, this recursively walks all subdirectories.
+/// Uses database cache for metadata like spawn_background_dir_scan.
+/// Returns (file_count) synchronously for immediate UI setup.
+pub fn spawn_background_flatten_scan(
+    paths: &[String],
+    sort_order: String,
+    ctx: &crate::db::AppContext,
+    batch_tx: Sender<Vec<FileMetadata>>,
+    progress_tx: Option<Sender<(usize, usize)>>,
+) -> usize {
+    let mut seen_paths = HashSet::new();
+    let mut entries: Vec<DirEntry> = Vec::new();
+
+    // Phase 1: Fast recursive directory enumeration using WalkDir
+    for path_str in paths {
+        let path = Path::new(path_str);
+        if path.is_dir() {
+            for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+                let entry_path = entry.path();
+                if entry_path.is_file()
+                    && is_image_ext(entry_path)
+                    && let Ok(canonical) = entry_path.canonicalize()
+                    && seen_paths.insert(canonical.clone())
+                    && let Ok(meta) = fs::metadata(&canonical)
+                    && let Some(unique_file_id) = get_file_key(&canonical)
+                {
+                    entries.push(DirEntry {
+                        path: canonical,
+                        size: meta.len(),
+                        modified: meta.modified().unwrap_or(UNIX_EPOCH).into(),
+                        unique_file_id,
+                    });
+                }
+            }
+        } else if path.is_file()
+            && is_image_ext(path)
+            && let Ok(canonical) = path.canonicalize()
+            && seen_paths.insert(canonical.clone())
+            && let Ok(meta) = fs::metadata(&canonical)
+            && let Some(unique_file_id) = get_file_key(&canonical)
+        {
+            entries.push(DirEntry {
+                path: canonical,
+                size: meta.len(),
+                modified: meta.modified().unwrap_or(UNIX_EPOCH).into(),
+                unique_file_id,
+            });
+        }
+    }
+
+    let file_count = entries.len();
+
+    if let Some(ref tx) = progress_tx {
+        let _ = tx.send((0, file_count));
+    }
+
+    if entries.is_empty() {
+        return 0;
+    }
+
+    // Prepare batch lookup data
+    let lookup_data: Vec<(u128, u64, u64)> = entries
+        .iter()
+        .map(|e| {
+            let mtime_ns = e.modified.timestamp_nanos_opt().unwrap_or(0) as u64;
+            (e.unique_file_id, e.size, mtime_ns)
+        })
+        .collect();
+
+    // Batch database lookup (single transaction)
+    let cached = ctx.lookup_cached_features_batch(&lookup_data);
+
+    // Phase 2: Background processing with batch results
+    std::thread::spawn(move || {
+        const BATCH_SIZE: usize = 500;
+
+        // Convert entries to FileMetadata using cached data
+        let mut files: Vec<FileMetadata> = entries
+            .into_iter()
+            .map(|e| {
+                let (resolution, orientation, gps_pos, exif_timestamp) =
+                    cached.get(&e.unique_file_id).cloned().unwrap_or((None, 1, None, None));
+
+                FileMetadata {
+                    path: e.path,
+                    size: e.size,
+                    modified: e.modified,
+                    pdqhash: None,
+                    resolution,
+                    content_hash: [0u8; 32],
+                    pixel_hash: None,
+                    orientation,
+                    gps_pos,
+                    unique_file_id: e.unique_file_id,
+                    exif_timestamp,
+                }
+            })
+            .collect();
+
+        // Sort all files
+        sort_files(&mut files, &sort_order);
+
+        // Stream in batches
+        let total = files.len();
+        let mut sent = 0;
+        for chunk in files.chunks(BATCH_SIZE) {
+            let _ = batch_tx.send(chunk.to_vec());
+            sent += chunk.len();
+            if let Some(ref tx) = progress_tx {
+                let _ = tx.send((sent, total));
+            }
+        }
+    });
+
+    file_count
+}
+
 /// Spawn a background thread to enrich files with content_hash and GPS data.
 /// This function handles:
 /// - Computing blake3 content_hash (parallel with rayon)
