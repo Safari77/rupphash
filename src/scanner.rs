@@ -306,6 +306,14 @@ fn get_exif_tags_from_rsraw(
                     None
                 }
             }
+            // TODO(rsraw-orientation): When rsraw exposes orientation, add:
+            // "orientation" => {
+            //     if let Some(orientation) = info.orientation { // or info.flip
+            //         Some(format!("{}", orientation))
+            //     } else {
+            //         None
+            //     }
+            // }
             // Skip derived sun position for rsraw (requires full timestamp parsing)
             "derivedsunposition" => None,
             // Skip other tags not available in rsraw
@@ -2354,7 +2362,11 @@ pub fn spawn_background_enrichment(
                     .or_else(|| raw_image.as_ref().and_then(raw_exif::get_gps_point_from_raw));
 
                 // Read orientation from EXIF (fresh, not from stale passed-in value)
-                // Note: rsraw does NOT provide orientation, so we always try kamadak-exif first
+                // TODO(rsraw-orientation): rsraw does NOT currently provide orientation.
+                // When rsraw exposes it, add fallback like:
+                //   let orientation = get_orientation(path, Some(&data))
+                //       .or_else(|| raw_image.as_ref().and_then(raw_exif::get_orientation_from_raw))
+                //       .unwrap_or(1);
                 let orientation = get_orientation(path, Some(&data));
 
                 // Read EXIF timestamp, with rsraw fallback

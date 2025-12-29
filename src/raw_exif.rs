@@ -4,8 +4,12 @@
 // Provides fallback when kamadak-exif fails to parse RAW files.
 // Maps rsraw structures to our ExifValue/ImageFeatures format.
 //
-// Note: Orientation is NOT available from rsraw structures.
-// For RAW files, orientation must be obtained from kamadak-exif or assumed to be 1.
+// TODO(rsraw-orientation): Orientation is NOT currently available from rsraw/LibRaw.
+// When rsraw exposes orientation (e.g., info.flip or info.orientation), update:
+//   1. build_features_from_raw_image() - extract and insert TAG_ORIENTATION
+//   2. Add get_orientation_from_raw() helper function
+//   3. scanner.rs spawn_background_enrichment() - use rsraw orientation as fallback
+//   4. scanner.rs get_exif_tags_from_rsraw() - add "orientation" tag handling
 //
 // GPS Coordinate Handling:
 // - rsraw stores GPS as [f32; 3] arrays in DMS format (degrees, minutes, seconds)
@@ -25,13 +29,19 @@ use rsraw::RawImage;
 /// Extract ImageFeatures from an rsraw RawImage.
 /// This is used as a fallback when kamadak-exif fails to parse the RAW file.
 ///
-/// Note: Orientation is NOT available from rsraw and must be handled separately.
+/// TODO(rsraw-orientation): Orientation is NOT available from rsraw.
+/// When rsraw exposes it, add: features.insert_tag(TAG_ORIENTATION, ExifValue::Short(orientation));
 ///
 /// Thread Safety: This function only reads from the RawImage, no mutation occurs.
 /// The RawImage should already have been opened by the caller.
 pub fn build_features_from_raw_image(raw: &RawImage) -> ImageFeatures {
     let info = raw.full_info();
     let mut features = ImageFeatures::new(info.width, info.height);
+
+    // TODO(rsraw-orientation): When rsraw exposes orientation, extract it here:
+    // if let Some(orientation) = info.orientation { // or info.flip
+    //     features.insert_tag(TAG_ORIENTATION, ExifValue::Short(orientation as u16));
+    // }
 
     // Camera info
     if !info.make.is_empty() {
@@ -164,11 +174,19 @@ pub fn get_timestamp_from_raw(raw: &RawImage) -> Option<i64> {
 /// Use this when kamadak-exif partially succeeded but might be missing some tags
 /// that rsraw can provide.
 ///
-/// Note: Orientation is NOT available from rsraw and is not set here.
+/// TODO(rsraw-orientation): Orientation is NOT available from rsraw.
+/// When rsraw exposes it, add orientation merging here (only if !features.has_tag(TAG_ORIENTATION)).
 ///
 /// Thread Safety: Mutates features, but RawImage is only read.
 pub fn merge_raw_info_into_features(features: &mut ImageFeatures, raw: &RawImage) {
     let info = raw.full_info();
+
+    // TODO(rsraw-orientation): When rsraw exposes orientation, merge it here:
+    // if !features.has_tag(TAG_ORIENTATION) {
+    //     if let Some(orientation) = info.orientation { // or info.flip
+    //         features.insert_tag(TAG_ORIENTATION, ExifValue::Short(orientation as u16));
+    //     }
+    // }
 
     // Camera info - only if not already present
     if !features.has_tag(TAG_MAKE) && !info.make.is_empty() {
