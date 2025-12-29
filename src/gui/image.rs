@@ -14,6 +14,7 @@ use crate::exif_types::{
     ExifValue, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE, TAG_ORIENTATION,
 };
 use crate::image_features::ImageFeatures;
+use crate::raw_exif;
 use crate::scanner;
 
 pub const MAX_TEXTURE_SIDE: usize = 8192;
@@ -120,9 +121,19 @@ fn load_and_process_image_with_hash(
         *hasher.finalize().as_bytes()
     };
 
-    // Read EXIF timestamp
+    // Read EXIF timestamp - with rsraw fallback for RAW files
     let exif_timestamp = crate::exif_extract::read_exif_data(path, Some(&bytes))
-        .and_then(|exif| crate::exif_extract::get_exif_timestamp(&exif));
+        .and_then(|exif| crate::exif_extract::get_exif_timestamp(&exif))
+        .or_else(|| {
+            // Fallback to rsraw for RAW files if kamadak-exif failed
+            if is_raw_ext(path) {
+                rsraw::RawImage::open(&bytes)
+                    .ok()
+                    .and_then(|raw| raw_exif::get_timestamp_from_raw(&raw))
+            } else {
+                None
+            }
+        });
 
     // Process the image using existing logic
     let (img, dims, orientation) = load_and_process_image_from_bytes(path, &bytes, use_thumbnails)?;
@@ -376,8 +387,8 @@ pub(super) fn update_file_metadata(
 
             // Add GPS position if available
             if let Some(pos) = gps_pos {
-                features.insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y() as f32));
-                features.insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(pos.x() as f32));
+                features.insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y()));
+                features.insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(pos.x()));
             }
 
             // Add timestamp if available

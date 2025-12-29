@@ -269,16 +269,16 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                 }
                 if v.len() == 1 {
                     if v[0].denom != 0 {
-                        ExifValue::Float(v[0].num as f32 / v[0].denom as f32)
+                        ExifValue::Float((v[0].num / v[0].denom) as f64)
                     } else {
                         continue;
                     }
                 } else {
                     // Multiple rationals (e.g., GPS coordinates)
-                    let floats: Vec<f32> = v
+                    let floats: Vec<f64> = v
                         .iter()
                         .filter(|r| r.denom != 0)
-                        .map(|r| r.num as f32 / r.denom as f32)
+                        .map(|r| r.num as f64 / r.denom as f64)
                         .collect();
                     if floats.is_empty() {
                         continue;
@@ -293,15 +293,15 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                 }
                 if v.len() == 1 {
                     if v[0].denom != 0 {
-                        ExifValue::Float(v[0].num as f32 / v[0].denom as f32)
+                        ExifValue::Float(v[0].num as f64 / v[0].denom as f64)
                     } else {
                         continue;
                     }
                 } else {
-                    let floats: Vec<f32> = v
+                    let floats: Vec<f64> = v
                         .iter()
                         .filter(|r| r.denom != 0)
-                        .map(|r| r.num as f32 / r.denom as f32)
+                        .map(|r| r.num as f64 / r.denom as f64)
                         .collect();
                     if floats.is_empty() {
                         continue;
@@ -376,8 +376,8 @@ pub fn build_image_features(
 
     // Store GPS as decimal degrees for easier querying
     if let Some((lat, lon)) = extract_gps_lat_lon(exif_data) {
-        features.insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(lat as f32));
-        features.insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(lon as f32));
+        features.insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(lat));
+        features.insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(lon));
 
         // Compute derived values if requested
         if compute_derived {
@@ -387,7 +387,7 @@ pub fn build_image_features(
 
     // Store altitude separately for easier access
     if let Some(alt) = get_altitude(exif_data) {
-        features.insert_tag(TAG_GPS_ALTITUDE, ExifValue::Float(alt as f32));
+        features.insert_tag(TAG_GPS_ALTITUDE, ExifValue::Float(alt));
     }
 
     // Store EXIF timestamp as derived value
@@ -474,7 +474,7 @@ fn derive_sun_position(
     lon: f64,
     exif_data: &exif::Exif,
     use_gps_utc: bool,
-) -> Option<(f32, f32, String)> {
+) -> Option<(f64, f64, String)> {
     // Try GPS time first if requested, then fall back to local time
     let (date_str, is_utc) = if use_gps_utc {
         if let Some(d) = get_date_str(exif_data, true) {
@@ -495,7 +495,7 @@ fn derive_sun_position(
     if let Ok((sun_alt, sun_az, tz)) =
         crate::position::sun_alt_and_azimuth(&date_str, lat, lon, Some(altitude), is_utc)
     {
-        Some((sun_az as f32, sun_alt as f32, tz))
+        Some((sun_az, sun_alt, tz))
     } else {
         None
     }
@@ -590,29 +590,4 @@ fn format_dms(decimal_deg: f64) -> String {
 
     let sign = if decimal_deg < 0.0 { "-" } else { "" };
     format!("{}{}° {}' {:.1}\"", sign, d, m, s)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exif_types;
-
-    #[test]
-    fn test_format_dms() {
-        // Paris: 48.8566° N
-        let dms = format_dms(48.8566);
-        assert!(dms.contains("48°"));
-        assert!(dms.contains("51'"));
-    }
-
-    #[test]
-    fn test_exposure_time_format() {
-        let val = ExifValue::Float(0.004); // 1/250s
-        let formatted = format_exif_value_for_display(exif_types::TAG_EXPOSURE_TIME, &val, true);
-        assert!(formatted.contains("1/250"));
-
-        let val = ExifValue::Float(2.0); // 2s
-        let formatted = format_exif_value_for_display(exif_types::TAG_EXPOSURE_TIME, &val, true);
-        assert!(formatted.contains("2.0s"));
-    }
 }

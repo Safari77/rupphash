@@ -28,9 +28,9 @@ pub enum ExifValue {
     /// 64-bit signed integer (for timestamps)
     Long64(i64),
     /// Floating point (converted from Rational/SRational for efficiency)
-    Float(f32),
+    Float(f64),
     /// Multiple floats (for GPS coordinates, etc.)
-    Floats(Vec<f32>),
+    Floats(Vec<f64>),
     /// ASCII or UTF-8 string (trimmed, null bytes removed)
     String(String),
 }
@@ -44,7 +44,7 @@ impl ExifValue {
             ExifValue::Long(v) => Some(*v as f32),
             ExifValue::Signed(v) => Some(*v as f32),
             ExifValue::Long64(v) => Some(*v as f32),
-            ExifValue::Float(v) => Some(*v),
+            ExifValue::Float(v) => Some(*v as f32),
             _ => None,
         }
     }

@@ -39,6 +39,7 @@ mod helper_exif;
 mod image_features;
 mod pdqhash;
 mod position;
+mod raw_exif;
 mod scanner;
 mod search_index;
 mod state;

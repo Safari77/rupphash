@@ -32,6 +32,7 @@ use crate::hamminghash::{HammingHash, MIHIndex, SparseBitSet};
 use crate::helper_exif::{get_altitude, get_date_str, get_exif_timestamp, parse_gps_coordinate};
 use crate::image_features::ImageFeatures;
 use crate::position;
+use crate::raw_exif;
 use crate::{FileMetadata, GroupInfo, GroupStatus};
 
 pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf"];
@@ -82,27 +83,62 @@ fn is_derived_tag(name: &str) -> bool {
     matches!(name.to_lowercase().as_str(), "derivedcountry" | "country" | "derivedsunposition")
 }
 
-/// Get multiple EXIF tags as a vector of (tag_name, value) pairs
+/// Get multiple EXIF tags as a vector of (tag_name, value) pairs.
+/// For RAW files, falls back to rsraw when kamadak-exif fails.
+///
+/// Thread Safety: This function reads the file from disk, so it's safe to call
+/// from multiple threads on different files. However, calling it on the same
+/// file from multiple threads is safe but wasteful (duplicate I/O).
 pub fn get_exif_tags(
     path: &Path,
     tag_names: &[String],
     decimal_coords: bool,
     use_gps_utc: bool,
 ) -> Vec<(String, String)> {
-    let Some(exif_data) = read_exif_data(path, None) else {
-        return Vec::new();
-    };
+    let exif_data = read_exif_data(path, None);
+    let is_raw = is_raw_ext(path);
 
+    eprintln!(
+        "[DEBUG-GET-EXIF-TAGS] path='{}', is_raw={}, kamadak_exif_ok={}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        is_raw,
+        exif_data.is_some()
+    );
+
+    // If kamadak-exif succeeded, use it
+    if let Some(ref exif) = exif_data {
+        return get_exif_tags_from_kamadak(exif, tag_names, decimal_coords, use_gps_utc);
+    }
+
+    // kamadak-exif failed - try rsraw for RAW files
+    if is_raw {
+        if let Ok(data) = std::fs::read(path) {
+            if let Ok(raw) = rsraw::RawImage::open(&data) {
+                return get_exif_tags_from_rsraw(&raw, tag_names, decimal_coords);
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+/// Extract EXIF tags from kamadak-exif data (original implementation)
+fn get_exif_tags_from_kamadak(
+    exif_data: &exif::Exif,
+    tag_names: &[String],
+    decimal_coords: bool,
+    use_gps_utc: bool,
+) -> Vec<(String, String)> {
     let mut results = Vec::new();
 
     // Pre-extract GPS coordinates if needed for derived values
     let needs_gps = tag_names.iter().any(|t| is_derived_tag(t));
-    let gps_coords = if needs_gps { extract_gps_lat_lon(&exif_data) } else { None };
+    let gps_coords = if needs_gps { extract_gps_lat_lon(exif_data) } else { None };
 
     // Pre-extract Data for Sun Position if needed
     let needs_sun = tag_names.iter().any(|t| t.eq_ignore_ascii_case("DerivedSunPosition"));
     let sun_inputs = if needs_sun && gps_coords.is_some() {
-        let alt = get_altitude(&exif_data);
+        let alt = get_altitude(exif_data);
         Some(alt)
     } else {
         None
@@ -111,7 +147,7 @@ pub fn get_exif_tags(
     for tag_name in tag_names {
         // Check for derived tags first
         if let Some(derived_entries) =
-            get_derived_value(tag_name, gps_coords, &sun_inputs, &exif_data, use_gps_utc)
+            get_derived_value(tag_name, gps_coords, &sun_inputs, exif_data, use_gps_utc)
         {
             results.extend(derived_entries);
         } else if let Some((tag, in_value)) = parse_exif_tag_name(tag_name)
@@ -123,6 +159,178 @@ pub fn get_exif_tags(
     }
 
     results
+}
+
+/// Extract EXIF tags from rsraw data (fallback for RAW files).
+/// Maps rsraw's FullRawInfo fields to the requested tag names.
+fn get_exif_tags_from_rsraw(
+    raw: &rsraw::RawImage,
+    tag_names: &[String],
+    decimal_coords: bool,
+) -> Vec<(String, String)> {
+    let info = raw.full_info();
+    let mut results = Vec::new();
+
+    eprintln!(
+        "[DEBUG-GET-EXIF-TAGS-RSRAW] make='{}', model='{}', iso={}, shutter={}, aperture={}, focal={}",
+        info.make, info.model, info.iso_speed, info.shutter, info.aperture, info.focal_len
+    );
+
+    for tag_name in tag_names {
+        let value = match tag_name.to_lowercase().as_str() {
+            "make" => {
+                if !info.make.is_empty() {
+                    Some(info.make.clone())
+                } else {
+                    None
+                }
+            }
+            "model" => {
+                if !info.model.is_empty() {
+                    Some(info.model.clone())
+                } else {
+                    None
+                }
+            }
+            "software" => {
+                if !info.software.is_empty() {
+                    Some(info.software.trim().to_string())
+                } else {
+                    None
+                }
+            }
+            "artist" => {
+                if !info.artist.is_empty() {
+                    Some(info.artist.clone())
+                } else {
+                    None
+                }
+            }
+            "iso" | "isospeedratings" | "photographicsensitivity" => {
+                if info.iso_speed > 0 {
+                    Some(format!("ISO {}", info.iso_speed))
+                } else {
+                    None
+                }
+            }
+            "exposuretime" | "exposure" => {
+                if info.shutter > 0.0 {
+                    if info.shutter >= 1.0 {
+                        Some(format!("{:.1}s", info.shutter))
+                    } else {
+                        Some(format!("1/{:.0}s", 1.0 / info.shutter))
+                    }
+                } else {
+                    None
+                }
+            }
+            "fnumber" | "aperture" => {
+                if info.aperture > 0.0 {
+                    Some(format!("f/{:.1}", info.aperture))
+                } else {
+                    None
+                }
+            }
+            "focallength" => {
+                if info.focal_len > 0.0 {
+                    Some(format!("{:.0}mm", info.focal_len))
+                } else {
+                    None
+                }
+            }
+            "focallengthin35mmfilm" | "focallength35mm" => {
+                if info.lens_info.focal_length_in_35mm_format > 0 {
+                    Some(format!("{}mm (35mm equiv)", info.lens_info.focal_length_in_35mm_format))
+                } else {
+                    None
+                }
+            }
+            "lensmodel" | "lens" => {
+                if !info.lens_info.lens_name.is_empty() {
+                    Some(info.lens_info.lens_name.trim().to_string())
+                } else {
+                    None
+                }
+            }
+            "lensmake" => {
+                if !info.lens_info.lens_make.is_empty() {
+                    Some(info.lens_info.lens_make.clone())
+                } else {
+                    None
+                }
+            }
+            "datetime" | "datetimeoriginal" => {
+                if let Some(ref dt) = info.datetime {
+                    Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                } else {
+                    None
+                }
+            }
+            "gpslatitude" => {
+                let lat = raw_exif::dms_to_decimal_pub(&info.gps.latitude);
+                if lat.abs() > 0.0001 {
+                    if decimal_coords {
+                        Some(format!("{:.6}°", lat))
+                    } else {
+                        Some(format_dms_from_decimal(lat as f64))
+                    }
+                } else {
+                    None
+                }
+            }
+            "gpslongitude" => {
+                let lon = raw_exif::dms_to_decimal_pub(&info.gps.longitude);
+                if lon.abs() > 0.0001 {
+                    if decimal_coords {
+                        Some(format!("{:.6}°", lon))
+                    } else {
+                        Some(format_dms_from_decimal(lon as f64))
+                    }
+                } else {
+                    None
+                }
+            }
+            "gpsaltitude" => {
+                if info.gps.altitude.abs() > 0.0001 {
+                    Some(format!("{:.1}m", info.gps.altitude))
+                } else {
+                    None
+                }
+            }
+            "derivedcountry" | "country" => {
+                let lat = raw_exif::dms_to_decimal_pub(&info.gps.latitude) as f64;
+                let lon = raw_exif::dms_to_decimal_pub(&info.gps.longitude) as f64;
+                if lat.abs() > 0.0001 || lon.abs() > 0.0001 {
+                    derive_country(lat, lon)
+                } else {
+                    None
+                }
+            }
+            // Skip derived sun position for rsraw (requires full timestamp parsing)
+            "derivedsunposition" => None,
+            // Skip other tags not available in rsraw
+            _ => None,
+        };
+
+        if let Some(v) = value {
+            results.push((tag_name.clone(), v));
+        }
+    }
+
+    eprintln!("[DEBUG-GET-EXIF-TAGS-RSRAW]   Returning {} tags", results.len());
+    results
+}
+
+/// Format decimal degrees as DMS string (helper for rsraw GPS display)
+fn format_dms_from_decimal(decimal_deg: f64) -> String {
+    let abs_deg = decimal_deg.abs();
+    let d = abs_deg.floor() as i32;
+    let m_float = (abs_deg - d as f64) * 60.0;
+    let m = m_float.floor() as i32;
+    let s = (m_float - m as f64) * 60.0;
+
+    let sign = if decimal_deg < 0.0 { "-" } else { "" };
+    format!("{}{}° {}' {:.1}\"", sign, d, m, s)
 }
 
 /// Get derived values based on tag name and available data
@@ -937,8 +1145,12 @@ pub fn scan_and_group(
 
                 if let Some(ref b) = bytes {
                     // Read Orientation, GPS location, and EXIF timestamp
-                    if let Some(exif) = read_exif_data(path, Some(b)) {
-                        if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
+                    // For RAW files, we may need to fall back to rsraw if kamadak-exif fails
+                    let exif_data = read_exif_data(path, Some(b));
+
+                    if let Some(ref exif) = exif_data {
+                        // kamadak-exif succeeded - extract data the normal way
+                        if let Some((lat, lon)) = extract_gps_lat_lon(exif) {
                             gps_pos = Some(Point::new(lon, lat)); // Geo uses (x, y) = (lon, lat)
                         }
                         if let Some(field) =
@@ -947,7 +1159,19 @@ pub fn scan_and_group(
                         {
                             orientation = v as u8;
                         }
-                        exif_timestamp = get_exif_timestamp(&exif);
+                        exif_timestamp = get_exif_timestamp(exif);
+                    } else if is_raw_ext(path) {
+                        // kamadak-exif failed on RAW file - try rsraw as fallback
+                        if let Ok(raw) = rsraw::RawImage::open(b) {
+                            // Get GPS from rsraw
+                            if let Some(point) = raw_exif::get_gps_point_from_raw(&raw) {
+                                gps_pos = Some(point);
+                            }
+                            // Get timestamp from rsraw
+                            exif_timestamp = raw_exif::get_timestamp_from_raw(&raw);
+                            // Note: orientation is NOT available from rsraw
+                            // It will remain at the default value of 1
+                        }
                     }
                     // 2. Calculate file hash if needed
                     if ck == [0u8; 32] {
@@ -1048,10 +1272,10 @@ pub fn scan_and_group(
                             // Add GPS position if available
                             if let Some(pos) = gps_pos {
                                 img_features
-                                    .insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y() as f32));
+                                    .insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y()));
                                 img_features.insert_tag(
                                     TAG_GPS_LONGITUDE,
-                                    ExifValue::Float(pos.x() as f32),
+                                    ExifValue::Float(pos.x()),
                                 );
                             }
 
@@ -2099,6 +2323,8 @@ pub fn spawn_background_enrichment(
 
     std::thread::spawn(move || {
         // Process files in parallel using rayon
+        // Thread Safety: Each file is processed independently, no shared mutable state
+        // between iterations. The db_tx and result_tx channels are thread-safe.
         files_to_enrich.par_iter().for_each(|(path, unique_file_id, resolution, _orientation)| {
             if let Ok(data) = std::fs::read(path) {
                 // Compute content_hash
@@ -2109,17 +2335,33 @@ pub fn spawn_background_enrichment(
                 // Read EXIF data once for GPS, orientation, and timestamp
                 let exif_data = read_exif_data(path, Some(&data));
 
-                // Read GPS from EXIF
+                // Determine if this is a RAW file for potential rsraw fallback
+                let is_raw = is_raw_ext(path);
+
+                // Try to get rsraw data for RAW files (we may need it as fallback)
+                // Only open rsraw if kamadak-exif failed - avoids double parsing
+                let raw_image = if is_raw && exif_data.is_none() {
+                    rsraw::RawImage::open(&data).ok()
+                } else {
+                    None
+                };
+
+                // Read GPS from EXIF, with rsraw fallback for RAW files
                 let gps_pos = exif_data
                     .as_ref()
                     .and_then(extract_gps_lat_lon)
-                    .map(|(lat, lon)| Point::new(lon, lat));
+                    .map(|(lat, lon)| Point::new(lon, lat))
+                    .or_else(|| raw_image.as_ref().and_then(raw_exif::get_gps_point_from_raw));
 
                 // Read orientation from EXIF (fresh, not from stale passed-in value)
+                // Note: rsraw does NOT provide orientation, so we always try kamadak-exif first
                 let orientation = get_orientation(path, Some(&data));
 
-                // Read EXIF timestamp
-                let exif_timestamp = exif_data.as_ref().and_then(get_exif_timestamp);
+                // Read EXIF timestamp, with rsraw fallback
+                let exif_timestamp = exif_data
+                    .as_ref()
+                    .and_then(get_exif_timestamp)
+                    .or_else(|| raw_image.as_ref().and_then(raw_exif::get_timestamp_from_raw));
 
                 // --- 1. BUILD FEATURES (Unified Path) ---
                 // We build the features object now so it can be used for BOTH the database
@@ -2127,12 +2369,33 @@ pub fn spawn_background_enrichment(
                 let (w, h) = resolution.unwrap_or((0, 0));
 
                 // Initialize: Use rich EXIF data if available, or blank slate
+                // For RAW files where kamadak-exif failed, use rsraw data
                 let mut features = if let Some(exif) = exif_data.as_ref() {
                     // 'true' here enables enrichment (Country, Sun Position, etc.)
                     crate::exif_extract::build_image_features(w, h, exif, true, false)
+                } else if let Some(ref raw) = raw_image {
+                    // kamadak-exif failed, but we have rsraw data
+                    raw_exif::build_features_from_raw_image(raw)
                 } else {
                     crate::image_features::ImageFeatures::new(w, h)
                 };
+
+                // If we have kamadak-exif data and this is a RAW file, also merge rsraw data
+                // (rsraw might have data that kamadak-exif missed, like lens info)
+                if exif_data.is_some() && is_raw {
+                    if let Ok(raw) = rsraw::RawImage::open(&data) {
+                        raw_exif::merge_raw_info_into_features(&mut features, &raw);
+                    }
+                }
+                
+                if false {
+                    eprintln!("[DEBUG-ENRICH]   Final features for '{}': tag_count={}, has_make={}, has_model={}, has_iso={}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        features.tag_count(),
+                        features.has_tag(crate::exif_types::TAG_MAKE),
+                        features.has_tag(crate::exif_types::TAG_MODEL),
+                        features.has_tag(crate::exif_types::TAG_ISO));
+                }
 
                 // Enforce critical tags (Orientation, GPS) to ensure consistency
                 // (These might be redundant if build_image_features ran, but safe to ensure)
@@ -2146,11 +2409,11 @@ pub fn spawn_background_enrichment(
                 if let Some(pos) = gps_pos {
                     features.insert_tag(
                         crate::exif_types::TAG_GPS_LATITUDE,
-                        crate::exif_types::ExifValue::Float(pos.y() as f32),
+                        crate::exif_types::ExifValue::Float(pos.y()),
                     );
                     features.insert_tag(
                         crate::exif_types::TAG_GPS_LONGITUDE,
-                        crate::exif_types::ExifValue::Float(pos.x() as f32),
+                        crate::exif_types::ExifValue::Float(pos.x()),
                     );
 
                     // Fallback: If build_image_features didn't derive country (or if we had no EXIF object), try manually
