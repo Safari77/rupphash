@@ -315,10 +315,7 @@ pub(super) fn update_file_metadata(
     let update_file =
         |file: &mut crate::FileMetadata| -> Option<(u128, Option<geo::Point<f64>>, Option<i64>, bool)> {
             if file.path == path {
-                eprintln!(
-                    "[DEBUG-UPDATE]   Found file! current orientation={}, new orientation={}",
-                    file.orientation, orientation
-                );
+                //eprintln!("[DEBUG-UPDATE]   Found file! current orientation={}, new orientation={}", file.orientation, orientation);
                 let mut changed = false;
                 if file.resolution.is_none() {
                     file.resolution = Some((w, h));
@@ -327,10 +324,7 @@ pub(super) fn update_file_metadata(
                 // Always update orientation from loader - it knows the correct value
                 // (e.g., for RAW full decode it's 1, for RAW thumbnails it's EXIF value)
                 if file.orientation != orientation {
-                    eprintln!(
-                        "[DEBUG-UPDATE]   Updated orientation {} -> {}",
-                        file.orientation, orientation
-                    );
+                    //eprintln!("[DEBUG-UPDATE]   Updated orientation {} -> {}", file.orientation, orientation);
                     file.orientation = orientation;
                     changed = true;
                 }

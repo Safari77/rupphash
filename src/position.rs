@@ -57,10 +57,7 @@ pub fn sun_alt_and_azimuth(
         return Err(format!("Coordinates out of bounds: {}, {}", lat, lon));
     }
 
-    eprintln!(
-        "sun_alt_and_azimuth time={} lat={} lon={} alt={:?} use_utc={}",
-        local_time_str, lat, lon, altitude, use_gps_utc
-    );
+    //eprintln!("sun_alt_and_azimuth time={} lat={} lon={} alt={:?} use_utc={}", local_time_str, lat, lon, altitude, use_gps_utc);
 
     // If using GPS time, we force UTC. Otherwise, we resolve the local timezone.
     let tz_name = if use_gps_utc { "UTC".to_string() } else { resolve_timezone(lon, lat) };
@@ -117,7 +114,7 @@ pub fn sun_alt_and_azimuth(
         Some(RefractionCorrection::standard()),
     )
     .map_err(|_| "SPA calculation failed")?;
-    eprintln!("  TZ={}", tz_display);
+    //eprintln!("  TZ={}", tz_display);
     Ok((pos.elevation_angle(), pos.azimuth(), tz_display))
 }
 

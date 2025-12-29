@@ -208,6 +208,40 @@ pub struct GuiApp {
 }
 
 impl GuiApp {
+    /// Applies spatial sorting based on the GPS map's optimized path
+    pub(super) fn apply_location_sort(&mut self) {
+        if self.state.groups.is_empty() {
+            return;
+        }
+
+        // 1. Ensure map uses spatial optimization and rebuild the path
+        self.gps_map.sort_by_exif_timestamp = false;
+        self.gps_map.optimize_path();
+
+        // 2. Save current selection to restore it after sorting
+        let current_path = self.state.get_current_image_path().cloned();
+
+        // 3. Sort groups using the map's optimized path_to_marker indices
+        // Files without GPS data are pushed to the end (usize::MAX)
+        for group in &mut self.state.groups {
+            group.sort_by_key(|f| {
+                self.gps_map.path_to_marker.get(&f.path).copied().unwrap_or(usize::MAX)
+            });
+        }
+
+        // 4. Restore selection index
+        if let Some(path) = current_path {
+            if let Some(group) = self.state.groups.get(self.state.current_group_idx) {
+                if let Some(new_idx) = group.iter().position(|f| f.path == path) {
+                    self.state.current_file_idx = new_idx;
+                }
+            }
+        }
+
+        self.cache_dirty = true;
+        self.state.selection_changed = true;
+    }
+
     pub fn build_search_index(&mut self) {
         use std::time::Instant;
         let start = Instant::now();
@@ -1161,27 +1195,34 @@ impl GuiApp {
             // SORTING LOGIC: Ensure content subgroups are contiguous.
             // We sort primarily by pixel_hash, secondarily by path.
             // This keeps "C1" files together, "C2" together, etc.
-            for group in &mut new_groups {
-                group.sort_by(|a, b| {
-                    match (a.pixel_hash, b.pixel_hash) {
-                        (Some(ha), Some(hb)) => {
-                            if ha == hb {
-                                a.path.cmp(&b.path)
-                            } else {
-                                ha.cmp(&hb)
+            // Only apply hardcoded pixel-hash sort in Duplicate Finder mode
+            if !self.state.view_mode {
+                for group in &mut new_groups {
+                    group.sort_by(|a, b| {
+                        match (a.pixel_hash, b.pixel_hash) {
+                            (Some(ha), Some(hb)) => {
+                                if ha == hb {
+                                    a.path.cmp(&b.path)
+                                } else {
+                                    ha.cmp(&hb)
+                                }
+                            }
+                            // Put files WITH pixel hash (potential content matches) before those without?
+                            // Or standard Option ordering: None < Some.
+                            // Let's use standard Ord which puts None first.
+                            // This means "Unmatched" files might appear at top/bottom,
+                            // but all "Some(hash)" will be grouped.
+                            (h1, h2) => {
+                                let ord = h1.cmp(&h2);
+                                if ord == std::cmp::Ordering::Equal {
+                                    a.path.cmp(&b.path)
+                                } else {
+                                    ord
+                                }
                             }
                         }
-                        // Put files WITH pixel hash (potential content matches) before those without?
-                        // Or standard Option ordering: None < Some.
-                        // Let's use standard Ord which puts None first.
-                        // This means "Unmatched" files might appear at top/bottom,
-                        // but all "Some(hash)" will be grouped.
-                        (h1, h2) => {
-                            let ord = h1.cmp(&h2);
-                            if ord == std::cmp::Ordering::Equal { a.path.cmp(&b.path) } else { ord }
-                        }
-                    }
-                });
+                    });
+                }
             }
 
             if let Some(first_group) = new_groups.first() {
@@ -1202,9 +1243,20 @@ impl GuiApp {
 
             // Only replace if we have results (duplicate mode) or finished view mode
             self.state.groups = new_groups;
+            if let Some(ref sort) = self.view_mode_sort {
+                if sort == "location" {
+                    self.apply_location_sort();
+                }
+            }
             self.cache_dirty = true;
             self.state.group_infos = new_infos;
             self.subdirs = new_subdirs;
+            if let Some(ref sort) = self.view_mode_sort {
+                if sort == "location" {
+                    // We must ingest markers first (already done by self.ingest_gps_markers)
+                    self.apply_location_sort();
+                }
+            }
             self.refresh_dir_cache(false);
             self.state.last_file_count = self.state.groups.iter().map(|g| g.len()).sum();
 
@@ -1436,10 +1488,7 @@ impl GuiApp {
         let width = self.ctx.gui_config.width.unwrap_or(1280) as f32;
         let height = self.ctx.gui_config.height.unwrap_or(720) as f32;
 
-        eprintln!(
-            "[DEBUG-RUN] Setting window size to {}x{} (physical pixels = logical points at ppp=1)",
-            width, height
-        );
+        //eprintln!("[DEBUG-RUN] Setting window size to {}x{} (physical pixels = logical points at ppp=1)", width, height);
 
         let is_windows = cfg!(target_os = "windows");
         let options = eframe::NativeOptions {
@@ -1519,14 +1568,10 @@ impl Drop for GuiApp {
         if let Some((w, h)) = self.last_window_size {
             gui_config.width = Some(w);
             gui_config.height = Some(h);
-            eprintln!("Saving window size: {}x{}", w, h);
-        } else {
-            eprintln!("Warning: No window size captured");
         }
         // panel_width is in current logical points (after font_scale)
         // Save it directly - we'll scale when loading
         gui_config.panel_width = Some(self.panel_width);
-        eprintln!("Saving panel width: {}", self.panel_width);
         eprintln!(
             "[DEBUG-EXIT] Calling save_gui_config with width={:?}, height={:?}, panel_width={:?}",
             gui_config.width, gui_config.height, gui_config.panel_width
@@ -1730,7 +1775,9 @@ impl eframe::App for GuiApp {
         // Process background enrichment results (view mode)
         // This updates FileMetadata with computed content_hash and GPS coordinates
         // Database writing is handled by scanner::spawn_background_enrichment
+        let mut enrichment_done = false;
         if let Some(ref rx) = self.enrichment_rx {
+            let mut got_new_gps = false;
             loop {
                 match rx.try_recv() {
                     Ok(result) => {
@@ -1742,6 +1789,7 @@ impl eframe::App for GuiApp {
                             file.content_hash = result.content_hash;
                             if result.gps_pos.is_some() {
                                 file.gps_pos = result.gps_pos;
+                                got_new_gps = true;
                             }
                             if result.exif_timestamp.is_some() {
                                 file.exif_timestamp = result.exif_timestamp;
@@ -1769,9 +1817,28 @@ impl eframe::App for GuiApp {
                         }
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        enrichment_done = true;
+                        break;
+                    }
                 }
             }
+            // --- Debounced Spatial Sort ---
+            // Only sort if we got new coordinates AND we are in location sort mode
+            if got_new_gps && self.view_mode_sort.as_deref() == Some("location") {
+                // Sort immediately if enrichment finished, otherwise debounce to once/sec
+                let time_since_last = self.last_fs_refresh.elapsed();
+                if enrichment_done || time_since_last > Duration::from_millis(1000) {
+                    eprintln!("[GPS] apply_location_sort (Debounced)");
+                    self.apply_location_sort();
+                    self.last_fs_refresh = Instant::now(); // Reset timer
+                }
+            }
+        }
+
+        // Clean up the channel handle once fully processed
+        if enrichment_done {
+            self.enrichment_rx = None;
         }
 
         self.check_reload(ctx);
@@ -1943,10 +2010,6 @@ impl eframe::App for GuiApp {
             let should_apply_saved_width = !self.initial_panel_width_applied && window_ready;
 
             if should_apply_saved_width {
-                eprintln!(
-                    "[DEBUG-PANEL] Applying saved panel width {} (ppp={})",
-                    self.saved_panel_width, ppp
-                );
                 self.initial_panel_width_applied = true;
             }
 

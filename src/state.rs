@@ -391,9 +391,16 @@ impl AppState {
                 }
             }
             InputIntent::ToggleSlideshow => {
-                self.slideshow_paused = !self.slideshow_paused;
+                if self.slideshow_interval.is_none() {
+                    // Initialize with 3 second interval if it wasn't set via CLI
+                    self.slideshow_interval = Some(3.0);
+                    self.slideshow_paused = false;
+                } else {
+                    self.slideshow_paused = !self.slideshow_paused;
+                }
+
                 let status =
-                    if self.slideshow_paused { "Slideshow paused" } else { "Slideshow resumed" };
+                    if self.slideshow_paused { "Slideshow paused" } else { "Slideshow active" };
                 self.set_status(status.to_string(), false);
             }
             InputIntent::ToggleFullscreen => {

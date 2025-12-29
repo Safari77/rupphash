@@ -1059,9 +1059,6 @@ impl AppContext {
         let config_dir = dirs::config_dir().ok_or("No config dir found")?;
         let config_path = config_dir.join(CONFIG_FILE_NAME);
 
-        eprintln!("[DEBUG-DB] save_gui_config called");
-        eprintln!("[DEBUG-DB] config_path = {:?}", config_path);
-
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
             let mut cfg: Config = toml::from_str(&content)?;

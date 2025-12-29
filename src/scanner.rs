@@ -1640,6 +1640,7 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
             let mut rng = rand::rng();
             files.shuffle(&mut rng);
         }
+        "location" => return, // Sorting logic is performed in the GUI layer using GPS state
         _ => {
             // Default fallback (Name Natural)
             files.sort_by_cached_key(|f| {

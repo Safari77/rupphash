@@ -163,7 +163,7 @@ struct Cli {
     #[arg(long)]
     pixel_hash: bool,
 
-    /// Sort order with --view: name, name-desc, name-natural, name-natural-desc, date, date-desc, size, size-desc, random, exif-date, exif-date-desc
+    /// Sort order with --view: name, name-desc, name-natural, name-natural-desc, date, date-desc, size, size-desc, random, exif-date, exif-date-desc, location
     #[arg(long, default_value = "name")]
     sort: String,
 
@@ -244,6 +244,7 @@ impl Cli {
             "random",
             "exif-date",
             "exif-date-desc",
+            "location",
         ];
         let sort_lower = self.sort.to_lowercase();
         if !valid_sorts.contains(&sort_lower.as_str()) {

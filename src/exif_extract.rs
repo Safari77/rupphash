@@ -429,7 +429,7 @@ fn add_derived_values(
     if let Some((azimuth, altitude, timezone)) =
         derive_sun_position(lat, lon, exif_data, use_gps_utc)
     {
-        eprintln!("exif_extract sun az={} alt={} tz={}", azimuth, altitude, timezone);
+        //eprintln!("exif_extract sun az={} alt={} tz={}", azimuth, altitude, timezone);
         features.insert_tag(TAG_DERIVED_SUN_AZIMUTH, ExifValue::Float(azimuth));
         features.insert_tag(TAG_DERIVED_SUN_ALTITUDE, ExifValue::Float(altitude));
         features.insert_tag(TAG_DERIVED_TIMEZONE, ExifValue::String(timezone));
