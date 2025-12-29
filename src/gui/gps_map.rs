@@ -274,6 +274,10 @@ pub struct GpsMapState {
     pub tile_error: Option<String>,
     /// Sort mode for markers: true = sort by EXIF timestamp, false = sort by distance
     pub sort_by_exif_timestamp: bool,
+    /// Last viewed position for movement calculation
+    pub last_pos: Option<(f64, f64)>,
+    /// Movement text display string
+    pub move_text: Option<String>,
 }
 
 impl Default for GpsMapState {
@@ -294,13 +298,15 @@ impl Default for GpsMapState {
             direction_to_image: false,
             tile_error: None,
             sort_by_exif_timestamp: false,
+            last_pos: None,
+            move_text: None,
         }
     }
 }
 
 impl GpsMapState {
     pub fn new(_cache_path: PathBuf, provider_name: String, provider_url: String) -> Self {
-        Self { provider_name, provider_url, ..Default::default() }
+        Self { provider_name, provider_url, last_pos: None, move_text: None, ..Default::default() }
     }
 
     /// Remove a marker by path and mark the list for sorting
@@ -484,6 +490,8 @@ impl GpsMapState {
         self.markers.clear();
         self.path_to_marker.clear();
         self.selected_marker = None;
+        self.last_pos = None;
+        self.move_text = None;
     }
 
     /// Center map on a specific marker
@@ -677,6 +685,32 @@ pub fn render_gps_map(
     current_path: Option<&Path>,
 ) -> Option<PathBuf> {
     state.ensure_tiles(ui.ctx());
+
+    // Update movement text if current image position changed
+    let current_marker_pos =
+        current_path.and_then(|p| state.get_marker_by_path(p)).map(|m| (m.lat, m.lon));
+
+    if let Some(pos) = current_marker_pos {
+        if let Some(last) = state.last_pos {
+            // Check if position actually changed
+            if (last.0 - pos.0).abs() > 1e-8 || (last.1 - pos.1).abs() > 1e-8 {
+                let (dist, bearing) = crate::position::distance_and_bearing(last, pos);
+                state.move_text = Some(format!(
+                    "Moved {} into direction {}",
+                    format_distance(dist),
+                    format_bearing(bearing)
+                ));
+                state.last_pos = Some(pos);
+            }
+        } else {
+            // First valid GPS image encountered since map was enabled
+            state.last_pos = Some(pos);
+            state.move_text = None;
+        }
+    } else {
+        // Clear move text if current file has no GPS data
+        state.move_text = None;
+    }
 
     // If there's a tile error, display it instead of the map
     if let Some(ref error) = state.tile_error {

@@ -2879,6 +2879,20 @@ impl eframe::App for GuiApp {
 
                     ui.separator();
 
+                    // Display movement info from previous image
+                    if let Some(ref move_text) = self.gps_map.move_text {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(egui::RichText::new("➡").color(egui::Color32::LIGHT_BLUE));
+                            ui.label(
+                                egui::RichText::new(move_text)
+                                    .strong()
+                                    .color(egui::Color32::LIGHT_BLUE),
+                            );
+                        });
+                        ui.separator();
+                    }
+
                     // Map area
                     let map_rect = ui.available_rect_before_wrap();
 

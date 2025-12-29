@@ -386,6 +386,8 @@ pub(super) fn handle_input(
                 // State 1: Map ON, Lines OFF
                 app.gps_map.visible = true;
                 app.gps_map.show_path_lines = false;
+                app.gps_map.last_pos = None;
+                app.gps_map.move_text = None;
 
                 // (Existing auto-center logic...)
                 if app.gps_map.selected_location.is_none() {
