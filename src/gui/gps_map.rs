@@ -553,13 +553,15 @@ impl GpsMapState {
 
 /// Plugin for drawing GPS markers on the map and detecting clicks
 pub struct GpsMarkersPlugin {
-    pub markers: Vec<(Position, egui::Color32, f32, usize)>, // (pos, color, radius, index)
+    pub markers: Vec<(Position, egui::Color32, f32, usize, String)>, // (pos, color, radius, index)
     pub clicked_idx: std::sync::Arc<std::sync::atomic::AtomicI32>, // -1 = no click, >= 0 = clicked marker index
     /// Sun position for current marker: (marker_position, azimuth, elevation)
     pub current_sun: Option<(Position, f64, f64)>,
     /// Map rect for clipping sun indicator to edges
     pub map_rect: egui::Rect,
     pub draw_lines: bool,
+    // Store the position of the currently selected image to calculate distance/bearing
+    pub current_image_pos: Option<Position>,
 }
 
 impl Plugin for GpsMarkersPlugin {
@@ -615,12 +617,14 @@ impl Plugin for GpsMarkersPlugin {
         }
 
         // --- DRAW MARKERS (Optimized) ---
+        let hover_pos = response.hover_pos();
         let click_pos = if response.clicked() { response.interact_pointer_pos() } else { None };
 
         let mut closest_dist = f32::MAX;
         let mut closest_idx = -1;
+        let mut hovered_marker: Option<(Position, String)> = None;
 
-        for (pos, color, radius, idx) in &self.markers {
+        for (pos, color, radius, idx, name) in &self.markers {
             let p_lat = pos.y();
             let p_lon = pos.x();
 
@@ -651,6 +655,13 @@ impl Plugin for GpsMarkersPlugin {
                 egui::Stroke::new(1.5, egui::Color32::WHITE),
             );
 
+            // Tooltip Detection
+            if let Some(h_pos) = hover_pos {
+                if screen_pos.distance(h_pos) < *radius + 2.0 {
+                    hovered_marker = Some((*pos, name.clone()));
+                }
+            }
+
             // Magnetic Selection
             if let Some(c_pos) = click_pos {
                 let dist = screen_pos.distance(c_pos);
@@ -664,6 +675,32 @@ impl Plugin for GpsMarkersPlugin {
         // Apply Selection
         if closest_idx >= 0 && closest_dist < 50.0 {
             self.clicked_idx.store(closest_idx, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if let Some((m_pos, m_name)) = hovered_marker {
+            // Using always_open as suggested by the compiler for manual tooltips
+            egui::Tooltip::always_open(
+                ui.ctx().clone(),
+                ui.layer_id(),
+                egui::Id::new("map_marker_tooltip"),
+                egui::PopupAnchor::Pointer,
+            )
+            .show(|ui| {
+                ui.label(egui::RichText::new(m_name).strong());
+
+                if let Some(cur_pos) = self.current_image_pos {
+                    // cur_pos and m_pos are walkers::Position (lat=y, lon=x)
+                    let p1 = (cur_pos.y(), cur_pos.x());
+                    let p2 = (m_pos.y(), m_pos.x());
+
+                    // position::distance_and_bearing calculates geodesics
+                    let (dist, bearing) = crate::position::distance_and_bearing(p1, p2);
+
+                    ui.separator();
+                    ui.label(format!("Distance: {}", format_distance(dist)));
+                    ui.label(format!("Bearing: {}", format_bearing(bearing)));
+                }
+            });
         }
 
         // --- DRAW SUN ---
@@ -728,6 +765,7 @@ pub fn render_gps_map(
     if state.show_path_lines && state.markers_needs_sort {
         state.optimize_path();
     }
+
     let default_center = walkers::lat_lon(51.0, 17.0);
 
     // Use path-based lookup for current marker position (works in view mode where content_hash is zeroed)
@@ -742,24 +780,21 @@ pub fn render_gps_map(
         state.map_memory.center_at(pos);
     }
 
+    // Get position of current image for distance comparison
+    let current_image_pos =
+        current_path.and_then(|p| state.get_marker_by_path(p)).map(|m| m.position());
     let markers_data: Vec<_> = state
         .markers
         .iter()
         .enumerate()
         .map(|(idx, marker)| {
-            let is_selected = state.selected_marker == Some(idx);
-            // Use path-based comparison for current marker
             let is_current = current_path.map(|p| p == marker.path).unwrap_or(false);
+            let color = if is_current { egui::Color32::GREEN } else { egui::Color32::GRAY };
+            let radius = if is_current { 8.0 } else { 5.0 };
 
-            let (color, radius) = if is_current {
-                (egui::Color32::GREEN, 8.0)
-            } else if is_selected {
-                (egui::Color32::YELLOW, 7.0)
-            } else {
-                (egui::Color32::GRAY, 5.0)
-            };
+            let name = marker.path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
-            (marker.position(), color, radius, idx)
+            (marker.position(), color, radius, idx, name)
         })
         .collect();
 
@@ -787,6 +822,7 @@ pub fn render_gps_map(
             current_sun,
             map_rect,
             draw_lines: state.show_path_lines,
+            current_image_pos,
         };
         let map =
             Map::new(Some(tiles), &mut state.map_memory, my_position).with_plugin(markers_plugin);
