@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 /// - "1/250s" -> 0.004 (Fractions with units)
 /// - "ISO 100" -> 100
 /// - "24mm" -> 24
-pub fn extract_number_from_string(s: &str) -> Option<f32> {
+pub fn extract_number_from_string(s: &str) -> Option<f64> {
     let s = s.trim();
 
     // 1. Remove "s" suffix (common in exposure time: "1/320s")
@@ -25,7 +25,7 @@ pub fn extract_number_from_string(s: &str) -> Option<f32> {
     // 2. Handle "f/" prefix (e.g. "f/2.8" or "F/2.8")
     // For aperture, we want the number itself (2.8), NOT the fraction (f divided by 2.8)
     if s.to_lowercase().starts_with("f/") {
-        if let Ok(val) = s[2..].trim().parse::<f32>() {
+        if let Ok(val) = s[2..].trim().parse::<f64>() {
             return Some(val);
         }
     }
@@ -35,7 +35,7 @@ pub fn extract_number_from_string(s: &str) -> Option<f32> {
         let before = s[..slash_pos].trim();
         let after = &s[slash_pos + 1..].trim();
 
-        if let (Ok(num), Ok(denom)) = (before.parse::<f32>(), after.parse::<f32>()) {
+        if let (Ok(num), Ok(denom)) = (before.parse::<f64>(), after.parse::<f64>()) {
             if denom != 0.0 {
                 return Some(num / denom);
             }
@@ -58,13 +58,13 @@ pub fn extract_number_from_string(s: &str) -> Option<f32> {
     }
 
     if !num_str.is_empty() {
-        if let Ok(val) = num_str.parse::<f32>() {
+        if let Ok(val) = num_str.parse::<f64>() {
             return Some(val);
         }
     }
 
     // 5. Last resort: direct parse
-    s.parse::<f32>().ok()
+    s.parse::<f64>().ok()
 }
 
 /// Search operator for queries
@@ -123,7 +123,7 @@ pub struct SearchIndex {
     exact_index: HashMap<u16, HashMap<u64, RoaringBitmap>>,
 
     /// Numeric index: tag_id -> sorted list of (value, file_index)
-    numeric_index: HashMap<u16, Vec<(f32, u32)>>,
+    numeric_index: HashMap<u16, Vec<(f64, u32)>>,
 
     /// Number of indexed files
     file_count: u32,
@@ -240,34 +240,34 @@ impl SearchIndex {
                 }
 
                 ExifValue::Short(v) => {
-                    self.insert_numeric(*tag_id, *v as f32, file_idx);
+                    self.insert_numeric(*tag_id, *v as f64, file_idx);
                     // Also index as string for contains search
                     self.insert_string(*tag_id, &v.to_string(), file_idx);
                 }
 
                 ExifValue::Long(v) => {
-                    self.insert_numeric(*tag_id, *v as f32, file_idx);
+                    self.insert_numeric(*tag_id, *v as f64, file_idx);
                     self.insert_string(*tag_id, &v.to_string(), file_idx);
                 }
 
                 ExifValue::Signed(v) => {
-                    self.insert_numeric(*tag_id, *v as f32, file_idx);
+                    self.insert_numeric(*tag_id, *v as f64, file_idx);
                     self.insert_string(*tag_id, &v.to_string(), file_idx);
                 }
 
                 ExifValue::Long64(v) => {
-                    self.insert_numeric(*tag_id, *v as f32, file_idx);
+                    self.insert_numeric(*tag_id, *v as f64, file_idx);
                     self.insert_string(*tag_id, &v.to_string(), file_idx);
                 }
 
                 ExifValue::Float(v) => {
-                    self.insert_numeric(*tag_id, *v, file_idx);
+                    self.insert_numeric(*tag_id, (*v).into(), file_idx);
                     // Format float for string search
                     self.insert_string(*tag_id, &format!("{:.2}", v), file_idx);
                 }
 
                 ExifValue::Byte(v) => {
-                    self.insert_numeric(*tag_id, *v as f32, file_idx);
+                    self.insert_numeric(*tag_id, *v as f64, file_idx);
                     self.insert_string(*tag_id, &v.to_string(), file_idx);
                 }
 
@@ -287,7 +287,7 @@ impl SearchIndex {
     }
 
     /// Insert a numeric value for range queries
-    fn insert_numeric(&mut self, tag_id: u16, value: f32, file_idx: u32) {
+    fn insert_numeric(&mut self, tag_id: u16, value: f64, file_idx: u32) {
         let list = self.numeric_index.entry(tag_id).or_default();
         list.push((value, file_idx));
     }
@@ -405,46 +405,66 @@ impl SearchIndex {
         result
     }
 
-    /// Search for numeric comparison
-    pub fn search_numeric(&self, tag_id: u16, op: SearchOp, value: f32) -> RoaringBitmap {
+    pub fn search_numeric(&self, tag_id: u16, op: SearchOp, value: f64) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
+        let epsilon = 0.001; // User requested epsilon for robust equality
 
         if let Some(list) = self.numeric_index.get(&tag_id) {
-            for &(v, idx) in list {
-                let matches = match op {
-                    SearchOp::LessThan => v < value,
-                    SearchOp::LessOrEqual => v <= value,
-                    SearchOp::GreaterThan => v > value,
-                    SearchOp::GreaterOrEqual => v >= value,
-                    SearchOp::Equals => (v - value).abs() < f32::EPSILON,
-                    _ => false,
-                };
-                if matches {
-                    result.insert(idx);
+            match op {
+                SearchOp::Equals => {
+                    // Find start of potential equality range
+                    let start = list.partition_point(|&(v, _)| v < value - epsilon);
+                    for &(v, idx) in &list[start..] {
+                        if v > value + epsilon {
+                            break;
+                        }
+                        result.insert(idx);
+                    }
                 }
+                SearchOp::LessThan => {
+                    let end = list.partition_point(|&(v, _)| v < value);
+                    for &(_, idx) in &list[..end] {
+                        result.insert(idx);
+                    }
+                }
+                SearchOp::LessOrEqual => {
+                    let end = list.partition_point(|&(v, _)| v <= value + epsilon);
+                    for &(_, idx) in &list[..end] {
+                        result.insert(idx);
+                    }
+                }
+                SearchOp::GreaterThan => {
+                    let start = list.partition_point(|&(v, _)| v <= value);
+                    for &(_, idx) in &list[start..] {
+                        result.insert(idx);
+                    }
+                }
+                SearchOp::GreaterOrEqual => {
+                    let start = list.partition_point(|&(v, _)| v >= value - epsilon);
+                    for &(_, idx) in &list[start..] {
+                        result.insert(idx);
+                    }
+                }
+                _ => {}
             }
         }
-
         result
     }
 
     /// Search for numeric range (inclusive)
-    pub fn search_range(&self, tag_id: u16, min: f32, max: f32) -> RoaringBitmap {
+    pub fn search_range(&self, tag_id: u16, min: f64, max: f64) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
+        let epsilon = 0.001;
 
         if let Some(list) = self.numeric_index.get(&tag_id) {
-            // Binary search for start position
-            let start = list.partition_point(|&(v, _)| v < min);
-
-            // Iterate until we exceed max
+            let start = list.partition_point(|&(v, _)| v < min - epsilon);
             for &(v, idx) in &list[start..] {
-                if v > max {
+                if v > max + epsilon {
                     break;
                 }
                 result.insert(idx);
             }
         }
-
         result
     }
 
@@ -461,7 +481,7 @@ impl SearchIndex {
 
         match criterion.op {
             SearchOp::Equals => {
-                if let Ok(v) = criterion.value.parse::<f32>() {
+                if let Ok(v) = criterion.value.parse::<f64>() {
                     self.search_numeric(criterion.tag_id, SearchOp::Equals, v)
                 } else {
                     self.search_exact(criterion.tag_id, &criterion.value)
@@ -473,7 +493,7 @@ impl SearchIndex {
             | SearchOp::LessOrEqual
             | SearchOp::GreaterThan
             | SearchOp::GreaterOrEqual => {
-                if let Ok(v) = criterion.value.parse::<f32>() {
+                if let Ok(v) = criterion.value.parse::<f64>() {
                     self.search_numeric(criterion.tag_id, criterion.op, v)
                 } else {
                     RoaringBitmap::new()
@@ -481,7 +501,7 @@ impl SearchIndex {
             }
             SearchOp::Between => {
                 if let (Ok(min), Some(Ok(max))) =
-                    (criterion.value.parse::<f32>(), criterion.value2.as_ref().map(|v| v.parse()))
+                    (criterion.value.parse::<f64>(), criterion.value2.as_ref().map(|v| v.parse()))
                 {
                     self.search_range(criterion.tag_id, min, max)
                 } else {
@@ -711,7 +731,7 @@ pub fn parse_range_value(value: &str) -> Option<(String, String)> {
             // Check 2: Parse Max
             // Handle empty max string as Infinity for open-ended ranges like "1600-"
             let max_val = if max_str.trim().is_empty() {
-                Some(f32::MAX)
+                Some(f64::MAX)
             } else {
                 extract_number_from_string(max_str)
             };

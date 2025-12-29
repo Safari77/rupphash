@@ -1643,9 +1643,9 @@ fn check_exif_criteria_fallback(
                 // FIX: Try numeric equality first (handles "f/2.8" vs "2.8")
                 if let (Some(f_val), Ok(c_val)) = (
                     crate::search_index::extract_number_from_string(value_str),
-                    criterion.value.parse::<f32>(),
+                    criterion.value.parse::<f64>(),
                 ) {
-                    (f_val - c_val).abs() < f32::EPSILON
+                    (f_val - c_val).abs() < f64::EPSILON
                 } else {
                     value_str.eq_ignore_ascii_case(&criterion.value)
                 }
