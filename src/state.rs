@@ -49,6 +49,7 @@ pub enum InputIntent {
     NextSearchResult,
     PrevSearchResult,
     CancelSearch,
+    FindInMap,
 }
 
 #[derive(Debug, Clone)]
@@ -506,6 +507,8 @@ impl AppState {
             InputIntent::PrevSearchResult => {
                 self.jump_search(false);
             }
+            InputIntent::FindInMap => { // handled in handle_dialogs
+            }
             InputIntent::ChangeSortOrder(_) => {}
         }
     }
@@ -513,6 +516,16 @@ impl AppState {
     pub fn set_status(&mut self, msg: String, is_error: bool) {
         self.status_message = Some((msg, is_error));
         self.status_set_time = Some(std::time::Instant::now());
+    }
+
+    pub fn is_any_dialog_open(&self) -> bool {
+        self.show_confirmation
+            || self.show_move_confirmation
+            || self.show_delete_immediate_confirmation
+            || self.show_sort_selection
+            || self.error_popup.is_some()
+            || self.renaming.is_some()
+            || self.show_search
     }
 
     pub fn get_current_image_path(&self) -> Option<&PathBuf> {

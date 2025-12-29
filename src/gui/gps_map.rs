@@ -309,6 +309,50 @@ impl GpsMapState {
         Self { provider_name, provider_url, last_pos: None, move_text: None, ..Default::default() }
     }
 
+    pub fn fit_positions(&mut self, positions: &[walkers::Position]) {
+        if positions.is_empty() {
+            return;
+        }
+
+        // 1. Calculate the bounding box
+        let mut min_lat = f64::MAX;
+        let mut max_lat = f64::MIN;
+        let mut min_lon = f64::MAX;
+        let mut max_lon = f64::MIN;
+
+        for pos in positions {
+            min_lat = min_lat.min(pos.y());
+            max_lat = max_lat.max(pos.y());
+            min_lon = min_lon.min(pos.x());
+            max_lon = max_lon.max(pos.x());
+        }
+
+        // 2. Center at the middle of the box
+        let center = walkers::lat_lon((min_lat + max_lat) / 2.0, (min_lon + max_lon) / 2.0);
+        self.map_memory.center_at(center);
+
+        // 3. Heuristic for zoom level (simple version)
+        let lat_diff = (max_lat - min_lat).abs();
+        let lon_diff = (max_lon - min_lon).abs();
+        let max_diff = lat_diff.max(lon_diff);
+
+        let zoom = if max_diff < 0.001 {
+            17.0
+        } else if max_diff < 0.01 {
+            14.0
+        } else if max_diff < 0.1 {
+            11.0
+        } else if max_diff < 1.0 {
+            8.0
+        } else if max_diff < 10.0 {
+            5.0
+        } else {
+            2.0
+        };
+
+        let _ = self.map_memory.set_zoom(zoom);
+    }
+
     /// Remove a marker by path and mark the list for sorting
     pub fn remove_marker(&mut self, path: &Path) {
         if let Some(idx) = self.path_to_marker.remove(path) {

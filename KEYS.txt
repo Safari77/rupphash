@@ -29,6 +29,7 @@ Right-Click (List)   : Open context menu (Rename, Copy full path, Delete)
 
 IMAGE VIEWING & ZOOM
 ------------------------------------------------------------------------------
+A                    : Autozoom GPS Map to fit all markers into view
 W                    : Cycle View Mode (Fit Window -> Fit Width -> Fit Height)
 Z                    : Cycle Zoom Level (1:1 -> 2x -> 4x -> 8x -> Fit)
 X                    : Toggle Zoom Type (Absolute vs Relative to window)

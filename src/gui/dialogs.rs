@@ -128,6 +128,14 @@ pub(super) fn handle_input(
             }
         }
 
+        if ctx.input(|i| i.key_pressed(egui::Key::A))
+            && !app.state.is_any_dialog_open()
+            && !app.show_move_input
+            && !app.show_dir_picker
+        {
+            *intent.borrow_mut() = Some(InputIntent::FindInMap);
+        }
+
         // Handle Down/Right navigation
         if ctx
             .input(|i| i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowRight))
@@ -574,6 +582,26 @@ pub(super) fn handle_dialogs(
                     app.completion_candidates.clear();
                     app.completion_index = 0;
                     app.state.handle_input(i);
+                }
+            }
+            InputIntent::FindInMap => {
+                if let Some(group) = app.state.groups.get(app.state.current_group_idx) {
+                    let positions: Vec<_> = group
+                        .iter()
+                        .filter_map(|f| app.gps_map.get_marker_by_path(&f.path))
+                        .map(|m| m.position())
+                        .collect();
+
+                    if !positions.is_empty() {
+                        app.gps_map.visible = true;
+                        app.gps_map.fit_positions(&positions);
+                        app.set_status(
+                            format!("Map fitted to {} group markers", positions.len()),
+                            false,
+                        );
+                    } else {
+                        app.set_status("No GPS markers found in current group".to_string(), true);
+                    }
                 }
             }
             _ => app.state.handle_input(i),
