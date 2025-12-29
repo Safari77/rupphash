@@ -8,6 +8,9 @@ use crate::image_features::ImageFeatures;
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
 
+// Maximum precision in search results for numbers
+const SEARCH_VALUE_EPSILON: f64 = 0.00001;
+
 /// Extract a numeric value from a string that may contain units or prefixes.
 /// Handles:
 /// - "f/2.8" -> 2.8 (Special handling for f-stops: returns denominator)
@@ -407,7 +410,7 @@ impl SearchIndex {
 
     pub fn search_numeric(&self, tag_id: u16, op: SearchOp, value: f64) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
-        let epsilon = 0.001; // User requested epsilon for robust equality
+        let epsilon = SEARCH_VALUE_EPSILON;
 
         if let Some(list) = self.numeric_index.get(&tag_id) {
             match op {
@@ -454,7 +457,7 @@ impl SearchIndex {
     /// Search for numeric range (inclusive)
     pub fn search_range(&self, tag_id: u16, min: f64, max: f64) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
-        let epsilon = 0.001;
+        let epsilon = SEARCH_VALUE_EPSILON;
 
         if let Some(list) = self.numeric_index.get(&tag_id) {
             let start = list.partition_point(|&(v, _)| v < min - epsilon);
