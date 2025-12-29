@@ -10,6 +10,7 @@ use std::sync::mpsc::{Receiver as StdReceiver, channel};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use ttf_parser::Face;
 
 use super::gps_map::GpsMapState;
 use super::image::{GroupViewState, ViewMode};
@@ -1534,25 +1535,55 @@ impl GuiApp {
                     }
                 }
 
-                let mut configure_font = |name: &str, family: egui::FontFamily| {
-                    if let Ok(data) = fs::read(name) {
-                        fonts
-                            .font_data
-                            .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(data)));
+                let _configure_font = |path: &str, family: egui::FontFamily| {
+                    if let Ok(data) = fs::read(path) {
+                        let mut selected_index = 0;
+
+                        // Compile regex for whole-word matching (case-insensitive)
+                        let re = regex::Regex::new(r"(?i)\b(term|mono|fixed)\b").unwrap();
+
+                        if let Some(count) = ttf_parser::fonts_in_collection(&data) {
+                            for i in 0..count {
+                                if let Ok(face) = ttf_parser::Face::parse(&data, i) {
+                                    let is_monospace = face.is_monospaced();
+
+                                    if family == egui::FontFamily::Monospace {
+                                        if is_monospace {
+                                            selected_index = i;
+
+                                            let name = face
+                                                .names()
+                                                .into_iter()
+                                                .find(|n| {
+                                                    n.name_id == ttf_parser::name_id::FULL_NAME
+                                                })
+                                                .and_then(|n| n.to_string())
+                                                .unwrap_or_default();
+
+                                            // Use regex to ensure we match whole words only
+                                            if re.is_match(&name) {
+                                                break;
+                                            }
+                                        }
+                                    } else if !is_monospace {
+                                        selected_index = i;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut font_data = egui::FontData::from_owned(data);
+                        font_data.index = selected_index;
+
+                        fonts.font_data.insert(path.to_owned(), std::sync::Arc::new(font_data));
                         if let Some(vec) = fonts.families.get_mut(&family) {
-                            vec.insert(0, name.to_owned());
+                            vec.insert(0, path.to_owned());
                         } else {
-                            fonts.families.insert(family, vec![name.to_owned()]);
+                            fonts.families.insert(family, vec![path.to_owned()]);
                         }
                     }
                 };
-
-                if let Some(mono) = &gui_config.font_monospace {
-                    configure_font(mono, egui::FontFamily::Monospace);
-                }
-                if let Some(ui_font) = &gui_config.font_ui {
-                    configure_font(ui_font, egui::FontFamily::Proportional);
-                }
 
                 cc.egui_ctx.set_fonts(fonts);
                 Ok(Box::new(self))
@@ -2470,13 +2501,14 @@ impl eframe::App for GuiApp {
                                     egui::vec2(file_rect.width(), row_meta_h),
                                 );
 
-                                // --- TEXT GENERATION ---
-                                let c_label = if let Some(id) = content_id {
-                                    format!("C{} ", id)
+                                // In view mode, we don't show content subgroup labels.
+                                let c_label = if self.state.view_mode {
+                                    String::new()
+                                } else if let Some(id) = content_id {
+                                    format!("C{:<2} ", id) // e.g., "C4  "
                                 } else {
-                                    "  ".to_string()
+                                    "    ".to_string()
                                 };
-
                                 let marker_text = format!(
                                     "{} {} {} ",
                                     if is_marked { "M" } else { " " },

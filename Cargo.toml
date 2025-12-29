@@ -76,6 +76,7 @@ wgpu = "27"
 delaunator = "1.0.2"
 walkers = "0.50"
 roaring = { version = "0.11", features = ["serde"] }
+ttf-parser = "0.25"
 
 [profile.release]
 opt-level = 3
