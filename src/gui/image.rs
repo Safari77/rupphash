@@ -313,20 +313,11 @@ pub(super) fn update_file_metadata(
     content_hash: [u8; 32],
     exif_timestamp: Option<i64>,
 ) {
-    eprintln!(
-        "[DEBUG-UPDATE] update_file_metadata called: path={:?}, orientation={}, content_hash={:?}, exif_ts={:?}",
-        path.file_name().unwrap_or_default(),
-        orientation,
-        &content_hash[..4],
-        exif_timestamp,
-    );
-
     // Helper to find and update the file in the group list
     // Returns Some((unique_file_id, gps_pos, exif_timestamp, changed)) if file was found
     let update_file =
         |file: &mut crate::FileMetadata| -> Option<(u128, Option<geo::Point<f64>>, Option<i64>, bool)> {
             if file.path == path {
-                //eprintln!("[DEBUG-UPDATE]   Found file! current orientation={}, new orientation={}", file.orientation, orientation);
                 let mut changed = false;
                 if file.resolution.is_none() {
                     file.resolution = Some((w, h));
@@ -335,7 +326,6 @@ pub(super) fn update_file_metadata(
                 // Always update orientation from loader - it knows the correct value
                 // (e.g., for RAW full decode it's 1, for RAW thumbnails it's EXIF value)
                 if file.orientation != orientation {
-                    //eprintln!("[DEBUG-UPDATE]   Updated orientation {} -> {}", file.orientation, orientation);
                     file.orientation = orientation;
                     changed = true;
                 }
@@ -406,16 +396,20 @@ pub(super) fn update_file_metadata(
             ) {
                 let _ = db_tx.send(update);
                 eprintln!(
-                    "[DEBUG-UPDATE]   Sent DB update for {:?}: resolution={}x{}, orientation={}",
+                    "[DEBUG-UPDATE]   Sent DB update for {:?}: resolution={}x{}, orientation={}, exif_ts={:?}",
                     path.file_name().unwrap_or_default(),
                     w,
                     h,
-                    orientation
+                    orientation,
+                    exif_timestamp,
                 );
             }
         }
     } else {
-        eprintln!("[DEBUG-UPDATE]   FILE NOT FOUND in any group!");
+        eprintln!(
+            "[DEBUG-UPDATE]   FILE {:?} NOT FOUND in any group",
+            path.file_name().unwrap_or_default()
+        );
     }
 }
 
