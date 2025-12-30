@@ -151,6 +151,22 @@ impl Default for SearchIndex {
 }
 
 impl SearchIndex {
+    /// Remove a file from the index before updating it
+    pub fn remove(&mut self, unique_file_id: u128) {
+        if let Some(file_idx) = self.id_to_index.get(&unique_file_id).copied() {
+            // Remove from string/exact index
+            for tag_map in self.exact_index.values_mut() {
+                for bitmap in tag_map.values_mut() {
+                    bitmap.remove(file_idx);
+                }
+            }
+            for list in self.numeric_index.values_mut() {
+                list.retain(|&(_, idx)| idx != file_idx);
+            }
+            self.is_finalized = false;
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             string_table: HashMap::new(),

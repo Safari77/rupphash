@@ -1159,6 +1159,14 @@ impl GuiApp {
         // 2. Process Partial Batches (Streaming View)
         if let Some(batch_rx) = &self.scan_batch_rx.clone() {
             while let Ok(new_files) = batch_rx.try_recv() {
+                for file in &new_files {
+                    // If file already has cached features, index it immediately
+                    if file.content_hash != [0u8; 32] {
+                        if let Ok(Some(features)) = self.ctx.get_features(&file.content_hash) {
+                            self.search_index.insert(file.unique_file_id, &features);
+                        }
+                    }
+                }
                 self.ingest_gps_markers(&new_files);
                 if self.state.groups.is_empty() {
                     self.state.groups.push(Vec::new());
@@ -1811,6 +1819,14 @@ impl eframe::App for GuiApp {
             loop {
                 match rx.try_recv() {
                     Ok(result) => {
+                        if let Some(features) = &result.features {
+                            self.search_index.remove(result.unique_file_id); // Prevent dupes
+                            self.search_index.insert(result.unique_file_id, features);
+                            // Re-sort numeric indices only if search is open
+                            if self.state.show_search {
+                                self.search_index.finalize();
+                            }
+                        }
                         // O(1) lookup using file_index
                         if let Some(&file_idx) = self.file_index.get(&result.unique_file_id)
                             && let Some(group) = self.state.groups.first_mut()
