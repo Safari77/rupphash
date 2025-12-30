@@ -168,6 +168,7 @@ pub struct AppState {
     pub use_gps_utc: bool, // Solar position
     // Per-file transform state (rotation and flips)
     pub file_transforms: HashMap<PathBuf, FileTransform>,
+    pub last_title: String,
 }
 
 impl AppState {
@@ -216,6 +217,7 @@ impl AppState {
             current_search_match: 0,
             use_gps_utc: false,
             file_transforms: HashMap::new(),
+            last_title: String::new(),
         }
     }
 

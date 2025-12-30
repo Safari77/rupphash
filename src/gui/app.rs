@@ -1627,19 +1627,25 @@ impl eframe::App for GuiApp {
             }
         }
 
-        let title_text = if self.state.is_loading {
+        // 1. Determine what the title SHOULD be
+        let current_title = if self.state.is_loading {
             format!("{} | Scanning... {}/{}", APP_TITLE, self.scan_progress.0, self.scan_progress.1)
         } else {
             self.get_title_string()
         };
 
-        // Send the title to the OS (updates Alt-Tab / Taskbar name)
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title_text.clone()));
+        // 2. Only update the OS if the title actually changed
+        if self.state.last_title != current_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(current_title.clone()));
+            self.state.last_title = current_title;
+        }
+
+        // 3. Use the title string for the internal label (doesn't trigger OS events)
         if !cfg!(target_os = "windows") && !self.state.is_fullscreen {
             egui::TopBottomPanel::top("custom_title_bar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let height = 12.0;
-                    ui.label(egui::RichText::new(title_text).strong());
+                    ui.label(egui::RichText::new(&self.state.last_title).strong());
                     // --- Window Dragging Logic ---
                     let available_width = ui.available_width() - 60.0;
                     let response = ui.allocate_response(
@@ -1667,14 +1673,6 @@ impl eframe::App for GuiApp {
                 });
             });
         }
-
-        // Sync metadata title (for Alt-Tab / Taskbar)
-        let current_title = if self.state.is_loading {
-            format!("Scanning... {}/{}", self.scan_progress.0, self.scan_progress.1)
-        } else {
-            self.get_title_string()
-        };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(current_title));
 
         // Local flag to force egui to respect our manual resize this frame
         let mut force_panel_resize = false;
@@ -1768,6 +1766,7 @@ impl eframe::App for GuiApp {
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         // Scan complete - start enrichment for files missing GPS
                         self.state.is_loading = false;
+                        self.dir_scan_rx = None;
                         self.state.last_file_count =
                             self.state.groups.first().map_or(0, |g| g.len());
 
@@ -2455,13 +2454,20 @@ impl eframe::App for GuiApp {
                             current_y += header_height;
                         }
 
+                        // --- JUMP TO FIRST VISIBLE FILE ---
+                        let group_content_start_y = current_y;
+                        let group_rel_scroll_y = (clip_rect.min.y - group_content_start_y).max(0.0);
+                        let start_f_idx = (group_rel_scroll_y / file_row_total_h) as usize;
+                        // Jump the cursor to the first visible file position
+                        current_y += start_f_idx as f32 * file_row_total_h;
+
                         // Render Files
                         let counts = get_bit_identical_counts(group);
                         let hardlink_groups = get_hardlink_groups(group);
                         // Pre-calculate subgroups for this group
                         let content_subgroups = get_content_subgroups(group);
 
-                        for (f_idx, file) in group.iter().enumerate() {
+                        for (f_idx, file) in group.iter().enumerate().skip(start_f_idx) {
                             // 1. Calculate Rects
                             let file_rect = egui::Rect::from_min_size(
                                 egui::pos2(ui.min_rect().left(), current_y),
