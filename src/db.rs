@@ -403,7 +403,11 @@ impl AppContext {
             map_size, config.db_size_mb
         );
 
-        let env = Environment::new().set_map_size(map_size).set_max_dbs(10).open(&db_path)?;
+        let env = Environment::new()
+            .set_map_size(map_size)
+            .set_max_dbs(10)
+            .set_max_readers(512)
+            .open(&db_path)?;
 
         let actual_map_size = match env.info() {
             Ok(info) => info.map_size(),
