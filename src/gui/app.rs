@@ -1780,7 +1780,7 @@ impl eframe::App for GuiApp {
 
                         // Collect files needing enrichment
                         if let Some(group) = self.state.groups.first() {
-                            let files_to_enrich: Vec<_> = group
+                            let mut files_to_enrich: Vec<_> = group
                                 .iter()
                                 .filter(|f| f.content_hash == [0u8; 32])
                                 .map(|f| {
@@ -1788,6 +1788,11 @@ impl eframe::App for GuiApp {
                                 })
                                 .collect();
 
+                            let current_idx = self.state.current_file_idx;
+                            files_to_enrich.sort_by_key(|(_, uid, _, _)| {
+                                let f_idx = self.file_index.get(uid).copied().unwrap_or(0);
+                                (f_idx as i64 - current_idx as i64).abs()
+                            });
                             if !files_to_enrich.is_empty() {
                                 let (result_tx, result_rx) = unbounded::<EnrichmentResult>();
                                 scanner::spawn_background_enrichment(
@@ -1827,6 +1832,7 @@ impl eframe::App for GuiApp {
                                 self.search_index.finalize();
                             }
                         }
+
                         // O(1) lookup using file_index
                         if let Some(&file_idx) = self.file_index.get(&result.unique_file_id)
                             && let Some(group) = self.state.groups.first_mut()
