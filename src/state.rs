@@ -167,7 +167,7 @@ pub struct AppState {
     pub current_search_match: usize,
     pub use_gps_utc: bool, // Solar position
     // Per-file transform state (rotation and flips)
-    pub file_transforms: HashMap<PathBuf, FileTransform>,
+    pub file_transforms: HashMap<u128, FileTransform>,
     pub last_title: String,
 }
 
@@ -411,24 +411,32 @@ impl AppState {
             }
             InputIntent::RotateCW => {
                 // Per-file rotation
-                if let Some(path) = self.get_current_image_path().cloned() {
-                    let transform = self.file_transforms.entry(path).or_default();
+                if let Some(group) = self.groups.get(self.current_group_idx)
+                    && let Some(file) = group.get(self.current_file_idx)
+                {
+                    let transform = self.file_transforms.entry(file.unique_file_id).or_default();
                     transform.rotation = (transform.rotation + 1) % 4;
                 }
+                self.manual_rotation = (self.manual_rotation + 1) % 4;
+
                 // Also update legacy manual_rotation for compatibility
                 self.manual_rotation = (self.manual_rotation + 1) % 4;
             }
             InputIntent::FlipHorizontal => {
                 // Per-file horizontal flip (left-right)
-                if let Some(path) = self.get_current_image_path().cloned() {
-                    let transform = self.file_transforms.entry(path).or_default();
+                if let Some(group) = self.groups.get(self.current_group_idx)
+                    && let Some(file) = group.get(self.current_file_idx)
+                {
+                    let transform = self.file_transforms.entry(file.unique_file_id).or_default();
                     transform.flip_horizontal = !transform.flip_horizontal;
                 }
             }
             InputIntent::FlipVertical => {
                 // Per-file vertical flip (up-down)
-                if let Some(path) = self.get_current_image_path().cloned() {
-                    let transform = self.file_transforms.entry(path).or_default();
+                if let Some(group) = self.groups.get(self.current_group_idx)
+                    && let Some(file) = group.get(self.current_file_idx)
+                {
+                    let transform = self.file_transforms.entry(file.unique_file_id).or_default();
                     transform.flip_vertical = !transform.flip_vertical;
                 }
             }
@@ -544,16 +552,12 @@ impl AppState {
 
     /// Get the transform state for the current file (or default if none set)
     pub fn get_current_file_transform(&self) -> FileTransform {
-        self.get_current_image_path()
-            .and_then(|path| self.file_transforms.get(path))
-            .copied()
-            .unwrap_or_default()
-    }
-
-    #[allow(unused)]
-    /// Get the transform state for a specific file path (or default if none set)
-    pub fn get_file_transform(&self, path: &PathBuf) -> FileTransform {
-        self.file_transforms.get(path).copied().unwrap_or_default()
+        if let Some(group) = self.groups.get(self.current_group_idx)
+            && let Some(file) = group.get(self.current_file_idx)
+        {
+            return self.file_transforms.get(&file.unique_file_id).copied().unwrap_or_default();
+        }
+        FileTransform::default()
     }
 
     fn perform_rename(&mut self, new_name: String) {
