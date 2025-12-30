@@ -1,4 +1,7 @@
 mod exif_extract;
+mod exif_types;
+mod helper_exif;
+mod image_features;
 mod position;
 
 use clap::Parser;
