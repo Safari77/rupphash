@@ -1103,12 +1103,9 @@ pub fn scan_and_group(
             let mut pixel_hash: Option<[u8; 32]> = None; // Init
             let mut new_pixel = None; // For DB update
 
+            let mut metadata_hit = false;
             if !force_rehash && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
-                eprintln!(
-                    "Cache HIT  meta_key {:x?} for {:?}",
-                    hex::encode(meta_key),
-                    path.display()
-                );
+                metadata_hit = true;
                 ck = ch;
                 // Refresh timestamp
                 new_meta = Some((meta_key, ck));
@@ -1141,14 +1138,17 @@ pub fn scan_and_group(
                         cache_hit_full = false;
                     }
                 }
+                if cache_hit_full {
+                    eprintln!("[CACHE-FULL] {:?}", path.display());
+                } else {
+                    eprintln!("[CACHE-PARTIAL] Metadata found, but features missing for {:?}", path.display());
+                }
             }
 
             if !cache_hit_full {
-                eprintln!(
-                    "Cache MISS meta_key {:x?} for {:?}",
-                    hex::encode(meta_key),
-                    path.display()
-                );
+                if !metadata_hit {
+                    eprintln!("[CACHE-MISS] New file: {:?}", path.display());
+                }
                 let bytes = fs::read(path).ok();
 
                 if let Some(ref b) = bytes {
@@ -1358,8 +1358,7 @@ pub fn scan_and_group(
     }
 
     let hash_elapsed = hash_start.elapsed();
-    eprintln!("[DEBUG] Algorithm: PDQ hash");
-    eprintln!("[DEBUG] Hashes loaded: {} in {:.2}s", valid_files.len(), hash_elapsed.as_secs_f64());
+    eprintln!("[DEBUG] PDQ hashes loaded: {} in {:.3}s", valid_files.len(), hash_elapsed.as_secs_f64());
 
     let group_start = Instant::now();
     let (processed_groups, processed_infos, comparison_count) =
