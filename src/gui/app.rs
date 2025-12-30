@@ -2734,9 +2734,10 @@ impl eframe::App for GuiApp {
                                         "unique_file_id: {:032x}",
                                         file.unique_file_id
                                     ));
+                                    ui.label(format!("size: {} bytes", file.size));
                                     ui.label(format!(
                                         "modified: {}",
-                                        file.modified.format("%Y-%m-%d %H:%M:%S")
+                                        file.modified.format("%Y-%m-%d %H:%M:%S.%f")
                                     ));
                                     ui.label(format!(
                                         "exif_timestamp: {}",
@@ -2750,6 +2751,26 @@ impl eframe::App for GuiApp {
                                             })
                                             .unwrap_or_else(|| "None".to_string())
                                     ));
+
+                                    // Calculate and display distance to location selected in GPS map
+                                    if let Some((loc_name, loc_point)) =
+                                        self.gps_map.selected_location.as_ref()
+                                    {
+                                        if let Some(img_pos) = file.gps_pos {
+                                            // position::distance returns meters
+                                            let (dist_m, bearing) =
+                                                crate::position::distance_and_bearing(
+                                                    (img_pos.y(), img_pos.x()),
+                                                    (loc_point.y(), loc_point.x()),
+                                                );
+                                            ui.label(format!(
+                                                "distance to {}: {:.3} km, bearing: {:.3}°",
+                                                loc_name,
+                                                dist_m / 1000.0,
+                                                bearing,
+                                            ));
+                                        }
+                                    }
                                 });
 
                                 // Context Menu (Shared)
