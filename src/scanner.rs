@@ -35,7 +35,7 @@ use crate::position;
 use crate::raw_exif;
 use crate::{FileMetadata, GroupInfo, GroupStatus};
 
-pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf"];
+pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf", "kdc", "dcr", "pef", "x3f", "srf", "3fr"];
 
 const JP2_MAX_PIXELS: u64 = 268_435_456;
 
