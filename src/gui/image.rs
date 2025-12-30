@@ -157,13 +157,7 @@ fn maybe_resize_image(
         let new_h = (h as f32 * scale).round() as usize;
 
         // Convert egui::ColorImage -> fast_image_resize::Image
-        // egui uses RGBA or RGB. standard load above is RGBA (4 bytes).
-        // RAW load above is RGB (3 bytes). We must handle both.
-        let pixel_type = if color_image.pixels.len() * 4 == color_image.as_raw().len() {
-            PixelType::U8x4 // Standard/Thumbnail (RGBA)
-        } else {
-            PixelType::U8x3 // Raw Decode (RGB)
-        };
+        let pixel_type = PixelType::U8x4;
 
         if let Ok(src_image) =
             FastImage::from_vec_u8(w as u32, h as u32, color_image.as_raw().to_vec(), pixel_type)
@@ -177,19 +171,8 @@ fn maybe_resize_image(
                     path, w, h, new_w, new_h
                 );
                 // Convert back to egui
-                match pixel_type {
-                    PixelType::U8x4 => {
-                        color_image = egui::ColorImage::from_rgba_unmultiplied(
-                            [new_w, new_h],
-                            dst_image.buffer(),
-                        );
-                    }
-                    PixelType::U8x3 => {
-                        color_image =
-                            egui::ColorImage::from_rgb([new_w, new_h], dst_image.buffer());
-                    }
-                    _ => {}
-                }
+                color_image =
+                    egui::ColorImage::from_rgba_unmultiplied([new_w, new_h], dst_image.buffer());
             }
         }
     }
@@ -227,18 +210,23 @@ fn load_and_process_image_from_bytes(
 
         let w = processed.width() as usize;
         let h = processed.height() as usize;
-
-        if processed.len() != w * h * 3 {
+        let total_pixels = w * h;
+        // Determine channels dynamically
+        let img = if processed.len() == total_pixels {
+            // Monochrome: 1 byte per pixel
+            egui::ColorImage::from_gray([w, h], &processed)
+        } else if processed.len() == total_pixels * 3 {
+            // RGB: 3 bytes per pixel
+            egui::ColorImage::from_rgb([w, h], &processed)
+        } else {
             return Err(format!(
-                "RAW size mismatch: expected {}x{}x3={}, got {}",
-                w,
-                h,
-                w * h * 3,
+                "RAW size mismatch: expected {} (Mono) or {} (RGB) bytes, got {}",
+                total_pixels,
+                total_pixels * 3,
                 processed.len()
             ));
-        }
+        };
 
-        let img = egui::ColorImage::from_rgb([w, h], &processed);
         // rsraw handles rotation, orientation=1
         return Ok(maybe_resize_image(img, dims, 1, path));
     }
@@ -696,14 +684,24 @@ fn compute_histogram_from_raw(path: &Path) -> Option<[u32; 256]> {
         raw.set_use_camera_wb(true);
         if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
             let mut hist = [0u32; 256];
-            // RGB data - convert to greyscale using luminance formula
-            // Y = 0.299*R + 0.587*G + 0.114*B
-            for chunk in processed.chunks_exact(3) {
-                let r = chunk[0] as u32;
-                let g = chunk[1] as u32;
-                let b = chunk[2] as u32;
-                let grey = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
-                hist[grey as usize] += 1;
+            let w = raw.width() as usize;
+            let h = raw.height() as usize;
+
+            if processed.len() == w * h {
+                // Monochrome: Direct count
+                for &pixel in processed.iter() {
+                    hist[pixel as usize] += 1;
+                }
+            } else if processed.len() == w * h * 3 {
+                // RGB: Convert to luminance
+                for chunk in processed.chunks_exact(3) {
+                    let r = chunk[0] as u32;
+                    let g = chunk[1] as u32;
+                    let b = chunk[2] as u32;
+                    // Y = 0.299*R + 0.587*G + 0.114*B
+                    let grey = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
+                    hist[grey as usize] += 1;
+                }
             }
             return Some(hist);
         }
