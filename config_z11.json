@@ -1,0 +1,15 @@
+{
+  "options": {
+    "paths": {
+      "root": "/data",
+      "fonts": "fonts",
+      "sprites": "sprites"
+    }
+  },
+  "styles": {
+    "map": { "style": "style_z11.json" }
+  },
+  "data": {
+    "protomaps": { "pmtiles": "world_z11.pmtiles" }
+  }
+}

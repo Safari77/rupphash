@@ -29,9 +29,34 @@ If you have `/mydata/tiles/finland.mbtiles` generated with
 `java -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=3128 -Xmx4g -jar planetiler.jar --download --area=finland --output=finland.mbtiles`:
 
 ```bash
-podman run --rm -it -p 17766:17766 -v "/mydata/tiles:/data:z" maptiler/tileserver-gl --verbose -b 0.0.0.0 -p 17766 --mbtiles /data/finland.mbtiles
+podman run --rm -it --log-driver k8s-file -p 17766:17766 -v "/mydata/tiles:/data:z" maptiler/tileserver-gl -b 0.0.0.0 -p 17766 --file /data/finland.mbtiles
 ```
 Open http://127.0.0.1:17766/ to view supported styles.
+
+You can also use pmtiles: install go-pmtiles from `https://github.com/protomaps/go-pmtiles` and then command
+```bash
+go-pmtiles extract https://build.protomaps.com/$(date --utc "+%Y%m%d" -d yesterday).pmtiles world_z11.pmtiles --maxzoom=11
+```
+makes a 7 GiB world "overview" file with maxzoom 11. Every zoom level you add doubles the data.
+
+tileserver-gl needs configuration to make it serve raster maps.
+```bash
+cd /data
+rm -rf fonts sprites tmp && mkdir tmp && cd tmp && \
+  rget https://github.com/protomaps/basemaps-assets/archive/refs/heads/main.tar.gz && \
+  tar xf basemaps-assets-main.tar.gz && \
+  mv basemaps-assets-main/{fonts,sprites} .. && \
+  cd .. && rm -rf tmp
+```
+Serve the data:
+```podman run --rm -it --log-driver k8s-file -p 17766:17766 -v "/mydata/tiles:/data:z" maptiler/tileserver-gl -b 0.0.0.0 --verbose -p 17766 --config /data/config_z11.json```
+`phdupes.conf`:
+```
+[map_providers]
+tileserver = "http://127.0.0.1:17766/styles/map/{z}/{x}/{y}@2x.png"
+```
+
+example style_z11.json and config_z11.json are provided for offline serving.
 
 ## The fonts
 To get the latest
