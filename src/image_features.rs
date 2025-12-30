@@ -53,14 +53,14 @@ impl ImageFeatures {
     /// Get GPS position from tags if both lat/lon are present
     pub fn gps_pos(&self) -> Option<Point<f64>> {
         let lat = self.tags.get(&TAG_GPS_LATITUDE).and_then(|v| match v {
-            ExifValue::Float(f) => Some(*f as f64),
-            ExifValue::Floats(f) if !f.is_empty() => Some(f[0] as f64),
+            ExifValue::Float(f) => Some(*f),
+            ExifValue::Floats(f) if !f.is_empty() => Some(f[0]),
             _ => None,
         })?;
 
         let lon = self.tags.get(&TAG_GPS_LONGITUDE).and_then(|v| match v {
-            ExifValue::Float(f) => Some(*f as f64),
-            ExifValue::Floats(f) if !f.is_empty() => Some(f[0] as f64),
+            ExifValue::Float(f) => Some(*f),
+            ExifValue::Floats(f) if !f.is_empty() => Some(f[0]),
             _ => None,
         })?;
 

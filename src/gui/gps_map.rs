@@ -57,7 +57,7 @@ fn dist_sq_approx(p1: (f64, f64), p2: (f64, f64)) -> f64 {
 
 /// Greedy Nearest Neighbor Sort (O(N^2))
 /// Best for visual paths (circles, routes) on datasets < 2000 items.
-pub fn sort_nearest_neighbor(markers: &mut Vec<GpsMarker>) {
+pub fn sort_nearest_neighbor(markers: &mut [GpsMarker]) {
     let len = markers.len();
     if len < 2 {
         return;
@@ -88,7 +88,7 @@ pub fn sort_nearest_neighbor(markers: &mut Vec<GpsMarker>) {
 
 /// Improves a path by uncrossing lines (2-Opt Algorithm).
 /// This fixes the "stranding" issue where the greedy sort leaves a long jump at the end.
-fn optimize_2opt(markers: &mut Vec<GpsMarker>) {
+fn optimize_2opt(markers: &mut [GpsMarker]) {
     let len = markers.len();
     if len < 4 {
         return;
@@ -159,7 +159,7 @@ fn part1by1_scalar(mut n: u32) -> u64 {
 
 /// Sorts markers spatially using a Z-Order curve.
 /// Includes logic to handle International Date Line wrapping.
-pub fn sort_by_hilbert_curve(markers: &mut Vec<GpsMarker>) {
+pub fn sort_by_hilbert_curve(markers: &mut [GpsMarker]) {
     if markers.len() < 2 {
         return;
     }
@@ -700,10 +700,10 @@ impl Plugin for GpsMarkersPlugin {
             );
 
             // Tooltip Detection
-            if let Some(h_pos) = hover_pos {
-                if screen_pos.distance(h_pos) < *radius + 2.0 {
-                    hovered_marker = Some((*pos, name.clone()));
-                }
+            if let Some(h_pos) = hover_pos
+                && screen_pos.distance(h_pos) < *radius + 2.0
+            {
+                hovered_marker = Some((*pos, name.clone()));
             }
 
             // Magnetic Selection

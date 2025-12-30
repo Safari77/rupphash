@@ -132,7 +132,7 @@ fn dms_to_decimal(dms: &[f32; 3]) -> f64 {
 
     // Handle negative degrees (southern/western hemispheres)
     let sign = if degrees < 0.0 { -1.0 } else { 1.0 };
-    let abs_degrees = degrees.abs() as f64;
+    let abs_degrees = degrees.abs();
 
     sign * (abs_degrees + minutes / 60.0 + seconds / 3600.0)
 }
@@ -140,7 +140,7 @@ fn dms_to_decimal(dms: &[f32; 3]) -> f64 {
 /// Public version of dms_to_decimal for use by scanner.rs get_exif_tags_from_rsraw()
 #[inline]
 pub fn dms_to_decimal_pub(dms: &[f32; 3]) -> f64 {
-    dms_to_decimal(dms) as f64
+    dms_to_decimal(dms)
 }
 
 /// Get GPS position as geo::Point from an rsraw RawImage.
@@ -149,8 +149,8 @@ pub fn dms_to_decimal_pub(dms: &[f32; 3]) -> f64 {
 /// Thread Safety: Only reads from RawImage.
 pub fn get_gps_point_from_raw(raw: &RawImage) -> Option<Point<f64>> {
     let info = raw.full_info();
-    let lat = dms_to_decimal(&info.gps.latitude) as f64;
-    let lon = dms_to_decimal(&info.gps.longitude) as f64;
+    let lat = dms_to_decimal(&info.gps.latitude);
+    let lon = dms_to_decimal(&info.gps.longitude);
 
     // Check if we have valid GPS coordinates
     if lat.abs() > 0.0001 || lon.abs() > 0.0001 {
@@ -252,11 +252,10 @@ pub fn merge_raw_info_into_features(features: &mut ImageFeatures, raw: &RawImage
     }
 
     // Timestamp
-    if !features.has_tag(TAG_DERIVED_TIMESTAMP) {
-        if let Some(ref dt) = info.datetime {
+    if !features.has_tag(TAG_DERIVED_TIMESTAMP)
+        && let Some(ref dt) = info.datetime {
             features.insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(dt.timestamp()));
         }
-    }
 }
 
 #[cfg(test)]

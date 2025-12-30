@@ -396,13 +396,11 @@ pub fn build_image_features(
     }
 
     // Ensure orientation is stored
-    if !features.has_tag(TAG_ORIENTATION) {
-        if let Some(field) = exif_data.get_field(Tag::Orientation, In::PRIMARY) {
-            if let Some(v @ 1..=8) = field.value.get_uint(0) {
+    if !features.has_tag(TAG_ORIENTATION)
+        && let Some(field) = exif_data.get_field(Tag::Orientation, In::PRIMARY)
+            && let Some(v @ 1..=8) = field.value.get_uint(0) {
                 features.insert_tag(TAG_ORIENTATION, ExifValue::Short(v as u16));
             }
-        }
-    }
 
     features
 }
@@ -459,11 +457,10 @@ pub fn derive_subdivision(lat: f64, lon: f64) -> Option<String> {
 
     for id in ids {
         let id_str = id.to_string();
-        if id_str.len() > 2 {
-            if let Ok(subdiv) = SubdivisionCode::from_str(&id_str) {
+        if id_str.len() > 2
+            && let Ok(subdiv) = SubdivisionCode::from_str(&id_str) {
                 return Some(subdiv.name().to_string());
             }
-        }
     }
     None
 }

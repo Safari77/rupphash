@@ -60,7 +60,6 @@ pub(super) fn spawn_image_loader_pool(
     for _ in 0..num_threads {
         let rx_clone = rx.clone();
         let tx_clone = result_tx.clone();
-        let content_key = content_key; // Copy for each thread
 
         thread::spawn(move || {
             while let Ok(path) = rx_clone.recv() {

@@ -10,13 +10,9 @@ use std::sync::mpsc::{Receiver as StdReceiver, channel};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use ttf_parser::Face;
 
 use super::gps_map::GpsMapState;
 use super::image::{GroupViewState, ViewMode};
-
-use crate::exif_extract::{extract_gps_lat_lon, get_exif_timestamp};
-use crate::image_features::ImageFeatures;
 
 use crate::GroupStatus;
 use crate::db::{AppContext, EnrichmentResult};
@@ -231,12 +227,11 @@ impl GuiApp {
         }
 
         // 4. Restore selection index
-        if let Some(path) = current_path {
-            if let Some(group) = self.state.groups.get(self.state.current_group_idx) {
-                if let Some(new_idx) = group.iter().position(|f| f.path == path) {
-                    self.state.current_file_idx = new_idx;
-                }
-            }
+        if let Some(path) = current_path
+            && let Some(group) = self.state.groups.get(self.state.current_group_idx)
+            && let Some(new_idx) = group.iter().position(|f| f.path == path)
+        {
+            self.state.current_file_idx = new_idx;
         }
 
         self.cache_dirty = true;
@@ -1161,10 +1156,10 @@ impl GuiApp {
             while let Ok(new_files) = batch_rx.try_recv() {
                 for file in &new_files {
                     // If file already has cached features, index it immediately
-                    if file.content_hash != [0u8; 32] {
-                        if let Ok(Some(features)) = self.ctx.get_features(&file.content_hash) {
-                            self.search_index.insert(file.unique_file_id, &features);
-                        }
+                    if file.content_hash != [0u8; 32]
+                        && let Ok(Some(features)) = self.ctx.get_features(&file.content_hash)
+                    {
+                        self.search_index.insert(file.unique_file_id, &features);
                     }
                 }
                 self.ingest_gps_markers(&new_files);
@@ -1252,19 +1247,19 @@ impl GuiApp {
 
             // Only replace if we have results (duplicate mode) or finished view mode
             self.state.groups = new_groups;
-            if let Some(ref sort) = self.view_mode_sort {
-                if sort == "location" {
-                    self.apply_location_sort();
-                }
+            if let Some(ref sort) = self.view_mode_sort
+                && sort == "location"
+            {
+                self.apply_location_sort();
             }
             self.cache_dirty = true;
             self.state.group_infos = new_infos;
             self.subdirs = new_subdirs;
-            if let Some(ref sort) = self.view_mode_sort {
-                if sort == "location" {
-                    // We must ingest markers first (already done by self.ingest_gps_markers)
-                    self.apply_location_sort();
-                }
+            if let Some(ref sort) = self.view_mode_sort
+                && sort == "location"
+            {
+                // We must ingest markers first (already done by self.ingest_gps_markers)
+                self.apply_location_sort();
             }
             self.refresh_dir_cache(false);
             self.state.last_file_count = self.state.groups.iter().map(|g| g.len()).sum();
@@ -1508,8 +1503,6 @@ impl GuiApp {
                 .with_resizable(true),
             ..Default::default()
         };
-
-        let gui_config = self.ctx.gui_config.clone();
 
         eframe::run_native(
             "phdupes",
@@ -2053,9 +2046,6 @@ impl eframe::App for GuiApp {
                 .input(|i| i.viewport().inner_rect.or(i.viewport().outer_rect).map(|r| r.width()))
                 .unwrap_or_else(|| ctx.used_rect().width());
             let panel_max_width = window_width * 0.5;
-
-            // Delay panel width restoration until after font_scale is applied
-            let ppp = ctx.pixels_per_point();
 
             // Check for >100 to prevent clamping to 0.0 on the first frame if viewport isn't ready.
             let window_ready = window_width > 100.0;
@@ -2755,21 +2745,20 @@ impl eframe::App for GuiApp {
                                     // Calculate and display distance to location selected in GPS map
                                     if let Some((loc_name, loc_point)) =
                                         self.gps_map.selected_location.as_ref()
+                                        && let Some(img_pos) = file.gps_pos
                                     {
-                                        if let Some(img_pos) = file.gps_pos {
-                                            // position::distance returns meters
-                                            let (dist_m, bearing) =
-                                                crate::position::distance_and_bearing(
-                                                    (img_pos.y(), img_pos.x()),
-                                                    (loc_point.y(), loc_point.x()),
-                                                );
-                                            ui.label(format!(
-                                                "distance to {}: {:.3} km, bearing: {:.3}°",
-                                                loc_name,
-                                                dist_m / 1000.0,
-                                                bearing,
-                                            ));
-                                        }
+                                        // position::distance returns meters
+                                        let (dist_m, bearing) =
+                                            crate::position::distance_and_bearing(
+                                                (img_pos.y(), img_pos.x()),
+                                                (loc_point.y(), loc_point.x()),
+                                            );
+                                        ui.label(format!(
+                                            "distance to {}: {:.3} km, bearing: {:.3}°",
+                                            loc_name,
+                                            dist_m / 1000.0,
+                                            bearing,
+                                        ));
                                     }
                                 });
 

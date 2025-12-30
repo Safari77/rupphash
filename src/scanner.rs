@@ -23,7 +23,7 @@ use crate::db::{
 };
 use crate::exif_extract::extract_gps_lat_lon;
 use crate::exif_types::{
-    ExifValue, TAG_DERIVED_COUNTRY, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE,
+    ExifValue, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE,
     TAG_ORIENTATION,
 };
 use crate::fileops;
@@ -111,13 +111,11 @@ pub fn get_exif_tags(
     }
 
     // kamadak-exif failed - try rsraw for RAW files
-    if is_raw {
-        if let Ok(data) = std::fs::read(path) {
-            if let Ok(raw) = rsraw::RawImage::open(&data) {
+    if is_raw
+        && let Ok(data) = std::fs::read(path)
+            && let Ok(raw) = rsraw::RawImage::open(&data) {
                 return get_exif_tags_from_rsraw(&raw, tag_names, decimal_coords);
             }
-        }
-    }
 
     Vec::new()
 }
@@ -260,11 +258,7 @@ fn get_exif_tags_from_rsraw(
                 }
             }
             "datetime" | "datetimeoriginal" => {
-                if let Some(ref dt) = info.datetime {
-                    Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                } else {
-                    None
-                }
+                info.datetime.as_ref().map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             }
             "gpslatitude" => {
                 let lat = raw_exif::dms_to_decimal_pub(&info.gps.latitude);
@@ -272,7 +266,7 @@ fn get_exif_tags_from_rsraw(
                     if decimal_coords {
                         Some(format!("{:.6}°", lat))
                     } else {
-                        Some(format_dms_from_decimal(lat as f64))
+                        Some(format_dms_from_decimal(lat))
                     }
                 } else {
                     None
@@ -284,7 +278,7 @@ fn get_exif_tags_from_rsraw(
                     if decimal_coords {
                         Some(format!("{:.6}°", lon))
                     } else {
-                        Some(format_dms_from_decimal(lon as f64))
+                        Some(format_dms_from_decimal(lon))
                     }
                 } else {
                     None
@@ -298,8 +292,8 @@ fn get_exif_tags_from_rsraw(
                 }
             }
             "derivedcountry" | "country" => {
-                let lat = raw_exif::dms_to_decimal_pub(&info.gps.latitude) as f64;
-                let lon = raw_exif::dms_to_decimal_pub(&info.gps.longitude) as f64;
+                let lat = raw_exif::dms_to_decimal_pub(&info.gps.latitude);
+                let lon = raw_exif::dms_to_decimal_pub(&info.gps.longitude);
                 if lat.abs() > 0.0001 || lon.abs() > 0.0001 {
                     derive_country(lat, lon)
                 } else {
@@ -1871,7 +1865,7 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
             let mut rng = rand::rng();
             files.shuffle(&mut rng);
         }
-        "location" => return, // Sorting logic is performed in the GUI layer using GPS state
+        "location" => (), // Sorting logic is performed in the GUI layer using GPS state
         _ => {
             // Default fallback (Name Natural)
             files.sort_by_cached_key(|f| {
@@ -2393,11 +2387,10 @@ pub fn spawn_background_enrichment(
 
                 // If we have kamadak-exif data and this is a RAW file, also merge rsraw data
                 // (rsraw might have data that kamadak-exif missed, like lens info)
-                if exif_data.is_some() && is_raw {
-                    if let Ok(raw) = rsraw::RawImage::open(&data) {
+                if exif_data.is_some() && is_raw
+                    && let Ok(raw) = rsraw::RawImage::open(&data) {
                         raw_exif::merge_raw_info_into_features(&mut features, &raw);
                     }
-                }
                 
                 if false {
                     eprintln!("[DEBUG-ENRICH]   Final features for '{}': tag_count={}, has_make={}, has_model={}, has_iso={}",
@@ -2428,15 +2421,14 @@ pub fn spawn_background_enrichment(
                     );
 
                     // Fallback: If build_image_features didn't derive country (or if we had no EXIF object), try manually
-                    if !features.has_tag(crate::exif_types::TAG_DERIVED_COUNTRY) {
-                        if let Some(country) = crate::exif_extract::derive_country(pos.y(), pos.x())
+                    if !features.has_tag(crate::exif_types::TAG_DERIVED_COUNTRY)
+                        && let Some(country) = crate::exif_extract::derive_country(pos.y(), pos.x())
                         {
                             features.insert_tag(
                                 crate::exif_types::TAG_DERIVED_COUNTRY,
                                 crate::exif_types::ExifValue::String(country),
                             );
                         }
-                    }
                 }
 
                 // Ensure derived timestamp is indexed (critical for range search)
@@ -2449,8 +2441,8 @@ pub fn spawn_background_enrichment(
 
                 // --- 2. SEND TO DATABASE ---
                 // We clone 'features' because the DB update takes ownership
-                if let Some(ref tx) = db_tx {
-                    if let Some(update) = create_feature_update(
+                if let Some(ref tx) = db_tx
+                    && let Some(update) = create_feature_update(
                         &meta_key_secret,
                         path,
                         *unique_file_id,
@@ -2459,7 +2451,6 @@ pub fn spawn_background_enrichment(
                     ) {
                         let _ = tx.send(update);
                     }
-                }
 
                 // --- 3. SEND TO GUI ---
                 // We pass 'features' directly. The GUI uses this to update the search index immediately.

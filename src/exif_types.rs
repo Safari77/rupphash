@@ -4,7 +4,6 @@
 // All EXIF tags are stored as big-endian u16 IDs with corresponding ExifValue.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 /// Maximum size for binary EXIF values (exclude thumbnails and large blobs)
 pub const MAX_TAG_SIZE: usize = 1024;

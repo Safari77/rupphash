@@ -398,10 +398,10 @@ pub(super) fn handle_input(
                 app.gps_map.move_text = None;
 
                 // (Existing auto-center logic...)
-                if app.gps_map.selected_location.is_none() {
-                    if let Some((name, point)) = app.ctx.locations.iter().next() {
-                        app.gps_map.selected_location = Some((name.clone(), *point));
-                    }
+                if app.gps_map.selected_location.is_none()
+                    && let Some((name, point)) = app.ctx.locations.iter().next()
+                {
+                    app.gps_map.selected_location = Some((name.clone(), *point));
                 }
 
                 // Set initial center on current image if it has GPS
@@ -487,10 +487,8 @@ pub(super) fn handle_input(
             }
         }
         // Sort selection is available in all view modes
-        if app.state.view_mode {
-            if ctx.input(|i| i.key_pressed(egui::Key::T)) {
-                *intent.borrow_mut() = Some(InputIntent::ShowSortSelection);
-            }
+        if app.state.view_mode && ctx.input(|i| i.key_pressed(egui::Key::T)) {
+            *intent.borrow_mut() = Some(InputIntent::ShowSortSelection);
         }
 
         let window_width =
@@ -1351,7 +1349,7 @@ fn perform_advanced_search(app: &mut GuiApp) {
                 let range_str = parts[2];
 
                 if let Some(loc_opt) = app.ctx.locations.get(location_name) {
-                    let target: geo::Point<f64> = loc_opt.clone().into();
+                    let target: geo::Point<f64> = *loc_opt;
                     if !parse_and_add_geo_filter(&mut geo_filters, target, range_str) {
                         search_errors
                             .push(format!("Invalid range '{}' in term '{}'", range_str, term));
@@ -1381,10 +1379,10 @@ fn perform_advanced_search(app: &mut GuiApp) {
 
             match (lon_str.parse::<f64>(), lat_str.parse::<f64>()) {
                 (Ok(lon), Ok(lat)) => {
-                    if lat < -90.0 || lat > 90.0 {
+                    if !(-90.0..=90.0).contains(&lat) {
                         search_errors
                             .push(format!("Invalid Latitude {}. Must be between -90 and 90.", lat));
-                    } else if lon < -180.0 || lon > 180.0 {
+                    } else if !(-180.0..=180.0).contains(&lon) {
                         search_errors.push(format!(
                             "Invalid Longitude {}. Must be between -180 and 180.",
                             lon
@@ -1558,11 +1556,7 @@ fn parse_and_add_geo_filter(
         geo_filters.push(GeoDistanceFilter { target_point: target, min_km, max_km });
         true
     } else if let Some(val) = crate::search_index::extract_number_from_string(range_str) {
-        geo_filters.push(GeoDistanceFilter {
-            target_point: target,
-            min_km: 0.0,
-            max_km: val as f64,
-        });
+        geo_filters.push(GeoDistanceFilter { target_point: target, min_km: 0.0, max_km: val });
         true
     } else {
         false
@@ -1658,7 +1652,7 @@ fn check_exif_criteria_fallback(
             | SearchOp::GreaterThan
             | SearchOp::GreaterOrEqual => {
                 if let (Some(file_val), Ok(crit_val)) = (
-                    crate::search_index::extract_number_from_string(value_str).map(|v| v as f64),
+                    crate::search_index::extract_number_from_string(value_str),
                     criterion.value.parse::<f64>(),
                 ) {
                     let eps = f64::EPSILON;
@@ -1683,7 +1677,7 @@ fn check_exif_criteria_fallback(
             }
             SearchOp::Between => {
                 if let (Some(file_val), Ok(min_val), Some(max_str)) = (
-                    crate::search_index::extract_number_from_string(value_str).map(|v| v as f64),
+                    crate::search_index::extract_number_from_string(value_str),
                     criterion.value.parse::<f64>(),
                     &criterion.value2,
                 ) {

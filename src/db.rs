@@ -1,4 +1,3 @@
-use crate::exif_types::ExifValue;
 use crate::image_features::ImageFeatures;
 use crate::scanner::RAW_EXTS;
 use chacha20poly1305::{
