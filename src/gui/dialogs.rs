@@ -1348,8 +1348,7 @@ fn perform_advanced_search(app: &mut GuiApp) {
                 let location_name = parts[1];
                 let range_str = parts[2];
 
-                if let Some(loc_opt) = app.ctx.locations.get(location_name) {
-                    let target: geo::Point<f64> = *loc_opt;
+                if let Some(target) = app.get_point(location_name) {
                     if !parse_and_add_geo_filter(&mut geo_filters, target, range_str) {
                         search_errors
                             .push(format!("Invalid range '{}' in term '{}'", range_str, term));

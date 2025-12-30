@@ -136,13 +136,6 @@ struct Config {
     pub selected_provider: Option<String>,
 }
 
-impl Config {
-    /// Retrieve a location by name as a geo::Point
-    pub fn get_point(&self, name: &str) -> Option<Point<f64>> {
-        self.locations.get(name).cloned().map(Into::into)
-    }
-}
-
 fn default_db_size_mb() -> u32 {
     DEFAULT_DB_SIZE_MB
 }
@@ -1006,6 +999,7 @@ impl AppContext {
 
     /// Iterate all features in the database for building search index.
     /// Calls the provided callback for each (content_hash, ImageFeatures) pair.
+    #[allow(dead_code)]
     pub fn iterate_all_features<F>(&self, mut callback: F) -> Result<usize, lmdb::Error>
     where
         F: FnMut(&[u8; 32], &ImageFeatures),

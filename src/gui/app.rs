@@ -1,5 +1,6 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
+use geo::Point;
 use jiff::Timestamp;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
 use std::cell::RefCell;
@@ -236,6 +237,10 @@ impl GuiApp {
 
         self.cache_dirty = true;
         self.state.selection_changed = true;
+    }
+
+    pub fn get_point(&self, name: &str) -> Option<Point<f64>> {
+        self.ctx.locations.get(name).cloned().map(Into::into)
     }
 
     pub fn build_search_index(&mut self) {

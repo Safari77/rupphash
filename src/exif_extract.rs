@@ -398,9 +398,10 @@ pub fn build_image_features(
     // Ensure orientation is stored
     if !features.has_tag(TAG_ORIENTATION)
         && let Some(field) = exif_data.get_field(Tag::Orientation, In::PRIMARY)
-            && let Some(v @ 1..=8) = field.value.get_uint(0) {
-                features.insert_tag(TAG_ORIENTATION, ExifValue::Short(v as u16));
-            }
+        && let Some(v @ 1..=8) = field.value.get_uint(0)
+    {
+        features.insert_tag(TAG_ORIENTATION, ExifValue::Short(v as u16));
+    }
 
     features
 }
@@ -458,9 +459,10 @@ pub fn derive_subdivision(lat: f64, lon: f64) -> Option<String> {
     for id in ids {
         let id_str = id.to_string();
         if id_str.len() > 2
-            && let Ok(subdiv) = SubdivisionCode::from_str(&id_str) {
-                return Some(subdiv.name().to_string());
-            }
+            && let Ok(subdiv) = SubdivisionCode::from_str(&id_str)
+        {
+            return Some(subdiv.name().to_string());
+        }
     }
     None
 }
@@ -502,82 +504,8 @@ fn derive_sun_position(
 // Display Formatting
 // =============================================================================
 
-/// Format an EXIF value for display (special formatting for certain tags)
-pub fn format_exif_value_for_display(
-    tag_id: u16,
-    value: &ExifValue,
-    decimal_coords: bool,
-) -> String {
-    use crate::exif_types::*;
-
-    match tag_id {
-        TAG_GPS_LATITUDE | TAG_GPS_LONGITUDE => {
-            if let Some(deg) = value.as_f32() {
-                if decimal_coords { format!("{:.6}°", deg) } else { format_dms(deg as f64) }
-            } else {
-                value.as_string()
-            }
-        }
-        TAG_EXPOSURE_TIME => {
-            if let ExifValue::Float(v) = value {
-                if *v >= 1.0 {
-                    format!("{:.1}s", v)
-                } else if *v > 0.0 {
-                    format!("1/{:.0}s", 1.0 / v)
-                } else {
-                    value.as_string()
-                }
-            } else {
-                value.as_string()
-            }
-        }
-        TAG_FNUMBER => {
-            if let Some(f) = value.as_f32() {
-                format!("f/{:.1}", f)
-            } else {
-                value.as_string()
-            }
-        }
-        TAG_FOCAL_LENGTH | TAG_FOCAL_LENGTH_35MM => {
-            if let Some(f) = value.as_f32() {
-                format!("{:.0}mm", f)
-            } else {
-                value.as_string()
-            }
-        }
-        TAG_ISO => {
-            if let Some(iso) = value.as_i64() {
-                format!("ISO {}", iso)
-            } else {
-                value.as_string()
-            }
-        }
-        TAG_EXPOSURE_BIAS => {
-            if let Some(ev) = value.as_f32() {
-                if ev >= 0.0 { format!("+{:.1} EV", ev) } else { format!("{:.1} EV", ev) }
-            } else {
-                value.as_string()
-            }
-        }
-        TAG_DERIVED_SUN_AZIMUTH | TAG_DERIVED_SUN_ALTITUDE => {
-            if let Some(deg) = value.as_f32() {
-                format!("{:.1}°", deg)
-            } else {
-                value.as_string()
-            }
-        }
-        TAG_GPS_ALTITUDE => {
-            if let Some(alt) = value.as_f32() {
-                format!("{:.1}m", alt)
-            } else {
-                value.as_string()
-            }
-        }
-        _ => value.as_string(),
-    }
-}
-
 /// Format decimal degrees as DMS string
+#[allow(dead_code)]
 fn format_dms(decimal_deg: f64) -> String {
     let abs_deg = decimal_deg.abs();
     let d = abs_deg.floor() as i32;

@@ -968,6 +968,7 @@ pub struct ScanConfig {
     pub similarity: u32,
     pub group_by: String,
     pub extensions: Vec<String>,
+    #[allow(unused)]
     pub ignore_same_stem: bool,
     pub calc_pixel_hash: bool,
 }

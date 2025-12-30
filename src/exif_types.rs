@@ -35,31 +35,6 @@ pub enum ExifValue {
 }
 
 impl ExifValue {
-    /// Get value as f32 if possible
-    pub fn as_f32(&self) -> Option<f32> {
-        match self {
-            ExifValue::Byte(v) => Some(*v as f32),
-            ExifValue::Short(v) => Some(*v as f32),
-            ExifValue::Long(v) => Some(*v as f32),
-            ExifValue::Signed(v) => Some(*v as f32),
-            ExifValue::Long64(v) => Some(*v as f32),
-            ExifValue::Float(v) => Some(*v as f32),
-            _ => None,
-        }
-    }
-
-    /// Get value as i64 if possible (for integer comparisons)
-    pub fn as_i64(&self) -> Option<i64> {
-        match self {
-            ExifValue::Byte(v) => Some(*v as i64),
-            ExifValue::Short(v) => Some(*v as i64),
-            ExifValue::Long(v) => Some(*v as i64),
-            ExifValue::Signed(v) => Some(*v as i64),
-            ExifValue::Long64(v) => Some(*v),
-            _ => None,
-        }
-    }
-
     /// Get value as string for display/search
     pub fn as_string(&self) -> String {
         match self {
@@ -76,12 +51,6 @@ impl ExifValue {
             }
             ExifValue::String(s) => s.clone(),
         }
-    }
-
-    /// Compute hash for exact matching in search index
-    pub fn hash_key(&self) -> u64 {
-        let hash = blake3::hash(self.as_string().to_lowercase().as_bytes());
-        u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
     }
 }
 
@@ -313,14 +282,4 @@ pub fn get_searchable_tags() -> Vec<(u16, &'static str, &'static str, bool)> {
         (TAG_DERIVED_SUN_ALTITUDE, "SunAltitude", "Sun altitude angle (degrees)", true),
         (TAG_DERIVED_TIMESTAMP, "Timestamp", "EXIF timestamp (Unix epoch)", true),
     ]
-}
-
-/// Check if a tag is a derived/computed value
-pub fn is_derived_tag(tag_id: u16) -> bool {
-    tag_id >= 0xF000
-}
-
-/// Get all tag IDs that should be indexed for search
-pub fn get_indexed_tag_ids() -> Vec<u16> {
-    get_searchable_tags().iter().map(|(id, _, _, _)| *id).collect()
 }

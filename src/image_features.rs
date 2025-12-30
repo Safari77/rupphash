@@ -78,11 +78,13 @@ impl ImageFeatures {
     }
 
     /// Get a tag value by ID
+    #[allow(dead_code)]
     pub fn get_tag(&self, tag_id: u16) -> Option<&ExifValue> {
         self.tags.get(&tag_id)
     }
 
     /// Get a tag value as string for display
+    #[allow(dead_code)]
     pub fn get_tag_string(&self, tag_id: u16) -> Option<String> {
         self.tags.get(&tag_id).map(|v| v.as_string())
     }
@@ -108,11 +110,13 @@ impl ImageFeatures {
     }
 
     /// Get all tag IDs present in this features set
+    #[allow(dead_code)]
     pub fn tag_ids(&self) -> Vec<u16> {
         self.tags.keys().copied().collect()
     }
 
     /// Merge tags from another ImageFeatures (overwrites existing)
+    #[allow(dead_code)]
     pub fn merge(&mut self, other: &ImageFeatures) {
         for (k, v) in &other.tags {
             self.tags.insert(*k, v.clone());
