@@ -27,11 +27,11 @@ jobs:
         gcc -dumpspecs
         touch /tmp/gcctest.c && gcc -v /tmp/gcctest.c -c
 
-    # Compile libdav1d 1.5.2 from source
-    - name: Build dav1d 1.5.2
+    # Compile libdav1d from source
+    - name: Build dav1d 1.5.3
       run: |
-        DAV1D_HASH="c748a3214cf02a6d23bc179a0e8caea9d6ece1e46314ef21f5508ca6b5de6262"
-        DAV1D_VERSION="1.5.2"
+        DAV1D_HASH="e099f53253f6c247580c554d53a13f1040638f2066edc3c740e4c2f15174ce22"
+        DAV1D_VERSION="1.5.3"
         wget -t 30 --waitretry 20 https://code.videolan.org/videolan/dav1d/-/archive/${DAV1D_VERSION}/dav1d-${DAV1D_VERSION}.tar.bz2
         echo "${DAV1D_HASH}  dav1d-${DAV1D_VERSION}.tar.bz2" | sha256sum --check
         echo "EXT_DAV1D_VER=${DAV1D_VERSION}" >> $GITHUB_ENV
