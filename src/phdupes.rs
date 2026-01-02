@@ -8,8 +8,10 @@ use jiff::Timestamp;
 use libheif_rs::integration::image::register_all_decoding_hooks;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::fs;
 use std::io::{self, Write};
+use std::os::raw::{c_char, c_void};
 use std::path::PathBuf;
 
 #[cfg(not(target_os = "windows"))]
@@ -73,6 +75,35 @@ pub struct GroupInfo {
     pub status: GroupStatus,
 }
 
+// --- Runtime Version Checking for dav1d and heif ---
+#[link(name = "dav1d")]
+unsafe extern "C" {
+    // dav1d_version() returns a pointer to a static string
+    fn dav1d_version() -> *const c_char;
+}
+
+#[link(name = "heif")]
+unsafe extern "C" {
+    // heif_get_version() returns a pointer to a static string
+    fn heif_get_version() -> *const c_char;
+}
+
+#[link(name = "aom")]
+unsafe extern "C" {
+    fn aom_codec_version_str() -> *const c_char;
+}
+
+fn get_runtime_library_versions() -> String {
+    let dav1d_v = unsafe { CStr::from_ptr(dav1d_version()).to_string_lossy().into_owned() };
+
+    let heif_v = unsafe { CStr::from_ptr(heif_get_version()).to_string_lossy().into_owned() };
+
+    let aom_v = unsafe { CStr::from_ptr(aom_codec_version_str()).to_string_lossy().into_owned() };
+
+    format!("dav1d: {}, libheif: {}, aom: {}", dav1d_v, heif_v, aom_v)
+}
+
+// --------------------------------
 // --- Helper: Relative Time ---
 pub fn format_relative_time(ts: Timestamp) -> String {
     let now = Timestamp::now();
@@ -440,7 +471,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.show_build_info {
-        println!("Built from Git commit: {}\n", env!("APP_GIT_HASH"));
+        println!("Built from Git commit: {}", env!("APP_GIT_HASH"));
+        println!("Loaded Libs: {}\n", get_runtime_library_versions());
         const DEP_INFO_RAW: &str = include_str!(env!("DEPS_INFO_PATH"));
         let deps: Vec<DepInfo> = serde_json::from_str(DEP_INFO_RAW).unwrap();
 

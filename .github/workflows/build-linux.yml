@@ -9,15 +9,34 @@ env:
 jobs:
   build-linux:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
     - uses: actions/checkout@v6
+
+    - name: Free Disk Space
+      run: |
+        df -Th /
+        echo nuke android
+        sudo rm -rf /usr/local/lib/android
+        df -Th /
+        echo nuke dotnet
+        sudo rm -rf /usr/share/dotnet
+        df -Th /
+        echo nuke haskell
+        sudo rm -rf /usr/local/.ghcup /opt/ghc
+        echo nuke docker
+        sudo docker image prune --all --force || true
+        echo finished, did it help?
+        df -Th /
 
     - name: Install Build Tools & Codecs
       run: |
         sudo apt-get update
+        sudo apt remove -y dav1d libdav1d-dev libaom3 libaom-dev
         sudo apt-get install -y \
           cmake meson ninja-build build-essential \
-          pkg-config libssl-dev libde265-dev libx265-dev libaom-dev \
+          pkg-config libssl-dev libde265-dev libx265-dev libopenjp2-7-dev libnuma-dev \
           libjpeg-dev libgtk-3-dev libxkbcommon-dev libwayland-dev nasm libxxhash-dev
 
     # get gcc specs
@@ -27,22 +46,54 @@ jobs:
         gcc -dumpspecs
         touch /tmp/gcctest.c && gcc -v /tmp/gcctest.c -c
 
-    # Compile libdav1d from source
+    # Compile libaom from source (STATIC)
+    - name: Build libaom 3.13.1
+      run: |
+        AOM_VERSION="3.13.1"
+        wget -q -t 30 --waitretry 10 -O aom-${AOM_VERSION}.tar.gz https://aomedia.googlesource.com/aom/+archive/v${AOM_VERSION}.tar.gz#/aom-${AOM_VERSION}.tar.gz
+        AOM_TS=$(date +%s)
+        echo "EXT_AOM_VER=${AOM_VERSION}" >> $GITHUB_ENV
+        echo "EXT_AOM_HASH=Unknown:ts=$AOM_TS" >> $GITHUB_ENV
+
+        mkdir aom-${AOM_VERSION}
+        cd aom-${AOM_VERSION}
+        tar -zxf ../aom-${AOM_VERSION}.tar.gz
+        find . -type f -printf '%s %p\n'
+        mkdir aom_build
+        cd aom_build
+        cmake -DCMAKE_INSTALL_PREFIX=/usr \
+              -DBUILD_SHARED_LIBS=0 \
+              -DENABLE_TESTS=0 \
+              -DENABLE_DOCS=0 \
+              -DENABLE_EXAMPLES=0 \
+              -DENABLE_TOOLS=0 \
+              -DCONFIG_AV1_ENCODER=1 \
+              -DCONFIG_AV1_DECODER=1 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DCONFIG_WEBM_IO=1 \
+              ..
+        make -j$(nproc)
+        sudo make install
+
+    # Compile libdav1d from source (STATIC)
     - name: Build dav1d 1.5.3
       run: |
         DAV1D_HASH="e099f53253f6c247580c554d53a13f1040638f2066edc3c740e4c2f15174ce22"
         DAV1D_VERSION="1.5.3"
-        wget -t 30 --waitretry 20 https://code.videolan.org/videolan/dav1d/-/archive/${DAV1D_VERSION}/dav1d-${DAV1D_VERSION}.tar.bz2
+        wget -q -t 30 --waitretry 10 https://code.videolan.org/videolan/dav1d/-/archive/${DAV1D_VERSION}/dav1d-${DAV1D_VERSION}.tar.bz2
         echo "${DAV1D_HASH}  dav1d-${DAV1D_VERSION}.tar.bz2" | sha256sum --check
         echo "EXT_DAV1D_VER=${DAV1D_VERSION}" >> $GITHUB_ENV
         echo "EXT_DAV1D_HASH=${DAV1D_HASH}" >> $GITHUB_ENV
 
         tar -xjf dav1d-${DAV1D_VERSION}.tar.bz2
         cd dav1d-${DAV1D_VERSION}
-        export CFLAGS="-fstack-protector-strong -fstack-clash-protection -fcf-protection=full"
+        export CFLAGS="-fstack-protector-strong -fstack-clash-protection -fcf-protection=full -fPIC"
         export LDFLAGS="-Wl,-z,relro"
+
         meson setup build --prefix=/usr --libdir=lib/x86_64-linux-gnu --buildtype=release \
-          -Denable_tests=false -Denable_tools=false
+          -Ddefault_library=static -Denable_tests=false -Denable_tools=false
+
         ninja -C build
         sudo ninja install -v -C build
         sudo ldconfig
@@ -50,14 +101,14 @@ jobs:
     - name: Check dav1d version
       run: |
         echo "Checking pkg-config for dav1d..."
-        pkg-config --libs --cflags dav1d 'dav1d == 1.5.2'
+        pkg-config --static --libs --cflags dav1d 'dav1d == 1.5.3'
 
-    # Compile libheif 1.20.2 from source
-    - name: Build libheif 1.20.2
+    # Compile libheif from source (STATIC)
+    - name: Build libheif 1.21.1
       run: |
-        HEIF_HASH="68ac9084243004e0ef3633f184eeae85d615fe7e4444373a0a21cebccae9d12a"
-        HEIF_VERSION="1.20.2"
-        wget -t 30 --waitretry 20 https://github.com/strukturag/libheif/releases/download/v${HEIF_VERSION}/libheif-${HEIF_VERSION}.tar.gz
+        HEIF_HASH="9799b4b1c19006f052bcf399c761cc147e279762683cefaf16871dbb9b4ea2a1"
+        HEIF_VERSION="1.21.1"
+        wget -q -t 30 --waitretry 10 https://github.com/strukturag/libheif/releases/download/v${HEIF_VERSION}/libheif-${HEIF_VERSION}.tar.gz
         echo "${HEIF_HASH}  libheif-${HEIF_VERSION}.tar.gz" | sha256sum --check
         echo "EXT_HEIF_VER=${HEIF_VERSION}" >> $GITHUB_ENV
         echo "EXT_HEIF_HASH=${HEIF_HASH}" >> $GITHUB_ENV
@@ -66,8 +117,9 @@ jobs:
         cd libheif-${HEIF_VERSION}
         mkdir build
         cd build
-        # We use /usr to override any system defaults and ensure pkg-config finds it easily
-        cmake -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DWITH_DAV1D=ON ..
+
+        cmake -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release \
+          -DWITH_DAV1D=ON -DWITH_OpenJPEG=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON ..
 
         make -j$(nproc)
         sudo make install
@@ -76,7 +128,7 @@ jobs:
     - name: Check libheif version
       run: |
         echo "Checking pkg-config for libheif..."
-        pkg-config --libs --cflags libheif 'libheif == 1.20.2'
+        pkg-config --static --libs --cflags libheif 'libheif == 1.21.1'
 
     - name: Install Rust 1.92.0
       uses: dtolnay/rust-toolchain@1.92.0
@@ -84,6 +136,10 @@ jobs:
         targets: "x86_64-unknown-linux-gnu"
 
     - name: Build Binary
+      env:
+        # Forces Rust to link all pkg-config dependencies statically
+        PKG_CONFIG_ALL_STATIC: 1
+        RUSTFLAGS: "-L native=/usr/lib/x86_64-linux-gnu -l dylib=stdc++ -l static=aom -l static=x265 -l static=dav1d -l static=de265"
       run: cargo build --release --verbose --bin phdupes
 
     - name: Rename and Stage

@@ -46,6 +46,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=EXT_DAV1D_HASH");
     println!("cargo:rerun-if-env-changed=EXT_HEIF_VER");
     println!("cargo:rerun-if-env-changed=EXT_HEIF_HASH");
+    println!("cargo:rerun-if-env-changed=EXT_AOM_VER");
+    println!("cargo:rerun-if-env-changed=EXT_AOM_HASH");
 
     let mut add_external_lib = |name: &str, ver_key: &str, hash_key: &str| {
         if let Ok(ver) = env::var(ver_key) {
@@ -61,6 +63,7 @@ fn main() {
 
     add_external_lib("dav1d (C-Lib)", "EXT_DAV1D_VER", "EXT_DAV1D_HASH");
     add_external_lib("libheif (C-Lib)", "EXT_HEIF_VER", "EXT_HEIF_HASH");
+    add_external_lib("libaom (C-Lib)", "EXT_AOM_VER", "EXT_AOM_HASH");
 
     let json_info = serde_json::to_string(&deps).expect("Failed to serialize deps");
 
