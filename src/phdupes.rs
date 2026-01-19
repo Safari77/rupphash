@@ -76,19 +76,19 @@ pub struct GroupInfo {
 }
 
 // --- Runtime Version Checking for dav1d and heif ---
-#[link(name = "dav1d")]
+#[link(name = "dav1d", kind = "static")]
 unsafe extern "C" {
     // dav1d_version() returns a pointer to a static string
     fn dav1d_version() -> *const c_char;
 }
 
-#[link(name = "heif")]
+#[link(name = "heif", kind = "static")]
 unsafe extern "C" {
     // heif_get_version() returns a pointer to a static string
     fn heif_get_version() -> *const c_char;
 }
 
-#[link(name = "aom")]
+#[link(name = "aom", kind = "static")]
 unsafe extern "C" {
     fn aom_codec_version_str() -> *const c_char;
 }

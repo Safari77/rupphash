@@ -48,13 +48,13 @@ jobs:
         # We look for the first non-whitespace string after the package name
         if ($Dav1dInfo -match "dav1d:x64-windows-static\s+([^\s]+)") {
             $Dav1dVer = $matches[1]
-        } else { 
+        } else {
             $Dav1dVer = "Unknown"
         }
 
         if ($HeifInfo -match "libheif:x64-windows-static\s+([^\s]+)") {
             $HeifVer = $matches[1]
-        } else { 
+        } else {
             $HeifVer = "Unknown"
         }
 
@@ -74,9 +74,13 @@ jobs:
     - name: Build Binary
       shell: powershell
       env:
+        DAV1D_STATIC: "1"
+        LIBHEIF_STATIC: "1"
+        LIBAOM_STATIC: "1"
         PKG_CONFIG_PATH: "C:/vcpkg/installed/x64-windows-static/lib/pkgconfig"
         PKG_CONFIG_ALL_STATIC: "1"
         RUSTFLAGS: "-C target-feature=+crt-static"
+        VCPKGRS_TRIPLET: x64-windows-static
       run: |
         if (Test-Path "$env:PKG_CONFIG_PATH/dav1d.pc") {
             Write-Host "Found static dav1d.pc" -ForegroundColor Green
