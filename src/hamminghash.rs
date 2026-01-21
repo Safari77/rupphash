@@ -54,13 +54,7 @@ impl HammingHash for [u8; 32] {
 
     #[inline(always)]
     fn hamming_distance(&self, other: &Self) -> u32 {
-        let mut dist = 0;
-        let a_u64 = unsafe { std::mem::transmute::<&[u8; 32], &[u64; 4]>(self) };
-        let b_u64 = unsafe { std::mem::transmute::<&[u8; 32], &[u64; 4]>(other) };
-        for i in 0..4 {
-            dist += (a_u64[i] ^ b_u64[i]).count_ones();
-        }
-        dist
+        self.iter().zip(other.iter()).map(|(a, b)| (a ^ b).count_ones()).sum()
     }
 
     fn bit_width_per_chunk() -> usize {
@@ -123,44 +117,51 @@ pub struct SparseBitSet {
     data: Vec<u64>,
     dirty: Vec<usize>,
 }
+
 impl SparseBitSet {
     pub fn new(size: usize) -> Self {
         Self { data: vec![0; size.div_ceil(64)], dirty: Vec::with_capacity(512) }
     }
+
     #[inline(always)]
     pub fn set(&mut self, idx: usize) -> bool {
+        debug_assert!(idx / 64 < self.data.len());
         let word_idx = idx / 64;
-        let mask = 1 << (idx % 64);
-        let word = unsafe { self.data.get_unchecked_mut(word_idx) };
-        let is_set = (*word & mask) != 0;
-        if !is_set {
+        let bit = idx % 64;
+        let mask = 1u64 << bit;
+
+        let word = &mut self.data[word_idx];
+        let was_set = (*word & mask) != 0;
+
+        if !was_set {
             if *word == 0 {
                 self.dirty.push(word_idx);
             }
             *word |= mask;
         }
-        is_set
+
+        was_set
     }
+
+    #[inline(always)]
     pub fn clear(&mut self) {
         for &idx in &self.dirty {
-            unsafe {
-                *self.data.get_unchecked_mut(idx) = 0;
-            }
+            self.data[idx] = 0;
         }
         self.dirty.clear();
     }
 }
 
-// --- Main Grouping Function ---
-#[allow(unused)]
 pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Vec<u32>> {
     let n = index.db_hashes.len();
     let chunk_tolerance = max_dist / (H::NUM_CHUNKS as u32);
     let bits_per_chunk = H::bit_width_per_chunk();
 
-    // Step 1: Parallel Neighbor Discovery
-    let adjacency: Vec<Vec<u32>> = index
-        .db_hashes
+    let offsets = &index.offsets;
+    let values = &index.values;
+    let db_hashes = &index.db_hashes;
+
+    let adjacency: Vec<Vec<u32>> = db_hashes
         .par_iter()
         .enumerate()
         .map_init(
@@ -175,20 +176,24 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
 
                     let mut check_bucket = |val: u16| {
                         let flat_idx = chunk_base + val as usize;
-                        let start = unsafe { *index.offsets.get_unchecked(flat_idx) } as usize;
-                        let end = unsafe { *index.offsets.get_unchecked(flat_idx + 1) } as usize;
-                        let bucket = unsafe { index.values.get_unchecked(start..end) };
+
+                        let start = offsets[flat_idx] as usize;
+                        let end = offsets[flat_idx + 1] as usize;
+                        debug_assert!(flat_idx + 1 < offsets.len());
+                        debug_assert!(end <= values.len());
+                        let bucket = &values[start..end];
 
                         for &cand_id in bucket {
-                            if cand_id as usize == i {
+                            let cand_idx = cand_id as usize;
+                            debug_assert!(cand_idx < db_hashes.len());
+
+                            if cand_idx == i {
                                 continue;
                             }
 
-                            if !visited.set(cand_id as usize) {
-                                let cand =
-                                    unsafe { index.db_hashes.get_unchecked(cand_id as usize) };
+                            if !visited.set(cand_idx) {
+                                let cand = &db_hashes[cand_idx];
 
-                                // --- VALID DISTANCE CHECK IS HERE ---
                                 if query_hash.hamming_distance(cand) <= max_dist {
                                     results.push(cand_id);
                                 }
@@ -204,20 +209,18 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
                         }
                     }
                 }
+
                 results.clone()
             },
         )
         .collect();
 
-    // Step 2: Greedy Clustering
+    // --- Greedy clustering (already safe) ---
     let mut visited = vec![false; n];
     let mut groups = Vec::new();
 
     for i in 0..n {
-        if visited[i] {
-            continue;
-        }
-        if adjacency[i].is_empty() {
+        if visited[i] || adjacency[i].is_empty() {
             continue;
         }
 
@@ -225,11 +228,13 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
         visited[i] = true;
 
         for &neighbor in &adjacency[i] {
-            if !visited[neighbor as usize] {
-                visited[neighbor as usize] = true;
+            let idx = neighbor as usize;
+            if !visited[idx] {
+                visited[idx] = true;
                 group.push(neighbor);
             }
         }
+
         if group.len() > 1 {
             groups.push(group);
         }
