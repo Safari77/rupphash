@@ -1,3 +1,4 @@
+use bytemuck::cast_slice;
 use chrono::{DateTime, Utc};
 use codes_iso_3166::part_1::CountryCode;
 use codes_iso_3166::part_2::SubdivisionCode;
@@ -23,8 +24,7 @@ use crate::db::{
 };
 use crate::exif_extract::extract_gps_lat_lon;
 use crate::exif_types::{
-    ExifValue, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE,
-    TAG_ORIENTATION,
+    ExifValue, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE, TAG_ORIENTATION,
 };
 use crate::fileops;
 use crate::fileops::get_file_key;
@@ -35,7 +35,10 @@ use crate::position;
 use crate::raw_exif;
 use crate::{FileMetadata, GroupInfo, GroupStatus};
 
-pub const RAW_EXTS: &[&str] = &["nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf", "kdc", "dcr", "pef", "x3f", "srf", "3fr"];
+pub const RAW_EXTS: &[&str] = &[
+    "nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf", "kdc", "dcr", "pef", "x3f", "srf",
+    "3fr",
+];
 
 const JP2_MAX_PIXELS: u64 = 268_435_456;
 
@@ -113,9 +116,10 @@ pub fn get_exif_tags(
     // kamadak-exif failed - try rsraw for RAW files
     if is_raw
         && let Ok(data) = std::fs::read(path)
-            && let Ok(raw) = rsraw::RawImage::open(&data) {
-                return get_exif_tags_from_rsraw(&raw, tag_names, decimal_coords);
-            }
+        && let Ok(raw) = rsraw::RawImage::open(&data)
+    {
+        return get_exif_tags_from_rsraw(&raw, tag_names, decimal_coords);
+    }
 
     Vec::new()
 }
@@ -1136,7 +1140,10 @@ pub fn scan_and_group(
                 if cache_hit_full {
                     eprintln!("[CACHE-FULL] {:?}", path.display());
                 } else {
-                    eprintln!("[CACHE-PARTIAL] Metadata found, but features missing for {:?}", path.display());
+                    eprintln!(
+                        "[CACHE-PARTIAL] Metadata found, but features missing for {:?}",
+                        path.display()
+                    );
                 }
             }
 
@@ -1229,12 +1236,7 @@ pub fn scan_and_group(
                             // This ensures 16-bit PNGs != 8-bit PNGs unless the extra bits are purely padding.
                             let rgba16 = img.to_rgba16();
                             let raw_u16 = rgba16.as_raw();
-                            let raw_bytes = unsafe {
-                                std::slice::from_raw_parts(
-                                    raw_u16.as_ptr() as *const u8,
-                                    raw_u16.len() * 2, // 2 bytes per u16
-                                )
-                            };
+                            let raw_bytes: &[u8] = cast_slice(raw_u16);
                             let ph = *blake3::hash(raw_bytes).as_bytes();
                             eprintln!(
                                 "[DEBUG-PIXEL_HASH 16BIT] {:?} : {}",
@@ -1276,10 +1278,8 @@ pub fn scan_and_group(
                             if let Some(pos) = gps_pos {
                                 img_features
                                     .insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y()));
-                                img_features.insert_tag(
-                                    TAG_GPS_LONGITUDE,
-                                    ExifValue::Float(pos.x()),
-                                );
+                                img_features
+                                    .insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(pos.x()));
                             }
 
                             // Add timestamp if available
@@ -1353,7 +1353,11 @@ pub fn scan_and_group(
     }
 
     let hash_elapsed = hash_start.elapsed();
-    eprintln!("[DEBUG] PDQ hashes loaded: {} in {:.3}s", valid_files.len(), hash_elapsed.as_secs_f64());
+    eprintln!(
+        "[DEBUG] PDQ hashes loaded: {} in {:.3}s",
+        valid_files.len(),
+        hash_elapsed.as_secs_f64()
+    );
 
     let group_start = Instant::now();
     let (processed_groups, processed_infos, comparison_count) =
@@ -1425,7 +1429,7 @@ impl GroupingStrategy<[u8; 32]> for PdqStrategy {
 fn group_files_generic<H, S>(
     valid_files: &[ScannedFile],
     config: &ScanConfig,
-    strategy: S, // Pass the struct, not closures
+    strategy: S,
 ) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>, usize)
 where
     H: HammingHash + std::fmt::Debug + Clone + Copy + Default,
@@ -1446,9 +1450,12 @@ where
     let dense_to_sparse: Vec<usize> = valid_entries.iter().map(|(i, _)| *i).collect();
 
     let mih = MIHIndex::new(hashes.clone());
-    let n = valid_files.len();
 
-    // Manually chunk the data to amortize allocation costs.
+    let offsets = &mih.offsets;
+    let values = &mih.values;
+    let db_hashes = &mih.db_hashes;
+
+    let n = valid_files.len();
     const CHUNK_SIZE: usize = 2000;
 
     // Flattened edge list (A, B)
@@ -1459,82 +1466,66 @@ where
             || (SparseBitSet::new(n), Vec::new(), [H::default(); 8]),
             |(visited, local_edges, variants_buf), (chunk_idx, chunk)| {
                 local_edges.clear();
-
-                // Calculate the real global index for the first file in this chunk
                 let chunk_base_idx = chunk_idx * CHUNK_SIZE;
 
                 for (offset, file) in chunk.iter().enumerate() {
-                    let i = chunk_base_idx + offset; // Global index of current file
+                    let i = chunk_base_idx + offset;
 
-                    if let Some(hash) = strategy.extract_hash(file) {
-                        // Generate variants into stack buffer (no Vec alloc)
-                        let count = strategy.generate_variants(file, hash, variants_buf);
-                        let variants = &variants_buf[0..count];
+                    let Some(hash) = strategy.extract_hash(file) else { continue };
 
-                        for &variant in variants {
-                            // Each variant is a distinct query. We must allow the same candidate
-                            // to be checked again if it matches a different rotation.
-                            visited.clear();
+                    let count = strategy.generate_variants(file, hash, variants_buf);
+                    let variants = &variants_buf[..count];
 
-                            // Manual inline of check_bucket to ensure no closure overhead
-                            for k in 0..H::NUM_CHUNKS {
-                                let q_chunk = variant.get_chunk(k);
-                                let chunk_base = k * H::NUM_BUCKETS;
+                    for &variant in variants {
+                        visited.clear();
 
-                                // Inline the check_neighbors logic:
-                                let check_neighbors =
-                                    config.similarity / (H::NUM_CHUNKS as u32) >= 1;
-                                let limit =
-                                    if check_neighbors { 1 + H::bit_width_per_chunk() } else { 1 };
+                        for k in 0..H::NUM_CHUNKS {
+                            let q_chunk = variant.get_chunk(k);
+                            let chunk_base = k * H::NUM_BUCKETS;
+                            let check_neighbors = config.similarity / H::NUM_CHUNKS as u32 >= 1;
+                            let limit =
+                                if check_neighbors { 1 + H::bit_width_per_chunk() } else { 1 };
 
-                                for pass in 0..limit {
-                                    let query_val = if pass == 0 {
-                                        q_chunk
-                                    } else {
-                                        q_chunk ^ (1 << (pass - 1))
-                                    };
+                            for pass in 0..limit {
+                                let query_val =
+                                    if pass == 0 { q_chunk } else { q_chunk ^ (1 << (pass - 1)) };
 
-                                    let flat_idx = chunk_base + query_val as usize;
-                                    let start =
-                                        unsafe { *mih.offsets.get_unchecked(flat_idx) } as usize;
-                                    let end = unsafe { *mih.offsets.get_unchecked(flat_idx + 1) }
-                                        as usize;
+                                let flat_idx = chunk_base + query_val as usize;
 
-                                    // Direct pointer access to avoid bounds checks in tight loop
-                                    if start < end {
-                                        let bucket =
-                                            unsafe { mih.values.get_unchecked(start..end) };
-                                        for &dense_id in bucket {
-                                            // dense_id is the index in `hashes` / `dense_to_sparse`
-                                            // We need to map it to the real file index `cand_idx`
-                                            let cand_idx = unsafe {
-                                                *dense_to_sparse.get_unchecked(dense_id as usize)
-                                            };
+                                debug_assert!(flat_idx + 1 < offsets.len());
 
-                                            // Only record edges where cand_idx > i
-                                            if cand_idx <= i {
-                                                continue;
-                                            }
+                                let start = offsets[flat_idx] as usize;
+                                let end = offsets[flat_idx + 1] as usize;
 
-                                            if visited.set(cand_idx) {
-                                                continue;
-                                            }
+                                if start >= end {
+                                    continue;
+                                }
 
-                                            let cand_hash = unsafe {
-                                                mih.db_hashes.get_unchecked(dense_id as usize)
-                                            };
-                                            if variant.hamming_distance(cand_hash)
-                                                <= config.similarity
-                                            {
-                                                local_edges.push((i as u32, cand_idx as u32));
-                                            }
-                                        }
+                                let bucket = &values[start..end];
+
+                                for &dense_id in bucket {
+                                    let dense_id = dense_id as usize;
+                                    debug_assert!(dense_id < db_hashes.len());
+
+                                    let cand_idx = dense_to_sparse[dense_id];
+                                    if cand_idx <= i {
+                                        continue;
+                                    }
+
+                                    if visited.set(cand_idx) {
+                                        continue;
+                                    }
+
+                                    let cand_hash = &db_hashes[dense_id];
+                                    if variant.hamming_distance(cand_hash) <= config.similarity {
+                                        local_edges.push((i as u32, cand_idx as u32));
                                     }
                                 }
                             }
                         }
                     }
                 }
+
                 local_edges.clone()
             },
         )
@@ -1542,7 +1533,6 @@ where
         .collect();
 
     let comparison_count = edges.len();
-
     // Union-Find to build groups from Edge List
     let mut parent: Vec<usize> = (0..n).collect();
 
@@ -1572,8 +1562,7 @@ where
         union(&mut parent, u as usize, v as usize);
     }
 
-    // Collect components
-    let mut groups_map: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut groups_map = HashMap::<usize, Vec<u32>>::new();
     for i in 0..n {
         let root = find(&mut parent, i);
         if root != i || groups_map.contains_key(&root) {
@@ -1582,10 +1571,8 @@ where
     }
 
     let raw_groups: Vec<Vec<u32>> = groups_map.into_values().filter(|g| g.len() > 1).collect();
-
     // Merge RAW+JPG logic
     let groups = merge_groups_by_stem(raw_groups, valid_files);
-
     // Process Metadata
     let (g, i) = process_raw_groups(groups, valid_files, config);
 
@@ -2392,7 +2379,7 @@ pub fn spawn_background_enrichment(
                     && let Ok(raw) = rsraw::RawImage::open(&data) {
                         raw_exif::merge_raw_info_into_features(&mut features, &raw);
                     }
-                
+
                 if false {
                     eprintln!("[DEBUG-ENRICH]   Final features for '{}': tag_count={}, has_make={}, has_model={}, has_iso={}",
                         path.file_name().unwrap_or_default().to_string_lossy(),
