@@ -63,52 +63,88 @@ impl HammingHash for [u8; 32] {
 }
 
 // --- The Index Struct (CSR Memory Layout) ---
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct DenseId(u32);
+
+impl DenseId {
+    #[inline(always)]
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BucketId(u32);
+
 pub struct MIHIndex<H: HammingHash> {
-    pub values: Vec<u32>,
-    pub offsets: Vec<u32>,
-    pub db_hashes: Vec<H>,
+    db_hashes: Box<[H]>,
+    offsets: Box<[u32]>,
+    values: Box<[DenseId]>,
 }
 
 impl<H: HammingHash> MIHIndex<H> {
     pub fn new(hashes: Vec<H>) -> Self {
-        let num_items = hashes.len();
-        let total_buckets = H::NUM_CHUNKS * H::NUM_BUCKETS;
+        let num_buckets = H::NUM_CHUNKS * H::NUM_BUCKETS;
+        let mut offsets = vec![0u32; num_buckets + 1];
+        let mut values = Vec::<DenseId>::new();
 
-        // 1. Histogram
-        let mut counts = vec![0u32; total_buckets];
-        for hash in &hashes {
+        // Count phase
+        for (i, h) in hashes.iter().enumerate() {
+            let dense = DenseId(i as u32);
             for k in 0..H::NUM_CHUNKS {
-                let val = hash.get_chunk(k);
-                let flat_idx = (k * H::NUM_BUCKETS) + val as usize;
-                counts[flat_idx] += 1;
+                let bucket = h.get_chunk(k) as usize;
+                let flat = k * H::NUM_BUCKETS + bucket;
+                offsets[flat + 1] += 1;
+            }
+            let _ = dense; // silence warnings if unused in some builds
+        }
+
+        // Prefix sum
+        for i in 1..offsets.len() {
+            offsets[i] += offsets[i - 1];
+        }
+
+        values.resize(offsets.last().copied().unwrap() as usize, DenseId(0));
+
+        // Fill phase
+        let mut cursor = offsets.clone();
+        for (i, h) in hashes.iter().enumerate() {
+            let dense = DenseId(i as u32);
+            for k in 0..H::NUM_CHUNKS {
+                let bucket = h.get_chunk(k) as usize;
+                let flat = k * H::NUM_BUCKETS + bucket;
+                let pos = cursor[flat] as usize;
+                values[pos] = dense;
+                cursor[flat] += 1;
             }
         }
 
-        // 2. Prefix Sum
-        let mut offsets = vec![0u32; total_buckets + 1];
-        let mut running_sum = 0;
-        for i in 0..total_buckets {
-            offsets[i] = running_sum;
-            running_sum += counts[i];
+        Self {
+            db_hashes: hashes.into_boxed_slice(),
+            offsets: offsets.into_boxed_slice(),
+            values: values.into_boxed_slice(),
         }
-        offsets[total_buckets] = running_sum;
+    }
 
-        // 3. Fill Values
-        let mut write_pos = offsets.clone();
-        let mut values = vec![0u32; num_items * H::NUM_CHUNKS];
+    #[inline(always)]
+    pub fn bucket(&self, chunk: usize, value: u16) -> &[DenseId] {
+        let flat = chunk * H::NUM_BUCKETS + value as usize;
+        let start = self.offsets[flat] as usize;
+        let end = self.offsets[flat + 1] as usize;
+        &self.values[start..end]
+    }
 
-        for (id, hash) in hashes.iter().enumerate() {
-            let id_u32 = id as u32;
-            for k in 0..H::NUM_CHUNKS {
-                let val = hash.get_chunk(k);
-                let flat_idx = (k * H::NUM_BUCKETS) + val as usize;
-                let pos = write_pos[flat_idx];
-                values[pos as usize] = id_u32;
-                write_pos[flat_idx] += 1;
-            }
-        }
+    #[inline(always)]
+    pub fn hash(&self, id: DenseId) -> &H {
+        &self.db_hashes[id.index()]
+    }
 
-        MIHIndex { values, offsets, db_hashes: hashes }
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.db_hashes.len()
     }
 }
 
@@ -153,59 +189,50 @@ impl SparseBitSet {
 }
 
 pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Vec<u32>> {
-    let n = index.db_hashes.len();
-    let chunk_tolerance = max_dist / (H::NUM_CHUNKS as u32);
+    let n = index.len();
+    let chunk_tolerance = max_dist / H::NUM_CHUNKS as u32;
     let bits_per_chunk = H::bit_width_per_chunk();
 
-    let offsets = &index.offsets;
-    let values = &index.values;
-    let db_hashes = &index.db_hashes;
-
-    let adjacency: Vec<Vec<u32>> = db_hashes
-        .par_iter()
-        .enumerate()
+    let adjacency: Vec<Vec<u32>> = (0..n)
+        .into_par_iter()
         .map_init(
             || (SparseBitSet::new(n), Vec::new()),
-            |(visited, results), (i, query_hash)| {
+            |(visited, results), i| {
                 visited.clear();
                 results.clear();
 
+                let query_hash = index.hash(DenseId(i as u32));
+
                 for k in 0..H::NUM_CHUNKS {
                     let q_chunk = query_hash.get_chunk(k);
-                    let chunk_base = k * H::NUM_BUCKETS;
 
-                    let mut check_bucket = |val: u16| {
-                        let flat_idx = chunk_base + val as usize;
+                    let check_bucket =
+                        |val: u16, visited: &mut SparseBitSet, results: &mut Vec<u32>| {
+                            let bucket = index.bucket(k, val);
 
-                        let start = offsets[flat_idx] as usize;
-                        let end = offsets[flat_idx + 1] as usize;
-                        debug_assert!(flat_idx + 1 < offsets.len());
-                        debug_assert!(end <= values.len());
-                        let bucket = &values[start..end];
+                            for dense in bucket {
+                                let dense_idx = dense.index();
 
-                        for &cand_id in bucket {
-                            let cand_idx = cand_id as usize;
-                            debug_assert!(cand_idx < db_hashes.len());
+                                if dense_idx == i {
+                                    continue;
+                                }
 
-                            if cand_idx == i {
-                                continue;
-                            }
+                                if visited.set(dense_idx) {
+                                    continue;
+                                }
 
-                            if !visited.set(cand_idx) {
-                                let cand = &db_hashes[cand_idx];
-
-                                if query_hash.hamming_distance(cand) <= max_dist {
-                                    results.push(cand_id);
+                                let cand_hash = index.hash(*dense);
+                                if query_hash.hamming_distance(cand_hash) <= max_dist {
+                                    results.push(dense_idx as u32);
                                 }
                             }
-                        }
-                    };
+                        };
 
-                    check_bucket(q_chunk);
+                    check_bucket(q_chunk, visited, results);
 
                     if chunk_tolerance >= 1 {
                         for bit in 0..bits_per_chunk {
-                            check_bucket(q_chunk ^ (1 << bit));
+                            check_bucket(q_chunk ^ (1 << bit), visited, results);
                         }
                     }
                 }
@@ -215,7 +242,7 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
         )
         .collect();
 
-    // --- Greedy clustering (already safe) ---
+    // --- Greedy clustering ---
     let mut visited = vec![false; n];
     let mut groups = Vec::new();
 

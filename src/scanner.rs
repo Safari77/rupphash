@@ -1449,21 +1449,16 @@ where
     let hashes: Vec<H> = valid_entries.iter().map(|(_, h)| *h).collect();
     let dense_to_sparse: Vec<usize> = valid_entries.iter().map(|(i, _)| *i).collect();
 
-    let mih = MIHIndex::new(hashes.clone());
-
-    let offsets = &mih.offsets;
-    let values = &mih.values;
-    let db_hashes = &mih.db_hashes;
-
+    let mih = MIHIndex::new(hashes);
     let n = valid_files.len();
+
     const CHUNK_SIZE: usize = 2000;
 
-    // Flattened edge list (A, B)
     let edges: Vec<(u32, u32)> = valid_files
         .par_chunks(CHUNK_SIZE)
-        .enumerate() // This gives us the chunk index (0, 1, 2...)
+        .enumerate()
         .map_init(
-            || (SparseBitSet::new(n), Vec::new(), [H::default(); 8]),
+            || (SparseBitSet::new(n), Vec::<(u32, u32)>::new(), [H::default(); 8]),
             |(visited, local_edges, variants_buf), (chunk_idx, chunk)| {
                 local_edges.clear();
                 let chunk_base_idx = chunk_idx * CHUNK_SIZE;
@@ -1481,7 +1476,6 @@ where
 
                         for k in 0..H::NUM_CHUNKS {
                             let q_chunk = variant.get_chunk(k);
-                            let chunk_base = k * H::NUM_BUCKETS;
                             let check_neighbors = config.similarity / H::NUM_CHUNKS as u32 >= 1;
                             let limit =
                                 if check_neighbors { 1 + H::bit_width_per_chunk() } else { 1 };
@@ -1490,33 +1484,17 @@ where
                                 let query_val =
                                     if pass == 0 { q_chunk } else { q_chunk ^ (1 << (pass - 1)) };
 
-                                let flat_idx = chunk_base + query_val as usize;
+                                let bucket = mih.bucket(k, query_val);
 
-                                debug_assert!(flat_idx + 1 < offsets.len());
-
-                                let start = offsets[flat_idx] as usize;
-                                let end = offsets[flat_idx + 1] as usize;
-
-                                if start >= end {
-                                    continue;
-                                }
-
-                                let bucket = &values[start..end];
-
-                                for &dense_id in bucket {
-                                    let dense_id = dense_id as usize;
-                                    debug_assert!(dense_id < db_hashes.len());
-
+                                for dense in bucket {
+                                    let dense_id = dense.index();
                                     let cand_idx = dense_to_sparse[dense_id];
-                                    if cand_idx <= i {
+
+                                    if cand_idx <= i || visited.set(cand_idx) {
                                         continue;
                                     }
 
-                                    if visited.set(cand_idx) {
-                                        continue;
-                                    }
-
-                                    let cand_hash = &db_hashes[dense_id];
+                                    let cand_hash = mih.hash(*dense);
                                     if variant.hamming_distance(cand_hash) <= config.similarity {
                                         local_edges.push((i as u32, cand_idx as u32));
                                     }
@@ -1533,7 +1511,8 @@ where
         .collect();
 
     let comparison_count = edges.len();
-    // Union-Find to build groups from Edge List
+
+    // --- Union-Find (unchanged) ---
     let mut parent: Vec<usize> = (0..n).collect();
 
     fn find(parent: &mut [usize], i: usize) -> usize {
@@ -1551,10 +1530,10 @@ where
     }
 
     fn union(parent: &mut [usize], i: usize, j: usize) {
-        let root_i = find(parent, i);
-        let root_j = find(parent, j);
-        if root_i != root_j {
-            parent[root_i] = root_j;
+        let ri = find(parent, i);
+        let rj = find(parent, j);
+        if ri != rj {
+            parent[ri] = rj;
         }
     }
 
@@ -1571,12 +1550,11 @@ where
     }
 
     let raw_groups: Vec<Vec<u32>> = groups_map.into_values().filter(|g| g.len() > 1).collect();
-    // Merge RAW+JPG logic
-    let groups = merge_groups_by_stem(raw_groups, valid_files);
-    // Process Metadata
-    let (g, i) = process_raw_groups(groups, valid_files, config);
 
-    (g, i, comparison_count)
+    let groups = merge_groups_by_stem(raw_groups, valid_files);
+    let (groups, info) = process_raw_groups(groups, valid_files, config);
+
+    (groups, info, comparison_count)
 }
 
 // --- 3. Wrapper Functions ---
