@@ -1,5 +1,3 @@
-// src/image_features.rs
-//
 // Image features storage for database.
 // Uses BTreeMap for flexible EXIF tag storage with postcard serialization.
 

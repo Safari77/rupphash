@@ -66,8 +66,8 @@ jobs:
         echo "EXT_DAV1D_HASH=Managed by vcpkg (x64-windows-static)" >> $env:GITHUB_ENV
         echo "EXT_HEIF_HASH=Managed by vcpkg (x64-windows-static)" >> $env:GITHUB_ENV
 
-    - name: Install Rust 1.92.0
-      uses: dtolnay/rust-toolchain@1.92.0
+    - name: Install Rust 1.93.0
+      uses: dtolnay/rust-toolchain@1.93.0
       with:
         targets: "x86_64-pc-windows-msvc"
 

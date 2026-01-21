@@ -240,7 +240,7 @@ impl GuiApp {
     }
 
     pub fn get_point(&self, name: &str) -> Option<Point<f64>> {
-        self.ctx.locations.get(name).cloned().map(Into::into)
+        self.ctx.locations.get(name).cloned()
     }
 
     pub fn build_search_index(&mut self) {

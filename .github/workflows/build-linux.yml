@@ -130,8 +130,8 @@ jobs:
         echo "Checking pkg-config for libheif..."
         pkg-config --static --libs --cflags libheif 'libheif == 1.21.1'
 
-    - name: Install Rust 1.92.0
-      uses: dtolnay/rust-toolchain@1.92.0
+    - name: Install Rust 1.93.0
+      uses: dtolnay/rust-toolchain@1.93.0
       with:
         targets: "x86_64-unknown-linux-gnu"
 

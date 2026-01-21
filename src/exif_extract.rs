@@ -1,9 +1,6 @@
-// src/exif_extract.rs
-//
 // EXIF extraction functions that convert exif crate data to our storage format.
 // Integrates functionality from helper_exif.rs.
 // Filters out thumbnails and large binary blobs.
-
 use crate::exif_types::{
     ExifValue, MAX_TAG_SIZE, TAG_DERIVED_COUNTRY, TAG_DERIVED_SUBDIVISION,
     TAG_DERIVED_SUN_ALTITUDE, TAG_DERIVED_SUN_AZIMUTH, TAG_DERIVED_TIMESTAMP, TAG_DERIVED_TIMEZONE,

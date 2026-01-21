@@ -1,8 +1,6 @@
-// src/exif_types.rs
-//
+#![allow(dead_code)]
 // Flexible EXIF value storage and tag definitions.
 // All EXIF tags are stored as big-endian u16 IDs with corresponding ExifValue.
-
 use serde::{Deserialize, Serialize};
 
 /// Maximum size for binary EXIF values (exclude thumbnails and large blobs)

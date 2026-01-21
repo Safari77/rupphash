@@ -1,5 +1,3 @@
-// src/raw_exif.rs
-//
 // RAW file EXIF extraction using rsraw's FullRawInfo.
 // Provides fallback when kamadak-exif fails to parse RAW files.
 // Maps rsraw structures to our ExifValue/ImageFeatures format.
@@ -253,9 +251,10 @@ pub fn merge_raw_info_into_features(features: &mut ImageFeatures, raw: &RawImage
 
     // Timestamp
     if !features.has_tag(TAG_DERIVED_TIMESTAMP)
-        && let Some(ref dt) = info.datetime {
-            features.insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(dt.timestamp()));
-        }
+        && let Some(ref dt) = info.datetime
+    {
+        features.insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(dt.timestamp()));
+    }
 }
 
 #[cfg(test)]

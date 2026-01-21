@@ -1,5 +1,3 @@
-// src/search_index.rs
-//
 // In-memory search index using RoaringBitmap for O(1) tag-based queries.
 // Built on application startup by iterating the feature database.
 
@@ -28,9 +26,10 @@ pub fn extract_number_from_string(s: &str) -> Option<f64> {
     // 2. Handle "f/" prefix (e.g. "f/2.8" or "F/2.8")
     // For aperture, we want the number itself (2.8), NOT the fraction (f divided by 2.8)
     if s.to_lowercase().starts_with("f/")
-        && let Ok(val) = s[2..].trim().parse::<f64>() {
-            return Some(val);
-        }
+        && let Ok(val) = s[2..].trim().parse::<f64>()
+    {
+        return Some(val);
+    }
 
     // 3. Handle fractions (e.g. "1/320" or "1/37.738...")
     if let Some(slash_pos) = s.find('/') {
@@ -38,9 +37,10 @@ pub fn extract_number_from_string(s: &str) -> Option<f64> {
         let after = &s[slash_pos + 1..].trim();
 
         if let (Ok(num), Ok(denom)) = (before.parse::<f64>(), after.parse::<f64>())
-            && denom != 0.0 {
-                return Some(num / denom);
-            }
+            && denom != 0.0
+        {
+            return Some(num / denom);
+        }
     }
 
     // 4. Handle "ISO" or "mm" style strings (remove non-numeric prefix/suffix)
@@ -59,9 +59,10 @@ pub fn extract_number_from_string(s: &str) -> Option<f64> {
     }
 
     if !num_str.is_empty()
-        && let Ok(val) = num_str.parse::<f64>() {
-            return Some(val);
-        }
+        && let Ok(val) = num_str.parse::<f64>()
+    {
+        return Some(val);
+    }
 
     // 5. Last resort: direct parse
     s.parse::<f64>().ok()
@@ -390,9 +391,10 @@ impl SearchIndex {
         if let Some(tag_map) = self.exact_index.get(&tag_id) {
             for (hash, bitmap) in tag_map {
                 if let Some(stored) = self.string_table.get(hash)
-                    && stored.contains(&normalized) {
-                        result |= bitmap;
-                    }
+                    && stored.contains(&normalized)
+                {
+                    result |= bitmap;
+                }
             }
         }
 
@@ -410,9 +412,10 @@ impl SearchIndex {
         if let Some(tag_map) = self.exact_index.get(&tag_id) {
             for (hash, bitmap) in tag_map {
                 if let Some(stored) = self.string_table.get(hash)
-                    && re.is_match(stored) {
-                        result |= bitmap;
-                    }
+                    && re.is_match(stored)
+                {
+                    result |= bitmap;
+                }
             }
         }
 

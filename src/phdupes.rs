@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
 use std::io::{self, Write};
-use std::os::raw::{c_char, c_void};
+use std::os::raw::c_char;
 use std::path::PathBuf;
 
 #[cfg(not(target_os = "windows"))]
