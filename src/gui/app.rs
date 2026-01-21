@@ -994,6 +994,8 @@ impl GuiApp {
 
                     // Clear terminal failures under renamed directory or file
                     self.clear_failed_under(dest);
+                    // Invalidate cache for the destination of the rename/exchange
+                    self.raw_cache.remove(dest);
                 }
                 continue;
             }
@@ -1004,6 +1006,9 @@ impl GuiApp {
                     for path in &event.paths {
                         self.failed_images.remove(path);
                         self.clear_failed_under(path);
+
+                        // Remove from cache if file is deleted
+                        self.raw_cache.remove(path);
 
                         if let Some(name) = path.file_name() {
                             let name_str = name.to_string_lossy().to_string();
@@ -1025,6 +1030,9 @@ impl GuiApp {
                 | notify::EventKind::Modify(notify::event::ModifyKind::Any) => {
                     for path in &event.paths {
                         if classify(path) {
+                            // Invalidate cache so perform_preload re-fetches the image
+                            self.raw_cache.remove(path);
+
                             if self.failed_images.remove(path).is_some() {
                                 eprintln!(
                                     "[DEBUG-NOTIFY] cleared failed_image due to modify/create: {:?}",
