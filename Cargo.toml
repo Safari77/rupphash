@@ -114,3 +114,4 @@ default = []
 # To include the Sarasa font into binary, copy it to assets/fonts/Sarasa-Regular.ttc
 # and run cargo build --release --features embed-fonts
 embed-fonts = []
+staticbuild = []

@@ -76,19 +76,23 @@ pub struct GroupInfo {
 }
 
 // --- Runtime Version Checking for dav1d and heif ---
-#[link(name = "dav1d", kind = "static")]
+// If "staticbuild" is enabled, link statically
+#[cfg_attr(feature = "staticbuild", link(name = "dav1d", kind = "static"))]
+#[cfg_attr(not(feature = "staticbuild"), link(name = "dav1d"))]
 unsafe extern "C" {
     // dav1d_version() returns a pointer to a static string
     fn dav1d_version() -> *const c_char;
 }
 
-#[link(name = "heif", kind = "static")]
+#[cfg_attr(feature = "staticbuild", link(name = "heif", kind = "static"))]
+#[cfg_attr(not(feature = "staticbuild"), link(name = "heif"))]
 unsafe extern "C" {
     // heif_get_version() returns a pointer to a static string
     fn heif_get_version() -> *const c_char;
 }
 
-#[link(name = "aom", kind = "static")]
+#[cfg_attr(feature = "staticbuild", link(name = "aom", kind = "static"))]
+#[cfg_attr(not(feature = "staticbuild"), link(name = "aom"))]
 unsafe extern "C" {
     fn aom_codec_version_str() -> *const c_char;
 }

@@ -99,6 +99,9 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --target x86_64-pc-windows-gnu
 ```
 
+Note: if you want to *statically* link heif/aom/dav1d, use
+`cargo build ... --features staticbuild`
+
 You might need to disable HEIF and/or rsraw manually, or you could use MSVC target.
 
 By default a dynamically linked binary is built.
