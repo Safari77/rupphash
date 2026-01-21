@@ -884,7 +884,12 @@ pub(super) fn handle_dialogs(
                     ui.collapsing("📖 Search Syntax Help", |ui| {
                         ui.spacing_mut().item_spacing.y = 4.0;
 
-                        ui.label(egui::RichText::new("Format: Tag:Operator:Value").code());
+                        ui.label(
+                            egui::RichText::new(
+                                "Format: Tag:Operator:Value — Shift-F3/F3 for prev/next match",
+                            )
+                            .code(),
+                        );
                         ui.add_space(4.0);
 
                         ui.label(egui::RichText::new("Operators:").strong());
@@ -909,17 +914,19 @@ pub(super) fn handle_dialogs(
                         ui.label(
                             egui::RichText::new("Examples (case-insensitive keywords):").strong(),
                         );
-                        ui.label("  Make:Canon             → Make equals 'Canon'");
-                        ui.label("  Make:~:Nik             → Make contains 'Nik'");
-                        ui.label("  FNumber:<:1.8          → FNumber smaller than 1.8");
-                        ui.label("  ISO:1600-              → ISO >= 1600");
-                        ui.label("  FocalLength:50-85      → Focal length 50-85mm");
-                        ui.label("  DistanceFrom:home:1-5  → Distance from home [km]");
-                        ui.label("    ([locations] [home] in phdupes.conf)");
-                        ui.label("  DistanceLonLat:-3:39:4 → Distance from lon:-3 lat:39 0-4 km");
-                        ui.label("  Country:Sweden         → Derived country");
-                        ui.label("  SunAzimuth:170-190     → Sun azimuth range");
-                        ui.label("  SunAltitude:-3-3       → Sun near horizon (golden hour)");
+                        ui.monospace("  Make:Canon             → Make equals 'Canon'");
+                        ui.monospace("  Make:~:Nik             → Make contains 'Nik'");
+                        ui.monospace("  FNumber:<:1.8          → FNumber smaller than 1.8");
+                        ui.monospace("  ISO:1600-              → ISO >= 1600");
+                        ui.monospace("  FocalLength:50-85      → Focal length 50-85mm");
+                        ui.monospace("  DistanceFrom:home:1-5  → Distance from home [km]");
+                        ui.monospace("    ([locations] [home] in phdupes.conf)");
+                        ui.monospace(
+                            "  DistanceLonLat:-3:39:4 → Distance from lon:-3 lat:39 0-4 km",
+                        );
+                        ui.monospace("  Country:Sweden         → Derived country");
+                        ui.monospace("  SunAzimuth:170-190     → Sun azimuth range");
+                        ui.monospace("  SunAltitude:-3-3       → Sun near horizon (golden hour)");
 
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("Available Tags:").strong());
