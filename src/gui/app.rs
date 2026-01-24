@@ -2733,6 +2733,7 @@ impl eframe::App for GuiApp {
 
                                 // Show tooltip with file details on filename hover
                                 let header_resp = header_resp.on_hover_ui(|ui| {
+                                    ui.label(format!("filename: {}", file.path.display()));
                                     ui.label(format!(
                                         "unique_file_id: {:032x}",
                                         file.unique_file_id
