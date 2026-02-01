@@ -1,10 +1,10 @@
 [package]
 name = "rupphash"
-version = "0.6.8"
+version = "0.6.9"
 edition = "2024"
 license = "GPL-3.0"
 authors = ["Sami Farin"]
-rust-version = "1.88"
+rust-version = "1.92"
 repository = "https://github.com/Safari77/rupphash"
 
 [dependencies]
