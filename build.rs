@@ -23,6 +23,25 @@ fn main() {
     println!("cargo:rustc-env=APP_GIT_HASH={}", git_hash);
     println!("cargo:rerun-if-changed=.git/HEAD");
 
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+
+    // Only apply these flags if we are specifically targeting Windows with MSVC.
+    if target_os == "windows" && target_env == "msvc" {
+        // High Entropy ASLR: Forces memory randomization (64-bit)
+        println!("cargo:rustc-link-arg=/HIGHENTROPYVA");
+
+        // DEP (Data Execution Prevention)
+        println!("cargo:rustc-link-arg=/NXCOMPAT");
+
+        // Dynamic Base: Required for ASLR
+        println!("cargo:rustc-link-arg=/DYNAMICBASE");
+
+        // CETCOMPAT: Control-flow Enforcement (Shadow Stack)
+        // Note: This requires VS 2019 v16.7+ or modern LLVM (lld).
+        println!("cargo:rustc-link-arg=/CETCOMPAT");
+    }
+
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let lock_path = Path::new(&manifest_dir).join("Cargo.lock");
 

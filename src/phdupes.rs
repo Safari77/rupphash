@@ -453,7 +453,51 @@ fn run_interactive_cli_delete(
     println!("\nDone.");
 }
 
+#[cfg(target_os = "windows")]
+mod windows_security {
+    use std::os::raw::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn HeapSetInformation(
+            HeapHandle: *mut c_void,
+            HeapInformationClass: u32,
+            HeapInformation: *mut c_void,
+            HeapInformationLength: usize,
+        ) -> i32;
+
+        fn GetProcessHeap() -> *mut c_void;
+    }
+
+    const HEAP_ENABLE_TERMINATION_ON_CORRUPTION: u32 = 1;
+
+    pub fn enable_heap_termination() {
+        unsafe {
+            // Enables the terminate-on-corruption feature. If the heap manager detects an error in
+            // any heap used by the process, it calls the Windows Error Reporting service and
+            // terminates the process.
+            let result = HeapSetInformation(
+                GetProcessHeap(),
+                HEAP_ENABLE_TERMINATION_ON_CORRUPTION,
+                std::ptr::null_mut(),
+                0,
+            );
+
+            if result == 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!(
+                    "SECURITY WARNING: Failed to enable Heap Termination on Corruption. Error: {}",
+                    err
+                );
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "windows")]
+    windows_security::enable_heap_termination();
+
     register_all_decoding_hooks();
     image_extras::register();
     let args = Cli::parse();
