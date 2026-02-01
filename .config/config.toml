@@ -1,0 +1,8 @@
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = [
+    # 1. Enable Control Flow Guard (Compiler + Linker)
+    "-C", "control-flow-guard",
+    "-C", "link-arg=/GUARD:CF",
+    # 2. Enable Intel CET / Shadow Stack (Linker only)
+    "-C", "link-arg=/CETCOMPAT"
+]
