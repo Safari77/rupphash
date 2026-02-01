@@ -19,7 +19,7 @@ country-boundaries = "1.2"
 crossbeam-channel = "0.5"
 crossterm = "0.29"
 dirs = "6"
-fast_image_resize = "5.4"
+fast_image_resize = "6"
 filetime = "0.2"
 file-id = "0.2"
 flate2 = { version = "1.1", features = [
@@ -74,7 +74,7 @@ egui = "0.33"
 egui_extras = { version = "0.33", features = ["all_loaders"] }
 wgpu = "27"
 delaunator = "1.0.2"
-walkers = "0.51"
+walkers = "0.52"
 roaring = { version = "0.11", features = ["serde"] }
 ttf-parser = "0.25"
 
