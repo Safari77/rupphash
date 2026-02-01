@@ -14,6 +14,35 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
+    - name: Check for Existing Linux Asset
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # 1. Extract Version from Cargo.toml
+        VERSION=$(awk -F '[""]' '/^version/ { print $2; exit }' Cargo.toml)
+        TAG_NAME="v$VERSION"
+        TARGET_ASSET="phdupes-v${VERSION}-linux"
+
+        echo "Checking for asset: $TARGET_ASSET in release $TAG_NAME"
+
+        # 2. Check if release exists
+        if gh release view "$TAG_NAME" > /dev/null 2>&1; then
+            echo "Release $TAG_NAME exists. Checking assets..."
+
+            # 3. Check if specific file exists in the asset list
+            if gh release view "$TAG_NAME" --json assets -q '.assets[].name' | grep -F -x "$TARGET_ASSET"; then
+                echo "::error::Asset '$TARGET_ASSET' already exists in release $TAG_NAME. Aborting."
+                exit 1
+            else
+                echo "Release exists but Linux asset is missing. Proceeding to build."
+            fi
+        else
+            echo "Release $TAG_NAME does not exist. Proceeding to build."
+        fi
+
+        # 4. Export VERSION for later steps
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+
     - name: Free Disk Space
       run: |
         df -Th /
@@ -145,9 +174,8 @@ jobs:
     - name: Rename and Stage
       shell: bash
       run: |
-        VERSION=$(awk -F '[""]' '/^version/ { print $2; exit }' Cargo.toml)
+        # Version is now loaded from env
         echo "Detected version: $VERSION"
-        echo "VERSION=$VERSION" >> $GITHUB_ENV
 
         mkdir -p staging
         cp -v "target/release/phdupes" "staging/phdupes-v${VERSION}-linux"

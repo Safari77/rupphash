@@ -66,6 +66,37 @@ jobs:
         echo "EXT_DAV1D_HASH=Managed by vcpkg (x64-windows-static)" >> $env:GITHUB_ENV
         echo "EXT_HEIF_HASH=Managed by vcpkg (x64-windows-static)" >> $env:GITHUB_ENV
 
+    - name: Check for Existing Windows Asset
+      shell: powershell
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # 1. Extract Version
+        $Content = Get-Content Cargo.toml
+        $Version = ($Content | Select-String -Pattern '^version\s*=\s*"(.*)"').Matches.Groups[1].Value
+        $TagName = "v$Version"
+        $TargetAsset = "phdupes-v$Version-windows-static.exe"
+
+        Write-Host "Checking for asset: $TargetAsset in release $TagName"
+
+        # 2. Check if release exists and get asset list
+        # We use --json assets to get the file list safely
+        $ExistingAssets = gh release view $TagName --json assets --jq '.assets[].name' 2>$null
+
+        if ($LASTEXITCODE -eq 0) {
+            if ($ExistingAssets -match [regex]::Escape($TargetAsset)) {
+                Write-Error "CRITICAL: Asset '$TargetAsset' already exists in release $TagName. Aborting to prevent overwrite."
+                exit 1
+            } else {
+                Write-Host "Release exists, but Windows asset is missing. Proceeding to build."
+            }
+        } else {
+            Write-Host "Release $TagName does not exist yet. Proceeding to build."
+            $global:LASTEXITCODE = 0
+        }
+
+        echo "VERSION=$Version" >> $env:GITHUB_ENV
+
     - name: Install Rust 1.93.0
       uses: dtolnay/rust-toolchain@1.93.0
       with:
@@ -94,13 +125,10 @@ jobs:
     - name: Stage Artifacts
       shell: powershell
       run: |
-        $Content = Get-Content Cargo.toml
-        $Version = ($Content | Select-String -Pattern '^version\s*=\s*"(.*)"').Matches.Groups[1].Value
-        echo "VERSION=$Version" >> $env:GITHUB_ENV
-
+        # VERSION is already in env from previous step
         New-Item -ItemType Directory -Force -Path "staging"
         $Src = "target/x86_64-pc-windows-msvc/release/phdupes.exe"
-        $Dest = "staging/phdupes-v$Version-windows-static.exe"
+        $Dest = "staging/phdupes-v$env:VERSION-windows-static.exe"
         Copy-Item $Src $Dest
         Write-Host "Bundled Static Exe: $Dest"
         Get-ChildItem "staging/"
