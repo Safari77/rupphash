@@ -75,6 +75,25 @@ jobs:
         gcc -dumpspecs
         touch /tmp/gcctest.c && gcc -v /tmp/gcctest.c -c
 
+    - name: Install Static libde265
+      run: |
+        LIBDE265_HASH="b92beb6b53c346db9a8fae968d686ab706240099cdd5aff87777362d668b0de7"
+        LIBDE265_VERSION="1.0.16"
+        wget -q -t 30 --waitretry 10 -O libde265-"${LIBDE265_VERSION}".tar.gz https://github.com/strukturag/libde265/releases/download/v"${LIBDE265_VERSION}"/libde265-"${LIBDE265_VERSION}".tar.gz
+        echo "${LIBDE265_HASH}  libde265-${LIBDE265_VERSION}.tar.gz" | sha256sum --check
+        tar -zxf libde265-${LIBDE265_VERSION}.tar.gz
+        cd libde265-${LIBDE265_VERSION}
+        mkdir build
+        cd build
+        cmake .. \
+          -DCMAKE_INSTALL_PREFIX=/usr \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -DCMAKE_BUILD_TYPE=Release
+
+        make -j$(nproc)
+        sudo make install
+
     # Compile libaom from source (STATIC)
     - name: Build libaom 3.13.1
       run: |
@@ -133,10 +152,10 @@ jobs:
         pkg-config --static --libs --cflags dav1d 'dav1d == 1.5.3'
 
     # Compile libheif from source (STATIC)
-    - name: Build libheif 1.21.1
+    - name: Build libheif 1.21.2
       run: |
-        HEIF_HASH="9799b4b1c19006f052bcf399c761cc147e279762683cefaf16871dbb9b4ea2a1"
-        HEIF_VERSION="1.21.1"
+        HEIF_HASH="75f530b7154bc93e7ecf846edfc0416bf5f490612de8c45983c36385aa742b42"
+        HEIF_VERSION="1.21.2"
         wget -q -t 30 --waitretry 10 https://github.com/strukturag/libheif/releases/download/v${HEIF_VERSION}/libheif-${HEIF_VERSION}.tar.gz
         echo "${HEIF_HASH}  libheif-${HEIF_VERSION}.tar.gz" | sha256sum --check
         echo "EXT_HEIF_VER=${HEIF_VERSION}" >> $GITHUB_ENV
@@ -157,7 +176,7 @@ jobs:
     - name: Check libheif version
       run: |
         echo "Checking pkg-config for libheif..."
-        pkg-config --static --libs --cflags libheif 'libheif == 1.21.1'
+        pkg-config --static --libs --cflags libheif 'libheif == 1.21.2'
 
     - name: Install Rust 1.93.0
       uses: dtolnay/rust-toolchain@1.93.0
