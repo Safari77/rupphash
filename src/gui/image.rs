@@ -179,6 +179,67 @@ fn maybe_resize_image(
     (color_image, real_dims, orientation)
 }
 
+/// Fallback: Manually carve out the largest embedded JPEG (PreviewImage)
+/// using EXIF/TIFF tags when the RAW decoder completely fails to open the file.
+fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<egui::ColorImage> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let reader = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+
+    let mut best_offset = 0;
+    let mut max_length = 0;
+    // Track which Image File Directory (IFD) we found the best preview in
+    let mut best_ifd = exif::In::PRIMARY;
+
+    // Iterate through ALL fields across ALL Image File Directories (IFDs)
+    for field in reader.fields() {
+        if field.tag == exif::Tag::JPEGInterchangeFormatLength {
+            let length = match field.value {
+                exif::Value::Long(ref v) if !v.is_empty() => v[0] as usize,
+                exif::Value::Short(ref v) if !v.is_empty() => v[0] as usize,
+                _ => continue,
+            };
+
+            // If this is the biggest one we've seen, find its matching offset
+            if length > max_length {
+                if let Some(offset_field) =
+                    reader.get_field(exif::Tag::JPEGInterchangeFormat, field.ifd_num)
+                {
+                    let offset = match offset_field.value {
+                        exif::Value::Long(ref v) if !v.is_empty() => v[0] as usize,
+                        exif::Value::Short(ref v) if !v.is_empty() => v[0] as usize,
+                        _ => continue,
+                    };
+
+                    max_length = length;
+                    best_offset = offset;
+                    best_ifd = field.ifd_num;
+                }
+            }
+        }
+    }
+
+    if max_length == 0 || best_offset + max_length > bytes.len() {
+        return None;
+    }
+
+    let jpeg_bytes = &bytes[best_offset..best_offset + max_length];
+
+    let img = image::load_from_memory(jpeg_bytes).ok()?;
+    let rgb = img.to_rgb8();
+    let (width, height) = rgb.dimensions();
+
+    eprintln!(
+        "[DEBUG] EXIF Fallback extracted thumbnail for {:?}:\n  \
+         - IFD Source: {:?}\n  \
+         - Byte Offset: {}\n  \
+         - File Size: {} bytes\n  \
+         - Resolution: {}x{}",
+        path, best_ifd, best_offset, max_length, width, height
+    );
+
+    Some(egui::ColorImage::from_rgb([width as usize, height as usize], rgb.as_raw()))
+}
+
 fn load_and_process_image_from_bytes(
     path: &Path,
     bytes: &[u8],
@@ -193,23 +254,25 @@ fn load_and_process_image_from_bytes(
         let mut raw = match rsraw::RawImage::open(bytes) {
             Ok(r) => r,
             Err(e) => {
+                // rsraw failed (likely unsupported RAW/ARW)
                 if use_thumbnails {
-                    return Err(format!("Failed to extract thumbnail from RAW: {}", e));
-                } else {
-                    return Err(format!("Failed to open RAW file: {}", e));
+                    if let Some(thumb) = extract_biggest_exif_preview(path, bytes) {
+                        let dims = (thumb.width() as u32, thumb.height() as u32);
+                        return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
+                    }
                 }
+
+                // If the fallback fails or we aren't using thumbnails, return the original error
+                return Err(format!("Failed to open RAW file (and EXIF fallback failed): {}", e));
             }
         };
+
         let dims = (raw.width(), raw.height());
 
-        // 1. Strict thumbnail mode if explicitly requested
-        if use_thumbnails {
-            if let Some(thumb) = extract_best_thumbnail(&mut raw) {
-                // Thumbnails are typically small, but resize if needed
-                return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
-            }
-            // Do not fall through to full decode if use_thumbnails is explicitly requested
-            return Err("Failed to extract thumbnail from RAW".to_string());
+        // Try standard rsraw thumbnail extraction first if it managed to open
+        if use_thumbnails && let Some(thumb) = extract_best_thumbnail(&mut raw) {
+            // Thumbnails are typically small, but resize if needed
+            return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
         }
 
         // 2. Full RAW decode mode
