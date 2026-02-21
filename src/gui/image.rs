@@ -190,44 +190,71 @@ fn load_and_process_image_from_bytes(
     if is_raw_ext(path) {
         let exif_orientation = crate::exif_extract::get_orientation(path, Some(bytes));
 
-        let mut raw =
-            rsraw::RawImage::open(bytes).map_err(|e| format!("Failed to open RAW file: {}", e))?;
+        let mut raw = match rsraw::RawImage::open(bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                if use_thumbnails {
+                    return Err(format!("Failed to extract thumbnail from RAW: {}", e));
+                } else {
+                    return Err(format!("Failed to open RAW file: {}", e));
+                }
+            }
+        };
         let dims = (raw.width(), raw.height());
 
-        // Try thumbnail first
-        if use_thumbnails && let Some(thumb) = extract_best_thumbnail(&mut raw) {
-            // Thumbnails are typically small, but resize if needed
-            return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
+        // 1. Strict thumbnail mode if explicitly requested
+        if use_thumbnails {
+            if let Some(thumb) = extract_best_thumbnail(&mut raw) {
+                // Thumbnails are typically small, but resize if needed
+                return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
+            }
+            // Do not fall through to full decode if use_thumbnails is explicitly requested
+            return Err("Failed to extract thumbnail from RAW".to_string());
         }
 
-        // Full RAW decode
+        // 2. Full RAW decode mode
         raw.set_use_camera_wb(true);
-        raw.unpack().map_err(|e| format!("Failed to unpack RAW: {}", e))?;
-        let processed = raw
-            .process::<{ rsraw::BIT_DEPTH_8 }>()
-            .map_err(|e| format!("Failed to process RAW: {}", e))?;
+        match raw.unpack() {
+            Ok(_) => match raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
+                Ok(processed) => {
+                    let w = processed.width() as usize;
+                    let h = processed.height() as usize;
+                    let total_pixels = w * h;
+                    // Determine channels dynamically
+                    let img = if processed.len() == total_pixels {
+                        // Monochrome: 1 byte per pixel
+                        egui::ColorImage::from_gray([w, h], &processed)
+                    } else if processed.len() == total_pixels * 3 {
+                        // RGB: 3 bytes per pixel
+                        egui::ColorImage::from_rgb([w, h], &processed)
+                    } else {
+                        return Err(format!(
+                            "RAW size mismatch: expected {} (Mono) or {} (RGB) bytes, got {}",
+                            total_pixels,
+                            total_pixels * 3,
+                            processed.len()
+                        ));
+                    };
 
-        let w = processed.width() as usize;
-        let h = processed.height() as usize;
-        let total_pixels = w * h;
-        // Determine channels dynamically
-        let img = if processed.len() == total_pixels {
-            // Monochrome: 1 byte per pixel
-            egui::ColorImage::from_gray([w, h], &processed)
-        } else if processed.len() == total_pixels * 3 {
-            // RGB: 3 bytes per pixel
-            egui::ColorImage::from_rgb([w, h], &processed)
-        } else {
-            return Err(format!(
-                "RAW size mismatch: expected {} (Mono) or {} (RGB) bytes, got {}",
-                total_pixels,
-                total_pixels * 3,
-                processed.len()
-            ));
-        };
-
-        // rsraw handles rotation, orientation=1
-        return Ok(maybe_resize_image(img, dims, 1, path));
+                    // rsraw handles rotation, orientation=1
+                    return Ok(maybe_resize_image(img, dims, 1, path));
+                }
+                Err(e) => {
+                    // Fallback to thumbnail on process error
+                    if let Some(thumb) = extract_best_thumbnail(&mut raw) {
+                        return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
+                    }
+                    return Err(format!("Failed to process RAW: {}", e));
+                }
+            },
+            Err(e) => {
+                // Fallback to thumbnail on unpack error (unsupported full decode formats)
+                if let Some(thumb) = extract_best_thumbnail(&mut raw) {
+                    return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
+                }
+                return Err(format!("Failed to unpack RAW: {}", e));
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
