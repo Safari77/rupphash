@@ -334,7 +334,7 @@ fn load_and_process_image_from_bytes(
     // ---------------------------------------------------------------------
     // JP2 / JXL FAST PATH
     // ---------------------------------------------------------------------
-    if matches!(ext.as_str(), "jp2" | "j2k" | "jxl") {
+    if matches!(ext.as_str(), "jp2" | "j2k" | "jxl" | "pdf") {
         eprintln!("[DEBUG-GUI] attempting scanner decode for {:?}", path);
 
         if let Some(dyn_img) = crate::scanner::load_image_fast(path, bytes) {

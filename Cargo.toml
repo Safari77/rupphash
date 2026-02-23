@@ -27,6 +27,8 @@ flate2 = { version = "1.1", features = [
 ], default-features = false }
 geo = { version = "0.32", features = ["serde"] }
 getrandom = "0.4"
+hayro = "0"
+hayro-syntax = "0"
 hex = "0.4"
 image-extras = { git = "https://github.com/image-rs/image-extras", branch = "main" }
 image = { version = "0.25", features = ["avif-native"] }

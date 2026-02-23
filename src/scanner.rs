@@ -648,6 +648,62 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
             }
         }
 
+        "pdf" => {
+            img_debug!("[pdf] attempting hayro decode");
+
+            // 1. Parse the PDF syntax
+            let pdf_data = std::sync::Arc::new(bytes.to_vec());
+            let pdf = match hayro::hayro_syntax::Pdf::new(pdf_data) {
+                Ok(p) => p,
+                Err(e) => {
+                    img_debug!("[pdf] parse failed: {:?}", e);
+                    return None;
+                }
+            };
+
+            // 2. Extract the first page
+            let pages = pdf.pages();
+            if let Some(first_page) = pages.first() {
+                let interpreter_settings = hayro::hayro_interpret::InterpreterSettings::default();
+
+                // 3. Configure render settings with a solid white background
+                let render_settings = hayro::RenderSettings {
+                    x_scale: 2.0,
+                    y_scale: 2.0,
+                    bg_color: hayro::vello_cpu::color::palette::css::WHITE,
+                    ..Default::default()
+                };
+
+                // 4. Render the page to a pixmap
+                let pixmap = hayro::render(&first_page, &interpreter_settings, &render_settings);
+
+                // 5. Zero-copy extraction
+                let width = pixmap.width() as u32;
+                let height = pixmap.height() as u32;
+                let pixel_slice = pixmap.data();
+
+                // Safely cast &[PremulRgba8] to &[u8]
+                let raw_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        pixel_slice.as_ptr() as *const u8,
+                        pixel_slice.len() * 4,
+                    )
+                };
+
+                // 6. Build the DynamicImage
+                // Because Alpha is 255 everywhere, Premultiplied == Straight RGBA.
+                if let Some(rgba_image) =
+                    image::RgbaImage::from_raw(width, height, raw_bytes.to_vec())
+                {
+                    img_debug!("[pdf] zero-copy decode successful");
+                    return Some(image::DynamicImage::ImageRgba8(rgba_image));
+                }
+            }
+
+            img_debug!("[pdf] document has no pages or render failed");
+            return None;
+        }
+
         _ => {}
     }
 
@@ -2013,6 +2069,8 @@ pub fn is_image_ext(path: &Path) -> bool {
             |"jp2"|"j2k"|"jxl"
             // image-extras
             |"xbm"|"xpm"|"ora"|"otb"|"pcx"|"sgi"|"wbmp"
+            // hayro
+            |"pdf"
             ) || RAW_EXTS.contains(&e.as_str())
         })
         .unwrap_or(false)
