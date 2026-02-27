@@ -36,8 +36,15 @@ pub(super) struct GroupViewState {
 }
 
 pub enum ImageLoadResult {
-    Loaded(egui::ColorImage, (u32, u32), u8, [u8; 32], Option<i64>), // image, resolution, orientation, content_hash, exif_timestamp
-    Failed(String),                                                  // Failure with error message
+    Loaded(
+        egui::ColorImage,
+        (u32, u32),
+        u8,
+        [u8; 32],
+        Option<i64>,
+        Option<([u32; 256], [egui::Color32; 5])>,
+    ), // image, resolution, orientation, content_hash, exif_timestamp, histogram+palette
+    Failed(String), // Failure with error message
 }
 
 impl Default for GroupViewState {
@@ -70,12 +77,16 @@ pub(super) fn spawn_image_loader_pool(
                 let result =
                     match load_and_process_image_with_hash(&path, use_thumbnails, &content_key) {
                         Ok((img, dims, orientation, content_hash, exif_timestamp)) => {
+                            // Compute histogram + palette from the already-decoded ColorImage
+                            // so the UI thread never has to re-read the file from disk
+                            let hist_palette = compute_histogram_from_colorimage(&img);
                             ImageLoadResult::Loaded(
                                 img,
                                 dims,
                                 orientation,
                                 content_hash,
                                 exif_timestamp,
+                                Some(hist_palette),
                             )
                         }
                         Err(err_msg) => ImageLoadResult::Failed(err_msg),
@@ -658,6 +669,119 @@ fn linear_to_srgb(c: f32) -> f32 {
     if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
 }
 
+/// Compute luminance histogram and dominant color palette directly from an egui::ColorImage.
+/// This avoids re-reading and re-decoding the image file from disk.
+fn compute_histogram_from_colorimage(img: &egui::ColorImage) -> ([u32; 256], [egui::Color32; 5]) {
+    let pixels = &img.pixels;
+
+    // --- Histogram: compute luminance for every pixel ---
+    let mut hist = [0u32; 256];
+    for px in pixels {
+        let r = px.r() as u32;
+        let g = px.g() as u32;
+        let b = px.b() as u32;
+        // ITU-R BT.601 luminance: 0.299R + 0.587G + 0.114B
+        let luma = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
+        hist[luma as usize] += 1;
+    }
+
+    // --- Palette: downsample to 64x64, cluster in Oklab ---
+    let palette = extract_palette_from_colorimage(img);
+
+    (hist, palette)
+}
+
+/// Extract 5-color dominant palette from an egui::ColorImage by downsampling
+/// to 64x64 in Oklab space, then running K-Means clustering.
+/// Sorted by Oklab perceived lightness for a perceptually ordered display.
+fn extract_palette_from_colorimage(img: &egui::ColorImage) -> [egui::Color32; 5] {
+    let (src_w, src_h) = (img.size[0], img.size[1]);
+    let (dst_w, dst_h) = (64usize, 64usize);
+
+    // Downsample to 64x64 using nearest-neighbour and convert directly to Oklab
+    let mut oklab_pixels = Vec::with_capacity(dst_w * dst_h);
+    for dy in 0..dst_h {
+        let sy = (dy * src_h) / dst_h;
+        for dx in 0..dst_w {
+            let sx = (dx * src_w) / dst_w;
+            let px = img.pixels[sy * src_w + sx];
+            let lr = srgb_to_linear(px.r() as f32 / 255.0);
+            let lg = srgb_to_linear(px.g() as f32 / 255.0);
+            let lb = srgb_to_linear(px.b() as f32 / 255.0);
+            oklab_pixels.push(linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb }));
+        }
+    }
+
+    // Initialize 5 centroids spread across the data
+    let n = oklab_pixels.len();
+    let mut centroids = [
+        oklab_pixels[0],
+        oklab_pixels[n / 4],
+        oklab_pixels[n / 2],
+        oklab_pixels[n * 3 / 4],
+        oklab_pixels[n - 1],
+    ];
+
+    // K-means clustering iterations
+    for _ in 0..10 {
+        let mut counts = [0u32; 5];
+        let mut sums = [(0.0f32, 0.0f32, 0.0f32); 5];
+
+        for &p in &oklab_pixels {
+            let mut min_dist = f32::MAX;
+            let mut best_idx = 0;
+
+            for (i, c) in centroids.iter().enumerate() {
+                let dist_sq = (p.l - c.l).powi(2) + (p.a - c.a).powi(2) + (p.b - c.b).powi(2);
+                if dist_sq < min_dist {
+                    min_dist = dist_sq;
+                    best_idx = i;
+                }
+            }
+
+            counts[best_idx] += 1;
+            sums[best_idx].0 += p.l;
+            sums[best_idx].1 += p.a;
+            sums[best_idx].2 += p.b;
+        }
+
+        for i in 0..5 {
+            if counts[i] > 0 {
+                let c = counts[i] as f32;
+                centroids[i].l = sums[i].0 / c;
+                centroids[i].a = sums[i].1 / c;
+                centroids[i].b = sums[i].2 / c;
+            }
+        }
+    }
+
+    // Convert centroids back to sRGB
+    let mut result = [egui::Color32::BLACK; 5];
+    // Keep Oklab L values for sorting
+    let mut lightness = [0.0f32; 5];
+    for i in 0..5 {
+        lightness[i] = centroids[i].l;
+        let srgb_linear = oklab_to_linear_srgb(centroids[i]);
+        let r = (linear_to_srgb(srgb_linear.r).clamp(0.0, 1.0) * 255.0).round() as u8;
+        let g = (linear_to_srgb(srgb_linear.g).clamp(0.0, 1.0) * 255.0).round() as u8;
+        let b = (linear_to_srgb(srgb_linear.b).clamp(0.0, 1.0) * 255.0).round() as u8;
+        result[i] = egui::Color32::from_rgb(r, g, b);
+    }
+
+    // Sort by Oklab perceived lightness (L component)
+    let mut indices: [usize; 5] = [0, 1, 2, 3, 4];
+    indices.sort_by(|&a, &b| lightness[a].partial_cmp(&lightness[b]).unwrap());
+    let sorted: [egui::Color32; 5] = [
+        result[indices[0]],
+        result[indices[1]],
+        result[indices[2]],
+        result[indices[3]],
+        result[indices[4]],
+    ];
+
+    sorted
+}
+
 /// Extracts a 5-color dominant palette using K-Means clustering in Oklab space
 fn extract_palette(image: &image::DynamicImage) -> [egui::Color32; 5] {
     // Resize to a small thumbnail for speed
@@ -718,7 +842,10 @@ fn extract_palette(image: &image::DynamicImage) -> [egui::Color32; 5] {
     }
 
     let mut result = [egui::Color32::BLACK; 5];
+    // Keep Oklab L values for sorting
+    let mut lightness = [0.0f32; 5];
     for i in 0..5 {
+        lightness[i] = centroids[i].l;
         // Convert back to Linear RGB, then back to sRGB for rendering
         let srgb_linear = oklab_to_linear_srgb(centroids[i]);
         let r = (linear_to_srgb(srgb_linear.r).clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -727,13 +854,18 @@ fn extract_palette(image: &image::DynamicImage) -> [egui::Color32; 5] {
         result[i] = egui::Color32::from_rgb(r, g, b);
     }
 
-    // Sort the palette by visual lightness (V in HSV) for a pleasing display
-    result.sort_by_key(|c| {
-        let hsv = egui::ecolor::Hsva::from(*c);
-        (hsv.v * 100.0) as u32
-    });
+    // Sort the palette by Oklab perceived lightness (L component)
+    let mut indices: [usize; 5] = [0, 1, 2, 3, 4];
+    indices.sort_by(|&a, &b| lightness[a].partial_cmp(&lightness[b]).unwrap());
+    let sorted: [egui::Color32; 5] = [
+        result[indices[0]],
+        result[indices[1]],
+        result[indices[2]],
+        result[indices[3]],
+        result[indices[4]],
+    ];
 
-    result
+    sorted
 }
 
 /// Compute histogram and palette from a standard image file
@@ -843,14 +975,14 @@ pub(super) fn render_histogram(
         egui::vec2(hist_width, hist_height),
     );
 
-    // Check cache first
-    let histogram_data = if let Some((cached_path, cached_data)) = &app.cached_histogram {
-        if cached_path == path { Some(*cached_data) } else { None }
+    // Check cache first (HashMap keyed by path, populated during preload)
+    let histogram_data = if let Some(cached_data) = app.cached_histogram.get(path) {
+        Some(*cached_data)
     } else {
         None
     };
 
-    // Compute if not cached
+    // Fallback: compute from disk if not preloaded (shouldn't happen often)
     let histogram_data = histogram_data.or_else(|| {
         let data = if is_raw_ext(path) {
             compute_histogram_from_raw(path)
@@ -859,7 +991,7 @@ pub(super) fn render_histogram(
         };
         // Cache the result
         if let Some(d) = data {
-            app.cached_histogram = Some((path.to_path_buf(), d));
+            app.cached_histogram.insert(path.to_path_buf(), d);
             Some(d)
         } else {
             None

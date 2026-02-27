@@ -148,8 +148,8 @@ pub struct GuiApp {
     // EXIF info display
     pub(super) show_exif: bool,
 
-    // Cache for current image's histogram and EXIF data (to avoid reloading on toggle)
-    pub(super) cached_histogram: Option<(std::path::PathBuf, ([u32; 256], [egui::Color32; 5]))>,
+    // Cache for histogram and palette data, keyed by path (lifecycle matches raw_cache)
+    pub(super) cached_histogram: HashMap<std::path::PathBuf, ([u32; 256], [egui::Color32; 5])>,
     pub(super) cached_exif: Option<(std::path::PathBuf, Vec<(String, String)>)>,
     pub(super) search_input: String,
     pub(super) search_focus_requested: bool,
@@ -374,7 +374,7 @@ impl GuiApp {
             completion_index: 0,
             show_histogram: false,
             show_exif: false,
-            cached_histogram: None,
+            cached_histogram: HashMap::new(),
             cached_exif: None,
             search_input: String::new(),
             search_focus_requested: false,
@@ -569,7 +569,7 @@ impl GuiApp {
             completion_index: 0,
             show_histogram: false,
             show_exif: false,
-            cached_histogram: None,
+            cached_histogram: HashMap::new(),
             cached_exif: None,
             search_input: String::new(),
             search_focus_requested: false,
@@ -796,6 +796,7 @@ impl GuiApp {
 
             // Clear caches first
             self.raw_cache.clear();
+            self.cached_histogram.clear();
             self.raw_loading.clear();
             self.exif_search_cache.clear();
             self.gps_map.clear_markers();
@@ -996,6 +997,7 @@ impl GuiApp {
                     self.clear_failed_under(dest);
                     // Invalidate cache for the destination of the rename/exchange
                     self.raw_cache.remove(dest);
+                    self.cached_histogram.remove(dest);
                 }
                 continue;
             }
@@ -1009,6 +1011,7 @@ impl GuiApp {
 
                         // Remove from cache if file is deleted
                         self.raw_cache.remove(path);
+                        self.cached_histogram.remove(path);
 
                         if let Some(name) = path.file_name() {
                             let name_str = name.to_string_lossy().to_string();
@@ -1032,6 +1035,7 @@ impl GuiApp {
                         if classify(path) {
                             // Invalidate cache so perform_preload re-fetches the image
                             self.raw_cache.remove(path);
+                            self.cached_histogram.remove(path);
 
                             if self.failed_images.remove(path).is_some() {
                                 eprintln!(
@@ -1462,6 +1466,7 @@ impl GuiApp {
 
         // Cache Eviction
         self.raw_cache.retain(|k, _| active_window_paths.contains(k));
+        self.cached_histogram.retain(|k, _| active_window_paths.contains(k));
         self.raw_loading.retain(|k| active_window_paths.contains(k));
     }
 
@@ -1716,6 +1721,7 @@ impl eframe::App for GuiApp {
                             orientation,
                             content_hash,
                             exif_timestamp,
+                            hist_palette,
                         ) => {
                             super::image::update_file_metadata(
                                 self,
@@ -1726,6 +1732,11 @@ impl eframe::App for GuiApp {
                                 content_hash,
                                 exif_timestamp,
                             );
+
+                            // Store precomputed histogram+palette in the cache
+                            if let Some(hp) = hist_palette {
+                                self.cached_histogram.insert(path.clone(), hp);
+                            }
 
                             let name = format!("img_{}", path.display());
                             let texture = ctx.load_texture(name, color_image, Default::default());
