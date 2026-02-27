@@ -562,10 +562,25 @@ pub(super) fn render_image_texture(
         ViewMode::FitHeight => screen_h / visual_size.y,
         ViewMode::ManualZoom(z) => {
             if app.state.zoom_relative {
+                // Relative zoom implicitly handles texture downscaling because fit_scale
+                // dynamically maps whatever the visual_size is to the screen bounds.
                 let fit_scale = (screen_w / visual_size.x).min(screen_h / visual_size.y);
                 z * fit_scale
             } else {
-                z
+                // 1. Divide by pixels_per_point so 1 image pixel = 1 physical screen pixel (ignores font_scale)
+                let ppp = ui.ctx().pixels_per_point();
+
+                // 2. Compensate for textures downscaled due to MAX_TEXTURE_SIDE (>8192px limits)
+                let resolution_scale = app
+                    .state
+                    .groups
+                    .get(app.state.current_group_idx)
+                    .and_then(|g| g.get(app.state.current_file_idx))
+                    .and_then(|f| f.resolution)
+                    .map(|(w, _)| w as f32 / texture_size.x)
+                    .unwrap_or(1.0);
+
+                (z * resolution_scale) / ppp
             }
         }
     };
