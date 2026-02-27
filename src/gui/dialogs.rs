@@ -378,6 +378,7 @@ pub(super) fn handle_input(
         }
         if ctx.input(|i| i.key_pressed(egui::Key::I)) {
             app.show_histogram = !app.show_histogram;
+            app.histogram_enabled.store(app.show_histogram, std::sync::atomic::Ordering::Relaxed);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::E)) {
             app.show_exif = !app.show_exif;

@@ -59,6 +59,8 @@ impl Default for GroupingConfig {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GuiConfig {
     pub font_monospace: Option<String>,
+    pub dominant_colors: Option<usize>,
+    pub saturation_bias: Option<f32>,
     pub font_ui: Option<String>,
     pub font_scale: Option<f32>,
     pub preload_count: Option<usize>,
@@ -89,6 +91,8 @@ impl Default for GuiConfig {
     fn default() -> Self {
         Self {
             font_monospace: None,
+            dominant_colors: Some(5),
+            saturation_bias: Some(1.0),
             font_ui: None,
             font_scale: Some(1.0),
             preload_count: Some(10),
@@ -278,8 +282,12 @@ impl AppContext {
                 .map_err(|_| "Failed to parse config. Format might have changed.")?;
 
             eprintln!(
-                "[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}",
-                cfg.gui.width, cfg.gui.height, cfg.gui.panel_width
+                "[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}, dominant_colors={:?}, saturation_bias={:?}",
+                cfg.gui.width,
+                cfg.gui.height,
+                cfg.gui.panel_width,
+                cfg.gui.dominant_colors,
+                cfg.gui.saturation_bias
             );
             eprintln!("[DEBUG-DB] LMDB map size: {} MiB", cfg.db_size_mb);
             eprintln!("[DEBUG-DB] Locations loaded: {}", cfg.locations.len());

@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, channel};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -144,12 +145,14 @@ pub struct GuiApp {
 
     // Histogram display
     pub(super) show_histogram: bool,
+    // Shared flag so worker threads skip histogram+palette when disabled
+    pub(super) histogram_enabled: Arc<AtomicBool>,
 
     // EXIF info display
     pub(super) show_exif: bool,
 
     // Cache for histogram and palette data, keyed by path (lifecycle matches raw_cache)
-    pub(super) cached_histogram: HashMap<std::path::PathBuf, ([u32; 256], [egui::Color32; 5])>,
+    pub(super) cached_histogram: HashMap<std::path::PathBuf, ([u32; 256], Vec<egui::Color32>)>,
     pub(super) cached_exif: Option<(std::path::PathBuf, Vec<(String, String)>)>,
     pub(super) search_input: String,
     pub(super) search_focus_requested: bool,
@@ -317,7 +320,16 @@ impl GuiApp {
         state.is_loading = true;
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
-        let (tx, rx) = super::image::spawn_image_loader_pool(use_raw_thumbnails, ctx.content_key);
+        let dominant_colors = ctx.gui_config.dominant_colors.unwrap_or(5);
+        let saturation_bias = ctx.gui_config.saturation_bias.unwrap_or(1.0);
+        let histogram_enabled = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = super::image::spawn_image_loader_pool(
+            use_raw_thumbnails,
+            ctx.content_key,
+            dominant_colors,
+            saturation_bias,
+            Arc::clone(&histogram_enabled),
+        );
         // panel_width is saved in logical points (after font_scale applied)
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
         // Initialize with configured size so we have a fallback if window size isn't captured
@@ -373,6 +385,7 @@ impl GuiApp {
             completion_candidates: Vec::new(),
             completion_index: 0,
             show_histogram: false,
+            histogram_enabled,
             show_exif: false,
             cached_histogram: HashMap::new(),
             cached_exif: None,
@@ -461,7 +474,16 @@ impl GuiApp {
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
         let ctx = crate::db::AppContext::new().expect("Failed to create context");
-        let (tx, rx) = super::image::spawn_image_loader_pool(use_raw_thumbnails, ctx.content_key);
+        let dominant_colors = ctx.gui_config.dominant_colors.unwrap_or(5);
+        let saturation_bias = ctx.gui_config.saturation_bias.unwrap_or(1.0);
+        let histogram_enabled = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = super::image::spawn_image_loader_pool(
+            use_raw_thumbnails,
+            ctx.content_key,
+            dominant_colors,
+            saturation_bias,
+            Arc::clone(&histogram_enabled),
+        );
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
         let initial_window_size =
             Some((ctx.gui_config.width.unwrap_or(1280), ctx.gui_config.height.unwrap_or(720)));
@@ -568,6 +590,7 @@ impl GuiApp {
             completion_candidates: Vec::new(),
             completion_index: 0,
             show_histogram: false,
+            histogram_enabled,
             show_exif: false,
             cached_histogram: HashMap::new(),
             cached_exif: None,

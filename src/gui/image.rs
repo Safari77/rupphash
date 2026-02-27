@@ -8,6 +8,8 @@ use oklab::{LinearRgb, Oklab, linear_srgb_to_oklab, oklab_to_linear_srgb};
 use std::f32::consts::PI;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use super::app::GuiApp;
@@ -42,7 +44,7 @@ pub enum ImageLoadResult {
         u8,
         [u8; 32],
         Option<i64>,
-        Option<([u32; 256], [egui::Color32; 5])>,
+        Option<([u32; 256], Vec<egui::Color32>)>,
     ), // image, resolution, orientation, content_hash, exif_timestamp, histogram+palette
     Failed(String), // Failure with error message
 }
@@ -56,6 +58,9 @@ impl Default for GroupViewState {
 pub(super) fn spawn_image_loader_pool(
     use_thumbnails: bool,
     content_key: [u8; 32],
+    dominant_colors: usize,
+    sat_bias: f32,
+    histogram_enabled: Arc<AtomicBool>,
 ) -> (Sender<PathBuf>, Receiver<(PathBuf, ImageLoadResult)>) {
     let (tx, rx) = unbounded::<PathBuf>();
     let (result_tx, result_rx): (
@@ -68,6 +73,7 @@ pub(super) fn spawn_image_loader_pool(
     for _ in 0..num_threads {
         let rx_clone = rx.clone();
         let tx_clone = result_tx.clone();
+        let hist_flag = Arc::clone(&histogram_enabled);
 
         thread::spawn(move || {
             while let Ok(path) = rx_clone.recv() {
@@ -77,16 +83,39 @@ pub(super) fn spawn_image_loader_pool(
                 let result =
                     match load_and_process_image_with_hash(&path, use_thumbnails, &content_key) {
                         Ok((img, dims, orientation, content_hash, exif_timestamp)) => {
-                            // Compute histogram + palette from the already-decoded ColorImage
-                            // so the UI thread never has to re-read the file from disk
-                            let hist_palette = compute_histogram_from_colorimage(&img);
+                            // Only compute histogram + palette when the overlay is enabled;
+                            // the disk-based fallback in render_histogram handles cache misses
+                            // when the user toggles it on later.
+                            let hist_palette = if hist_flag.load(Ordering::Relaxed) {
+                                let hp = compute_histogram_from_colorimage(
+                                    &img,
+                                    dominant_colors,
+                                    sat_bias,
+                                );
+
+                                // Log dominant colors as gamma-encoded sRGB values
+                                let colors_str: Vec<String> =
+                                    hp.1.iter()
+                                        .map(|c| format!("({}, {}, {})", c.r(), c.g(), c.b()))
+                                        .collect();
+                                eprintln!(
+                                    "[PALETTE] {:?}: [{}]",
+                                    path.file_name().unwrap_or_default(),
+                                    colors_str.join(", ")
+                                );
+
+                                Some(hp)
+                            } else {
+                                None
+                            };
+
                             ImageLoadResult::Loaded(
                                 img,
                                 dims,
                                 orientation,
                                 content_hash,
                                 exif_timestamp,
-                                Some(hist_palette),
+                                hist_palette,
                             )
                         }
                         Err(err_msg) => ImageLoadResult::Failed(err_msg),
@@ -670,35 +699,18 @@ fn linear_to_srgb(c: f32) -> f32 {
 }
 
 /// Compute luminance histogram and dominant color palette directly from an egui::ColorImage.
-/// This avoids re-reading and re-decoding the image file from disk.
-fn compute_histogram_from_colorimage(img: &egui::ColorImage) -> ([u32; 256], [egui::Color32; 5]) {
-    let pixels = &img.pixels;
-
-    // --- Histogram: compute luminance for every pixel ---
-    let mut hist = [0u32; 256];
-    for px in pixels {
-        let r = px.r() as u32;
-        let g = px.g() as u32;
-        let b = px.b() as u32;
-        // ITU-R BT.601 luminance: 0.299R + 0.587G + 0.114B
-        let luma = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
-        hist[luma as usize] += 1;
-    }
-
-    // --- Palette: downsample to 64x64, cluster in Oklab ---
-    let palette = extract_palette_from_colorimage(img);
-
-    (hist, palette)
-}
-
-/// Extract 5-color dominant palette from an egui::ColorImage by downsampling
-/// to 64x64 in Oklab space, then running K-Means clustering.
-/// Sorted by Oklab perceived lightness for a perceptually ordered display.
-fn extract_palette_from_colorimage(img: &egui::ColorImage) -> [egui::Color32; 5] {
+/// Downsamples to 128x128 once, converts to Oklab, then computes both histogram (from L)
+/// and palette (via K-means++) from the same pixel buffer. This avoids running expensive
+/// srgb_to_oklab_l on every pixel of the full-resolution image.
+fn compute_histogram_from_colorimage(
+    img: &egui::ColorImage,
+    dominant_colors: usize,
+    sat_bias: f32,
+) -> ([u32; 256], Vec<egui::Color32>) {
     let (src_w, src_h) = (img.size[0], img.size[1]);
-    let (dst_w, dst_h) = (64usize, 64usize);
+    let (dst_w, dst_h) = (128usize, 128usize);
 
-    // Downsample to 64x64 using nearest-neighbour and convert directly to Oklab
+    // Downsample to 128x128 using nearest-neighbour and convert to Oklab (one pass)
     let mut oklab_pixels = Vec::with_capacity(dst_w * dst_h);
     for dy in 0..dst_h {
         let sy = (dy * src_h) / dst_h;
@@ -712,83 +724,210 @@ fn extract_palette_from_colorimage(img: &egui::ColorImage) -> [egui::Color32; 5]
         }
     }
 
-    // Initialize 5 centroids spread across the data
-    let n = oklab_pixels.len();
-    let mut centroids = [
-        oklab_pixels[0],
-        oklab_pixels[n / 4],
-        oklab_pixels[n / 2],
-        oklab_pixels[n * 3 / 4],
-        oklab_pixels[n - 1],
-    ];
+    // --- Histogram: from Oklab L values of the downsampled pixels ---
+    let mut hist = [0u32; 256];
+    for p in &oklab_pixels {
+        let bin = (p.l.clamp(0.0, 1.0) * 255.0).round() as usize;
+        hist[bin] += 1;
+    }
 
-    // K-means clustering iterations
-    for _ in 0..10 {
-        let mut counts = [0u32; 5];
-        let mut sums = [(0.0f32, 0.0f32, 0.0f32); 5];
+    // --- Palette: K-means++ on the same Oklab pixels ---
+    let palette = kmeans_palette(&oklab_pixels, dominant_colors, sat_bias);
 
-        for &p in &oklab_pixels {
-            let mut min_dist = f32::MAX;
-            let mut best_idx = 0;
+    (hist, palette)
+}
 
-            for (i, c) in centroids.iter().enumerate() {
-                let dist_sq = (p.l - c.l).powi(2) + (p.a - c.a).powi(2) + (p.b - c.b).powi(2);
-                if dist_sq < min_dist {
-                    min_dist = dist_sq;
-                    best_idx = i;
-                }
+/// K-means++ clustering in Oklab space with 3 restarts, 20 iterations, early convergence.
+/// Shared implementation used by all palette extraction paths.
+/// Returns colors sorted by Oklab perceived lightness.
+fn kmeans_palette(pixels: &[Oklab], dominant_colors: usize, sat_bias: f32) -> Vec<egui::Color32> {
+    let k = dominant_colors.clamp(1, 25);
+
+    if pixels.is_empty() {
+        return vec![egui::Color32::BLACK; k];
+    }
+
+    // Stretch the a and b color axes to force K-means to care more about color differences than brightness differences
+    let chroma_mult = sat_bias.max(1.0);
+
+    // Calculate weights using an exponential curve for BOTH Saturation and Brightness.
+    let weights: Vec<f32> = pixels
+        .iter()
+        .map(|p| {
+            if (sat_bias - 1.0).abs() < f32::EPSILON {
+                1.0 // Baseline
+            } else {
+                // 1. Chroma (Saturation) Weight
+                let chroma = (p.a.powi(2) + p.b.powi(2)).sqrt();
+                let chroma_weight = chroma * sat_bias * 5.0;
+
+                // 2. Brightness (Luminance) Weight
+                let bright_weight = p.l.powi(4) * sat_bias * 1.5;
+
+                // 3. Logarithmic Darkness Penalty
+                // Human vision is logarithmic. We use log10 to gently taper mid-shadows
+                // but aggressively crush the weight of absolute pitch black.
+                let log_curve = (p.l * 9.0 + 1.0).log10();
+                let darkness_penalty = log_curve * 0.9 + 0.1;
+
+                // Combine the weights, square the bonuses, and apply the darkness penalty
+                (1.0 + (chroma_weight + bright_weight).powi(2)) * darkness_penalty
+            }
+        })
+        .collect();
+
+    let mut best_centroids = vec![pixels[0]; k];
+    let mut best_cost = f32::MAX;
+
+    // Run K-means 3 times with different seeds, keep the best result
+    for restart in 0..3u64 {
+        // K-means++ initialization: pick centroids proportional to squared distance
+        let mut centroids = vec![pixels[0]; k];
+        let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_0000 ^ (restart * 0x9E3779B97F4A7C15);
+        let mut xorshift = || -> u64 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+
+        centroids[0] = pixels[(xorshift() as usize) % pixels.len()];
+
+        // 1. Weighted Initialization with Stretched Axes
+        for ki in 1..k {
+            let mut dists: Vec<f32> = pixels
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let mut min_d = f32::MAX;
+                    for c in &centroids[..ki] {
+                        // DISTANCE FORMULA: L is normal, A and B are stretched by chroma_mult
+                        let d = (p.l - c.l).powi(2)
+                            + ((p.a - c.a) * chroma_mult).powi(2)
+                            + ((p.b - c.b) * chroma_mult).powi(2);
+                        if d < min_d {
+                            min_d = d;
+                        }
+                    }
+                    min_d * weights[i]
+                })
+                .collect();
+
+            let total: f32 = dists.iter().sum();
+            if total <= 0.0 {
+                centroids[ki] = pixels[(xorshift() as usize) % pixels.len()];
+                continue;
+            }
+            for i in 1..dists.len() {
+                dists[i] += dists[i - 1];
             }
 
-            counts[best_idx] += 1;
-            sums[best_idx].0 += p.l;
-            sums[best_idx].1 += p.a;
-            sums[best_idx].2 += p.b;
+            let threshold = (xorshift() as f32 / u64::MAX as f32) * total;
+            let idx = dists.partition_point(|&d| d < threshold).min(pixels.len() - 1);
+            centroids[ki] = pixels[idx];
         }
 
-        for i in 0..5 {
-            if counts[i] > 0 {
-                let c = counts[i] as f32;
-                centroids[i].l = sums[i].0 / c;
-                centroids[i].a = sums[i].1 / c;
-                centroids[i].b = sums[i].2 / c;
+        // 2. Weighted K-means Iterations
+        for _ in 0..20 {
+            let mut counts = vec![0.0f32; k];
+            let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
+
+            for (idx, &p) in pixels.iter().enumerate() {
+                let mut min_dist = f32::MAX;
+                let mut best_idx = 0;
+                for (i, c) in centroids.iter().enumerate() {
+                    // Apply stretched axes here too
+                    let dist_sq = (p.l - c.l).powi(2)
+                        + ((p.a - c.a) * chroma_mult).powi(2)
+                        + ((p.b - c.b) * chroma_mult).powi(2);
+
+                    if dist_sq < min_dist {
+                        min_dist = dist_sq;
+                        best_idx = i;
+                    }
+                }
+
+                let w = weights[idx];
+                counts[best_idx] += w;
+                sums[best_idx].0 += p.l * w;
+                sums[best_idx].1 += p.a * w;
+                sums[best_idx].2 += p.b * w;
             }
+
+            let mut max_shift = 0.0f32;
+            for i in 0..k {
+                if counts[i] > 0.0 {
+                    let new_l = sums[i].0 / counts[i];
+                    let new_a = sums[i].1 / counts[i];
+                    let new_b = sums[i].2 / counts[i];
+
+                    // Keep tracking shift in stretched space to determine convergence
+                    let shift = (centroids[i].l - new_l).powi(2)
+                        + ((centroids[i].a - new_a) * chroma_mult).powi(2)
+                        + ((centroids[i].b - new_b) * chroma_mult).powi(2);
+
+                    max_shift = max_shift.max(shift);
+                    centroids[i].l = new_l;
+                    centroids[i].a = new_a;
+                    centroids[i].b = new_b;
+                }
+            }
+            if max_shift < 1e-6 {
+                break;
+            }
+        }
+
+        // 3. Weighted Cost Evaluation
+        let cost: f32 = pixels
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let min_dist = centroids
+                    .iter()
+                    .map(|c| {
+                        (p.l - c.l).powi(2)
+                            + ((p.a - c.a) * chroma_mult).powi(2)
+                            + ((p.b - c.b) * chroma_mult).powi(2)
+                    })
+                    .fold(f32::MAX, f32::min);
+                min_dist * weights[i]
+            })
+            .sum();
+
+        if cost < best_cost {
+            best_cost = cost;
+            best_centroids = centroids;
         }
     }
 
-    // Convert centroids back to sRGB
-    let mut result = [egui::Color32::BLACK; 5];
-    // Keep Oklab L values for sorting
-    let mut lightness = [0.0f32; 5];
-    for i in 0..5 {
-        lightness[i] = centroids[i].l;
-        let srgb_linear = oklab_to_linear_srgb(centroids[i]);
+    // Convert centroids to sRGB and sort by Oklab perceived lightness
+    let mut result: Vec<egui::Color32> = Vec::with_capacity(k);
+    let mut lightness: Vec<f32> = Vec::with_capacity(k);
+    for i in 0..k {
+        lightness.push(best_centroids[i].l);
+        let srgb_linear = oklab_to_linear_srgb(best_centroids[i]);
         let r = (linear_to_srgb(srgb_linear.r).clamp(0.0, 1.0) * 255.0).round() as u8;
         let g = (linear_to_srgb(srgb_linear.g).clamp(0.0, 1.0) * 255.0).round() as u8;
         let b = (linear_to_srgb(srgb_linear.b).clamp(0.0, 1.0) * 255.0).round() as u8;
-        result[i] = egui::Color32::from_rgb(r, g, b);
+        result.push(egui::Color32::from_rgb(r, g, b));
     }
 
-    // Sort by Oklab perceived lightness (L component)
-    let mut indices: [usize; 5] = [0, 1, 2, 3, 4];
+    let mut indices: Vec<usize> = (0..k).collect();
     indices.sort_by(|&a, &b| lightness[a].partial_cmp(&lightness[b]).unwrap());
-    let sorted: [egui::Color32; 5] = [
-        result[indices[0]],
-        result[indices[1]],
-        result[indices[2]],
-        result[indices[3]],
-        result[indices[4]],
-    ];
-
-    sorted
+    indices.iter().map(|&i| result[i]).collect()
 }
 
-/// Extracts a 5-color dominant palette using K-Means clustering in Oklab space
-fn extract_palette(image: &image::DynamicImage) -> [egui::Color32; 5] {
-    // Resize to a small thumbnail for speed
-    let thumb = image.thumbnail_exact(64, 64).to_rgb8();
-
-    // Convert all pixels to Oklab
-    let pixels: Vec<Oklab> = thumb
+/// Compute histogram and palette from a DynamicImage by thumbnailing to 128x128,
+/// converting to Oklab once, then computing both histogram (from L) and palette
+/// (via K-means++) from the same buffer.
+/// Shared by the disk-based fallback paths (standard images and RAW).
+fn compute_histogram_from_dynamic_image(
+    img: &image::DynamicImage,
+    dominant_colors: usize,
+    sat_bias: f32,
+) -> ([u32; 256], Vec<egui::Color32>) {
+    let thumb = img.thumbnail_exact(128, 128).to_rgb8();
+    let oklab_pixels: Vec<Oklab> = thumb
         .pixels()
         .map(|p| {
             let lr = srgb_to_linear(p[0] as f32 / 255.0);
@@ -798,95 +937,32 @@ fn extract_palette(image: &image::DynamicImage) -> [egui::Color32; 5] {
         })
         .collect();
 
-    // Initialize 5 centroids spread across the data
-    let mut centroids = [
-        pixels[0],
-        pixels[pixels.len() / 4],
-        pixels[pixels.len() / 2],
-        pixels[pixels.len() * 3 / 4],
-        pixels[pixels.len() - 1],
-    ];
-
-    // K-means clustering iterations
-    for _ in 0..10 {
-        let mut counts = [0; 5];
-        let mut sums = [(0.0, 0.0, 0.0); 5];
-
-        for &p in &pixels {
-            let mut min_dist = f32::MAX;
-            let mut best_idx = 0;
-
-            for (i, c) in centroids.iter().enumerate() {
-                // Perceptually uniform distance calculation
-                let dist_sq = (p.l - c.l).powi(2) + (p.a - c.a).powi(2) + (p.b - c.b).powi(2);
-                if dist_sq < min_dist {
-                    min_dist = dist_sq;
-                    best_idx = i;
-                }
-            }
-
-            counts[best_idx] += 1;
-            sums[best_idx].0 += p.l;
-            sums[best_idx].1 += p.a;
-            sums[best_idx].2 += p.b;
-        }
-
-        // Update centroids based on the mean of assigned pixels
-        for i in 0..5 {
-            if counts[i] > 0 {
-                centroids[i].l = sums[i].0 / counts[i] as f32;
-                centroids[i].a = sums[i].1 / counts[i] as f32;
-                centroids[i].b = sums[i].2 / counts[i] as f32;
-            }
-        }
+    let mut hist = [0u32; 256];
+    for p in &oklab_pixels {
+        let bin = (p.l.clamp(0.0, 1.0) * 255.0).round() as usize;
+        hist[bin] += 1;
     }
 
-    let mut result = [egui::Color32::BLACK; 5];
-    // Keep Oklab L values for sorting
-    let mut lightness = [0.0f32; 5];
-    for i in 0..5 {
-        lightness[i] = centroids[i].l;
-        // Convert back to Linear RGB, then back to sRGB for rendering
-        let srgb_linear = oklab_to_linear_srgb(centroids[i]);
-        let r = (linear_to_srgb(srgb_linear.r).clamp(0.0, 1.0) * 255.0).round() as u8;
-        let g = (linear_to_srgb(srgb_linear.g).clamp(0.0, 1.0) * 255.0).round() as u8;
-        let b = (linear_to_srgb(srgb_linear.b).clamp(0.0, 1.0) * 255.0).round() as u8;
-        result[i] = egui::Color32::from_rgb(r, g, b);
-    }
-
-    // Sort the palette by Oklab perceived lightness (L component)
-    let mut indices: [usize; 5] = [0, 1, 2, 3, 4];
-    indices.sort_by(|&a, &b| lightness[a].partial_cmp(&lightness[b]).unwrap());
-    let sorted: [egui::Color32; 5] = [
-        result[indices[0]],
-        result[indices[1]],
-        result[indices[2]],
-        result[indices[3]],
-        result[indices[4]],
-    ];
-
-    sorted
+    let palette = kmeans_palette(&oklab_pixels, dominant_colors, sat_bias);
+    (hist, palette)
 }
 
 /// Compute histogram and palette from a standard image file
-fn compute_histogram_from_image(path: &Path) -> Option<([u32; 256], [egui::Color32; 5])> {
+fn compute_histogram_from_image(
+    path: &Path,
+    dominant_colors: usize,
+    sat_bias: f32,
+) -> Option<([u32; 256], Vec<egui::Color32>)> {
     let img = image::open(path).ok()?;
-
-    // Histogram
-    let grey = img.to_luma8();
-    let mut hist = [0u32; 256];
-    for pixel in grey.pixels() {
-        hist[pixel.0[0] as usize] += 1;
-    }
-
-    // Palette
-    let palette = extract_palette(&img);
-
-    Some((hist, palette))
+    Some(compute_histogram_from_dynamic_image(&img, dominant_colors, sat_bias))
 }
 
 /// Compute histogram and palette from a RAW file using rsraw
-fn compute_histogram_from_raw(path: &Path) -> Option<([u32; 256], [egui::Color32; 5])> {
+fn compute_histogram_from_raw(
+    path: &Path,
+    dominant_colors: usize,
+    sat_bias: f32,
+) -> Option<([u32; 256], Vec<egui::Color32>)> {
     let data = fs::read(path).ok()?;
     let mut raw = rsraw::RawImage::open(&data).ok()?;
 
@@ -898,13 +974,7 @@ fn compute_histogram_from_raw(path: &Path) -> Option<([u32; 256], [egui::Color32
             .max_by_key(|t| t.width * t.height)
         {
             if let Ok(img) = image::load_from_memory(&best_thumb.data) {
-                let grey = img.to_luma8();
-                let mut hist = [0u32; 256];
-                for pixel in grey.pixels() {
-                    hist[pixel.0[0] as usize] += 1;
-                }
-                let palette = extract_palette(&img);
-                return Some((hist, palette));
+                return Some(compute_histogram_from_dynamic_image(&img, dominant_colors, sat_bias));
             }
         }
     }
@@ -913,36 +983,32 @@ fn compute_histogram_from_raw(path: &Path) -> Option<([u32; 256], [egui::Color32
     if raw.unpack().is_ok() {
         raw.set_use_camera_wb(true);
         if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
-            let mut hist = [0u32; 256];
             let w = raw.width() as usize;
             let h = raw.height() as usize;
-            let mut result_palette = [egui::Color32::BLACK; 5];
 
             if processed.len() == w * h {
-                // Monochrome: Direct count
-                for &pixel in processed.iter() {
-                    hist[pixel as usize] += 1;
-                }
-                for i in 0..5 {
-                    result_palette[i] = egui::Color32::from_gray((i * 255 / 4) as u8);
+                // Monochrome: construct grayscale DynamicImage
+                if let Some(gray_buf) =
+                    image::GrayImage::from_raw(w as u32, h as u32, processed.to_vec())
+                {
+                    return Some(compute_histogram_from_dynamic_image(
+                        &image::DynamicImage::ImageLuma8(gray_buf),
+                        dominant_colors,
+                        sat_bias,
+                    ));
                 }
             } else if processed.len() == w * h * 3 {
-                // RGB: Convert to luminance for histogram
-                for chunk in processed.chunks_exact(3) {
-                    let r = chunk[0] as u32;
-                    let g = chunk[1] as u32;
-                    let b = chunk[2] as u32;
-                    let grey = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
-                    hist[grey as usize] += 1;
-                }
-                // Extract palette by converting raw buffer to DynamicImage
+                // RGB: construct DynamicImage
                 if let Some(img_buf) =
                     image::RgbImage::from_raw(w as u32, h as u32, processed.to_vec())
                 {
-                    result_palette = extract_palette(&image::DynamicImage::ImageRgb8(img_buf));
+                    return Some(compute_histogram_from_dynamic_image(
+                        &image::DynamicImage::ImageRgb8(img_buf),
+                        dominant_colors,
+                        sat_bias,
+                    ));
                 }
             }
-            return Some((hist, result_palette));
         }
     }
     None
@@ -955,6 +1021,10 @@ pub(super) fn render_histogram(
     available_rect: egui::Rect,
     path: &Path,
 ) {
+    let dominant_colors = app.ctx.gui_config.dominant_colors.unwrap_or(5);
+    let sat_bias = app.ctx.gui_config.saturation_bias.unwrap_or(1.0);
+    let num_rows = (dominant_colors + 4) / 5; // ceiling division by 5
+
     let window_width = ui.ctx().input(|i| {
         i.viewport()
             .inner_rect
@@ -967,7 +1037,9 @@ pub(super) fn render_histogram(
     let hist_height = hist_width * 0.75;
     let swatch_height = 16.0;
 
-    let total_height = hist_height + swatch_height + 4.0;
+    // Total height accounts for multiple palette rows (each row = swatch_height + 4.0 gap)
+    let palette_total_height = (num_rows as f32) * swatch_height + ((num_rows as f32) * 4.0);
+    let total_height = hist_height + palette_total_height;
     let padding = 10.0;
 
     let hist_rect = egui::Rect::from_min_size(
@@ -977,7 +1049,7 @@ pub(super) fn render_histogram(
 
     // Check cache first (HashMap keyed by path, populated during preload)
     let histogram_data = if let Some(cached_data) = app.cached_histogram.get(path) {
-        Some(*cached_data)
+        Some(cached_data.clone())
     } else {
         None
     };
@@ -985,13 +1057,20 @@ pub(super) fn render_histogram(
     // Fallback: compute from disk if not preloaded (shouldn't happen often)
     let histogram_data = histogram_data.or_else(|| {
         let data = if is_raw_ext(path) {
-            compute_histogram_from_raw(path)
+            compute_histogram_from_raw(path, dominant_colors, sat_bias)
         } else {
-            compute_histogram_from_image(path)
+            compute_histogram_from_image(path, dominant_colors, sat_bias)
         };
         // Cache the result
         if let Some(d) = data {
-            app.cached_histogram.insert(path.to_path_buf(), d);
+            let colors_str: Vec<String> =
+                d.1.iter().map(|c| format!("({}, {}, {})", c.r(), c.g(), c.b())).collect();
+            eprintln!(
+                "[PALETTE-FALLBACK] {:?}: [{}]",
+                path.file_name().unwrap_or_default(),
+                colors_str.join(", ")
+            );
+            app.cached_histogram.insert(path.to_path_buf(), d.clone());
             Some(d)
         } else {
             None
@@ -1008,7 +1087,7 @@ fn draw_histogram(
     ui: &mut egui::Ui,
     hist_rect: egui::Rect,
     hist: &[u32; 256],
-    palette: &[egui::Color32; 5],
+    palette: &[egui::Color32],
 ) {
     // Find max value for normalization
     let max_val = hist[1..255].iter().copied().max().unwrap_or(1).max(1);
@@ -1055,32 +1134,43 @@ fn draw_histogram(
         egui::StrokeKind::Outside,
     );
 
-    // 3. Draw Palette Swatches
+    // 3. Draw Palette Swatches in rows of 5
     let swatch_height = 16.0;
-    let swatch_width = hist_width / 5.0;
+    let colors_per_row = 5;
+    let swatch_width = hist_width / colors_per_row as f32;
+    let num_rows = (palette.len() + colors_per_row - 1) / colors_per_row;
 
-    for (i, &color) in palette.iter().enumerate() {
-        let x = hist_rect.min.x + (i as f32) * swatch_width;
-        let y = hist_rect.max.y + 4.0;
+    for row in 0..num_rows {
+        let row_start = row * colors_per_row;
+        let row_end = (row_start + colors_per_row).min(palette.len());
+        let row_y = hist_rect.max.y + 4.0 + (row as f32) * (swatch_height + 4.0);
 
-        let swatch_rect =
-            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(swatch_width, swatch_height));
+        for (i, &color) in palette[row_start..row_end].iter().enumerate() {
+            let x = hist_rect.min.x + (i as f32) * swatch_width;
 
-        painter.rect_filled(swatch_rect, 0.0, color);
+            let swatch_rect = egui::Rect::from_min_size(
+                egui::pos2(x, row_y),
+                egui::vec2(swatch_width, swatch_height),
+            );
+
+            painter.rect_filled(swatch_rect, 0.0, color);
+        }
+
+        // Draw a border encompassing this row's color strip
+        let row_color_count = row_end - row_start;
+        let row_strip_width = row_color_count as f32 * swatch_width;
+        let palette_rect = egui::Rect::from_min_size(
+            egui::pos2(hist_rect.min.x, row_y),
+            egui::vec2(row_strip_width, swatch_height),
+        );
+
+        painter.rect_stroke(
+            palette_rect,
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::GRAY),
+            egui::StrokeKind::Outside,
+        );
     }
-
-    // Draw a border encompassing the color strip
-    let palette_rect = egui::Rect::from_min_size(
-        egui::pos2(hist_rect.min.x, hist_rect.max.y + 4.0),
-        egui::vec2(hist_width, swatch_height),
-    );
-
-    painter.rect_stroke(
-        palette_rect,
-        0.0,
-        egui::Stroke::new(1.0, egui::Color32::GRAY),
-        egui::StrokeKind::Outside,
-    );
 }
 
 /// Render EXIF information overlay, using cached data if available
