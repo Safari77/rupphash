@@ -64,6 +64,7 @@ walkdir = "2.5"
 zerocopy = "0.8"
 zeroize = "1.8"
 zune-jpeg = "0.4"
+oklab = "1"
 
 # GUI
 eframe = { version = "0.33", default-features = false, features = [

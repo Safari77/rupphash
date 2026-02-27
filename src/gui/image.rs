@@ -4,6 +4,7 @@ use eframe::egui;
 use fast_image_resize::images::Image as FastImage;
 use fast_image_resize::{PixelType, ResizeOptions, Resizer};
 use image::GenericImageView;
+use oklab::{LinearRgb, Oklab, linear_srgb_to_oklab, oklab_to_linear_srgb};
 use std::f32::consts::PI;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -647,14 +648,181 @@ pub(super) fn render_image_texture(
     }
 }
 
-/// Render greyscale histogram, using cached data if available
+#[inline(always)]
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+#[inline(always)]
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// Extracts a 5-color dominant palette using K-Means clustering in Oklab space
+fn extract_palette(image: &image::DynamicImage) -> [egui::Color32; 5] {
+    // Resize to a small thumbnail for speed
+    let thumb = image.thumbnail_exact(64, 64).to_rgb8();
+
+    // Convert all pixels to Oklab
+    let pixels: Vec<Oklab> = thumb
+        .pixels()
+        .map(|p| {
+            let lr = srgb_to_linear(p[0] as f32 / 255.0);
+            let lg = srgb_to_linear(p[1] as f32 / 255.0);
+            let lb = srgb_to_linear(p[2] as f32 / 255.0);
+            linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb })
+        })
+        .collect();
+
+    // Initialize 5 centroids spread across the data
+    let mut centroids = [
+        pixels[0],
+        pixels[pixels.len() / 4],
+        pixels[pixels.len() / 2],
+        pixels[pixels.len() * 3 / 4],
+        pixels[pixels.len() - 1],
+    ];
+
+    // K-means clustering iterations
+    for _ in 0..10 {
+        let mut counts = [0; 5];
+        let mut sums = [(0.0, 0.0, 0.0); 5];
+
+        for &p in &pixels {
+            let mut min_dist = f32::MAX;
+            let mut best_idx = 0;
+
+            for (i, c) in centroids.iter().enumerate() {
+                // Perceptually uniform distance calculation
+                let dist_sq = (p.l - c.l).powi(2) + (p.a - c.a).powi(2) + (p.b - c.b).powi(2);
+                if dist_sq < min_dist {
+                    min_dist = dist_sq;
+                    best_idx = i;
+                }
+            }
+
+            counts[best_idx] += 1;
+            sums[best_idx].0 += p.l;
+            sums[best_idx].1 += p.a;
+            sums[best_idx].2 += p.b;
+        }
+
+        // Update centroids based on the mean of assigned pixels
+        for i in 0..5 {
+            if counts[i] > 0 {
+                centroids[i].l = sums[i].0 / counts[i] as f32;
+                centroids[i].a = sums[i].1 / counts[i] as f32;
+                centroids[i].b = sums[i].2 / counts[i] as f32;
+            }
+        }
+    }
+
+    let mut result = [egui::Color32::BLACK; 5];
+    for i in 0..5 {
+        // Convert back to Linear RGB, then back to sRGB for rendering
+        let srgb_linear = oklab_to_linear_srgb(centroids[i]);
+        let r = (linear_to_srgb(srgb_linear.r).clamp(0.0, 1.0) * 255.0).round() as u8;
+        let g = (linear_to_srgb(srgb_linear.g).clamp(0.0, 1.0) * 255.0).round() as u8;
+        let b = (linear_to_srgb(srgb_linear.b).clamp(0.0, 1.0) * 255.0).round() as u8;
+        result[i] = egui::Color32::from_rgb(r, g, b);
+    }
+
+    // Sort the palette by visual lightness (V in HSV) for a pleasing display
+    result.sort_by_key(|c| {
+        let hsv = egui::ecolor::Hsva::from(*c);
+        (hsv.v * 100.0) as u32
+    });
+
+    result
+}
+
+/// Compute histogram and palette from a standard image file
+fn compute_histogram_from_image(path: &Path) -> Option<([u32; 256], [egui::Color32; 5])> {
+    let img = image::open(path).ok()?;
+
+    // Histogram
+    let grey = img.to_luma8();
+    let mut hist = [0u32; 256];
+    for pixel in grey.pixels() {
+        hist[pixel.0[0] as usize] += 1;
+    }
+
+    // Palette
+    let palette = extract_palette(&img);
+
+    Some((hist, palette))
+}
+
+/// Compute histogram and palette from a RAW file using rsraw
+fn compute_histogram_from_raw(path: &Path) -> Option<([u32; 256], [egui::Color32; 5])> {
+    let data = fs::read(path).ok()?;
+    let mut raw = rsraw::RawImage::open(&data).ok()?;
+
+    // Try to extract thumbnail first (faster)
+    if let Ok(thumbs) = raw.extract_thumbs() {
+        if let Some(best_thumb) = thumbs
+            .into_iter()
+            .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
+            .max_by_key(|t| t.width * t.height)
+        {
+            if let Ok(img) = image::load_from_memory(&best_thumb.data) {
+                let grey = img.to_luma8();
+                let mut hist = [0u32; 256];
+                for pixel in grey.pixels() {
+                    hist[pixel.0[0] as usize] += 1;
+                }
+                let palette = extract_palette(&img);
+                return Some((hist, palette));
+            }
+        }
+    }
+
+    // Fallback: process the full RAW (slower)
+    if raw.unpack().is_ok() {
+        raw.set_use_camera_wb(true);
+        if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
+            let mut hist = [0u32; 256];
+            let w = raw.width() as usize;
+            let h = raw.height() as usize;
+            let mut result_palette = [egui::Color32::BLACK; 5];
+
+            if processed.len() == w * h {
+                // Monochrome: Direct count
+                for &pixel in processed.iter() {
+                    hist[pixel as usize] += 1;
+                }
+                for i in 0..5 {
+                    result_palette[i] = egui::Color32::from_gray((i * 255 / 4) as u8);
+                }
+            } else if processed.len() == w * h * 3 {
+                // RGB: Convert to luminance for histogram
+                for chunk in processed.chunks_exact(3) {
+                    let r = chunk[0] as u32;
+                    let g = chunk[1] as u32;
+                    let b = chunk[2] as u32;
+                    let grey = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
+                    hist[grey as usize] += 1;
+                }
+                // Extract palette by converting raw buffer to DynamicImage
+                if let Some(img_buf) =
+                    image::RgbImage::from_raw(w as u32, h as u32, processed.to_vec())
+                {
+                    result_palette = extract_palette(&image::DynamicImage::ImageRgb8(img_buf));
+                }
+            }
+            return Some((hist, result_palette));
+        }
+    }
+    None
+}
+
+/// Render greyscale histogram and dominant palette, using cached data if available
 pub(super) fn render_histogram(
     app: &mut GuiApp,
     ui: &mut egui::Ui,
     available_rect: egui::Rect,
     path: &Path,
 ) {
-    // Get window width for histogram sizing (10% of window width)
     let window_width = ui.ctx().input(|i| {
         i.viewport()
             .inner_rect
@@ -662,59 +830,66 @@ pub(super) fn render_histogram(
             .map(|r| r.width())
             .unwrap_or(available_rect.width())
     });
-    let hist_width = window_width * 0.10;
-    let hist_height = hist_width * 0.75; // 4:3 aspect ratio for histogram
 
-    // Position in bottom-left corner with some padding
+    let hist_width = window_width * 0.10;
+    let hist_height = hist_width * 0.75;
+    let swatch_height = 16.0;
+
+    let total_height = hist_height + swatch_height + 4.0;
     let padding = 10.0;
+
     let hist_rect = egui::Rect::from_min_size(
-        egui::pos2(available_rect.min.x + padding, available_rect.max.y - hist_height - padding),
+        egui::pos2(available_rect.min.x + padding, available_rect.max.y - total_height - padding),
         egui::vec2(hist_width, hist_height),
     );
 
     // Check cache first
-    let histogram = if let Some((cached_path, cached_hist)) = &app.cached_histogram {
-        if cached_path == path { Some(*cached_hist) } else { None }
+    let histogram_data = if let Some((cached_path, cached_data)) = &app.cached_histogram {
+        if cached_path == path { Some(*cached_data) } else { None }
     } else {
         None
     };
 
     // Compute if not cached
-    let histogram = histogram.or_else(|| {
-        let hist = if is_raw_ext(path) {
+    let histogram_data = histogram_data.or_else(|| {
+        let data = if is_raw_ext(path) {
             compute_histogram_from_raw(path)
         } else {
             compute_histogram_from_image(path)
         };
         // Cache the result
-        if let Some(h) = hist {
-            app.cached_histogram = Some((path.to_path_buf(), h));
-            Some(h)
+        if let Some(d) = data {
+            app.cached_histogram = Some((path.to_path_buf(), d));
+            Some(d)
         } else {
             None
         }
     });
 
-    if let Some(hist) = histogram {
-        draw_histogram(ui, hist_rect, &hist);
+    if let Some((hist, palette)) = histogram_data {
+        draw_histogram(ui, hist_rect, &hist, &palette);
     }
 }
 
-/// Draw histogram bars (pure rendering, no I/O)
-fn draw_histogram(ui: &mut egui::Ui, hist_rect: egui::Rect, hist: &[u32; 256]) {
-    // Find max value for normalization (skip extremes which might be clipped)
+/// Draw histogram bars and dominant color palette
+fn draw_histogram(
+    ui: &mut egui::Ui,
+    hist_rect: egui::Rect,
+    hist: &[u32; 256],
+    palette: &[egui::Color32; 5],
+) {
+    // Find max value for normalization
     let max_val = hist[1..255].iter().copied().max().unwrap_or(1).max(1);
-
     let painter = ui.painter();
     let hist_width = hist_rect.width();
     let hist_height = hist_rect.height();
 
-    // Draw background
+    // 1. Draw Histogram Background
     painter.rect_filled(hist_rect, 0.0, egui::Color32::from_black_alpha(180));
 
-    // Draw histogram bars
+    // 2. Draw Histogram Bars
     let bar_width = hist_width / 256.0;
-    let usable_height = hist_height - 4.0; // Small padding
+    let usable_height = hist_height - 4.0;
 
     for (i, &count) in hist.iter().enumerate() {
         if count == 0 {
@@ -728,7 +903,6 @@ fn draw_histogram(ui: &mut egui::Ui, hist_rect: egui::Rect, hist: &[u32; 256]) {
         let y_bottom = hist_rect.max.y - 2.0;
         let y_top = y_bottom - bar_height;
 
-        // Color based on luminance value (darker values = darker bars)
         let grey = (i as u8).saturating_add(40).min(220);
         let color = egui::Color32::from_gray(grey);
 
@@ -742,75 +916,39 @@ fn draw_histogram(ui: &mut egui::Ui, hist_rect: egui::Rect, hist: &[u32; 256]) {
         );
     }
 
-    // Draw border
     painter.rect_stroke(
         hist_rect,
         0.0,
         egui::Stroke::new(1.0, egui::Color32::GRAY),
         egui::StrokeKind::Outside,
     );
-}
 
-/// Compute histogram from a standard image file
-fn compute_histogram_from_image(path: &Path) -> Option<[u32; 256]> {
-    let img = image::open(path).ok()?;
-    let grey = img.to_luma8();
-    let mut hist = [0u32; 256];
-    for pixel in grey.pixels() {
-        hist[pixel.0[0] as usize] += 1;
-    }
-    Some(hist)
-}
+    // 3. Draw Palette Swatches
+    let swatch_height = 16.0;
+    let swatch_width = hist_width / 5.0;
 
-/// Compute histogram from a RAW file using rsraw
-fn compute_histogram_from_raw(path: &Path) -> Option<[u32; 256]> {
-    let data = fs::read(path).ok()?;
-    let mut raw = rsraw::RawImage::open(&data).ok()?;
+    for (i, &color) in palette.iter().enumerate() {
+        let x = hist_rect.min.x + (i as f32) * swatch_width;
+        let y = hist_rect.max.y + 4.0;
 
-    // Try to extract thumbnail first (faster)
-    if let Ok(thumbs) = raw.extract_thumbs()
-        && let Some(best_thumb) = thumbs
-            .into_iter()
-            .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
-            .max_by_key(|t| t.width * t.height)
-        && let Ok(img) = image::load_from_memory(&best_thumb.data)
-    {
-        let grey = img.to_luma8();
-        let mut hist = [0u32; 256];
-        for pixel in grey.pixels() {
-            hist[pixel.0[0] as usize] += 1;
-        }
-        return Some(hist);
+        let swatch_rect =
+            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(swatch_width, swatch_height));
+
+        painter.rect_filled(swatch_rect, 0.0, color);
     }
 
-    // Fallback: process the full RAW (slower)
-    if raw.unpack().is_ok() {
-        raw.set_use_camera_wb(true);
-        if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
-            let mut hist = [0u32; 256];
-            let w = raw.width() as usize;
-            let h = raw.height() as usize;
+    // Draw a border encompassing the color strip
+    let palette_rect = egui::Rect::from_min_size(
+        egui::pos2(hist_rect.min.x, hist_rect.max.y + 4.0),
+        egui::vec2(hist_width, swatch_height),
+    );
 
-            if processed.len() == w * h {
-                // Monochrome: Direct count
-                for &pixel in processed.iter() {
-                    hist[pixel as usize] += 1;
-                }
-            } else if processed.len() == w * h * 3 {
-                // RGB: Convert to luminance
-                for chunk in processed.chunks_exact(3) {
-                    let r = chunk[0] as u32;
-                    let g = chunk[1] as u32;
-                    let b = chunk[2] as u32;
-                    // Y = 0.299*R + 0.587*G + 0.114*B
-                    let grey = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
-                    hist[grey as usize] += 1;
-                }
-            }
-            return Some(hist);
-        }
-    }
-    None
+    painter.rect_stroke(
+        palette_rect,
+        0.0,
+        egui::Stroke::new(1.0, egui::Color32::GRAY),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// Render EXIF information overlay, using cached data if available

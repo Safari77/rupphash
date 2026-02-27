@@ -149,7 +149,7 @@ pub struct GuiApp {
     pub(super) show_exif: bool,
 
     // Cache for current image's histogram and EXIF data (to avoid reloading on toggle)
-    pub(super) cached_histogram: Option<(std::path::PathBuf, [u32; 256])>,
+    pub(super) cached_histogram: Option<(std::path::PathBuf, ([u32; 256], [egui::Color32; 5]))>,
     pub(super) cached_exif: Option<(std::path::PathBuf, Vec<(String, String)>)>,
     pub(super) search_input: String,
     pub(super) search_focus_requested: bool,
