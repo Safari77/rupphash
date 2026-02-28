@@ -1050,10 +1050,13 @@ impl GuiApp {
                     }
                 }
 
-                notify::EventKind::Create(_)
-                | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
-                | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(_))
-                | notify::EventKind::Modify(notify::event::ModifyKind::Any) => {
+                notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
+                    notify::event::MetadataKind::AccessTime,
+                )) => {
+                    continue;
+                }
+
+                notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
                     for path in &event.paths {
                         if classify(path) {
                             // Invalidate cache so perform_preload re-fetches the image
@@ -1487,9 +1490,36 @@ impl GuiApp {
             }
         }
 
-        // Cache Eviction
-        self.raw_cache.retain(|k, _| active_window_paths.contains(k));
-        self.cached_histogram.retain(|k, _| active_window_paths.contains(k));
+        // --- Cache Eviction with Hysteresis ---
+        // We preload a tight window (active_window_paths) to save CPU,
+        // but we RETAIN a much wider window in RAM so going backwards doesn't thrash.
+        let mut retention_paths = HashSet::new();
+        let retention_limit = preload_limit * 3; // Keep 3x as many files in RAM as we actively preload
+
+        if self.state.groups.len() == 1 {
+            let group = &self.state.groups[0];
+            let half_ret = retention_limit / 2;
+            let start = current_f.saturating_sub(half_ret);
+            let end = (start + retention_limit).min(group.len());
+            for i in start..end {
+                retention_paths.insert(group[i].path.clone());
+            }
+        } else {
+            // Multiple groups (Duplicate Mode): Retain current group + 2 groups adjacent
+            let start_g = current_g.saturating_sub(2);
+            let end_g = (current_g + 3).min(self.state.groups.len());
+            for g in start_g..end_g {
+                for file in &self.state.groups[g] {
+                    retention_paths.insert(file.path.clone());
+                }
+            }
+        }
+
+        // Evict from memory only if it falls completely outside the wider retention window
+        self.raw_cache.retain(|k, _| retention_paths.contains(k));
+        self.cached_histogram.retain(|k, _| retention_paths.contains(k));
+
+        // Active worker tasks should still be cancelled strictly based on the active window
         self.raw_loading.retain(|k| active_window_paths.contains(k));
     }
 
