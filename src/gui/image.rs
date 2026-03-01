@@ -44,7 +44,7 @@ pub enum ImageLoadResult {
         u8,
         [u8; 32],
         Option<i64>,
-        Option<([u32; 256], Vec<egui::Color32>)>,
+        Option<([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>)>,
     ), // image, resolution, orientation, content_hash, exif_timestamp, histogram+palette
     Failed(String), // Failure with error message
 }
@@ -95,7 +95,7 @@ pub(super) fn spawn_image_loader_pool(
 
                                 // Log dominant colors as gamma-encoded sRGB values
                                 let colors_str: Vec<String> =
-                                    hp.1.iter()
+                                    hp.3.iter()
                                         .map(|c| format!("({}, {}, {})", c.r(), c.g(), c.b()))
                                         .collect();
                                 eprintln!(
@@ -698,6 +698,30 @@ fn linear_to_srgb(c: f32) -> f32 {
     if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
 }
 
+/// Helper to extract L, A, and B channel histograms simultaneously
+fn build_histograms(oklab_pixels: &[Oklab]) -> ([u32; 256], [u32; 256], [u32; 256]) {
+    let mut hist_l = [0u32; 256];
+    let mut hist_a = [0u32; 256];
+    let mut hist_b = [0u32; 256];
+
+    for p in oklab_pixels {
+        // Lightness [0.0, 1.0]
+        let bin_l = (p.l.clamp(0.0, 1.0) * 255.0).round() as usize;
+
+        // A and B for sRGB practically bound between -0.3 and 0.3.
+        // We map [-0.3, 0.3] to [0.0, 1.0]. This beautifully keeps pure grey (0.0)
+        // exactly centered at bin 127 in the UI.
+        let bin_a = (((p.a + 0.3) / 0.6).clamp(0.0, 1.0) * 255.0).round() as usize;
+        let bin_b = (((p.b + 0.3) / 0.6).clamp(0.0, 1.0) * 255.0).round() as usize;
+
+        hist_l[bin_l] += 1;
+        hist_a[bin_a] += 1;
+        hist_b[bin_b] += 1;
+    }
+
+    (hist_l, hist_a, hist_b)
+}
+
 /// Compute luminance histogram and dominant color palette directly from an egui::ColorImage.
 /// Downsamples to 128x128 once, converts to Oklab, then computes both histogram (from L)
 /// and palette (via K-means++) from the same pixel buffer. This avoids running expensive
@@ -706,7 +730,7 @@ fn compute_histogram_from_colorimage(
     img: &egui::ColorImage,
     dominant_colors: usize,
     sat_bias: f32,
-) -> ([u32; 256], Vec<egui::Color32>) {
+) -> ([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>) {
     let (src_w, src_h) = (img.size[0], img.size[1]);
     let (dst_w, dst_h) = (128usize, 128usize);
 
@@ -724,17 +748,11 @@ fn compute_histogram_from_colorimage(
         }
     }
 
-    // --- Histogram: from Oklab L values of the downsampled pixels ---
-    let mut hist = [0u32; 256];
-    for p in &oklab_pixels {
-        let bin = (p.l.clamp(0.0, 1.0) * 255.0).round() as usize;
-        hist[bin] += 1;
-    }
-
+    let (hist_l, hist_a, hist_b) = build_histograms(&oklab_pixels);
     // --- Palette: K-means++ on the same Oklab pixels ---
     let palette = kmeans_palette(&oklab_pixels, dominant_colors, sat_bias);
 
-    (hist, palette)
+    (hist_l, hist_a, hist_b, palette)
 }
 
 /// K-means++ clustering in Oklab space with 3 restarts, 20 iterations, early convergence.
@@ -925,7 +943,7 @@ fn compute_histogram_from_dynamic_image(
     img: &image::DynamicImage,
     dominant_colors: usize,
     sat_bias: f32,
-) -> ([u32; 256], Vec<egui::Color32>) {
+) -> ([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>) {
     let thumb = img.thumbnail_exact(128, 128).to_rgb8();
     let oklab_pixels: Vec<Oklab> = thumb
         .pixels()
@@ -937,14 +955,9 @@ fn compute_histogram_from_dynamic_image(
         })
         .collect();
 
-    let mut hist = [0u32; 256];
-    for p in &oklab_pixels {
-        let bin = (p.l.clamp(0.0, 1.0) * 255.0).round() as usize;
-        hist[bin] += 1;
-    }
-
+    let (hist_l, hist_a, hist_b) = build_histograms(&oklab_pixels);
     let palette = kmeans_palette(&oklab_pixels, dominant_colors, sat_bias);
-    (hist, palette)
+    (hist_l, hist_a, hist_b, palette)
 }
 
 /// Compute histogram and palette from a standard image file
@@ -952,7 +965,7 @@ fn compute_histogram_from_image(
     path: &Path,
     dominant_colors: usize,
     sat_bias: f32,
-) -> Option<([u32; 256], Vec<egui::Color32>)> {
+) -> Option<([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>)> {
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
@@ -993,7 +1006,7 @@ fn compute_histogram_from_raw(
     path: &Path,
     dominant_colors: usize,
     sat_bias: f32,
-) -> Option<([u32; 256], Vec<egui::Color32>)> {
+) -> Option<([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>)> {
     let data = match fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -1162,7 +1175,7 @@ pub(super) fn render_histogram(
         // Cache the result
         if let Some(d) = data {
             let colors_str: Vec<String> =
-                d.1.iter().map(|c| format!("({}, {}, {})", c.r(), c.g(), c.b())).collect();
+                d.3.iter().map(|c| format!("({}, {}, {})", c.r(), c.g(), c.b())).collect();
             eprintln!(
                 "[PALETTE-FALLBACK] {:?}: [{}]",
                 path.file_name().unwrap_or_default(),
@@ -1175,8 +1188,39 @@ pub(super) fn render_histogram(
         }
     });
 
-    if let Some((hist, palette)) = histogram_data {
-        draw_histogram(ui, hist_rect, &hist, &palette);
+    if let Some((hist_l, hist_a, hist_b, palette)) = histogram_data {
+        // Use a thread-local timer to debounce scroll wheel events so it doesn't flicker wildly
+        thread_local! {
+            static LAST_HIST_SWITCH: std::cell::RefCell<std::time::Instant> = std::cell::RefCell::new(std::time::Instant::now());
+        }
+
+        let response = ui.interact(hist_rect, ui.id().with("hist_scroll"), egui::Sense::hover());
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+
+            if scroll.abs() > 0.1 {
+                LAST_HIST_SWITCH.with(|last| {
+                    let mut last_mut = last.borrow_mut();
+                    // 200ms debounce
+                    if last_mut.elapsed().as_secs_f32() > 0.2 {
+                        if scroll > 0.0 {
+                            app.histogram_channel = (app.histogram_channel + 1) % 3;
+                        } else {
+                            app.histogram_channel = (app.histogram_channel + 2) % 3;
+                        }
+                        *last_mut = std::time::Instant::now();
+                    }
+                });
+            }
+        }
+
+        let hist_to_draw = match app.histogram_channel {
+            1 => &hist_a,
+            2 => &hist_b,
+            _ => &hist_l,
+        };
+
+        draw_histogram(ui, hist_rect, hist_to_draw, &palette, app.histogram_channel);
     }
 }
 
@@ -1186,6 +1230,7 @@ fn draw_histogram(
     hist_rect: egui::Rect,
     hist: &[u32; 256],
     palette: &[egui::Color32],
+    channel: usize,
 ) {
     // Find max value for normalization
     let max_val = hist[1..255].iter().copied().max().unwrap_or(1).max(1);
@@ -1230,6 +1275,20 @@ fn draw_histogram(
         0.0,
         egui::Stroke::new(1.0, egui::Color32::GRAY),
         egui::StrokeKind::Outside,
+    );
+
+    // Draw the active channel label on top of the histogram
+    let label = match channel {
+        1 => "A",
+        2 => "B",
+        _ => "L",
+    };
+    painter.text(
+        hist_rect.min + egui::vec2(6.0, 4.0),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        egui::Color32::WHITE,
     );
 
     // 3. Draw Palette Swatches in rows of 5

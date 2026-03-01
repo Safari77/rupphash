@@ -152,7 +152,9 @@ pub struct GuiApp {
     pub(super) show_exif: bool,
 
     // Cache for histogram and palette data, keyed by path (lifecycle matches raw_cache)
-    pub(super) cached_histogram: HashMap<std::path::PathBuf, ([u32; 256], Vec<egui::Color32>)>,
+    pub(super) cached_histogram:
+        HashMap<std::path::PathBuf, ([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>)>,
+    pub(super) histogram_channel: usize, // 0 = L, 1 = A, 2 = B
     pub(super) cached_exif: Option<(std::path::PathBuf, Vec<(String, String)>)>,
     pub(super) search_input: String,
     pub(super) search_focus_requested: bool,
@@ -385,6 +387,7 @@ impl GuiApp {
             completion_candidates: Vec::new(),
             completion_index: 0,
             show_histogram: false,
+            histogram_channel: 0,
             histogram_enabled,
             show_exif: false,
             cached_histogram: HashMap::new(),
@@ -590,6 +593,7 @@ impl GuiApp {
             completion_candidates: Vec::new(),
             completion_index: 0,
             show_histogram: false,
+            histogram_channel: 0,
             histogram_enabled,
             show_exif: false,
             cached_histogram: HashMap::new(),
