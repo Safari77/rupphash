@@ -953,7 +953,38 @@ fn compute_histogram_from_image(
     dominant_colors: usize,
     sat_bias: f32,
 ) -> Option<([u32; 256], Vec<egui::Color32>)> {
-    let img = image::open(path).ok()?;
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    // Fast path for formats the `image` crate doesn't support natively (PDF, JP2, JXL)
+    if matches!(ext.as_str(), "jp2" | "j2k" | "jxl" | "pdf") {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Some(dyn_img) = crate::scanner::load_image_fast(path, &bytes) {
+                return Some(compute_histogram_from_dynamic_image(
+                    &dyn_img,
+                    dominant_colors,
+                    sat_bias,
+                ));
+            } else {
+                eprintln!("[DEBUG-HISTOGRAM] scanner::load_image_fast failed for {:?}", path);
+            }
+        } else {
+            eprintln!("[DEBUG-HISTOGRAM] Failed to read bytes for {:?}", path);
+        }
+    }
+
+    // Standard fallback using the `image` crate
+    let img = match image::open(path) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[DEBUG-HISTOGRAM] image::open failed for {:?}: {}", path, e);
+            return None;
+        }
+    };
+
     Some(compute_histogram_from_dynamic_image(&img, dominant_colors, sat_bias))
 }
 
@@ -963,26 +994,77 @@ fn compute_histogram_from_raw(
     dominant_colors: usize,
     sat_bias: f32,
 ) -> Option<([u32; 256], Vec<egui::Color32>)> {
-    let data = fs::read(path).ok()?;
-    let mut raw = rsraw::RawImage::open(&data).ok()?;
+    let data = match fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[DEBUG-HISTOGRAM] Failed to read RAW file {:?}: {}", path, e);
+            return None;
+        }
+    };
 
-    // Try to extract thumbnail first (faster)
-    if let Ok(thumbs) = raw.extract_thumbs() {
-        if let Some(best_thumb) = thumbs
-            .into_iter()
-            .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
-            .max_by_key(|t| t.width * t.height)
-        {
-            if let Ok(img) = image::load_from_memory(&best_thumb.data) {
-                return Some(compute_histogram_from_dynamic_image(&img, dominant_colors, sat_bias));
+    let mut raw = match rsraw::RawImage::open(&data) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[DEBUG-HISTOGRAM] rsraw failed to open {:?}: {}. Trying EXIF fallback...",
+                path, e
+            );
+            // Re-use the fallback from the main loader!
+            if let Some(color_img) = extract_biggest_exif_preview(path, &data) {
+                eprintln!("[DEBUG-HISTOGRAM] EXIF fallback success for {:?}", path);
+                return Some(compute_histogram_from_colorimage(
+                    &color_img,
+                    dominant_colors,
+                    sat_bias,
+                ));
+            } else {
+                eprintln!("[DEBUG-HISTOGRAM] EXIF fallback also failed for {:?}", path);
+                return None;
             }
         }
+    };
+
+    // Try to extract thumbnail first (faster)
+    match raw.extract_thumbs() {
+        Ok(thumbs) => {
+            if let Some(best_thumb) = thumbs
+                .into_iter()
+                .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
+                .max_by_key(|t| t.width * t.height)
+            {
+                match image::load_from_memory(&best_thumb.data) {
+                    Ok(img) => {
+                        return Some(compute_histogram_from_dynamic_image(
+                            &img,
+                            dominant_colors,
+                            sat_bias,
+                        ));
+                    }
+                    Err(e) => eprintln!(
+                        "[DEBUG-HISTOGRAM] image::load_from_memory failed on rsraw thumb for {:?}: {}",
+                        path, e
+                    ),
+                }
+            } else {
+                eprintln!(
+                    "[DEBUG-HISTOGRAM] No suitable JPEG thumbnail found by rsraw for {:?}",
+                    path
+                );
+            }
+        }
+        Err(e) => eprintln!("[DEBUG-HISTOGRAM] rsraw.extract_thumbs failed for {:?}: {}", path, e),
     }
 
     // Fallback: process the full RAW (slower)
-    if raw.unpack().is_ok() {
-        raw.set_use_camera_wb(true);
-        if let Ok(processed) = raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
+    eprintln!("[DEBUG-HISTOGRAM] Falling back to full RAW decode for {:?}", path);
+    if let Err(e) = raw.unpack() {
+        eprintln!("[DEBUG-HISTOGRAM] rsraw.unpack failed for {:?}: {}", path, e);
+        return None;
+    }
+
+    raw.set_use_camera_wb(true);
+    match raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
+        Ok(processed) => {
             let w = raw.width() as usize;
             let h = raw.height() as usize;
 
@@ -996,6 +1078,8 @@ fn compute_histogram_from_raw(
                         dominant_colors,
                         sat_bias,
                     ));
+                } else {
+                    eprintln!("[DEBUG-HISTOGRAM] Failed to create GrayImage buffer for {:?}", path);
                 }
             } else if processed.len() == w * h * 3 {
                 // RGB: construct DynamicImage
@@ -1007,10 +1091,24 @@ fn compute_histogram_from_raw(
                         dominant_colors,
                         sat_bias,
                     ));
+                } else {
+                    eprintln!("[DEBUG-HISTOGRAM] Failed to create RgbImage buffer for {:?}", path);
                 }
+            } else {
+                eprintln!(
+                    "[DEBUG-HISTOGRAM] RAW size mismatch for {:?}: w={}, h={}, len={}",
+                    path,
+                    w,
+                    h,
+                    processed.len()
+                );
             }
         }
+        Err(e) => {
+            eprintln!("[DEBUG-HISTOGRAM] rsraw.process failed for {:?}: {}", path, e);
+        }
     }
+
     None
 }
 
