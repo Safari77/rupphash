@@ -164,6 +164,7 @@ pub(super) fn handle_input(
             && !app.state.view_mode_flatten
             && let Some(dir_idx) = app.dir_selection_idx
         {
+            let is_going_up = has_parent && dir_idx == 0;
             // Determine which directory to open
             let dir_to_open = if has_parent {
                 if dir_idx == 0 {
@@ -178,8 +179,27 @@ pub(super) fn handle_input(
                 app.subdirs.get(dir_idx).cloned()
             };
             if let Some(dir) = dir_to_open {
+                let old_dir = app.current_dir.clone();
                 app.dir_selection_idx = None;
                 app.change_directory(dir);
+
+                // If we went up, find the folder we just left and select it
+                if is_going_up {
+                    if let Some(old) = old_dir {
+                        if let Some(old_name) = old.file_name() {
+                            if let Some(pos) =
+                                app.subdirs.iter().position(|d| d.file_name() == Some(old_name))
+                            {
+                                let new_has_parent =
+                                    app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+                                app.dir_selection_idx =
+                                    Some(if new_has_parent { pos + 1 } else { pos });
+                                app.dir_scroll_to_selection = true;
+                                app.state.selection_changed = false; // Prevent auto-scroll to file 0
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -484,9 +504,27 @@ pub(super) fn handle_input(
                 app.open_dir_picker();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Period)) {
+                let old_dir = app.current_dir.clone();
                 app.go_up_directory();
+
+                // Select the directory we just came from
+                if let Some(old) = old_dir {
+                    if let Some(old_name) = old.file_name() {
+                        if let Some(pos) =
+                            app.subdirs.iter().position(|d| d.file_name() == Some(old_name))
+                        {
+                            let new_has_parent =
+                                app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+                            app.dir_selection_idx =
+                                Some(if new_has_parent { pos + 1 } else { pos });
+                            app.dir_scroll_to_selection = true;
+                            app.state.selection_changed = false; // Prevent auto-scroll to file 0
+                        }
+                    }
+                }
             }
         }
+
         // Sort selection is available in all view modes
         if app.state.view_mode && ctx.input(|i| i.key_pressed(egui::Key::T)) {
             *intent.borrow_mut() = Some(InputIntent::ShowSortSelection);

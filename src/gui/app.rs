@@ -2370,6 +2370,7 @@ impl eframe::App for GuiApp {
                             ui.separator();
                         }
 
+                        self.dir_scroll_to_selection = false;
                         // Return the height consumed by directories
                         ui.cursor().min.y - start_cursor_y
                     } else {
