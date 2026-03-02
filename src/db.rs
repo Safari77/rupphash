@@ -281,6 +281,12 @@ impl AppContext {
             let mut cfg: Config = toml::from_str(&content)
                 .map_err(|_| "Failed to parse config. Format might have changed.")?;
 
+            // Clamp dominant_colors to 1..25 range
+            let original_colors = cfg.gui.dominant_colors;
+            let clamped_val = cfg.gui.dominant_colors.unwrap_or(5).clamp(1, 25);
+            cfg.gui.dominant_colors = Some(clamped_val);
+            let colors_clamped = original_colors != cfg.gui.dominant_colors;
+
             eprintln!(
                 "[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}, dominant_colors={:?}, saturation_bias={:?}",
                 cfg.gui.width,
@@ -317,10 +323,19 @@ impl AppContext {
                 cfg.selected_provider = Some("OpenStreetMap".to_string());
             }
 
-            if missing_grouping || missing_gui || missing_db_size || missing_locations {
+            if missing_grouping
+                || missing_gui
+                || missing_db_size
+                || missing_locations
+                || colors_clamped
+            {
                 eprintln!(
-                    "[DEBUG-DB] Writing back defaults (grouping={}, gui={}, db_size={}, locations={})",
-                    missing_grouping, missing_gui, missing_db_size, missing_locations
+                    "[DEBUG-DB] Writing back defaults/fixes (grouping={}, gui={}, db_size={}, locations={}, colors_clamped={})",
+                    missing_grouping,
+                    missing_gui,
+                    missing_db_size,
+                    missing_locations,
+                    colors_clamped
                 );
                 let toml_str = toml::to_string_pretty(&cfg)?;
                 fs::write(&config_path, toml_str)?;
