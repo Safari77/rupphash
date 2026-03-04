@@ -1760,7 +1760,7 @@ impl eframe::App for GuiApp {
         }
 
         if let Some(set_time) = self.state.status_set_time
-            && set_time.elapsed() > std::time::Duration::from_secs(5)
+            && set_time.elapsed() > std::time::Duration::from_secs(2)
         {
             self.state.status_message = None;
             self.state.status_set_time = None;
