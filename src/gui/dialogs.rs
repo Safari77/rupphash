@@ -184,10 +184,10 @@ pub(super) fn handle_input(
                 app.change_directory(dir);
 
                 // If we went up, find the folder we just left and select it
-                if is_going_up {
-                    if let Some(old) = old_dir {
-                        if let Some(old_name) = old.file_name() {
-                            if let Some(pos) =
+                if is_going_up
+                    && let Some(old) = old_dir
+                        && let Some(old_name) = old.file_name()
+                            && let Some(pos) =
                                 app.subdirs.iter().position(|d| d.file_name() == Some(old_name))
                             {
                                 let new_has_parent =
@@ -197,9 +197,6 @@ pub(super) fn handle_input(
                                 app.dir_scroll_to_selection = true;
                                 app.state.selection_changed = false; // Prevent auto-scroll to file 0
                             }
-                        }
-                    }
-                }
             }
         }
 
@@ -508,9 +505,9 @@ pub(super) fn handle_input(
                 app.go_up_directory();
 
                 // Select the directory we just came from
-                if let Some(old) = old_dir {
-                    if let Some(old_name) = old.file_name() {
-                        if let Some(pos) =
+                if let Some(old) = old_dir
+                    && let Some(old_name) = old.file_name()
+                        && let Some(pos) =
                             app.subdirs.iter().position(|d| d.file_name() == Some(old_name))
                         {
                             let new_has_parent =
@@ -520,8 +517,6 @@ pub(super) fn handle_input(
                             app.dir_scroll_to_selection = true;
                             app.state.selection_changed = false; // Prevent auto-scroll to file 0
                         }
-                    }
-                }
             }
         }
 

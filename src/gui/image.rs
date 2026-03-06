@@ -241,8 +241,8 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<egui::Color
             };
 
             // If this is the biggest one we've seen, find its matching offset
-            if length > max_length {
-                if let Some(offset_field) =
+            if length > max_length
+                && let Some(offset_field) =
                     reader.get_field(exif::Tag::JPEGInterchangeFormat, field.ifd_num)
                 {
                     let offset = match offset_field.value {
@@ -255,7 +255,6 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<egui::Color
                     best_offset = offset;
                     best_ifd = field.ifd_num;
                 }
-            }
         }
     }
 
@@ -296,12 +295,11 @@ fn load_and_process_image_from_bytes(
             Ok(r) => r,
             Err(e) => {
                 // rsraw failed (likely unsupported RAW/ARW)
-                if use_thumbnails {
-                    if let Some(thumb) = extract_biggest_exif_preview(path, bytes) {
+                if use_thumbnails
+                    && let Some(thumb) = extract_biggest_exif_preview(path, bytes) {
                         let dims = (thumb.width() as u32, thumb.height() as u32);
                         return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
                     }
-                }
 
                 // If the fallback fails or we aren't using thumbnails, return the original error
                 return Err(format!("Failed to open RAW file (and EXIF fallback failed): {}", e));
@@ -1134,7 +1132,7 @@ pub(super) fn render_histogram(
 ) {
     let dominant_colors = app.ctx.gui_config.dominant_colors.unwrap_or(5);
     let sat_bias = app.ctx.gui_config.saturation_bias.unwrap_or(1.0);
-    let num_rows = (dominant_colors + 4) / 5; // ceiling division by 5
+    let num_rows = dominant_colors.div_ceil(5); // ceiling division by 5
 
     let window_width = ui.ctx().input(|i| {
         i.viewport()
@@ -1159,11 +1157,7 @@ pub(super) fn render_histogram(
     );
 
     // Check cache first (HashMap keyed by path, populated during preload)
-    let histogram_data = if let Some(cached_data) = app.cached_histogram.get(path) {
-        Some(cached_data.clone())
-    } else {
-        None
-    };
+    let histogram_data = app.cached_histogram.get(path).cloned();
 
     // Fallback: compute from disk if not preloaded (shouldn't happen often)
     let histogram_data = histogram_data.or_else(|| {
@@ -1295,7 +1289,7 @@ fn draw_histogram(
     let swatch_height = 16.0;
     let colors_per_row = 5;
     let swatch_width = hist_width / colors_per_row as f32;
-    let num_rows = (palette.len() + colors_per_row - 1) / colors_per_row;
+    let num_rows = palette.len().div_ceil(colors_per_row);
 
     for row in 0..num_rows {
         let row_start = row * colors_per_row;

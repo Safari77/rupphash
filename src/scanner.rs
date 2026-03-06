@@ -675,7 +675,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                 };
 
                 // 4. Render the page to a pixmap
-                let pixmap = hayro::render(&first_page, &interpreter_settings, &render_settings);
+                let pixmap = hayro::render(first_page, &interpreter_settings, &render_settings);
 
                 // 5. Zero-copy extraction
                 let width = pixmap.width() as u32;

@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver as StdReceiver, channel};
 use std::sync::{Arc, RwLock};
 use std::thread;
