@@ -40,8 +40,6 @@ pub const RAW_EXTS: &[&str] = &[
     "3fr",
 ];
 
-const JP2_MAX_PIXELS: u64 = 268_435_456;
-
 trait BufReadSeek: std::io::BufRead + std::io::Seek {}
 impl<T: std::io::BufRead + std::io::Seek> BufReadSeek for T {}
 
@@ -395,66 +393,6 @@ fn get_derived_value(
     }
 }
 
-fn jp2_components_to_rgb(
-    components: &[jpeg2k::ImageComponent],
-    width: u32,
-    height: u32,
-) -> Option<DynamicImage> {
-    if components.len() != 3 {
-        return None;
-    }
-
-    let r = &components[0];
-    let g = &components[1];
-    let b = &components[2];
-
-    let pixels = (width * height) as usize;
-
-    // Decide bit depth from component precision
-    let is_8bit = r.precision() <= 8 && g.precision() <= 8 && b.precision() <= 8;
-
-    let mut out = Vec::with_capacity(pixels * 3);
-
-    if is_8bit {
-        // ---------- 8-bit fast path ----------
-        let mut r_it = r.data_u8();
-        let mut g_it = g.data_u8();
-        let mut b_it = b.data_u8();
-
-        for _ in 0..pixels {
-            out.push(r_it.next()?);
-            out.push(g_it.next()?);
-            out.push(b_it.next()?);
-        }
-    } else {
-        // ---------- 16-bit → normalize to 8-bit ----------
-        let mut r_it = r.data_u16();
-        let mut g_it = g.data_u16();
-        let mut b_it = b.data_u16();
-
-        for _ in 0..pixels {
-            out.push((r_it.next()? >> 8) as u8);
-            out.push((g_it.next()? >> 8) as u8);
-            out.push((b_it.next()? >> 8) as u8);
-        }
-    }
-
-    let img = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, out)?;
-    Some(DynamicImage::ImageRgb8(img))
-}
-
-#[inline]
-fn collect_u8<I: Iterator<Item = u8>>(it: I, expected: usize) -> Option<Vec<u8>> {
-    let v: Vec<u8> = it.collect();
-    (v.len() == expected).then_some(v)
-}
-
-#[inline]
-fn collect_u16_to_u8<I: Iterator<Item = u16>>(it: I, expected: usize) -> Option<Vec<u8>> {
-    let v: Vec<u8> = it.map(|x| (x >> 8) as u8).collect();
-    (v.len() == expected).then_some(v)
-}
-
 pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
     let ext =
         path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
@@ -544,80 +482,6 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                 }
             }
         }
-        // TODO: Replace manual component conversion when jpeg2k
-        // gains native support for image 0.25+ DynamicImage conversion.
-        "jp2" | "j2k" => {
-            use jpeg2k::Image;
-
-            img_debug!("[jp2] attempting decode");
-
-            let jp2 = match Image::from_bytes(bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    img_debug!("[jp2] decode failed: {:?}", e);
-                    return None;
-                }
-            };
-
-            let width = jp2.width();
-            let height = jp2.height();
-            let components = jp2.components();
-
-            img_debug!("[jp2] decoded: {}x{}, components={}", width, height, components.len());
-
-            if width == 0 || height == 0 {
-                img_debug!("[jp2] invalid dimensions");
-                return None;
-            }
-
-            if (width as u64) * (height as u64) > JP2_MAX_PIXELS {
-                img_debug!("[jp2] image too large");
-                return None;
-            }
-
-            for (i, c) in components.iter().enumerate() {
-                img_debug!(
-                    "[jp2] component {}: len8={}, len16={}",
-                    i,
-                    c.data_u8().count(),
-                    c.data_u16().count()
-                );
-            }
-
-            if components.len() == 4 {
-                img_debug!("[jp2] treating 4 components as RGBA");
-
-                let pixels = (width * height) as usize;
-
-                let r = collect_u8(components[0].data_u8(), pixels)
-                    .or_else(|| collect_u16_to_u8(components[0].data_u16(), pixels))?;
-                let g = collect_u8(components[1].data_u8(), pixels)
-                    .or_else(|| collect_u16_to_u8(components[1].data_u16(), pixels))?;
-                let b = collect_u8(components[2].data_u8(), pixels)
-                    .or_else(|| collect_u16_to_u8(components[2].data_u16(), pixels))?;
-                let a = collect_u8(components[3].data_u8(), pixels)
-                    .or_else(|| collect_u16_to_u8(components[3].data_u16(), pixels))?;
-
-                let mut out = Vec::with_capacity(pixels * 4);
-                for i in 0..pixels {
-                    out.push(r[i]);
-                    out.push(g[i]);
-                    out.push(b[i]);
-                    out.push(a[i]);
-                }
-
-                let img = image::RgbaImage::from_raw(width, height, out)?;
-                return Some(image::DynamicImage::ImageRgba8(img));
-            }
-
-            if components.len() == 3 {
-                return jp2_components_to_rgb(components, width, height);
-            }
-
-            img_debug!("[jp2] unsupported component layout");
-            return None;
-        }
-
         "jxl" => {
             use image::ImageDecoder;
             use jxl_oxide::integration::JxlDecoder;
@@ -2066,11 +1930,12 @@ pub fn is_image_ext(path: &Path) -> bool {
                 e.as_str(),
                 "dds"|"exr"|"ff"|"hdr"|"ico"|"pnm"|"qoi"|"gif"|"jpg"|"jpeg"|"png"|"webp"
             |"bmp"|"tiff"|"tif"|"avif"|"heic"|"heif"|"tga"
-            |"jp2"|"j2k"|"jxl"
+            // hayro-jpeg2000
+            |"jp2"|"j2k"
             // image-extras
             |"xbm"|"xpm"|"ora"|"otb"|"pcx"|"sgi"|"wbmp"
-            // hayro
-            |"pdf"
+            // hayro pdf, jxl - update also load_and_process_image_from_bytes fast path
+            |"jxl"|"pdf"
             ) || RAW_EXTS.contains(&e.as_str())
         })
         .unwrap_or(false)

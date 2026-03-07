@@ -498,6 +498,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     windows_security::enable_heap_termination();
 
+    hayro_jpeg2000::integration::register_decoding_hook();
     register_all_decoding_hooks();
     image_extras::register();
     let args = Cli::parse();

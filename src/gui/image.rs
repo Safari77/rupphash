@@ -244,17 +244,17 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<egui::Color
             if length > max_length
                 && let Some(offset_field) =
                     reader.get_field(exif::Tag::JPEGInterchangeFormat, field.ifd_num)
-                {
-                    let offset = match offset_field.value {
-                        exif::Value::Long(ref v) if !v.is_empty() => v[0] as usize,
-                        exif::Value::Short(ref v) if !v.is_empty() => v[0] as usize,
-                        _ => continue,
-                    };
+            {
+                let offset = match offset_field.value {
+                    exif::Value::Long(ref v) if !v.is_empty() => v[0] as usize,
+                    exif::Value::Short(ref v) if !v.is_empty() => v[0] as usize,
+                    _ => continue,
+                };
 
-                    max_length = length;
-                    best_offset = offset;
-                    best_ifd = field.ifd_num;
-                }
+                max_length = length;
+                best_offset = offset;
+                best_ifd = field.ifd_num;
+            }
         }
     }
 
@@ -295,11 +295,10 @@ fn load_and_process_image_from_bytes(
             Ok(r) => r,
             Err(e) => {
                 // rsraw failed (likely unsupported RAW/ARW)
-                if use_thumbnails
-                    && let Some(thumb) = extract_biggest_exif_preview(path, bytes) {
-                        let dims = (thumb.width() as u32, thumb.height() as u32);
-                        return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
-                    }
+                if use_thumbnails && let Some(thumb) = extract_biggest_exif_preview(path, bytes) {
+                    let dims = (thumb.width() as u32, thumb.height() as u32);
+                    return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
+                }
 
                 // If the fallback fails or we aren't using thumbnails, return the original error
                 return Err(format!("Failed to open RAW file (and EXIF fallback failed): {}", e));
@@ -371,9 +370,9 @@ fn load_and_process_image_from_bytes(
         .unwrap_or_default();
 
     // ---------------------------------------------------------------------
-    // JP2 / JXL FAST PATH
+    // JXL / PDF FAST PATH
     // ---------------------------------------------------------------------
-    if matches!(ext.as_str(), "jp2" | "j2k" | "jxl" | "pdf") {
+    if matches!(ext.as_str(), "jxl" | "pdf") {
         eprintln!("[DEBUG-GUI] attempting scanner decode for {:?}", path);
 
         if let Some(dyn_img) = crate::scanner::load_image_fast(path, bytes) {
