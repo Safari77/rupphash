@@ -4,7 +4,7 @@ use codes_iso_3166::part_1::CountryCode;
 use codes_iso_3166::part_2::SubdivisionCode;
 use crossbeam_channel::{Sender, unbounded};
 use geo::Point;
-use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb};
+use image::{DynamicImage, GenericImageView};
 use jpeg_decoder::Decoder as Tier2Decoder;
 use libheif_rs::HeifContext;
 use rayon::prelude::*;
@@ -568,6 +568,98 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
             return None;
         }
 
+        "tif" | "tiff" => {
+            use std::io::Cursor;
+
+            eprintln!(
+                "[DEBUG-TIFF] Attempting image crate wrapper for {:?}",
+                path.file_name().unwrap_or_default()
+            );
+
+            // 1. Try the standard image crate TiffDecoder (Handles standard TIFFs & LZW YCbCr)
+            match image::codecs::tiff::TiffDecoder::new(Cursor::new(bytes)) {
+                Ok(mut decoder) => {
+                    use image::ImageDecoder;
+                    if decoder.color_type() == image::ColorType::Rgb8 {
+                        let (w, h) = decoder.dimensions();
+                        let mut buffer = vec![0u8; decoder.total_bytes() as usize];
+                        if decoder.read_image(&mut buffer).is_ok() {
+                            if let Some(buf) =
+                                image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, buffer)
+                            {
+                                return Some(image::DynamicImage::ImageRgb8(buf));
+                            }
+                        }
+                    } else if let Ok(img) = image::DynamicImage::from_decoder(decoder) {
+                        return Some(img);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[DEBUG-TIFF] Wrapper failed: {}. Falling back to native tiff crate...",
+                        e
+                    );
+
+                    // 2. NATIVE TIFF BYPASS: Handles JPEG-compressed YCbCr
+                    if let Ok(mut native_decoder) = tiff::decoder::Decoder::new(Cursor::new(bytes))
+                    {
+                        let is_ycbcr =
+                            matches!(native_decoder.colortype(), Ok(tiff::ColorType::YCbCr(_)));
+
+                        if let Ok((w, h)) = native_decoder.dimensions() {
+                            if let Ok(tiff::decoder::DecodingResult::U8(mut data)) =
+                                native_decoder.read_image()
+                            {
+                                let expected_rgb_len = (w * h * 3) as usize;
+                                let expected_rgba_len = (w * h * 4) as usize;
+
+                                if data.len() == expected_rgb_len {
+                                    // Convert YCbCr to RGB in-place
+                                    if is_ycbcr {
+                                        eprintln!(
+                                            "[DEBUG-TIFF] Converting raw YCbCr bytes to RGB in-place..."
+                                        );
+                                        for chunk in data.chunks_exact_mut(3) {
+                                            let y = chunk[0] as f32;
+                                            let cb = chunk[1] as f32 - 128.0;
+                                            let cr = chunk[2] as f32 - 128.0;
+
+                                            // BT.601 Color Conversion Math
+                                            chunk[0] = (y + 1.402 * cr).clamp(0.0, 255.0) as u8; // Red
+                                            chunk[1] = (y - 0.344136 * cb - 0.714136 * cr)
+                                                .clamp(0.0, 255.0)
+                                                as u8; // Green
+                                            chunk[2] = (y + 1.772 * cb).clamp(0.0, 255.0) as u8; // Blue
+                                        }
+                                    }
+
+                                    if let Some(buf) =
+                                        image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(
+                                            w, h, data,
+                                        )
+                                    {
+                                        eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGB8");
+                                        return Some(image::DynamicImage::ImageRgb8(buf));
+                                    }
+                                } else if data.len() == expected_rgba_len {
+                                    if let Some(buf) =
+                                        image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+                                            w, h, data,
+                                        )
+                                    {
+                                        eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGBA8");
+                                        return Some(image::DynamicImage::ImageRgba8(buf));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        eprintln!("[DEBUG-TIFF] Native tiff decoder also rejected the file.");
+                    }
+                }
+            }
+        }
+
         _ => {}
     }
 
@@ -861,6 +953,25 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
 
             if let Ok(handle) = ctx.primary_image_handle() {
                 return Some((handle.width(), handle.height()));
+            }
+        }
+
+        // 2.5 Handle TIFF specifically to bypass ImageReader color space limits
+        if ext == "tif" || ext == "tiff" {
+            let data_cow;
+            let data_slice = match bytes {
+                Some(b) => b,
+                None => {
+                    data_cow = fs::read(path).ok()?;
+                    &data_cow
+                }
+            };
+
+            if let Ok(decoder) =
+                image::codecs::tiff::TiffDecoder::new(std::io::Cursor::new(data_slice))
+            {
+                use image::ImageDecoder;
+                return Some(decoder.dimensions());
             }
         }
     }

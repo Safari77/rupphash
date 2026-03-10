@@ -372,7 +372,7 @@ fn load_and_process_image_from_bytes(
     // ---------------------------------------------------------------------
     // JXL / PDF FAST PATH
     // ---------------------------------------------------------------------
-    if matches!(ext.as_str(), "jxl" | "pdf") {
+    if matches!(ext.as_str(), "jxl" | "pdf" | "tif" | "tiff") {
         eprintln!("[DEBUG-GUI] attempting scanner decode for {:?}", path);
 
         if let Some(dyn_img) = crate::scanner::load_image_fast(path, bytes) {
@@ -970,7 +970,7 @@ fn compute_histogram_from_image(
         .unwrap_or_default();
 
     // Fast path for formats the `image` crate doesn't support natively (PDF, JP2, JXL)
-    if matches!(ext.as_str(), "jp2" | "j2k" | "jxl" | "pdf") {
+    if matches!(ext.as_str(), "jp2" | "j2k" | "jxl" | "pdf" | "tif" | "tiff") {
         if let Ok(bytes) = std::fs::read(path) {
             if let Some(dyn_img) = crate::scanner::load_image_fast(path, &bytes) {
                 return Some(compute_histogram_from_dynamic_image(
