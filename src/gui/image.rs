@@ -375,18 +375,18 @@ fn load_and_process_image_from_bytes(
     if matches!(ext.as_str(), "jxl" | "pdf" | "tif" | "tiff") {
         eprintln!("[DEBUG-GUI] attempting scanner decode for {:?}", path);
 
-        if let Some(dyn_img) = crate::scanner::load_image_fast(path, bytes) {
-            let (w, h) = dyn_img.dimensions();
-            let color_image = dynamic_image_to_egui(dyn_img);
+        match crate::scanner::load_image_fast(path, bytes) {
+            Ok(dyn_img) => {
+                let (w, h) = dyn_img.dimensions();
+                let color_image = dynamic_image_to_egui(dyn_img);
 
-            eprintln!("[DEBUG-GUI] scanner decode SUCCESS for {:?}", path);
-            return Ok(maybe_resize_image(color_image, (w, h), orientation, path));
-        } else {
-            eprintln!("[DEBUG-GUI] scanner decode FAILED for {:?} (unsupported or corrupt)", path);
-            return Err(format!(
-                "Failed to decode {} file (unsupported or corrupt)",
-                ext.to_uppercase()
-            ));
+                eprintln!("[DEBUG-GUI] scanner decode SUCCESS for {:?}", path);
+                return Ok(maybe_resize_image(color_image, (w, h), orientation, path));
+            }
+            Err(err_msg) => {
+                eprintln!("[DEBUG-GUI] scanner decode FAILED for {:?}: {}", path, err_msg);
+                return Err(format!("Failed to decode {} file: {}", ext.to_uppercase(), err_msg));
+            }
         }
     }
 
@@ -972,17 +972,27 @@ fn compute_histogram_from_image(
     // Fast path for formats the `image` crate doesn't support natively (PDF, JP2, JXL)
     if matches!(ext.as_str(), "jp2" | "j2k" | "jxl" | "pdf" | "tif" | "tiff") {
         if let Ok(bytes) = std::fs::read(path) {
-            if let Some(dyn_img) = crate::scanner::load_image_fast(path, &bytes) {
-                return Some(compute_histogram_from_dynamic_image(
-                    &dyn_img,
-                    dominant_colors,
-                    sat_bias,
-                ));
-            } else {
-                eprintln!("[DEBUG-HISTOGRAM] scanner::load_image_fast failed for {:?}", path);
+            match crate::scanner::load_image_fast(path, &bytes) {
+                Ok(dyn_img) => {
+                    // Explicit return here exits the function early with our data
+                    return Some(compute_histogram_from_dynamic_image(
+                        &dyn_img,
+                        dominant_colors,
+                        sat_bias,
+                    ));
+                }
+                Err(e) => {
+                    // Log the actual error that bubbled up and explicitly return None
+                    eprintln!(
+                        "[DEBUG-HISTOGRAM] scanner::load_image_fast failed for {:?}: {}",
+                        path, e
+                    );
+                    return None;
+                }
             }
         } else {
             eprintln!("[DEBUG-HISTOGRAM] Failed to read bytes for {:?}", path);
+            return None;
         }
     }
 

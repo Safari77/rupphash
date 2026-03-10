@@ -393,7 +393,7 @@ fn get_derived_value(
     }
 }
 
-pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage> {
+pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage, String> {
     let ext =
         path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
 
@@ -401,7 +401,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
 
     // Explicitly reject RAWs here so they are handled by the RAW-specific logic
     if crate::scanner::RAW_EXTS.contains(&ext.as_str()) {
-        return None;
+        return Err("RAW formats handled elsewhere".to_string());
     }
 
     match ext.as_str() {
@@ -417,7 +417,6 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
 
                 // Robustly handle Grayscale vs RGB based on buffer size
                 if len == (w * h) as usize {
-                    // Grayscale
                     if let Some(buf) =
                         image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels)
                     {
@@ -425,10 +424,9 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                             "[DEBUG-LOAD] {:?} -> Zune-JPEG (Grayscale)",
                             path.file_name().unwrap_or_default()
                         );
-                        return Some(image::DynamicImage::ImageLuma8(buf));
+                        return Ok(image::DynamicImage::ImageLuma8(buf));
                     }
                 } else if len == (w * h * 3) as usize {
-                    // RGB
                     if let Some(buf) =
                         image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels)
                     {
@@ -436,7 +434,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                             "[DEBUG-LOAD] {:?} -> Zune-JPEG (RGB)",
                             path.file_name().unwrap_or_default()
                         );
-                        return Some(image::DynamicImage::ImageRgb8(buf));
+                        return Ok(image::DynamicImage::ImageRgb8(buf));
                     }
                 } else if len == (w * h * 4) as usize {
                     // CMYK or RGBA (Zune might output RGBA for CMYK)
@@ -447,7 +445,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                             "[DEBUG-LOAD] {:?} -> Zune-JPEG (RGBA/CMYK)",
                             path.file_name().unwrap_or_default()
                         );
-                        return Some(image::DynamicImage::ImageRgba8(buf));
+                        return Ok(image::DynamicImage::ImageRgba8(buf));
                     }
                 }
             }
@@ -468,7 +466,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                             "[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback Grayscale)",
                             path.file_name().unwrap_or_default()
                         );
-                        return Some(image::DynamicImage::ImageLuma8(buf));
+                        return Ok(image::DynamicImage::ImageLuma8(buf));
                     }
                 } else if len == (w * h * 3) as usize
                     && let Some(buf) =
@@ -478,7 +476,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                         "[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback RGB)",
                         path.file_name().unwrap_or_default()
                     );
-                    return Some(image::DynamicImage::ImageRgb8(buf));
+                    return Ok(image::DynamicImage::ImageRgb8(buf));
                 }
             }
         }
@@ -493,7 +491,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                 Ok(d) => d,
                 Err(e) => {
                     img_debug!("[jxl] decoder init failed: {:?}", e);
-                    return None;
+                    return Err(format!("JXL decoder init failed: {:?}", e));
                 }
             };
 
@@ -503,11 +501,11 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
             match DynamicImage::from_decoder(decoder) {
                 Ok(img) => {
                     img_debug!("[jxl] decode successful");
-                    return Some(img);
+                    return Ok(img);
                 }
                 Err(e) => {
                     img_debug!("[jxl] decode failed: {:?}", e);
-                    return None;
+                    return Err(format!("JXL decode failed: {:?}", e));
                 }
             }
         }
@@ -515,22 +513,19 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
         "pdf" => {
             img_debug!("[pdf] attempting hayro decode");
 
-            // 1. Parse the PDF syntax
             let pdf_data = std::sync::Arc::new(bytes.to_vec());
             let pdf = match hayro::hayro_syntax::Pdf::new(pdf_data) {
                 Ok(p) => p,
                 Err(e) => {
                     img_debug!("[pdf] parse failed: {:?}", e);
-                    return None;
+                    return Err(format!("PDF parse failed: {:?}", e));
                 }
             };
 
-            // 2. Extract the first page
             let pages = pdf.pages();
             if let Some(first_page) = pages.first() {
                 let interpreter_settings = hayro::hayro_interpret::InterpreterSettings::default();
-
-                // 3. Configure render settings with a solid white background
+                // Configure render settings with a solid white background
                 let render_settings = hayro::RenderSettings {
                     x_scale: 2.0,
                     y_scale: 2.0,
@@ -538,15 +533,13 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                     ..Default::default()
                 };
 
-                // 4. Render the page to a pixmap
+                // Render the page to a pixmap
                 let pixmap = hayro::render(first_page, &interpreter_settings, &render_settings);
 
-                // 5. Zero-copy extraction
                 let width = pixmap.width() as u32;
                 let height = pixmap.height() as u32;
                 let pixel_slice = pixmap.data();
 
-                // Safely cast &[PremulRgba8] to &[u8]
                 let raw_bytes = unsafe {
                     std::slice::from_raw_parts(
                         pixel_slice.as_ptr() as *const u8,
@@ -555,17 +548,16 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                 };
 
                 // 6. Build the DynamicImage
-                // Because Alpha is 255 everywhere, Premultiplied == Straight RGBA.
                 if let Some(rgba_image) =
                     image::RgbaImage::from_raw(width, height, raw_bytes.to_vec())
                 {
                     img_debug!("[pdf] zero-copy decode successful");
-                    return Some(image::DynamicImage::ImageRgba8(rgba_image));
+                    return Ok(image::DynamicImage::ImageRgba8(rgba_image));
                 }
             }
 
             img_debug!("[pdf] document has no pages or render failed");
-            return None;
+            return Err("PDF document has no pages or render failed".to_string());
         }
 
         "tif" | "tiff" => {
@@ -576,9 +568,8 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                 path.file_name().unwrap_or_default()
             );
 
-            // 1. Try the standard image crate TiffDecoder (Handles standard TIFFs & LZW YCbCr)
             match image::codecs::tiff::TiffDecoder::new(Cursor::new(bytes)) {
-                Ok(mut decoder) => {
+                Ok(decoder) => {
                     use image::ImageDecoder;
                     if decoder.color_type() == image::ColorType::Rgb8 {
                         let (w, h) = decoder.dimensions();
@@ -587,11 +578,11 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                             if let Some(buf) =
                                 image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, buffer)
                             {
-                                return Some(image::DynamicImage::ImageRgb8(buf));
+                                return Ok(image::DynamicImage::ImageRgb8(buf));
                             }
                         }
                     } else if let Ok(img) = image::DynamicImage::from_decoder(decoder) {
-                        return Some(img);
+                        return Ok(img);
                     }
                 }
                 Err(e) => {
@@ -614,7 +605,6 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                                 let expected_rgba_len = (w * h * 4) as usize;
 
                                 if data.len() == expected_rgb_len {
-                                    // Convert YCbCr to RGB in-place
                                     if is_ycbcr {
                                         eprintln!(
                                             "[DEBUG-TIFF] Converting raw YCbCr bytes to RGB in-place..."
@@ -624,12 +614,11 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                                             let cb = chunk[1] as f32 - 128.0;
                                             let cr = chunk[2] as f32 - 128.0;
 
-                                            // BT.601 Color Conversion Math
-                                            chunk[0] = (y + 1.402 * cr).clamp(0.0, 255.0) as u8; // Red
+                                            chunk[0] = (y + 1.402 * cr).clamp(0.0, 255.0) as u8;
                                             chunk[1] = (y - 0.344136 * cb - 0.714136 * cr)
                                                 .clamp(0.0, 255.0)
-                                                as u8; // Green
-                                            chunk[2] = (y + 1.772 * cb).clamp(0.0, 255.0) as u8; // Blue
+                                                as u8;
+                                            chunk[2] = (y + 1.772 * cb).clamp(0.0, 255.0) as u8;
                                         }
                                     }
 
@@ -639,7 +628,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                                         )
                                     {
                                         eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGB8");
-                                        return Some(image::DynamicImage::ImageRgb8(buf));
+                                        return Ok(image::DynamicImage::ImageRgb8(buf));
                                     }
                                 } else if data.len() == expected_rgba_len {
                                     if let Some(buf) =
@@ -648,7 +637,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
                                         )
                                     {
                                         eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGBA8");
-                                        return Some(image::DynamicImage::ImageRgba8(buf));
+                                        return Ok(image::DynamicImage::ImageRgba8(buf));
                                     }
                                 }
                             }
@@ -678,7 +667,8 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Option<image::DynamicImage>
         reader.set_format(fmt);
     }
 
-    reader.decode().ok()
+    // Capture the image crate's format string and map the internal error out
+    reader.decode().map_err(|e| e.to_string())
 }
 
 /// Derive country name from GPS coordinates using country-boundaries
@@ -1238,7 +1228,7 @@ pub fn scan_and_group(
                             {
                                 // Decode using our robust fast loader.
                                 img_for_hashing =
-                                    load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data);
+                                    load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data).ok();
 
                                 if let Some(img) = &img_for_hashing
                                     && resolution.is_none()
@@ -1253,7 +1243,7 @@ pub fn scan_and_group(
                         }
                     } else {
                         // STANDARD IMAGE: Use fast loader directly
-                        img_for_hashing = load_image_fast(path, b);
+                        img_for_hashing = load_image_fast(path, b).ok();
                     }
 
                     if let Some(img) = &img_for_hashing {
