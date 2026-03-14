@@ -91,6 +91,8 @@ pub(super) fn spawn_image_loader_pool(
                                     &img,
                                     dominant_colors,
                                     sat_bias,
+                                    img.size[0] != dims.0 as usize
+                                        || img.size[1] != dims.1 as usize,
                                 );
 
                                 // Log dominant colors as gamma-encoded sRGB values
@@ -727,34 +729,106 @@ fn compute_histogram_from_colorimage(
     img: &egui::ColorImage,
     dominant_colors: usize,
     sat_bias: f32,
+    pre_resized: bool,
 ) -> ([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>) {
-    let (src_w, src_h) = (img.size[0], img.size[1]);
-    let (dst_w, dst_h) = (128usize, 128usize);
+    let (src_w, src_h) = (img.size[0] as u32, img.size[1] as u32);
+    let (dst_w, dst_h) = (128u32, 128u32);
 
-    // Downsample to 128x128 using nearest-neighbour and convert to Oklab (one pass)
-    let mut oklab_pixels = Vec::with_capacity(dst_w * dst_h);
-    for dy in 0..dst_h {
-        let sy = (dy * src_h) / dst_h;
-        for dx in 0..dst_w {
-            let sx = (dx * src_w) / dst_w;
-            let px = img.pixels[sy * src_w + sx];
-            let lr = srgb_to_linear(px.r() as f32 / 255.0);
-            let lg = srgb_to_linear(px.g() as f32 / 255.0);
-            let lb = srgb_to_linear(px.b() as f32 / 255.0);
+    // Detect low-color images (1-bit, indexed, etc.) by sampling the pixels
+    // for unique RGB values. If there are fewer unique colors than requested,
+    // we return them directly and skip k-means entirely.
+    //
+    // This only works when the pixels are original (not Lanczos-resampled),
+    // because resampling creates intermediate colors at edges. When the image
+    // was pre-resized (e.g. exceeding MAX_TEXTURE_SIDE), we skip this check
+    // and let k-means handle it.
+    let k = dominant_colors.clamp(1, 25);
+    let low_color_palette: Option<Vec<egui::Color32>> = if !pre_resized {
+        let total_pixels = (src_w as usize) * (src_h as usize);
+        let sample_count = total_pixels.min(4096);
+        let step = (total_pixels / sample_count).max(1);
+        let mut unique: std::collections::HashSet<(u8, u8, u8)> = std::collections::HashSet::new();
+        let mut idx = 0;
+        while idx < total_pixels && unique.len() <= k {
+            let px = img.pixels[idx];
+            unique.insert((px.r(), px.g(), px.b()));
+            idx += step;
+        }
+        if unique.len() <= k {
+            let mut colors: Vec<(Oklab, egui::Color32)> = unique
+                .iter()
+                .map(|&(r, g, b)| {
+                    let lr = srgb_to_linear(r as f32 / 255.0);
+                    let lg = srgb_to_linear(g as f32 / 255.0);
+                    let lb = srgb_to_linear(b as f32 / 255.0);
+                    let ok = linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb });
+                    (ok, egui::Color32::from_rgb(r, g, b))
+                })
+                .collect();
+            colors.sort_by(|a, b| a.0.l.partial_cmp(&b.0.l).unwrap_or(std::cmp::Ordering::Equal));
+            Some(colors.into_iter().map(|(_, c)| c).collect())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut oklab_pixels = Vec::with_capacity((dst_w * dst_h) as usize);
+    let pixel_type = PixelType::U8x4;
+
+    // 1. High-quality downsample using fast_image_resize
+    let resized_successfully =
+        FastImage::from_vec_u8(src_w, src_h, img.as_raw().to_vec(), pixel_type).ok().and_then(
+            |src_image| {
+                let mut dst_image = FastImage::new(dst_w, dst_h, pixel_type);
+                let mut resizer = Resizer::new();
+
+                resizer
+                    .resize(&src_image, &mut dst_image, &ResizeOptions::default())
+                    .ok()
+                    .map(|_| dst_image)
+            },
+        );
+
+    if let Some(dst_image) = resized_successfully {
+        // 2. Convert smoothed pixels to Oklab
+        for chunk in dst_image.buffer().chunks_exact(4) {
+            let lr = srgb_to_linear(chunk[0] as f32 / 255.0);
+            let lg = srgb_to_linear(chunk[1] as f32 / 255.0);
+            let lb = srgb_to_linear(chunk[2] as f32 / 255.0);
             oklab_pixels.push(linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb }));
+        }
+    } else {
+        // Fallback: Original nearest-neighbor logic if the high-quality resize fails
+        let src_w_usize = src_w as usize;
+        let src_h_usize = src_h as usize;
+        let dst_w_usize = dst_w as usize;
+        let dst_h_usize = dst_h as usize;
+
+        for dy in 0..dst_h_usize {
+            let sy = (dy * src_h_usize) / dst_h_usize;
+            for dx in 0..dst_w_usize {
+                let sx = (dx * src_w_usize) / dst_w_usize;
+                let px = img.pixels[sy * src_w_usize + sx];
+                let lr = srgb_to_linear(px.r() as f32 / 255.0);
+                let lg = srgb_to_linear(px.g() as f32 / 255.0);
+                let lb = srgb_to_linear(px.b() as f32 / 255.0);
+                oklab_pixels.push(linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb }));
+            }
         }
     }
 
     let (hist_l, hist_a, hist_b) = build_histograms(&oklab_pixels);
-    // --- Palette: K-means++ on the same Oklab pixels ---
-    let palette = kmeans_palette(&oklab_pixels, dominant_colors, sat_bias);
+
+    // Use pre-computed palette for low-color images, otherwise run k-means
+    let palette = low_color_palette
+        .unwrap_or_else(|| kmeans_palette(&oklab_pixels, dominant_colors, sat_bias));
 
     (hist_l, hist_a, hist_b, palette)
 }
 
-/// K-means++ clustering in Oklab space with 3 restarts, 20 iterations, early convergence.
-/// Shared implementation used by all palette extraction paths.
-/// Returns colors sorted by Oklab perceived lightness.
+/// K-means++ clustering with Logarithmic Culling and Oklch Distance.
 fn kmeans_palette(pixels: &[Oklab], dominant_colors: usize, sat_bias: f32) -> Vec<egui::Color32> {
     let k = dominant_colors.clamp(1, 25);
 
@@ -762,173 +836,293 @@ fn kmeans_palette(pixels: &[Oklab], dominant_colors: usize, sat_bias: f32) -> Ve
         return vec![egui::Color32::BLACK; k];
     }
 
-    // Stretch the a and b color axes to force K-means to care more about color differences than brightness differences
-    let chroma_mult = sat_bias.max(1.0);
+    // 1. logarithmic filtering & exponential weights
+    let mut working_pixels = Vec::with_capacity(pixels.len());
+    let mut weights = Vec::with_capacity(pixels.len());
 
-    // Calculate weights using an exponential curve for BOTH Saturation and Brightness.
-    let weights: Vec<f32> = pixels
-        .iter()
-        .map(|p| {
-            if (sat_bias - 1.0).abs() < f32::EPSILON {
-                1.0 // Baseline
-            } else {
-                // 1. Chroma (Saturation) Weight
-                let chroma = (p.a.powi(2) + p.b.powi(2)).sqrt();
-                let chroma_weight = chroma * sat_bias * 5.0;
+    // The cutoff is now 1.0 / 5.5 = 0.18 Oklab Lightness.
+    // sRGB(1, 4, 6) is L~0.10 -> Dead.
+    // sRGB(25, 38, 54) is L~0.25 -> Alive and well!
+    let dark_tuning = 5.5;
 
-                // 2. Brightness (Luminance) Weight
-                let bright_weight = p.l.powi(4) * sat_bias * 1.5;
-
-                // 3. Logarithmic Darkness Penalty
-                // Human vision is logarithmic. We use log10 to gently taper mid-shadows
-                // but aggressively crush the weight of absolute pitch black.
-                let log_curve = (p.l * 9.0 + 1.0).log10();
-                let darkness_penalty = log_curve * 0.9 + 0.1;
-
-                // Combine the weights, square the bonuses, and apply the darkness penalty
-                (1.0 + (chroma_weight + bright_weight).powi(2)) * darkness_penalty
-            }
-        })
-        .collect();
-
-    let mut best_centroids = vec![pixels[0]; k];
-    let mut best_cost = f32::MAX;
-
-    // Run K-means 3 times with different seeds, keep the best result
-    for restart in 0..3u64 {
-        // K-means++ initialization: pick centroids proportional to squared distance
-        let mut centroids = vec![pixels[0]; k];
-        let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_0000 ^ (restart * 0x9E3779B97F4A7C15);
-        let mut xorshift = || -> u64 {
-            rng_state ^= rng_state << 13;
-            rng_state ^= rng_state >> 7;
-            rng_state ^= rng_state << 17;
-            rng_state
-        };
-
-        centroids[0] = pixels[(xorshift() as usize) % pixels.len()];
-
-        // 1. Weighted Initialization with Stretched Axes
-        for ki in 1..k {
-            let mut dists: Vec<f32> = pixels
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let mut min_d = f32::MAX;
-                    for c in &centroids[..ki] {
-                        // DISTANCE FORMULA: L is normal, A and B are stretched by chroma_mult
-                        let d = (p.l - c.l).powi(2)
-                            + ((p.a - c.a) * chroma_mult).powi(2)
-                            + ((p.b - c.b) * chroma_mult).powi(2);
-                        if d < min_d {
-                            min_d = d;
-                        }
-                    }
-                    min_d * weights[i]
-                })
-                .collect();
-
-            let total: f32 = dists.iter().sum();
-            if total <= 0.0 {
-                centroids[ki] = pixels[(xorshift() as usize) % pixels.len()];
-                continue;
-            }
-            for i in 1..dists.len() {
-                dists[i] += dists[i - 1];
-            }
-
-            let threshold = (xorshift() as f32 / u64::MAX as f32) * total;
-            let idx = dists.partition_point(|&d| d < threshold).min(pixels.len() - 1);
-            centroids[ki] = pixels[idx];
+    for &p in pixels {
+        // THE HARD FLOOR: Don't even run the math if it's visually near-black.
+        // This ruthlessly culls the abyss before it can infect the K-means weights.
+        if p.l < 0.12 {
+            continue;
         }
 
-        // 2. Weighted K-means Iterations
-        for _ in 0..20 {
-            let mut counts = vec![0.0f32; k];
-            let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
+        let chroma = (p.a.powi(2) + p.b.powi(2)).sqrt();
+        let l_weight = (p.l * dark_tuning).log10();
 
-            for (idx, &p) in pixels.iter().enumerate() {
-                let mut min_dist = f32::MAX;
-                let mut best_idx = 0;
-                for (i, c) in centroids.iter().enumerate() {
-                    // Apply stretched axes here too
-                    let dist_sq = (p.l - c.l).powi(2)
-                        + ((p.a - c.a) * chroma_mult).powi(2)
-                        + ((p.b - c.b) * chroma_mult).powi(2);
+        if l_weight > 0.0 {
+            let color_boost = 1.0 + (chroma * 30.0).powi(2) * sat_bias;
 
-                    if dist_sq < min_dist {
-                        min_dist = dist_sq;
-                        best_idx = i;
+            working_pixels.push(p);
+            weights.push(l_weight * color_boost);
+        }
+    }
+
+    // Fallback: If the image is literally a pitch-black square, don't crash.
+    if working_pixels.len() < k {
+        working_pixels = pixels.to_vec();
+        weights = vec![1.0; pixels.len()];
+    }
+
+    // We group every pixel into one of 4 dominant color zones using Oklab's native axes.
+    let mut zone_weights = [0.0f32; 4];
+
+    for (p, &w) in working_pixels.iter().zip(weights.iter()) {
+        if p.a.abs() > p.b.abs() {
+            if p.a > 0.0 {
+                zone_weights[0] += w;
+            }
+            // RED dominant
+            else {
+                zone_weights[1] += w;
+            } // GREEN dominant
+        } else {
+            if p.b > 0.0 {
+                zone_weights[2] += w;
+            }
+            // YELLOW dominant
+            else {
+                zone_weights[3] += w;
+            } // BLUE dominant
+        }
+    }
+
+    // Find the average weight of an active zone
+    let active_zones = zone_weights.iter().filter(|&&w| w > 0.0).count() as f32;
+    let avg_zone_weight =
+        if active_zones > 0.0 { zone_weights.iter().sum::<f32>() / active_zones } else { 1.0 };
+
+    // Equalize! If Orange/Brown (Red+Yellow) is hoarding 1,000,000 weight
+    // and Blue only has 10,000, this will mathematically level the playing field.
+    for (p, w) in working_pixels.iter().zip(weights.iter_mut()) {
+        let zone = if p.a.abs() > p.b.abs() {
+            if p.a > 0.0 { 0 } else { 1 }
+        } else {
+            if p.b > 0.0 { 2 } else { 3 }
+        };
+
+        if zone_weights[zone] > 0.0 {
+            // We use .sqrt() on the ratio so we don't accidentally give a single
+            // stray blue noise pixel the power of a million suns. It's a gentle but firm equalization.
+            let equalization_factor = (avg_zone_weight / zone_weights[zone]).sqrt();
+            *w *= equalization_factor;
+        }
+    }
+
+    // 2. Oklch distance metric
+    let calc_dist = |p: &Oklab, c: &Oklab| -> f32 {
+        let p_c = (p.a.powi(2) + p.b.powi(2)).sqrt();
+        let c_c = (c.a.powi(2) + c.b.powi(2)).sqrt();
+
+        let mut d_h_angle = (p.b.atan2(p.a) - c.b.atan2(c.a)).abs();
+        if d_h_angle > std::f32::consts::PI {
+            d_h_angle = std::f32::consts::PI * 2.0 - d_h_angle;
+        }
+
+        // THE WEDGE: Raise the floor to 0.08.
+        // Even if a pixel is practically black/grey (chroma 0.005), K-means is
+        // mathematically forced to treat it as having a chroma of 0.08.
+        // This violently physically separates dark red from dark blue.
+        let effective_chroma = p_c.max(c_c).clamp(0.08, 0.25);
+
+        // dl and dc stay gentle so we don't break perceptual space
+        let dl = (p.l - c.l) * 1.5;
+        let dc = p_c - c_c;
+
+        // Multiply hue distance by the boosted effective_chroma
+        let dh_weighted = d_h_angle * effective_chroma * 2.5;
+
+        dl.powi(2) + dc.powi(2) + dh_weighted.powi(2)
+    };
+
+    // 3. K-Means++ initialization
+    let mut centroids = vec![working_pixels[0]; k];
+
+    let mut rng_state: u64 = 0x5EED_C0DE_1234_5678;
+    let mut xorshift = || -> u64 {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        rng_state
+    };
+
+    let total_w: f32 = weights.iter().sum();
+    let mut threshold = (xorshift() as f32 / u64::MAX as f32) * total_w;
+    for (i, &w) in weights.iter().enumerate() {
+        threshold -= w;
+        if threshold <= 0.0 {
+            centroids[0] = working_pixels[i];
+            break;
+        }
+    }
+
+    for ki in 1..k {
+        let dists: Vec<f32> = working_pixels
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut min_d = f32::MAX;
+                for c in &centroids[..ki] {
+                    let d = calc_dist(p, c);
+                    if d < min_d {
+                        min_d = d;
                     }
                 }
+                min_d * weights[i]
+            })
+            .collect();
 
-                let w = weights[idx];
-                counts[best_idx] += w;
-                sums[best_idx].0 += p.l * w;
-                sums[best_idx].1 += p.a * w;
-                sums[best_idx].2 += p.b * w;
+        let total: f32 = dists.iter().sum();
+        if total <= 0.0 {
+            centroids[ki] = working_pixels[(xorshift() as usize) % working_pixels.len()];
+            continue;
+        }
+
+        let mut target = (xorshift() as f32 / u64::MAX as f32) * total;
+        for (i, &d) in dists.iter().enumerate() {
+            target -= d;
+            if target <= 0.0 {
+                centroids[ki] = working_pixels[i];
+                break;
             }
+        }
+    }
 
-            let mut max_shift = 0.0f32;
-            for i in 0..k {
-                if counts[i] > 0.0 {
-                    let new_l = sums[i].0 / counts[i];
-                    let new_a = sums[i].1 / counts[i];
-                    let new_b = sums[i].2 / counts[i];
+    // 4. K-Means iterations
+    let mut final_counts = vec![0.0f32; k];
+    for _ in 0..20 {
+        let mut counts = vec![0.0f32; k];
+        let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
 
-                    // Keep tracking shift in stretched space to determine convergence
-                    let shift = (centroids[i].l - new_l).powi(2)
-                        + ((centroids[i].a - new_a) * chroma_mult).powi(2)
-                        + ((centroids[i].b - new_b) * chroma_mult).powi(2);
-
-                    max_shift = max_shift.max(shift);
-                    centroids[i].l = new_l;
-                    centroids[i].a = new_a;
-                    centroids[i].b = new_b;
+        for (idx, &p) in working_pixels.iter().enumerate() {
+            let mut min_dist = f32::MAX;
+            let mut best_idx = 0;
+            for (i, c) in centroids.iter().enumerate() {
+                let dist_sq = calc_dist(&p, c);
+                if dist_sq < min_dist {
+                    min_dist = dist_sq;
+                    best_idx = i;
                 }
             }
-            if max_shift < 1e-6 {
+
+            let w = weights[idx];
+            counts[best_idx] += w;
+            sums[best_idx].0 += p.l * w;
+            sums[best_idx].1 += p.a * w;
+            sums[best_idx].2 += p.b * w;
+        }
+
+        let mut max_shift = 0.0f32;
+        for i in 0..k {
+            if counts[i] > 0.0 {
+                let new_l = sums[i].0 / counts[i];
+                let new_a = sums[i].1 / counts[i];
+                let new_b = sums[i].2 / counts[i];
+
+                let shift = calc_dist(&centroids[i], &Oklab { l: new_l, a: new_a, b: new_b });
+
+                max_shift = max_shift.max(shift);
+                centroids[i].l = new_l;
+                centroids[i].a = new_a;
+                centroids[i].b = new_b;
+            }
+        }
+        if max_shift < 1e-6 {
+            final_counts = counts;
+            break;
+        }
+        final_counts = counts;
+    }
+
+    // 4.5. Anti-crowding deduplication (the tuning knob)
+    // ==========================================================
+    // TUNING KNOB: 0.001 to 0.005.
+    // 0.002 will only merge colors that are practically identical to the human eye,
+    // which perfectly kills the "tiny bright spot" duplicates without
+    // collapsing your subtle dark palettes.
+    let similarity_threshold = 0.002;
+
+    let mut clusters: Vec<(f32, Oklab)> =
+        centroids.into_iter().enumerate().map(|(i, c)| (final_counts[i], c)).collect();
+
+    clusters.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut unique_centroids: Vec<(f32, Oklab)> = Vec::new();
+    let total_pixels: f32 = clusters.iter().map(|(count, _)| count).sum();
+
+    for (count, c) in clusters {
+        if count == 0.0 {
+            continue;
+        }
+
+        let mut too_close = false;
+        let is_tiny_spot = count < (total_pixels * 0.02);
+
+        for &(kept_count, kept_c) in &unique_centroids {
+            let dist = calc_dist(&c, &kept_c);
+
+            if dist < 0.0005 || (is_tiny_spot && dist < 0.003 && count < kept_count * 0.5) {
+                too_close = true;
                 break;
             }
         }
 
-        // 3. Weighted Cost Evaluation
-        let cost: f32 = pixels
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let min_dist = centroids
-                    .iter()
-                    .map(|c| {
-                        (p.l - c.l).powi(2)
-                            + ((p.a - c.a) * chroma_mult).powi(2)
-                            + ((p.b - c.b) * chroma_mult).powi(2)
-                    })
-                    .fold(f32::MAX, f32::min);
-                min_dist * weights[i]
-            })
-            .sum();
-
-        if cost < best_cost {
-            best_cost = cost;
-            best_centroids = centroids;
+        if !too_close {
+            unique_centroids.push((count, c));
         }
     }
+    let unique_centroids: Vec<Oklab> = unique_centroids.into_iter().map(|(_, c)| c).collect();
 
-    // Convert centroids to sRGB and sort by Oklab perceived lightness
-    let mut result: Vec<egui::Color32> = Vec::with_capacity(k);
-    let mut lightness: Vec<f32> = Vec::with_capacity(k);
-    for i in 0..k {
-        lightness.push(best_centroids[i].l);
-        let srgb_linear = oklab_to_linear_srgb(best_centroids[i]);
+    // 5. Convert and sort (hue buckets + lightness)
+    // ==========================================================
+    // Returning 6 distinct, beautiful colors is vastly superior to
+    // returning 10 colors where 4 are identical bright spots.
+    let final_k = unique_centroids.len();
+
+    // Check if ALL centroids are achromatic (grey). When chroma is near-zero
+    // the hue angle from atan2 is meaningless noise, so hue-bucket sorting
+    // scrambles what should be a clean dark-to-light gradient.
+    let grey_threshold = 0.01;
+    let all_grey =
+        unique_centroids.iter().all(|c| (c.a.powi(2) + c.b.powi(2)).sqrt() < grey_threshold);
+
+    let mut result: Vec<egui::Color32> = Vec::with_capacity(final_k);
+    let mut sort_keys: Vec<(i32, u32)> = Vec::with_capacity(final_k);
+
+    for i in 0..final_k {
+        let l_key = (unique_centroids[i].l * 1000.0) as u32;
+
+        if all_grey {
+            // Pure lightness sort: hue bucket forced to 0 so only l_key matters
+            sort_keys.push((0, l_key));
+        } else {
+            let mut h = unique_centroids[i].b.atan2(unique_centroids[i].a);
+            if h < 0.0 {
+                h += std::f32::consts::PI * 2.0;
+            }
+
+            let hue_bucket = ((h * 8.0) / (std::f32::consts::PI * 2.0)).round() as i32 % 8;
+            sort_keys.push((hue_bucket, l_key));
+        }
+
+        let srgb_linear = oklab_to_linear_srgb(unique_centroids[i]);
         let r = (linear_to_srgb(srgb_linear.r).clamp(0.0, 1.0) * 255.0).round() as u8;
         let g = (linear_to_srgb(srgb_linear.g).clamp(0.0, 1.0) * 255.0).round() as u8;
         let b = (linear_to_srgb(srgb_linear.b).clamp(0.0, 1.0) * 255.0).round() as u8;
         result.push(egui::Color32::from_rgb(r, g, b));
     }
 
-    let mut indices: Vec<usize> = (0..k).collect();
-    indices.sort_by(|&a, &b| lightness[a].partial_cmp(&lightness[b]).unwrap());
+    let mut indices: Vec<usize> = (0..final_k).collect();
+    indices.sort_by(|&a, &b| {
+        let cmp = sort_keys[a].0.cmp(&sort_keys[b].0);
+        if cmp == std::cmp::Ordering::Equal { sort_keys[a].1.cmp(&sort_keys[b].1) } else { cmp }
+    });
+
     indices.iter().map(|&i| result[i]).collect()
 }
 
@@ -941,19 +1135,86 @@ fn compute_histogram_from_dynamic_image(
     dominant_colors: usize,
     sat_bias: f32,
 ) -> ([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>) {
-    let thumb = img.thumbnail_exact(128, 128).to_rgb8();
-    let oklab_pixels: Vec<Oklab> = thumb
-        .pixels()
-        .map(|p| {
-            let lr = srgb_to_linear(p[0] as f32 / 255.0);
-            let lg = srgb_to_linear(p[1] as f32 / 255.0);
-            let lb = srgb_to_linear(p[2] as f32 / 255.0);
-            linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb })
-        })
-        .collect();
+    let rgba = img.to_rgba8();
+    let (src_w, src_h) = rgba.dimensions();
+    let (dst_w, dst_h) = (128u32, 128u32);
+    let pixel_type = PixelType::U8x4;
+
+    // Detect low-color images before Lanczos downsampling destroys the information.
+    // This path always receives original (non-resized) pixels.
+    let k = dominant_colors.clamp(1, 25);
+    let raw_pixels = rgba.as_raw();
+    let total_pixels = (src_w as usize) * (src_h as usize);
+    let sample_count = total_pixels.min(4096);
+    let step = (total_pixels / sample_count).max(1);
+    let mut unique_rgb: std::collections::HashSet<(u8, u8, u8)> = std::collections::HashSet::new();
+    let mut idx = 0;
+    while idx < total_pixels && unique_rgb.len() <= k {
+        let base = idx * 4;
+        unique_rgb.insert((raw_pixels[base], raw_pixels[base + 1], raw_pixels[base + 2]));
+        idx += step;
+    }
+
+    // 1. High-quality downsample using fast_image_resize (matches ColorImage path)
+    let resized_successfully = FastImage::from_vec_u8(src_w, src_h, rgba.into_raw(), pixel_type)
+        .ok()
+        .and_then(|src_image| {
+            let mut dst_image = FastImage::new(dst_w, dst_h, pixel_type);
+            let mut resizer = Resizer::new();
+
+            resizer
+                .resize(&src_image, &mut dst_image, &ResizeOptions::default())
+                .ok()
+                .map(|_| dst_image)
+        });
+
+    let oklab_pixels: Vec<Oklab> = if let Some(dst_image) = resized_successfully {
+        // Parse the smoothed buffer
+        dst_image
+            .buffer()
+            .chunks_exact(4)
+            .map(|chunk| {
+                let lr = srgb_to_linear(chunk[0] as f32 / 255.0);
+                let lg = srgb_to_linear(chunk[1] as f32 / 255.0);
+                let lb = srgb_to_linear(chunk[2] as f32 / 255.0);
+                linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb })
+            })
+            .collect()
+    } else {
+        // Fallback: If fast_image_resize fails, use the image crate's high-quality Lanczos3 filter
+        // instead of the lower quality thumbnail_exact() method.
+        let thumb =
+            img.resize_exact(dst_w, dst_h, image::imageops::FilterType::Lanczos3).to_rgba8();
+        thumb
+            .pixels()
+            .map(|p| {
+                let lr = srgb_to_linear(p[0] as f32 / 255.0);
+                let lg = srgb_to_linear(p[1] as f32 / 255.0);
+                let lb = srgb_to_linear(p[2] as f32 / 255.0);
+                linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb })
+            })
+            .collect()
+    };
 
     let (hist_l, hist_a, hist_b) = build_histograms(&oklab_pixels);
-    let palette = kmeans_palette(&oklab_pixels, dominant_colors, sat_bias);
+
+    let palette = if unique_rgb.len() <= k {
+        let mut colors: Vec<(Oklab, egui::Color32)> = unique_rgb
+            .iter()
+            .map(|&(r, g, b)| {
+                let lr = srgb_to_linear(r as f32 / 255.0);
+                let lg = srgb_to_linear(g as f32 / 255.0);
+                let lb = srgb_to_linear(b as f32 / 255.0);
+                let ok = linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb });
+                (ok, egui::Color32::from_rgb(r, g, b))
+            })
+            .collect();
+        colors.sort_by(|a, b| a.0.l.partial_cmp(&b.0.l).unwrap_or(std::cmp::Ordering::Equal));
+        colors.into_iter().map(|(_, c)| c).collect()
+    } else {
+        kmeans_palette(&oklab_pixels, dominant_colors, sat_bias)
+    };
+
     (hist_l, hist_a, hist_b, palette)
 }
 
@@ -1036,6 +1297,7 @@ fn compute_histogram_from_raw(
                     &color_img,
                     dominant_colors,
                     sat_bias,
+                    false,
                 ));
             } else {
                 eprintln!("[DEBUG-HISTOGRAM] EXIF fallback also failed for {:?}", path);
