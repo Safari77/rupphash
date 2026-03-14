@@ -574,13 +574,12 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                     if decoder.color_type() == image::ColorType::Rgb8 {
                         let (w, h) = decoder.dimensions();
                         let mut buffer = vec![0u8; decoder.total_bytes() as usize];
-                        if decoder.read_image(&mut buffer).is_ok() {
-                            if let Some(buf) =
+                        if decoder.read_image(&mut buffer).is_ok()
+                            && let Some(buf) =
                                 image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, buffer)
                             {
                                 return Ok(image::DynamicImage::ImageRgb8(buf));
                             }
-                        }
                     } else if let Ok(img) = image::DynamicImage::from_decoder(decoder) {
                         return Ok(img);
                     }
@@ -597,8 +596,8 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                         let is_ycbcr =
                             matches!(native_decoder.colortype(), Ok(tiff::ColorType::YCbCr(_)));
 
-                        if let Ok((w, h)) = native_decoder.dimensions() {
-                            if let Ok(tiff::decoder::DecodingResult::U8(mut data)) =
+                        if let Ok((w, h)) = native_decoder.dimensions()
+                            && let Ok(tiff::decoder::DecodingResult::U8(mut data)) =
                                 native_decoder.read_image()
                             {
                                 let expected_rgb_len = (w * h * 3) as usize;
@@ -630,8 +629,8 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                                         eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGB8");
                                         return Ok(image::DynamicImage::ImageRgb8(buf));
                                     }
-                                } else if data.len() == expected_rgba_len {
-                                    if let Some(buf) =
+                                } else if data.len() == expected_rgba_len
+                                    && let Some(buf) =
                                         image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
                                             w, h, data,
                                         )
@@ -639,9 +638,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                                         eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGBA8");
                                         return Ok(image::DynamicImage::ImageRgba8(buf));
                                     }
-                                }
                             }
-                        }
                     } else {
                         eprintln!("[DEBUG-TIFF] Native tiff decoder also rejected the file.");
                     }
