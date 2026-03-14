@@ -728,25 +728,57 @@ fn compute_histogram_from_colorimage(
     dominant_colors: usize,
     sat_bias: f32,
 ) -> ([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>) {
-    let (src_w, src_h) = (img.size[0], img.size[1]);
-    let (dst_w, dst_h) = (128usize, 128usize);
+    let (src_w, src_h) = (img.size[0] as u32, img.size[1] as u32);
+    let (dst_w, dst_h) = (128u32, 128u32);
 
-    // Downsample to 128x128 using nearest-neighbour and convert to Oklab (one pass)
-    let mut oklab_pixels = Vec::with_capacity(dst_w * dst_h);
-    for dy in 0..dst_h {
-        let sy = (dy * src_h) / dst_h;
-        for dx in 0..dst_w {
-            let sx = (dx * src_w) / dst_w;
-            let px = img.pixels[sy * src_w + sx];
-            let lr = srgb_to_linear(px.r() as f32 / 255.0);
-            let lg = srgb_to_linear(px.g() as f32 / 255.0);
-            let lb = srgb_to_linear(px.b() as f32 / 255.0);
+    let mut oklab_pixels = Vec::with_capacity((dst_w * dst_h) as usize);
+    let pixel_type = PixelType::U8x4;
+
+    // 1. High-quality downsample using fast_image_resize
+    let resized_successfully =
+        FastImage::from_vec_u8(src_w, src_h, img.as_raw().to_vec(), pixel_type).ok().and_then(
+            |src_image| {
+                let mut dst_image = FastImage::new(dst_w, dst_h, pixel_type);
+                let mut resizer = Resizer::new();
+
+                resizer
+                    .resize(&src_image, &mut dst_image, &ResizeOptions::default())
+                    .ok()
+                    .map(|_| dst_image)
+            },
+        );
+
+    if let Some(dst_image) = resized_successfully {
+        // 2. Convert smoothed pixels to Oklab
+        for chunk in dst_image.buffer().chunks_exact(4) {
+            let lr = srgb_to_linear(chunk[0] as f32 / 255.0);
+            let lg = srgb_to_linear(chunk[1] as f32 / 255.0);
+            let lb = srgb_to_linear(chunk[2] as f32 / 255.0);
             oklab_pixels.push(linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb }));
+        }
+    } else {
+        // Fallback: Original nearest-neighbor logic if the high-quality resize fails
+        let src_w_usize = src_w as usize;
+        let src_h_usize = src_h as usize;
+        let dst_w_usize = dst_w as usize;
+        let dst_h_usize = dst_h as usize;
+
+        for dy in 0..dst_h_usize {
+            let sy = (dy * src_h_usize) / dst_h_usize;
+            for dx in 0..dst_w_usize {
+                let sx = (dx * src_w_usize) / dst_w_usize;
+                let px = img.pixels[sy * src_w_usize + sx];
+                let lr = srgb_to_linear(px.r() as f32 / 255.0);
+                let lg = srgb_to_linear(px.g() as f32 / 255.0);
+                let lb = srgb_to_linear(px.b() as f32 / 255.0);
+                oklab_pixels.push(linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb }));
+            }
         }
     }
 
     let (hist_l, hist_a, hist_b) = build_histograms(&oklab_pixels);
-    // --- Palette: K-means++ on the same Oklab pixels ---
+
+    // --- Palette: K-means++ on the smoothed Oklab pixels ---
     let palette = kmeans_palette(&oklab_pixels, dominant_colors, sat_bias);
 
     (hist_l, hist_a, hist_b, palette)
@@ -762,165 +794,167 @@ fn kmeans_palette(pixels: &[Oklab], dominant_colors: usize, sat_bias: f32) -> Ve
         return vec![egui::Color32::BLACK; k];
     }
 
-    // Stretch the a and b color axes to force K-means to care more about color differences than brightness differences
-    let chroma_mult = sat_bias.max(1.0);
+    // ---------------------------------------------------------------------
+    // AXIS WARPING: Force K-means to care about Hue, not Shading
+    // ---------------------------------------------------------------------
+    // CRUSH Lightness so it stops building brightness ladders.
+    let l_squash = 0.15;
 
-    // Calculate weights using an exponential curve for BOTH Saturation and Brightness.
+    // Lock the geometry
+    let chroma_mult = 8.0;
+
+    // ---------------------------------------------------------------------
+    // WEIGHTS: Respect density, boost color, carefully penalize shadows
+    // ---------------------------------------------------------------------
     let weights: Vec<f32> = pixels
         .iter()
         .map(|p| {
-            if (sat_bias - 1.0).abs() < f32::EPSILON {
-                1.0 // Baseline
-            } else {
-                // 1. Chroma (Saturation) Weight
-                let chroma = (p.a.powi(2) + p.b.powi(2)).sqrt();
-                let chroma_weight = chroma * sat_bias * 5.0;
+            let chroma = (p.a.powi(2) + p.b.powi(2)).sqrt();
 
-                // 2. Brightness (Luminance) Weight
-                let bright_weight = p.l.powi(4) * sat_bias * 1.5;
+            // Baseline: Every pixel gets a 1.0 vote to ensure density counts.
+            let mut w = 1.0;
 
-                // 3. Logarithmic Darkness Penalty
-                // Human vision is logarithmic. We use log10 to gently taper mid-shadows
-                // but aggressively crush the weight of absolute pitch black.
-                let log_curve = (p.l * 9.0 + 1.0).log10();
-                let darkness_penalty = log_curve * 0.9 + 0.1;
-
-                // Combine the weights, square the bonuses, and apply the darkness penalty
-                (1.0 + (chroma_weight + bright_weight).powi(2)) * darkness_penalty
+            if (sat_bias - 1.0).abs() > f32::EPSILON {
+                // Use a square root curve for sat_bias.
+                // This means a bias of 10.0 gives a 3x weight boost (strong but safe),
+                // rather than a 10x boost that turns the most saturated pixels into black holes.
+                let color_bonus = (chroma * 10.0).min(2.0) * sat_bias.sqrt();
+                w += color_bonus;
             }
+
+            // Logarithmic Shadow Penalty (Smoothly tapers off shadows)
+            let log_curve = (p.l * 9.0 + 1.0).log10();
+
+            // Protect dark colors: If chroma hits 0.05, color_lack becomes 0.0, bypassing the penalty.
+            let color_lack = (1.0 - (chroma * 20.0)).clamp(0.0, 1.0);
+            let penalty = 1.0 - (color_lack * (1.0 - log_curve));
+
+            // Apply penalty, keeping a minimum floor of 0.05
+            w *= penalty.max(0.05);
+            w
         })
         .collect();
 
-    let mut best_centroids = vec![pixels[0]; k];
-    let mut best_cost = f32::MAX;
+    let mut centroids = vec![pixels[0]; k];
 
-    // Run K-means 3 times with different seeds, keep the best result
-    for restart in 0..3u64 {
-        // K-means++ initialization: pick centroids proportional to squared distance
-        let mut centroids = vec![pixels[0]; k];
-        let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_0000 ^ (restart * 0x9E3779B97F4A7C15);
-        let mut xorshift = || -> u64 {
-            rng_state ^= rng_state << 13;
-            rng_state ^= rng_state >> 7;
-            rng_state ^= rng_state << 17;
-            rng_state
-        };
+    // ---------------------------------------------------------------------
+    // STABLE K-MEANS++ INITIALIZATION (Locked Seed)
+    // ---------------------------------------------------------------------
+    let mut rng_state: u64 = 0x5EED_C0DE_1234_5678;
+    let mut xorshift = || -> u64 {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        rng_state
+    };
 
-        centroids[0] = pixels[(xorshift() as usize) % pixels.len()];
-
-        // 1. Weighted Initialization with Stretched Axes
-        for ki in 1..k {
-            let mut dists: Vec<f32> = pixels
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let mut min_d = f32::MAX;
-                    for c in &centroids[..ki] {
-                        // DISTANCE FORMULA: L is normal, A and B are stretched by chroma_mult
-                        let d = (p.l - c.l).powi(2)
-                            + ((p.a - c.a) * chroma_mult).powi(2)
-                            + ((p.b - c.b) * chroma_mult).powi(2);
-                        if d < min_d {
-                            min_d = d;
-                        }
-                    }
-                    min_d * weights[i]
-                })
-                .collect();
-
-            let total: f32 = dists.iter().sum();
-            if total <= 0.0 {
-                centroids[ki] = pixels[(xorshift() as usize) % pixels.len()];
-                continue;
-            }
-            for i in 1..dists.len() {
-                dists[i] += dists[i - 1];
-            }
-
-            let threshold = (xorshift() as f32 / u64::MAX as f32) * total;
-            let idx = dists.partition_point(|&d| d < threshold).min(pixels.len() - 1);
-            centroids[ki] = pixels[idx];
-        }
-
-        // 2. Weighted K-means Iterations
-        for _ in 0..20 {
-            let mut counts = vec![0.0f32; k];
-            let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
-
-            for (idx, &p) in pixels.iter().enumerate() {
-                let mut min_dist = f32::MAX;
-                let mut best_idx = 0;
-                for (i, c) in centroids.iter().enumerate() {
-                    // Apply stretched axes here too
-                    let dist_sq = (p.l - c.l).powi(2)
-                        + ((p.a - c.a) * chroma_mult).powi(2)
-                        + ((p.b - c.b) * chroma_mult).powi(2);
-
-                    if dist_sq < min_dist {
-                        min_dist = dist_sq;
-                        best_idx = i;
-                    }
-                }
-
-                let w = weights[idx];
-                counts[best_idx] += w;
-                sums[best_idx].0 += p.l * w;
-                sums[best_idx].1 += p.a * w;
-                sums[best_idx].2 += p.b * w;
-            }
-
-            let mut max_shift = 0.0f32;
-            for i in 0..k {
-                if counts[i] > 0.0 {
-                    let new_l = sums[i].0 / counts[i];
-                    let new_a = sums[i].1 / counts[i];
-                    let new_b = sums[i].2 / counts[i];
-
-                    // Keep tracking shift in stretched space to determine convergence
-                    let shift = (centroids[i].l - new_l).powi(2)
-                        + ((centroids[i].a - new_a) * chroma_mult).powi(2)
-                        + ((centroids[i].b - new_b) * chroma_mult).powi(2);
-
-                    max_shift = max_shift.max(shift);
-                    centroids[i].l = new_l;
-                    centroids[i].a = new_a;
-                    centroids[i].b = new_b;
-                }
-            }
-            if max_shift < 1e-6 {
-                break;
-            }
-        }
-
-        // 3. Weighted Cost Evaluation
-        let cost: f32 = pixels
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let min_dist = centroids
-                    .iter()
-                    .map(|c| {
-                        (p.l - c.l).powi(2)
-                            + ((p.a - c.a) * chroma_mult).powi(2)
-                            + ((p.b - c.b) * chroma_mult).powi(2)
-                    })
-                    .fold(f32::MAX, f32::min);
-                min_dist * weights[i]
-            })
-            .sum();
-
-        if cost < best_cost {
-            best_cost = cost;
-            best_centroids = centroids;
+    // First centroid
+    let total_w: f32 = weights.iter().sum();
+    let mut threshold = (xorshift() as f32 / u64::MAX as f32) * total_w;
+    for (i, &w) in weights.iter().enumerate() {
+        threshold -= w;
+        if threshold <= 0.0 {
+            centroids[0] = pixels[i];
+            break;
         }
     }
 
-    // Convert centroids to sRGB and sort by Oklab perceived lightness
+    // Remaining centroids (Probability = Weight * Distance^2)
+    for ki in 1..k {
+        let dists: Vec<f32> = pixels
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut min_d = f32::MAX;
+                for c in &centroids[..ki] {
+                    // DISTANCE 1: Squashed L, Stretched A/B
+                    let d = ((p.l - c.l) * l_squash).powi(2)
+                        + ((p.a - c.a) * chroma_mult).powi(2)
+                        + ((p.b - c.b) * chroma_mult).powi(2);
+                    if d < min_d {
+                        min_d = d;
+                    }
+                }
+                min_d * weights[i]
+            })
+            .collect();
+
+        let total: f32 = dists.iter().sum();
+        if total <= 0.0 {
+            centroids[ki] = pixels[(xorshift() as usize) % pixels.len()];
+            continue;
+        }
+
+        let mut target = (xorshift() as f32 / u64::MAX as f32) * total;
+        for (i, &d) in dists.iter().enumerate() {
+            target -= d;
+            if target <= 0.0 {
+                centroids[ki] = pixels[i];
+                break;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // K-MEANS ITERATIONS
+    // ---------------------------------------------------------------------
+    for _ in 0..20 {
+        let mut counts = vec![0.0f32; k];
+        let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
+
+        for (idx, &p) in pixels.iter().enumerate() {
+            let mut min_dist = f32::MAX;
+            let mut best_idx = 0;
+            for (i, c) in centroids.iter().enumerate() {
+                // DISTANCE 2: Squashed L, Stretched A/B
+                let dist_sq = ((p.l - c.l) * l_squash).powi(2)
+                    + ((p.a - c.a) * chroma_mult).powi(2)
+                    + ((p.b - c.b) * chroma_mult).powi(2);
+
+                if dist_sq < min_dist {
+                    min_dist = dist_sq;
+                    best_idx = i;
+                }
+            }
+
+            let w = weights[idx];
+            counts[best_idx] += w;
+            sums[best_idx].0 += p.l * w;
+            sums[best_idx].1 += p.a * w;
+            sums[best_idx].2 += p.b * w;
+        }
+
+        let mut max_shift = 0.0f32;
+        for i in 0..k {
+            if counts[i] > 0.0 {
+                let new_l = sums[i].0 / counts[i];
+                let new_a = sums[i].1 / counts[i];
+                let new_b = sums[i].2 / counts[i];
+
+                // DISTANCE 3: Squashed L, Stretched A/B
+                let shift = ((centroids[i].l - new_l) * l_squash).powi(2)
+                    + ((centroids[i].a - new_a) * chroma_mult).powi(2)
+                    + ((centroids[i].b - new_b) * chroma_mult).powi(2);
+
+                max_shift = max_shift.max(shift);
+                centroids[i].l = new_l;
+                centroids[i].a = new_a;
+                centroids[i].b = new_b;
+            }
+        }
+        if max_shift < 1e-6 {
+            break;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // CONVERT AND SORT
+    // ---------------------------------------------------------------------
     let mut result: Vec<egui::Color32> = Vec::with_capacity(k);
     let mut lightness: Vec<f32> = Vec::with_capacity(k);
     for i in 0..k {
-        lightness.push(best_centroids[i].l);
-        let srgb_linear = oklab_to_linear_srgb(best_centroids[i]);
+        lightness.push(centroids[i].l);
+        let srgb_linear = oklab_to_linear_srgb(centroids[i]);
         let r = (linear_to_srgb(srgb_linear.r).clamp(0.0, 1.0) * 255.0).round() as u8;
         let g = (linear_to_srgb(srgb_linear.g).clamp(0.0, 1.0) * 255.0).round() as u8;
         let b = (linear_to_srgb(srgb_linear.b).clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -941,19 +975,55 @@ fn compute_histogram_from_dynamic_image(
     dominant_colors: usize,
     sat_bias: f32,
 ) -> ([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>) {
-    let thumb = img.thumbnail_exact(128, 128).to_rgb8();
-    let oklab_pixels: Vec<Oklab> = thumb
-        .pixels()
-        .map(|p| {
-            let lr = srgb_to_linear(p[0] as f32 / 255.0);
-            let lg = srgb_to_linear(p[1] as f32 / 255.0);
-            let lb = srgb_to_linear(p[2] as f32 / 255.0);
-            linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb })
-        })
-        .collect();
+    let rgba = img.to_rgba8();
+    let (src_w, src_h) = rgba.dimensions();
+    let (dst_w, dst_h) = (128u32, 128u32);
+    let pixel_type = PixelType::U8x4;
+
+    // 1. High-quality downsample using fast_image_resize (matches ColorImage path)
+    let resized_successfully = FastImage::from_vec_u8(src_w, src_h, rgba.into_raw(), pixel_type)
+        .ok()
+        .and_then(|src_image| {
+            let mut dst_image = FastImage::new(dst_w, dst_h, pixel_type);
+            let mut resizer = Resizer::new();
+
+            resizer
+                .resize(&src_image, &mut dst_image, &ResizeOptions::default())
+                .ok()
+                .map(|_| dst_image)
+        });
+
+    let oklab_pixels: Vec<Oklab> = if let Some(dst_image) = resized_successfully {
+        // Parse the smoothed buffer
+        dst_image
+            .buffer()
+            .chunks_exact(4)
+            .map(|chunk| {
+                let lr = srgb_to_linear(chunk[0] as f32 / 255.0);
+                let lg = srgb_to_linear(chunk[1] as f32 / 255.0);
+                let lb = srgb_to_linear(chunk[2] as f32 / 255.0);
+                linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb })
+            })
+            .collect()
+    } else {
+        // Fallback: If fast_image_resize fails, use the image crate's high-quality Lanczos3 filter
+        // instead of the lower quality thumbnail_exact() method.
+        let thumb =
+            img.resize_exact(dst_w, dst_h, image::imageops::FilterType::Lanczos3).to_rgba8();
+        thumb
+            .pixels()
+            .map(|p| {
+                let lr = srgb_to_linear(p[0] as f32 / 255.0);
+                let lg = srgb_to_linear(p[1] as f32 / 255.0);
+                let lb = srgb_to_linear(p[2] as f32 / 255.0);
+                linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb })
+            })
+            .collect()
+    };
 
     let (hist_l, hist_a, hist_b) = build_histograms(&oklab_pixels);
     let palette = kmeans_palette(&oklab_pixels, dominant_colors, sat_bias);
+
     (hist_l, hist_a, hist_b, palette)
 }
 
