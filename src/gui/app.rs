@@ -144,7 +144,7 @@ pub struct GuiApp {
     pub(super) completion_index: usize,
 
     // Histogram display
-    pub(super) show_histogram: bool,
+    pub(super) histogram_mode: u8,
     // Shared flag so worker threads skip histogram+palette when disabled
     pub(super) histogram_enabled: Arc<AtomicBool>,
 
@@ -152,8 +152,10 @@ pub struct GuiApp {
     pub(super) show_exif: bool,
 
     // Cache for histogram and palette data, keyed by path (lifecycle matches raw_cache)
-    pub(super) cached_histogram:
-        HashMap<std::path::PathBuf, ([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>)>,
+    pub(super) cached_histogram: HashMap<
+        std::path::PathBuf,
+        ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>),
+    >,
     pub(super) histogram_channel: usize, // 0 = L, 1 = A, 2 = B
     pub(super) cached_exif: Option<(std::path::PathBuf, Vec<(String, String)>)>,
     pub(super) search_input: String,
@@ -386,7 +388,7 @@ impl GuiApp {
             dir_scroll_to_selection: false,
             completion_candidates: Vec::new(),
             completion_index: 0,
-            show_histogram: false,
+            histogram_mode: 0,
             histogram_channel: 0,
             histogram_enabled,
             show_exif: false,
@@ -592,7 +594,7 @@ impl GuiApp {
             dir_scroll_to_selection: false,
             completion_candidates: Vec::new(),
             completion_index: 0,
-            show_histogram: false,
+            histogram_mode: 0,
             histogram_channel: 0,
             histogram_enabled,
             show_exif: false,
@@ -2045,7 +2047,7 @@ impl eframe::App for GuiApp {
                         "".to_string()
                     };
                     let sort_str = if self.state.view_mode { " | [T] Sort" } else { "" };
-                    let hist_str = if self.show_histogram { " | [I] Hist" } else { "" };
+                    let hist_str = if self.histogram_mode > 0 { " | [I] Hist" } else { "" };
                     let exif_str = if self.show_exif { " | [E] EXIF" } else { "" };
                     let pos_str = if !self.state.groups.is_empty() {
                         let total: usize = self.state.groups.iter().map(|g| g.len()).sum();
@@ -3222,7 +3224,7 @@ impl eframe::App for GuiApp {
                 }
 
                 // Histogram Overlay (toggle with 'I' key)
-                if self.show_histogram {
+                if self.histogram_mode > 0 {
                     super::image::render_histogram(self, ui, available_rect, &path);
                 }
 

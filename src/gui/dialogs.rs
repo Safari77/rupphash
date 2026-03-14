@@ -393,8 +393,10 @@ pub(super) fn handle_input(
             *intent.borrow_mut() = Some(InputIntent::ResetTransform);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::I)) {
-            app.show_histogram = !app.show_histogram;
-            app.histogram_enabled.store(app.show_histogram, std::sync::atomic::Ordering::Relaxed);
+            // Cycle: 0 (Off) -> 1 (Standard Grid) -> 2 (Proportional Strip) -> 0 (Off)
+            app.histogram_mode = (app.histogram_mode + 1) % 3;
+            app.histogram_enabled
+                .store(app.histogram_mode > 0, std::sync::atomic::Ordering::Relaxed);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::E)) {
             app.show_exif = !app.show_exif;

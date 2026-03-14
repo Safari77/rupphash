@@ -44,7 +44,7 @@ pub enum ImageLoadResult {
         u8,
         [u8; 32],
         Option<i64>,
-        Option<([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>)>,
+        Option<([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>)>,
     ), // image, resolution, orientation, content_hash, exif_timestamp, histogram+palette
     Failed(String), // Failure with error message
 }
@@ -98,7 +98,15 @@ pub(super) fn spawn_image_loader_pool(
                                 // Log dominant colors as gamma-encoded sRGB values
                                 let colors_str: Vec<String> =
                                     hp.3.iter()
-                                        .map(|c| format!("({}, {}, {})", c.r(), c.g(), c.b()))
+                                        .map(|(c, w)| {
+                                            format!(
+                                                "({}, {}, {} {:.0}%)",
+                                                c.r(),
+                                                c.g(),
+                                                c.b(),
+                                                w * 100.0
+                                            )
+                                        })
                                         .collect();
                                 eprintln!(
                                     "[PALETTE] {:?}: [{}]",
@@ -730,7 +738,7 @@ fn compute_histogram_from_colorimage(
     dominant_colors: usize,
     sat_bias: f32,
     pre_resized: bool,
-) -> ([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>) {
+) -> ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>) {
     let (src_w, src_h) = (img.size[0] as u32, img.size[1] as u32);
     let (dst_w, dst_h) = (128u32, 128u32);
 
@@ -743,7 +751,7 @@ fn compute_histogram_from_colorimage(
     // was pre-resized (e.g. exceeding MAX_TEXTURE_SIDE), we skip this check
     // and let k-means handle it.
     let k = dominant_colors.clamp(1, 25);
-    let low_color_palette: Option<Vec<egui::Color32>> = if !pre_resized {
+    let low_color_palette: Option<Vec<(egui::Color32, f32)>> = if !pre_resized {
         let total_pixels = (src_w as usize) * (src_h as usize);
         let sample_count = total_pixels.min(4096);
         let step = (total_pixels / sample_count).max(1);
@@ -755,6 +763,7 @@ fn compute_histogram_from_colorimage(
             idx += step;
         }
         if unique.len() <= k {
+            let n = unique.len() as f32;
             let mut colors: Vec<(Oklab, egui::Color32)> = unique
                 .iter()
                 .map(|&(r, g, b)| {
@@ -766,7 +775,7 @@ fn compute_histogram_from_colorimage(
                 })
                 .collect();
             colors.sort_by(|a, b| a.0.l.partial_cmp(&b.0.l).unwrap_or(std::cmp::Ordering::Equal));
-            Some(colors.into_iter().map(|(_, c)| c).collect())
+            Some(colors.into_iter().map(|(_, c)| (c, 1.0 / n)).collect())
         } else {
             None
         }
@@ -829,11 +838,15 @@ fn compute_histogram_from_colorimage(
 }
 
 /// K-means++ clustering with Logarithmic Culling and Oklch Distance.
-fn kmeans_palette(pixels: &[Oklab], dominant_colors: usize, sat_bias: f32) -> Vec<egui::Color32> {
+fn kmeans_palette(
+    pixels: &[Oklab],
+    dominant_colors: usize,
+    sat_bias: f32,
+) -> Vec<(egui::Color32, f32)> {
     let k = dominant_colors.clamp(1, 25);
 
     if pixels.is_empty() {
-        return vec![egui::Color32::BLACK; k];
+        return vec![(egui::Color32::BLACK, 1.0 / k as f32); k];
     }
 
     // 1. logarithmic filtering & exponential weights
@@ -1040,13 +1053,6 @@ fn kmeans_palette(pixels: &[Oklab], dominant_colors: usize, sat_bias: f32) -> Ve
     }
 
     // 4.5. Anti-crowding deduplication (the tuning knob)
-    // ==========================================================
-    // TUNING KNOB: 0.001 to 0.005.
-    // 0.002 will only merge colors that are practically identical to the human eye,
-    // which perfectly kills the "tiny bright spot" duplicates without
-    // collapsing your subtle dark palettes.
-    let similarity_threshold = 0.002;
-
     let mut clusters: Vec<(f32, Oklab)> =
         centroids.into_iter().enumerate().map(|(i, c)| (final_counts[i], c)).collect();
 
@@ -1076,7 +1082,7 @@ fn kmeans_palette(pixels: &[Oklab], dominant_colors: usize, sat_bias: f32) -> Ve
             unique_centroids.push((count, c));
         }
     }
-    let unique_centroids: Vec<Oklab> = unique_centroids.into_iter().map(|(_, c)| c).collect();
+    let unique_centroids: Vec<(f32, Oklab)> = unique_centroids;
 
     // 5. Convert and sort (hue buckets + lightness)
     // ==========================================================
@@ -1089,19 +1095,24 @@ fn kmeans_palette(pixels: &[Oklab], dominant_colors: usize, sat_bias: f32) -> Ve
     // scrambles what should be a clean dark-to-light gradient.
     let grey_threshold = 0.01;
     let all_grey =
-        unique_centroids.iter().all(|c| (c.a.powi(2) + c.b.powi(2)).sqrt() < grey_threshold);
+        unique_centroids.iter().all(|(_, c)| (c.a.powi(2) + c.b.powi(2)).sqrt() < grey_threshold);
 
-    let mut result: Vec<egui::Color32> = Vec::with_capacity(final_k);
+    // Total weight for computing fractions
+    let total_weight: f32 = unique_centroids.iter().map(|(w, _)| w).sum();
+    let total_weight = if total_weight > 0.0 { total_weight } else { 1.0 };
+
+    let mut result: Vec<(egui::Color32, f32)> = Vec::with_capacity(final_k);
     let mut sort_keys: Vec<(i32, u32)> = Vec::with_capacity(final_k);
 
     for i in 0..final_k {
-        let l_key = (unique_centroids[i].l * 1000.0) as u32;
+        let (weight, ref centroid) = unique_centroids[i];
+        let l_key = (centroid.l * 1000.0) as u32;
 
         if all_grey {
             // Pure lightness sort: hue bucket forced to 0 so only l_key matters
             sort_keys.push((0, l_key));
         } else {
-            let mut h = unique_centroids[i].b.atan2(unique_centroids[i].a);
+            let mut h = centroid.b.atan2(centroid.a);
             if h < 0.0 {
                 h += std::f32::consts::PI * 2.0;
             }
@@ -1110,11 +1121,11 @@ fn kmeans_palette(pixels: &[Oklab], dominant_colors: usize, sat_bias: f32) -> Ve
             sort_keys.push((hue_bucket, l_key));
         }
 
-        let srgb_linear = oklab_to_linear_srgb(unique_centroids[i]);
+        let srgb_linear = oklab_to_linear_srgb(*centroid);
         let r = (linear_to_srgb(srgb_linear.r).clamp(0.0, 1.0) * 255.0).round() as u8;
         let g = (linear_to_srgb(srgb_linear.g).clamp(0.0, 1.0) * 255.0).round() as u8;
         let b = (linear_to_srgb(srgb_linear.b).clamp(0.0, 1.0) * 255.0).round() as u8;
-        result.push(egui::Color32::from_rgb(r, g, b));
+        result.push((egui::Color32::from_rgb(r, g, b), weight / total_weight));
     }
 
     let mut indices: Vec<usize> = (0..final_k).collect();
@@ -1134,7 +1145,7 @@ fn compute_histogram_from_dynamic_image(
     img: &image::DynamicImage,
     dominant_colors: usize,
     sat_bias: f32,
-) -> ([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>) {
+) -> ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>) {
     let rgba = img.to_rgba8();
     let (src_w, src_h) = rgba.dimensions();
     let (dst_w, dst_h) = (128u32, 128u32);
@@ -1199,6 +1210,7 @@ fn compute_histogram_from_dynamic_image(
     let (hist_l, hist_a, hist_b) = build_histograms(&oklab_pixels);
 
     let palette = if unique_rgb.len() <= k {
+        let n = unique_rgb.len() as f32;
         let mut colors: Vec<(Oklab, egui::Color32)> = unique_rgb
             .iter()
             .map(|&(r, g, b)| {
@@ -1210,7 +1222,7 @@ fn compute_histogram_from_dynamic_image(
             })
             .collect();
         colors.sort_by(|a, b| a.0.l.partial_cmp(&b.0.l).unwrap_or(std::cmp::Ordering::Equal));
-        colors.into_iter().map(|(_, c)| c).collect()
+        colors.into_iter().map(|(_, c)| (c, 1.0 / n)).collect()
     } else {
         kmeans_palette(&oklab_pixels, dominant_colors, sat_bias)
     };
@@ -1223,7 +1235,7 @@ fn compute_histogram_from_image(
     path: &Path,
     dominant_colors: usize,
     sat_bias: f32,
-) -> Option<([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>)> {
+) -> Option<([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>)> {
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
@@ -1274,7 +1286,7 @@ fn compute_histogram_from_raw(
     path: &Path,
     dominant_colors: usize,
     sat_bias: f32,
-) -> Option<([u32; 256], [u32; 256], [u32; 256], Vec<egui::Color32>)> {
+) -> Option<([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>)> {
     let data = match fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -1403,7 +1415,7 @@ pub(super) fn render_histogram(
 ) {
     let dominant_colors = app.ctx.gui_config.dominant_colors.unwrap_or(5);
     let sat_bias = app.ctx.gui_config.saturation_bias.unwrap_or(1.0);
-    let num_rows = dominant_colors.div_ceil(5); // ceiling division by 5
+    let histogram_mode = app.histogram_mode;
 
     let window_width = ui.ctx().input(|i| {
         i.viewport()
@@ -1417,8 +1429,15 @@ pub(super) fn render_histogram(
     let hist_height = hist_width * 0.75;
     let swatch_height = 16.0;
 
-    // Total height accounts for multiple palette rows (each row = swatch_height + 4.0 gap)
-    let palette_total_height = (num_rows as f32) * swatch_height + ((num_rows as f32) * 4.0);
+    // Dynamic height: standard grid uses multiple rows, proportional strip uses one row
+    let palette_total_height = if histogram_mode == 2 {
+        // Proportional strip: single row
+        swatch_height + 4.0
+    } else {
+        // Standard grid: rows of 5
+        let num_rows = dominant_colors.div_ceil(5);
+        (num_rows as f32) * swatch_height + ((num_rows as f32) * 4.0)
+    };
     let total_height = hist_height + palette_total_height;
     let padding = 10.0;
 
@@ -1440,7 +1459,9 @@ pub(super) fn render_histogram(
         // Cache the result
         if let Some(d) = data {
             let colors_str: Vec<String> =
-                d.3.iter().map(|c| format!("({}, {}, {})", c.r(), c.g(), c.b())).collect();
+                d.3.iter()
+                    .map(|(c, w)| format!("({}, {}, {} {:.0}%)", c.r(), c.g(), c.b(), w * 100.0))
+                    .collect();
             eprintln!(
                 "[PALETTE-FALLBACK] {:?}: [{}]",
                 path.file_name().unwrap_or_default(),
@@ -1485,7 +1506,14 @@ pub(super) fn render_histogram(
             _ => &hist_l,
         };
 
-        draw_histogram(ui, hist_rect, hist_to_draw, &palette, app.histogram_channel);
+        draw_histogram(
+            ui,
+            hist_rect,
+            hist_to_draw,
+            &palette,
+            app.histogram_channel,
+            histogram_mode,
+        );
     }
 }
 
@@ -1494,8 +1522,9 @@ fn draw_histogram(
     ui: &mut egui::Ui,
     hist_rect: egui::Rect,
     hist: &[u32; 256],
-    palette: &[egui::Color32],
+    palette: &[(egui::Color32, f32)],
     channel: usize,
+    histogram_mode: u8,
 ) {
     // Find max value for normalization
     let max_val = hist[1..255].iter().copied().max().unwrap_or(1).max(1);
@@ -1556,42 +1585,70 @@ fn draw_histogram(
         egui::Color32::WHITE,
     );
 
-    // 3. Draw Palette Swatches in rows of 5
+    // 3. Draw Palette Swatches
     let swatch_height = 16.0;
-    let colors_per_row = 5;
-    let swatch_width = hist_width / colors_per_row as f32;
-    let num_rows = palette.len().div_ceil(colors_per_row);
 
-    for row in 0..num_rows {
-        let row_start = row * colors_per_row;
-        let row_end = (row_start + colors_per_row).min(palette.len());
-        let row_y = hist_rect.max.y + 4.0 + (row as f32) * (swatch_height + 4.0);
+    if histogram_mode == 2 {
+        // Proportional strip: each swatch width is proportional to its pixel weight
+        let strip_y = hist_rect.max.y + 4.0;
+        let mut x = hist_rect.min.x;
 
-        for (i, &color) in palette[row_start..row_end].iter().enumerate() {
-            let x = hist_rect.min.x + (i as f32) * swatch_width;
-
-            let swatch_rect = egui::Rect::from_min_size(
-                egui::pos2(x, row_y),
-                egui::vec2(swatch_width, swatch_height),
-            );
-
+        for &(color, weight) in palette {
+            let w = (weight * hist_width).max(1.0);
+            let swatch_rect =
+                egui::Rect::from_min_size(egui::pos2(x, strip_y), egui::vec2(w, swatch_height));
             painter.rect_filled(swatch_rect, 0.0, color);
+            x += w;
         }
 
-        // Draw a border encompassing this row's color strip
-        let row_color_count = row_end - row_start;
-        let row_strip_width = row_color_count as f32 * swatch_width;
-        let palette_rect = egui::Rect::from_min_size(
-            egui::pos2(hist_rect.min.x, row_y),
-            egui::vec2(row_strip_width, swatch_height),
+        // Border around the full strip
+        let strip_rect = egui::Rect::from_min_size(
+            egui::pos2(hist_rect.min.x, strip_y),
+            egui::vec2(hist_width, swatch_height),
         );
-
         painter.rect_stroke(
-            palette_rect,
+            strip_rect,
             0.0,
             egui::Stroke::new(1.0, egui::Color32::GRAY),
             egui::StrokeKind::Outside,
         );
+    } else {
+        // Standard grid: rows of 5 equal-width swatches
+        let colors_per_row = 5;
+        let swatch_width = hist_width / colors_per_row as f32;
+        let num_rows = palette.len().div_ceil(colors_per_row);
+
+        for row in 0..num_rows {
+            let row_start = row * colors_per_row;
+            let row_end = (row_start + colors_per_row).min(palette.len());
+            let row_y = hist_rect.max.y + 4.0 + (row as f32) * (swatch_height + 4.0);
+
+            for (i, &(color, _)) in palette[row_start..row_end].iter().enumerate() {
+                let x = hist_rect.min.x + (i as f32) * swatch_width;
+
+                let swatch_rect = egui::Rect::from_min_size(
+                    egui::pos2(x, row_y),
+                    egui::vec2(swatch_width, swatch_height),
+                );
+
+                painter.rect_filled(swatch_rect, 0.0, color);
+            }
+
+            // Draw a border encompassing this row's color strip
+            let row_color_count = row_end - row_start;
+            let row_strip_width = row_color_count as f32 * swatch_width;
+            let palette_rect = egui::Rect::from_min_size(
+                egui::pos2(hist_rect.min.x, row_y),
+                egui::vec2(row_strip_width, swatch_height),
+            );
+
+            painter.rect_stroke(
+                palette_rect,
+                0.0,
+                egui::Stroke::new(1.0, egui::Color32::GRAY),
+                egui::StrokeKind::Outside,
+            );
+        }
     }
 }
 
@@ -1662,7 +1719,7 @@ pub(super) fn render_exif(
     let exif_height = (tags.len() as f32) * line_height + 8.0;
 
     // Calculate position: to the right of histogram if shown, else bottom-left
-    let exif_x = if app.show_histogram {
+    let exif_x = if app.histogram_mode > 0 {
         let hist_width = window_width * 0.10;
         available_rect.min.x + padding + hist_width + padding
     } else {
