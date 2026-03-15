@@ -1542,12 +1542,11 @@ fn draw_histogram(
 ) {
     // Find max value for normalization
     let max_val = hist[1..255].iter().copied().max().unwrap_or(1).max(1);
-    let painter = ui.painter();
     let hist_width = hist_rect.width();
     let hist_height = hist_rect.height();
 
     // 1. Draw Histogram Background
-    painter.rect_filled(hist_rect, 0.0, egui::Color32::from_black_alpha(180));
+    ui.painter().rect_filled(hist_rect, 0.0, egui::Color32::from_black_alpha(180));
 
     // 2. Draw Histogram Bars
     let bar_width = hist_width / 256.0;
@@ -1568,7 +1567,7 @@ fn draw_histogram(
         let grey = (i as u8).saturating_add(40).min(220);
         let color = egui::Color32::from_gray(grey);
 
-        painter.rect_filled(
+        ui.painter().rect_filled(
             egui::Rect::from_min_max(
                 egui::pos2(x, y_top),
                 egui::pos2(x + bar_width.max(1.0), y_bottom),
@@ -1578,7 +1577,7 @@ fn draw_histogram(
         );
     }
 
-    painter.rect_stroke(
+    ui.painter().rect_stroke(
         hist_rect,
         0.0,
         egui::Stroke::new(1.0, egui::Color32::GRAY),
@@ -1591,7 +1590,7 @@ fn draw_histogram(
         2 => "B",
         _ => "L",
     };
-    painter.text(
+    ui.painter().text(
         hist_rect.min + egui::vec2(6.0, 4.0),
         egui::Align2::LEFT_TOP,
         label,
@@ -1611,7 +1610,15 @@ fn draw_histogram(
             let w = (weight * hist_width).max(1.0);
             let swatch_rect =
                 egui::Rect::from_min_size(egui::pos2(x, strip_y), egui::vec2(w, swatch_height));
-            painter.rect_filled(swatch_rect, 0.0, color);
+            ui.painter().rect_filled(swatch_rect, 0.0, color);
+            // Allocate the rect for interaction and attach a tooltip
+            ui.allocate_rect(swatch_rect, egui::Sense::hover()).on_hover_text(format!(
+                "RGB: {}, {}, {}\n{:.1}%",
+                color.r(),
+                color.g(),
+                color.b(),
+                weight * 100.0
+            ));
             x += w;
         }
 
@@ -1620,7 +1627,7 @@ fn draw_histogram(
             egui::pos2(hist_rect.min.x, strip_y),
             egui::vec2(hist_width, swatch_height),
         );
-        painter.rect_stroke(
+        ui.painter().rect_stroke(
             strip_rect,
             0.0,
             egui::Stroke::new(1.0, egui::Color32::GRAY),
@@ -1637,7 +1644,7 @@ fn draw_histogram(
             let row_end = (row_start + colors_per_row).min(palette.len());
             let row_y = hist_rect.max.y + 4.0 + (row as f32) * (swatch_height + 4.0);
 
-            for (i, &(color, _)) in palette[row_start..row_end].iter().enumerate() {
+            for (i, &(color, weight)) in palette[row_start..row_end].iter().enumerate() {
                 let x = hist_rect.min.x + (i as f32) * swatch_width;
 
                 let swatch_rect = egui::Rect::from_min_size(
@@ -1645,7 +1652,16 @@ fn draw_histogram(
                     egui::vec2(swatch_width, swatch_height),
                 );
 
-                painter.rect_filled(swatch_rect, 0.0, color);
+                ui.painter().rect_filled(swatch_rect, 0.0, color);
+
+                // Allocate the rect for interaction and attach a tooltip
+                ui.allocate_rect(swatch_rect, egui::Sense::hover()).on_hover_text(format!(
+                    "RGB: {}, {}, {}\n{:.1}%",
+                    color.r(),
+                    color.g(),
+                    color.b(),
+                    weight * 100.0
+                ));
             }
 
             // Draw a border encompassing this row's color strip
@@ -1656,7 +1672,7 @@ fn draw_histogram(
                 egui::vec2(row_strip_width, swatch_height),
             );
 
-            painter.rect_stroke(
+            ui.painter().rect_stroke(
                 palette_rect,
                 0.0,
                 egui::Stroke::new(1.0, egui::Color32::GRAY),
