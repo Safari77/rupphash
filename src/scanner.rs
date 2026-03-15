@@ -577,9 +577,9 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                         if decoder.read_image(&mut buffer).is_ok()
                             && let Some(buf) =
                                 image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, buffer)
-                            {
-                                return Ok(image::DynamicImage::ImageRgb8(buf));
-                            }
+                        {
+                            return Ok(image::DynamicImage::ImageRgb8(buf));
+                        }
                     } else if let Ok(img) = image::DynamicImage::from_decoder(decoder) {
                         return Ok(img);
                     }
@@ -599,46 +599,42 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                         if let Ok((w, h)) = native_decoder.dimensions()
                             && let Ok(tiff::decoder::DecodingResult::U8(mut data)) =
                                 native_decoder.read_image()
+                        {
+                            let expected_rgb_len = (w * h * 3) as usize;
+                            let expected_rgba_len = (w * h * 4) as usize;
+
+                            if data.len() == expected_rgb_len {
+                                if is_ycbcr {
+                                    eprintln!(
+                                        "[DEBUG-TIFF] Converting raw YCbCr bytes to RGB in-place..."
+                                    );
+                                    for chunk in data.chunks_exact_mut(3) {
+                                        let y = chunk[0] as f32;
+                                        let cb = chunk[1] as f32 - 128.0;
+                                        let cr = chunk[2] as f32 - 128.0;
+
+                                        chunk[0] = (y + 1.402 * cr).clamp(0.0, 255.0) as u8;
+                                        chunk[1] = (y - 0.344136 * cb - 0.714136 * cr)
+                                            .clamp(0.0, 255.0)
+                                            as u8;
+                                        chunk[2] = (y + 1.772 * cb).clamp(0.0, 255.0) as u8;
+                                    }
+                                }
+
+                                if let Some(buf) =
+                                    image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, data)
+                                {
+                                    eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGB8");
+                                    return Ok(image::DynamicImage::ImageRgb8(buf));
+                                }
+                            } else if data.len() == expected_rgba_len
+                                && let Some(buf) =
+                                    image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, data)
                             {
-                                let expected_rgb_len = (w * h * 3) as usize;
-                                let expected_rgba_len = (w * h * 4) as usize;
-
-                                if data.len() == expected_rgb_len {
-                                    if is_ycbcr {
-                                        eprintln!(
-                                            "[DEBUG-TIFF] Converting raw YCbCr bytes to RGB in-place..."
-                                        );
-                                        for chunk in data.chunks_exact_mut(3) {
-                                            let y = chunk[0] as f32;
-                                            let cb = chunk[1] as f32 - 128.0;
-                                            let cr = chunk[2] as f32 - 128.0;
-
-                                            chunk[0] = (y + 1.402 * cr).clamp(0.0, 255.0) as u8;
-                                            chunk[1] = (y - 0.344136 * cb - 0.714136 * cr)
-                                                .clamp(0.0, 255.0)
-                                                as u8;
-                                            chunk[2] = (y + 1.772 * cb).clamp(0.0, 255.0) as u8;
-                                        }
-                                    }
-
-                                    if let Some(buf) =
-                                        image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(
-                                            w, h, data,
-                                        )
-                                    {
-                                        eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGB8");
-                                        return Ok(image::DynamicImage::ImageRgb8(buf));
-                                    }
-                                } else if data.len() == expected_rgba_len
-                                    && let Some(buf) =
-                                        image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
-                                            w, h, data,
-                                        )
-                                    {
-                                        eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGBA8");
-                                        return Ok(image::DynamicImage::ImageRgba8(buf));
-                                    }
+                                eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGBA8");
+                                return Ok(image::DynamicImage::ImageRgba8(buf));
                             }
+                        }
                     } else {
                         eprintln!("[DEBUG-TIFF] Native tiff decoder also rejected the file.");
                     }
