@@ -856,12 +856,12 @@ fn kmeans_palette(
     // The cutoff is now 1.0 / 5.5 = 0.18 Oklab Lightness.
     // sRGB(1, 4, 6) is L~0.10 -> Dead.
     // sRGB(25, 38, 54) is L~0.25 -> Alive and well!
-    let dark_tuning = 5.5;
+    let dark_tuning = 8.0;
 
     for &p in pixels {
         // THE HARD FLOOR: Don't even run the math if it's visually near-black.
         // This ruthlessly culls the abyss before it can infect the K-means weights.
-        if p.l < 0.12 {
+        if p.l < 0.05 {
             continue;
         }
 
@@ -869,7 +869,7 @@ fn kmeans_palette(
         let l_weight = (p.l * dark_tuning).log10();
 
         if l_weight > 0.0 {
-            let color_boost = 1.0 + (chroma * 30.0).powi(2) * sat_bias;
+            let color_boost = 1.0 + (chroma * 15.0).powf(1.5) * sat_bias;
 
             working_pixels.push(p);
             weights.push(l_weight * color_boost);
@@ -937,18 +937,22 @@ fn kmeans_palette(
             d_h_angle = std::f32::consts::PI * 2.0 - d_h_angle;
         }
 
-        // THE WEDGE: Raise the floor to 0.08.
-        // Even if a pixel is practically black/grey (chroma 0.005), K-means is
-        // mathematically forced to treat it as having a chroma of 0.08.
-        // This violently physically separates dark red from dark blue.
-        let effective_chroma = p_c.max(c_c).clamp(0.08, 0.25);
+        let mut effective_chroma = p_c.max(c_c);
 
-        // dl and dc stay gentle so we don't break perceptual space
-        let dl = (p.l - c.l) * 1.5;
-        let dc = p_c - c_c;
+        // Only apply the wedge to dark colors if they ACTUALLY have some color.
+        // If it's practically pure grey (chroma < 0.015), let it stay grey!
+        if p.l < 0.6 && c.l < 0.6 && effective_chroma > 0.015 {
+            effective_chroma = effective_chroma.max(0.04);
+        }
+        effective_chroma = effective_chroma.min(0.25);
+
+        // Lightness
+        let dl = (p.l - c.l) * 2.0;
+        // Chroma distance
+        let dc = (p_c - c_c) * 4.0;
 
         // Multiply hue distance by the boosted effective_chroma
-        let dh_weighted = d_h_angle * effective_chroma * 2.5;
+        let dh_weighted = d_h_angle * effective_chroma * 3.0;
 
         dl.powi(2) + dc.powi(2) + dh_weighted.powi(2)
     };
@@ -1067,12 +1071,22 @@ fn kmeans_palette(
         }
 
         let mut too_close = false;
-        let is_tiny_spot = count < (total_pixels * 0.02);
+        // Lower the tiny spot threshold so it doesn't trigger on medium-small details
+        let is_tiny_spot = count < (total_pixels * 0.015);
 
         for &(kept_count, kept_c) in &unique_centroids {
             let dist = calc_dist(&c, &kept_c);
 
-            if dist < 0.0005 || (is_tiny_spot && dist < 0.003 && count < kept_count * 0.5) {
+            // Give dark colors a "shield" against aggressive merging.
+            // If both colors are dark, they must be VERY close to merge.
+            let is_dark_collision = c.l < 0.35 && kept_c.l < 0.35;
+
+            let tiny_merge_dist = if is_dark_collision { 0.0005 } else { 0.0015 };
+            let standard_merge_dist = if is_dark_collision { 0.0001 } else { 0.0003 };
+
+            if dist < standard_merge_dist
+                || (is_tiny_spot && dist < tiny_merge_dist && count < kept_count * 0.5)
+            {
                 too_close = true;
                 break;
             }
