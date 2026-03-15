@@ -705,6 +705,24 @@ fn linear_to_srgb(c: f32) -> f32 {
     if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
 }
 
+/// Compute a contrasting border color by inverting lightness and rotating hue 180° in Oklab.
+fn opposite_color(color: egui::Color32) -> egui::Color32 {
+    let lr = srgb_to_linear(color.r() as f32 / 255.0);
+    let lg = srgb_to_linear(color.g() as f32 / 255.0);
+    let lb = srgb_to_linear(color.b() as f32 / 255.0);
+    let ok = linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb });
+    let opp = Oklab {
+        l: 1.0 - ok.l, // invert lightness
+        a: -ok.a,      // rotate hue 180°
+        b: -ok.b,
+    };
+    let lin = oklab_to_linear_srgb(opp);
+    let r = (linear_to_srgb(lin.r).clamp(0.0, 1.0) * 255.0).round() as u8;
+    let g = (linear_to_srgb(lin.g).clamp(0.0, 1.0) * 255.0).round() as u8;
+    let b = (linear_to_srgb(lin.b).clamp(0.0, 1.0) * 255.0).round() as u8;
+    egui::Color32::from_rgb(r, g, b)
+}
+
 /// Helper to extract L, A, and B channel histograms simultaneously
 fn build_histograms(oklab_pixels: &[Oklab]) -> ([u32; 256], [u32; 256], [u32; 256]) {
     let mut hist_l = [0u32; 256];
@@ -1146,7 +1164,7 @@ fn kmeans_palette(
     let dominant_bucket = bucket_counts
         .iter()
         .enumerate()
-        .max_by_key(|&(_, &cnt)| cnt)
+        .max_by_key(|&(_, cnt)| cnt)
         .map(|(i, _)| i as i32)
         .unwrap_or(0);
 
@@ -1676,13 +1694,29 @@ fn draw_histogram(
                 egui::Rect::from_min_size(egui::pos2(x, strip_y), egui::vec2(w, swatch_height));
             ui.painter().rect_filled(swatch_rect, 0.0, color);
             // Allocate the rect for interaction and attach a tooltip
-            ui.allocate_rect(swatch_rect, egui::Sense::hover()).on_hover_text(format!(
-                "RGB: {}, {}, {}\n{:.1}%",
-                color.r(),
-                color.g(),
-                color.b(),
-                weight * 100.0
-            ));
+            ui.allocate_rect(swatch_rect, egui::Sense::hover()).on_hover_ui(|tip| {
+                tip.horizontal(|tip| {
+                    let box_size = swatch_height + 8.0; // 16 + 4px border on each side
+                    let (tip_rect, _) = tip
+                        .allocate_exact_size(egui::vec2(box_size, box_size), egui::Sense::hover());
+                    let border_color = opposite_color(color);
+                    let inset = tip_rect.shrink(2.0); // shrink by half the stroke width
+                    tip.painter().rect_filled(inset, 0.0, color);
+                    tip.painter().rect_stroke(
+                        tip_rect,
+                        2.0,
+                        egui::Stroke::new(4.0, border_color),
+                        egui::StrokeKind::Inside,
+                    );
+                    tip.label(format!(
+                        "RGB: {}, {}, {}\n{:.1}%",
+                        color.r(),
+                        color.g(),
+                        color.b(),
+                        weight * 100.0
+                    ));
+                });
+            });
             x += w;
         }
 
@@ -1719,13 +1753,31 @@ fn draw_histogram(
                 ui.painter().rect_filled(swatch_rect, 0.0, color);
 
                 // Allocate the rect for interaction and attach a tooltip
-                ui.allocate_rect(swatch_rect, egui::Sense::hover()).on_hover_text(format!(
-                    "RGB: {}, {}, {}\n{:.1}%",
-                    color.r(),
-                    color.g(),
-                    color.b(),
-                    weight * 100.0
-                ));
+                ui.allocate_rect(swatch_rect, egui::Sense::hover()).on_hover_ui(|tip| {
+                    tip.horizontal(|tip| {
+                        let box_size = swatch_height + 8.0; // 16 + 4px border on each side
+                        let (tip_rect, _) = tip.allocate_exact_size(
+                            egui::vec2(box_size, box_size),
+                            egui::Sense::hover(),
+                        );
+                        let border_color = opposite_color(color);
+                        let inset = tip_rect.shrink(2.0); // shrink by half the stroke width
+                        tip.painter().rect_filled(inset, 0.0, color);
+                        tip.painter().rect_stroke(
+                            tip_rect,
+                            2.0,
+                            egui::Stroke::new(4.0, border_color),
+                            egui::StrokeKind::Inside,
+                        );
+                        tip.label(format!(
+                            "RGB: {}, {}, {}\n{:.1}%",
+                            color.r(),
+                            color.g(),
+                            color.b(),
+                            weight * 100.0
+                        ));
+                    });
+                });
             }
 
             // Draw a border encompassing this row's color strip
