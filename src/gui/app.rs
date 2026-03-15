@@ -324,14 +324,12 @@ impl GuiApp {
         state.is_loading = true;
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
-        let dominant_colors = ctx.gui_config.dominant_colors.unwrap_or(5);
-        let saturation_bias = ctx.gui_config.saturation_bias.unwrap_or(1.0);
+        let palette_config = crate::db::PaletteConfig::from_gui_config(&ctx.gui_config);
         let histogram_enabled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = super::image::spawn_image_loader_pool(
             use_raw_thumbnails,
             ctx.content_key,
-            dominant_colors,
-            saturation_bias,
+            palette_config,
             Arc::clone(&histogram_enabled),
         );
         // panel_width is saved in logical points (after font_scale applied)
@@ -479,14 +477,12 @@ impl GuiApp {
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
         let ctx = crate::db::AppContext::new().expect("Failed to create context");
-        let dominant_colors = ctx.gui_config.dominant_colors.unwrap_or(5);
-        let saturation_bias = ctx.gui_config.saturation_bias.unwrap_or(1.0);
+        let palette_config = crate::db::PaletteConfig::from_gui_config(&ctx.gui_config);
         let histogram_enabled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = super::image::spawn_image_loader_pool(
             use_raw_thumbnails,
             ctx.content_key,
-            dominant_colors,
-            saturation_bias,
+            palette_config,
             Arc::clone(&histogram_enabled),
         );
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);

@@ -58,8 +58,7 @@ impl Default for GroupViewState {
 pub(super) fn spawn_image_loader_pool(
     use_thumbnails: bool,
     content_key: [u8; 32],
-    dominant_colors: usize,
-    sat_bias: f32,
+    palette_config: crate::db::PaletteConfig,
     histogram_enabled: Arc<AtomicBool>,
 ) -> (Sender<PathBuf>, Receiver<(PathBuf, ImageLoadResult)>) {
     let (tx, rx) = unbounded::<PathBuf>();
@@ -75,6 +74,7 @@ pub(super) fn spawn_image_loader_pool(
         let tx_clone = result_tx.clone();
         let hist_flag = Arc::clone(&histogram_enabled);
 
+        let pcfg = palette_config;
         thread::spawn(move || {
             while let Ok(path) = rx_clone.recv() {
                 // Load & Process (Resize + Orientation)
@@ -89,8 +89,7 @@ pub(super) fn spawn_image_loader_pool(
                             let hist_palette = if hist_flag.load(Ordering::Relaxed) {
                                 let hp = compute_histogram_from_colorimage(
                                     &img,
-                                    dominant_colors,
-                                    sat_bias,
+                                    pcfg,
                                     img.size[0] != dims.0 as usize
                                         || img.size[1] != dims.1 as usize,
                                 );
@@ -753,10 +752,14 @@ fn build_histograms(oklab_pixels: &[Oklab]) -> ([u32; 256], [u32; 256], [u32; 25
 /// srgb_to_oklab_l on every pixel of the full-resolution image.
 fn compute_histogram_from_colorimage(
     img: &egui::ColorImage,
-    dominant_colors: usize,
-    sat_bias: f32,
+    palette_config: crate::db::PaletteConfig,
     pre_resized: bool,
 ) -> ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>) {
+    let crate::db::PaletteConfig {
+        dominant_colors,
+        saturation_bias: sat_bias,
+        palette_sort: pal_sort,
+    } = palette_config;
     let (src_w, src_h) = (img.size[0] as u32, img.size[1] as u32);
     let (dst_w, dst_h) = (128u32, 128u32);
 
@@ -860,7 +863,7 @@ fn compute_histogram_from_colorimage(
 
     // Use pre-computed palette for low-color images, otherwise run k-means
     let palette = low_color_palette
-        .unwrap_or_else(|| kmeans_palette(&oklab_pixels, dominant_colors, sat_bias));
+        .unwrap_or_else(|| kmeans_palette(&oklab_pixels, dominant_colors, sat_bias, pal_sort));
 
     (hist_l, hist_a, hist_b, palette)
 }
@@ -870,6 +873,7 @@ fn kmeans_palette(
     pixels: &[Oklab],
     dominant_colors: usize,
     sat_bias: f32,
+    pal_sort: crate::db::PaletteSort,
 ) -> Vec<(egui::Color32, f32)> {
     let k = dominant_colors.clamp(1, 25);
 
@@ -1156,7 +1160,9 @@ fn kmeans_palette(
 
     // If the palette spans 2 or fewer hue buckets (earth tones, monochrome,
     // all-grey), a clean dark-to-light gradient is more useful than hue grouping.
-    let use_lightness_only = chromatic_buckets.len() <= 2;
+    // When luminance sort is explicitly requested, always sort by lightness.
+    let use_lightness_only =
+        pal_sort == crate::db::PaletteSort::Luminance || chromatic_buckets.len() <= 2;
 
     // When hue-bucket sorting IS used, achromatic colors get the dominant
     // (most populated) hue bucket so they blend in by lightness instead of
@@ -1220,9 +1226,13 @@ fn kmeans_palette(
 /// Shared by the disk-based fallback paths (standard images and RAW).
 fn compute_histogram_from_dynamic_image(
     img: &image::DynamicImage,
-    dominant_colors: usize,
-    sat_bias: f32,
+    palette_config: crate::db::PaletteConfig,
 ) -> ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>) {
+    let crate::db::PaletteConfig {
+        dominant_colors,
+        saturation_bias: sat_bias,
+        palette_sort: pal_sort,
+    } = palette_config;
     let rgba = img.to_rgba8();
     let (src_w, src_h) = rgba.dimensions();
     let (dst_w, dst_h) = (128u32, 128u32);
@@ -1321,7 +1331,7 @@ fn compute_histogram_from_dynamic_image(
     let (hist_l, hist_a, hist_b) = build_histograms(&oklab_pixels);
 
     let palette = low_color_palette
-        .unwrap_or_else(|| kmeans_palette(&oklab_pixels, dominant_colors, sat_bias));
+        .unwrap_or_else(|| kmeans_palette(&oklab_pixels, dominant_colors, sat_bias, pal_sort));
 
     (hist_l, hist_a, hist_b, palette)
 }
@@ -1329,8 +1339,7 @@ fn compute_histogram_from_dynamic_image(
 /// Compute histogram and palette from a standard image file
 fn compute_histogram_from_image(
     path: &Path,
-    dominant_colors: usize,
-    sat_bias: f32,
+    palette_config: crate::db::PaletteConfig,
 ) -> Option<([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>)> {
     let ext = path
         .extension()
@@ -1344,11 +1353,7 @@ fn compute_histogram_from_image(
             match crate::scanner::load_image_fast(path, &bytes) {
                 Ok(dyn_img) => {
                     // Explicit return here exits the function early with our data
-                    return Some(compute_histogram_from_dynamic_image(
-                        &dyn_img,
-                        dominant_colors,
-                        sat_bias,
-                    ));
+                    return Some(compute_histogram_from_dynamic_image(&dyn_img, palette_config));
                 }
                 Err(e) => {
                     // Log the actual error that bubbled up and explicitly return None
@@ -1374,14 +1379,13 @@ fn compute_histogram_from_image(
         }
     };
 
-    Some(compute_histogram_from_dynamic_image(&img, dominant_colors, sat_bias))
+    Some(compute_histogram_from_dynamic_image(&img, palette_config))
 }
 
 /// Compute histogram and palette from a RAW file using rsraw
 fn compute_histogram_from_raw(
     path: &Path,
-    dominant_colors: usize,
-    sat_bias: f32,
+    palette_config: crate::db::PaletteConfig,
 ) -> Option<([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>)> {
     let data = match fs::read(path) {
         Ok(d) => d,
@@ -1401,12 +1405,7 @@ fn compute_histogram_from_raw(
             // Re-use the fallback from the main loader!
             if let Some(color_img) = extract_biggest_exif_preview(path, &data) {
                 eprintln!("[DEBUG-HISTOGRAM] EXIF fallback success for {:?}", path);
-                return Some(compute_histogram_from_colorimage(
-                    &color_img,
-                    dominant_colors,
-                    sat_bias,
-                    false,
-                ));
+                return Some(compute_histogram_from_colorimage(&color_img, palette_config, false));
             } else {
                 eprintln!("[DEBUG-HISTOGRAM] EXIF fallback also failed for {:?}", path);
                 return None;
@@ -1424,11 +1423,7 @@ fn compute_histogram_from_raw(
             {
                 match image::load_from_memory(&best_thumb.data) {
                     Ok(img) => {
-                        return Some(compute_histogram_from_dynamic_image(
-                            &img,
-                            dominant_colors,
-                            sat_bias,
-                        ));
+                        return Some(compute_histogram_from_dynamic_image(&img, palette_config));
                     }
                     Err(e) => eprintln!(
                         "[DEBUG-HISTOGRAM] image::load_from_memory failed on rsraw thumb for {:?}: {}",
@@ -1465,8 +1460,7 @@ fn compute_histogram_from_raw(
                 {
                     return Some(compute_histogram_from_dynamic_image(
                         &image::DynamicImage::ImageLuma8(gray_buf),
-                        dominant_colors,
-                        sat_bias,
+                        palette_config,
                     ));
                 } else {
                     eprintln!("[DEBUG-HISTOGRAM] Failed to create GrayImage buffer for {:?}", path);
@@ -1478,8 +1472,7 @@ fn compute_histogram_from_raw(
                 {
                     return Some(compute_histogram_from_dynamic_image(
                         &image::DynamicImage::ImageRgb8(img_buf),
-                        dominant_colors,
-                        sat_bias,
+                        palette_config,
                     ));
                 } else {
                     eprintln!("[DEBUG-HISTOGRAM] Failed to create RgbImage buffer for {:?}", path);
@@ -1509,8 +1502,7 @@ pub(super) fn render_histogram(
     available_rect: egui::Rect,
     path: &Path,
 ) {
-    let dominant_colors = app.ctx.gui_config.dominant_colors.unwrap_or(5);
-    let sat_bias = app.ctx.gui_config.saturation_bias.unwrap_or(1.0);
+    let palette_config = crate::db::PaletteConfig::from_gui_config(&app.ctx.gui_config);
     let histogram_mode = app.histogram_mode;
 
     let window_width = ui.ctx().input(|i| {
@@ -1531,7 +1523,7 @@ pub(super) fn render_histogram(
         swatch_height + 4.0
     } else {
         // Standard grid: rows of 5
-        let num_rows = dominant_colors.div_ceil(5);
+        let num_rows = palette_config.dominant_colors.div_ceil(5);
         (num_rows as f32) * swatch_height + ((num_rows as f32) * 4.0)
     };
     let total_height = hist_height + palette_total_height;
@@ -1548,9 +1540,9 @@ pub(super) fn render_histogram(
     // Fallback: compute from disk if not preloaded (shouldn't happen often)
     let histogram_data = histogram_data.or_else(|| {
         let data = if is_raw_ext(path) {
-            compute_histogram_from_raw(path, dominant_colors, sat_bias)
+            compute_histogram_from_raw(path, palette_config)
         } else {
-            compute_histogram_from_image(path, dominant_colors, sat_bias)
+            compute_histogram_from_image(path, palette_config)
         };
         // Cache the result
         if let Some(d) = data {

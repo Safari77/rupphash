@@ -39,6 +39,33 @@ pub enum HashAlgorithm {
     PdqHash,
 }
 
+/// Palette sort order for dominant color display
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PaletteSort {
+    Hue,
+    #[default]
+    Luminance,
+}
+
+/// Bundled palette extraction configuration
+#[derive(Debug, Clone, Copy)]
+pub struct PaletteConfig {
+    pub dominant_colors: usize,
+    pub saturation_bias: f32,
+    pub palette_sort: PaletteSort,
+}
+
+impl PaletteConfig {
+    pub fn from_gui_config(gui: &GuiConfig) -> Self {
+        Self {
+            dominant_colors: gui.dominant_colors.unwrap_or(5),
+            saturation_bias: gui.saturation_bias.unwrap_or(1.0),
+            palette_sort: gui.palette_sort.unwrap_or_default(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GroupingConfig {
     pub ignore_same_stem: bool,
@@ -61,6 +88,7 @@ pub struct GuiConfig {
     pub font_monospace: Option<String>,
     pub dominant_colors: Option<usize>,
     pub saturation_bias: Option<f32>,
+    pub palette_sort: Option<PaletteSort>,
     pub font_ui: Option<String>,
     pub font_scale: Option<f32>,
     pub preload_count: Option<usize>,
@@ -93,6 +121,7 @@ impl Default for GuiConfig {
             font_monospace: None,
             dominant_colors: Some(5),
             saturation_bias: Some(1.0),
+            palette_sort: None,
             font_ui: None,
             font_scale: Some(1.0),
             preload_count: Some(10),
@@ -288,12 +317,13 @@ impl AppContext {
             let colors_clamped = original_colors != cfg.gui.dominant_colors;
 
             eprintln!(
-                "[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}, dominant_colors={:?}, saturation_bias={:?}",
+                "[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}, dominant_colors={:?}, saturation_bias={:?}, palette_sort={:?}",
                 cfg.gui.width,
                 cfg.gui.height,
                 cfg.gui.panel_width,
                 cfg.gui.dominant_colors,
-                cfg.gui.saturation_bias
+                cfg.gui.saturation_bias,
+                cfg.gui.palette_sort
             );
             eprintln!("[DEBUG-DB] LMDB map size: {} MiB", cfg.db_size_mb);
             eprintln!("[DEBUG-DB] Locations loaded: {}", cfg.locations.len());
