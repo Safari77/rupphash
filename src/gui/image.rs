@@ -1114,12 +1114,41 @@ fn kmeans_palette(
     // returning 10 colors where 4 are identical bright spots.
     let final_k = unique_centroids.len();
 
-    // Check if ALL centroids are achromatic (grey). When chroma is near-zero
-    // the hue angle from atan2 is meaningless noise, so hue-bucket sorting
-    // scrambles what should be a clean dark-to-light gradient.
+    // Classify each centroid as chromatic or achromatic.
+    // When chroma is near-zero the hue angle from atan2 is meaningless
+    // noise, so we must not let it drive sorting.
     let grey_threshold = 0.01;
-    let all_grey =
-        unique_centroids.iter().all(|(_, c)| (c.a.powi(2) + c.b.powi(2)).sqrt() < grey_threshold);
+
+    // Compute hue buckets only for chromatic centroids; count distinct buckets
+    // to decide whether hue-bucket sorting adds value or just scrambles things.
+    let mut chromatic_buckets: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut bucket_counts: [u32; 8] = [0; 8];
+    for (_, c) in &unique_centroids {
+        let chroma = (c.a.powi(2) + c.b.powi(2)).sqrt();
+        if chroma >= grey_threshold {
+            let mut h = c.b.atan2(c.a);
+            if h < 0.0 {
+                h += std::f32::consts::PI * 2.0;
+            }
+            let bucket = ((h * 8.0) / (std::f32::consts::PI * 2.0)).round() as i32 % 8;
+            chromatic_buckets.insert(bucket);
+            bucket_counts[bucket as usize] += 1;
+        }
+    }
+
+    // If the palette spans 2 or fewer hue buckets (earth tones, monochrome,
+    // all-grey), a clean dark-to-light gradient is more useful than hue grouping.
+    let use_lightness_only = chromatic_buckets.len() <= 2;
+
+    // When hue-bucket sorting IS used, achromatic colors get the dominant
+    // (most populated) hue bucket so they blend in by lightness instead of
+    // landing in a random bucket from atan2 noise.
+    let dominant_bucket = bucket_counts
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &cnt)| cnt)
+        .map(|(i, _)| i as i32)
+        .unwrap_or(0);
 
     // Total weight for computing fractions
     let total_weight: f32 = unique_centroids.iter().map(|(w, _)| w).sum();
@@ -1132,17 +1161,23 @@ fn kmeans_palette(
         let (weight, ref centroid) = unique_centroids[i];
         let l_key = (centroid.l * 1000.0) as u32;
 
-        if all_grey {
+        if use_lightness_only {
             // Pure lightness sort: hue bucket forced to 0 so only l_key matters
             sort_keys.push((0, l_key));
         } else {
-            let mut h = centroid.b.atan2(centroid.a);
-            if h < 0.0 {
-                h += std::f32::consts::PI * 2.0;
+            let chroma = (centroid.a.powi(2) + centroid.b.powi(2)).sqrt();
+            if chroma < grey_threshold {
+                // Achromatic: slot into the dominant hue bucket so it sorts
+                // by lightness among its chromatic neighbours
+                sort_keys.push((dominant_bucket, l_key));
+            } else {
+                let mut h = centroid.b.atan2(centroid.a);
+                if h < 0.0 {
+                    h += std::f32::consts::PI * 2.0;
+                }
+                let hue_bucket = ((h * 8.0) / (std::f32::consts::PI * 2.0)).round() as i32 % 8;
+                sort_keys.push((hue_bucket, l_key));
             }
-
-            let hue_bucket = ((h * 8.0) / (std::f32::consts::PI * 2.0)).round() as i32 % 8;
-            sort_keys.push((hue_bucket, l_key));
         }
 
         let srgb_linear = oklab_to_linear_srgb(*centroid);
