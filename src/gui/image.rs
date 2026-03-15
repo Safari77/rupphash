@@ -755,27 +755,37 @@ fn compute_histogram_from_colorimage(
         let total_pixels = (src_w as usize) * (src_h as usize);
         let sample_count = total_pixels.min(4096);
         let step = (total_pixels / sample_count).max(1);
-        let mut unique: std::collections::HashSet<(u8, u8, u8)> = std::collections::HashSet::new();
+        let mut counts: std::collections::HashMap<(u8, u8, u8), u32> =
+            std::collections::HashMap::new();
         let mut idx = 0;
-        while idx < total_pixels && unique.len() <= k {
+        while idx < total_pixels && counts.len() <= k {
             let px = img.pixels[idx];
-            unique.insert((px.r(), px.g(), px.b()));
+            *counts.entry((px.r(), px.g(), px.b())).or_insert(0) += 1;
             idx += step;
         }
-        if unique.len() <= k {
-            let n = unique.len() as f32;
-            let mut colors: Vec<(Oklab, egui::Color32)> = unique
+        if counts.len() <= k {
+            // Re-count with the full sample to get accurate pixel distribution
+            // (the first pass may have stopped early once unique count exceeded k)
+            counts.clear();
+            idx = 0;
+            while idx < total_pixels {
+                let px = img.pixels[idx];
+                *counts.entry((px.r(), px.g(), px.b())).or_insert(0) += 1;
+                idx += step;
+            }
+            let total_sampled: u32 = counts.values().sum();
+            let mut colors: Vec<(Oklab, egui::Color32, f32)> = counts
                 .iter()
-                .map(|&(r, g, b)| {
+                .map(|(&(r, g, b), &count)| {
                     let lr = srgb_to_linear(r as f32 / 255.0);
                     let lg = srgb_to_linear(g as f32 / 255.0);
                     let lb = srgb_to_linear(b as f32 / 255.0);
                     let ok = linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb });
-                    (ok, egui::Color32::from_rgb(r, g, b))
+                    (ok, egui::Color32::from_rgb(r, g, b), count as f32 / total_sampled as f32)
                 })
                 .collect();
             colors.sort_by(|a, b| a.0.l.partial_cmp(&b.0.l).unwrap_or(std::cmp::Ordering::Equal));
-            Some(colors.into_iter().map(|(_, c)| (c, 1.0 / n)).collect())
+            Some(colors.into_iter().map(|(_, c, w)| (c, w)).collect())
         } else {
             None
         }
@@ -1172,13 +1182,47 @@ fn compute_histogram_from_dynamic_image(
     let total_pixels = (src_w as usize) * (src_h as usize);
     let sample_count = total_pixels.min(4096);
     let step = (total_pixels / sample_count).max(1);
-    let mut unique_rgb: std::collections::HashSet<(u8, u8, u8)> = std::collections::HashSet::new();
+    let mut unique_rgb: std::collections::HashMap<(u8, u8, u8), u32> =
+        std::collections::HashMap::new();
     let mut idx = 0;
     while idx < total_pixels && unique_rgb.len() <= k {
         let base = idx * 4;
-        unique_rgb.insert((raw_pixels[base], raw_pixels[base + 1], raw_pixels[base + 2]));
+        *unique_rgb
+            .entry((raw_pixels[base], raw_pixels[base + 1], raw_pixels[base + 2]))
+            .or_insert(0) += 1;
         idx += step;
     }
+
+    // Build the low-color palette now while raw_pixels is still valid
+    // (rgba.into_raw() below will consume it)
+    let low_color_palette: Option<Vec<(egui::Color32, f32)>> = if unique_rgb.len() <= k {
+        // Re-count with the full sample to get accurate pixel distribution
+        // (the first pass may have stopped early once unique count exceeded k)
+        unique_rgb.clear();
+        let mut full_idx = 0;
+        while full_idx < total_pixels {
+            let base = full_idx * 4;
+            *unique_rgb
+                .entry((raw_pixels[base], raw_pixels[base + 1], raw_pixels[base + 2]))
+                .or_insert(0) += 1;
+            full_idx += step;
+        }
+        let total_sampled: u32 = unique_rgb.values().sum();
+        let mut colors: Vec<(Oklab, egui::Color32, f32)> = unique_rgb
+            .iter()
+            .map(|(&(r, g, b), &count)| {
+                let lr = srgb_to_linear(r as f32 / 255.0);
+                let lg = srgb_to_linear(g as f32 / 255.0);
+                let lb = srgb_to_linear(b as f32 / 255.0);
+                let ok = linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb });
+                (ok, egui::Color32::from_rgb(r, g, b), count as f32 / total_sampled as f32)
+            })
+            .collect();
+        colors.sort_by(|a, b| a.0.l.partial_cmp(&b.0.l).unwrap_or(std::cmp::Ordering::Equal));
+        Some(colors.into_iter().map(|(_, c, w)| (c, w)).collect())
+    } else {
+        None
+    };
 
     // 1. High-quality downsample using fast_image_resize (matches ColorImage path)
     let resized_successfully = FastImage::from_vec_u8(src_w, src_h, rgba.into_raw(), pixel_type)
@@ -1223,23 +1267,8 @@ fn compute_histogram_from_dynamic_image(
 
     let (hist_l, hist_a, hist_b) = build_histograms(&oklab_pixels);
 
-    let palette = if unique_rgb.len() <= k {
-        let n = unique_rgb.len() as f32;
-        let mut colors: Vec<(Oklab, egui::Color32)> = unique_rgb
-            .iter()
-            .map(|&(r, g, b)| {
-                let lr = srgb_to_linear(r as f32 / 255.0);
-                let lg = srgb_to_linear(g as f32 / 255.0);
-                let lb = srgb_to_linear(b as f32 / 255.0);
-                let ok = linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb });
-                (ok, egui::Color32::from_rgb(r, g, b))
-            })
-            .collect();
-        colors.sort_by(|a, b| a.0.l.partial_cmp(&b.0.l).unwrap_or(std::cmp::Ordering::Equal));
-        colors.into_iter().map(|(_, c)| (c, 1.0 / n)).collect()
-    } else {
-        kmeans_palette(&oklab_pixels, dominant_colors, sat_bias)
-    };
+    let palette = low_color_palette
+        .unwrap_or_else(|| kmeans_palette(&oklab_pixels, dominant_colors, sat_bias));
 
     (hist_l, hist_a, hist_b, palette)
 }
