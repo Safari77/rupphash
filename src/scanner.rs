@@ -34,6 +34,8 @@ use crate::image_features::ImageFeatures;
 use crate::position;
 use crate::raw_exif;
 use crate::{FileMetadata, GroupInfo, GroupStatus};
+use std::sync::OnceLock;
+use sysinfo::System;
 
 pub const RAW_EXTS: &[&str] = &[
     "nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf", "kdc", "dcr", "pef", "x3f", "srf",
@@ -48,6 +50,23 @@ macro_rules! img_debug {
         #[cfg(debug_assertions)]
         eprintln!($($arg)*);
     };
+}
+
+// Create an empty lock to hold our calculated byte limit.
+static IMAGE_MEMORY_LIMIT: OnceLock<u64> = OnceLock::new();
+
+/// Gets the 75% RAM limit
+fn get_image_memory_limit() -> u64 {
+    *IMAGE_MEMORY_LIMIT.get_or_init(|| {
+        let mut sys = System::new();
+        sys.refresh_memory();
+
+        let total_ram_bytes = sys.total_memory();
+        let limit_bytes = (total_ram_bytes * 3) / 4;
+
+        eprintln!("[SYSTEM] Set image-rs fallback memory limit to {} bytes", limit_bytes);
+        limit_bytes
+    })
 }
 
 pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exif::Exif> {
@@ -659,6 +678,11 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
     {
         reader.set_format(fmt);
     }
+
+    // Apply the dynamic memory limit
+    let mut custom_limits = image::io::Limits::default();
+    custom_limits.max_alloc = Some(get_image_memory_limit());
+    reader.limits(custom_limits);
 
     // Capture the image crate's format string and map the internal error out
     reader.decode().map_err(|e| e.to_string())
