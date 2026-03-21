@@ -50,6 +50,9 @@ pub enum InputIntent {
     PrevSearchResult,
     CancelSearch,
     FindInMap,
+    IgnoreCurrent,      // Q key: ignore marked files or current file (duplicate mode)
+    IgnoreGroup,        // Ctrl+Q: ignore all files in current group (duplicate mode)
+    ConfirmIgnoreGroup, // Y on ignore group confirmation dialog
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +149,7 @@ pub struct AppState {
     pub show_move_confirmation: bool,
     pub show_delete_immediate_confirmation: bool,
     pub show_sort_selection: bool,
+    pub show_ignore_group_confirmation: bool,
     pub error_popup: Option<String>,
     pub exit_requested: bool,
     pub selection_changed: bool,
@@ -198,6 +202,7 @@ impl AppState {
             show_move_confirmation: false,
             show_delete_immediate_confirmation: false,
             show_sort_selection: false,
+            show_ignore_group_confirmation: false,
             error_popup: None,
             exit_requested: false,
             selection_changed: true,
@@ -282,6 +287,21 @@ impl AppState {
                 }
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_delete_immediate_confirmation = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Handle ignore-group confirmation modal
+        if self.show_ignore_group_confirmation {
+            match intent {
+                InputIntent::ConfirmIgnoreGroup => {
+                    self.show_ignore_group_confirmation = false;
+                    // Actual DB work is done in dialogs.rs handle_dialogs
+                }
+                InputIntent::Cancel | InputIntent::Quit => {
+                    self.show_ignore_group_confirmation = false;
                 }
                 _ => {}
             }
@@ -520,6 +540,14 @@ impl AppState {
             InputIntent::FindInMap => { // handled in handle_dialogs
             }
             InputIntent::ChangeSortOrder(_) => {}
+            InputIntent::IgnoreCurrent => {} // handled in dialogs.rs
+            InputIntent::IgnoreGroup => {
+                // Show confirmation dialog (actual DB work in dialogs.rs)
+                if !self.view_mode {
+                    self.show_ignore_group_confirmation = true;
+                }
+            }
+            InputIntent::ConfirmIgnoreGroup => {} // handled in dialogs.rs
         }
     }
 
@@ -533,6 +561,7 @@ impl AppState {
             || self.show_move_confirmation
             || self.show_delete_immediate_confirmation
             || self.show_sort_selection
+            || self.show_ignore_group_confirmation
             || self.error_popup.is_some()
             || self.renaming.is_some()
             || self.show_search

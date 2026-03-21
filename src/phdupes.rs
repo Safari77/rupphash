@@ -186,6 +186,8 @@ struct Cli {
     #[arg(required_unless_present = "show_build_info")]
     #[arg(required_unless_present = "show_exif_tags")]
     #[arg(required_unless_present = "prune")]
+    #[arg(required_unless_present = "show_ignored")]
+    #[arg(required_unless_present = "unignore")]
     paths: Vec<String>,
 
     #[arg(long)]
@@ -253,6 +255,14 @@ struct Cli {
     /// Show build info from Cargo.lock at time of building
     #[arg(long)]
     show_build_info: bool,
+
+    /// Show all ignored files (blake3 hash, group UUID, timestamp)
+    #[arg(long)]
+    show_ignored: bool,
+
+    /// Remove file(s) from ignore list by filename(s), group UUID, or PDQ hash
+    #[arg(long, value_name = "VALUE", num_args(1..))]
+    unignore: Vec<String>,
 }
 
 impl Cli {
@@ -562,6 +572,171 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => eprintln!("Pruning failed: {}", e),
         }
         // Exit immediately after pruning
+        return Ok(());
+    }
+
+    // --- SHOW IGNORED ---
+    if args.show_ignored {
+        let ctx = AppContext::with_algorithm(hash_algorithm)?;
+
+        match ctx.get_all_ignored() {
+            Ok(entries) => {
+                if entries.is_empty() {
+                    println!("No ignored files.");
+                } else {
+                    println!("Ignored files ({} entries):\n", entries.len());
+
+                    // Group by UUID for display
+                    let mut by_uuid: HashMap<[u8; 16], Vec<([u8; 32], db::IgnoredEntry)>> =
+                        HashMap::new();
+                    let mut no_group = Vec::new();
+                    for (ch, entry) in &entries {
+                        if entry.group_uuid == [0u8; 16] {
+                            no_group.push((*ch, entry.clone()));
+                        } else {
+                            by_uuid.entry(entry.group_uuid).or_default().push((*ch, entry.clone()));
+                        }
+                    }
+
+                    for (uuid, group_entries) in &by_uuid {
+                        let uuid_str = AppContext::format_uuid(uuid);
+                        println!("Group UUID: {}", uuid_str);
+                        for (ch, entry) in group_entries {
+                            let pdq_str = entry
+                                .pdqhash
+                                .map(|h| hex::encode(h))
+                                .unwrap_or_else(|| "none".to_string());
+                            let ts_str =
+                                chrono::DateTime::<Utc>::from_timestamp(entry.timestamp as i64, 0)
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                                    .unwrap_or_else(|| format!("{}", entry.timestamp));
+                            println!(
+                                "  blake3: {}  pdqhash: {}  added: {}",
+                                hex::encode(ch),
+                                pdq_str,
+                                ts_str
+                            );
+                        }
+                        println!();
+                    }
+
+                    for (ch, entry) in &no_group {
+                        let pdq_str = entry
+                            .pdqhash
+                            .map(|h| hex::encode(h))
+                            .unwrap_or_else(|| "none".to_string());
+                        let ts_str =
+                            chrono::DateTime::<Utc>::from_timestamp(entry.timestamp as i64, 0)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                                .unwrap_or_else(|| format!("{}", entry.timestamp));
+                        println!(
+                            "blake3: {}  pdqhash: {}  added: {}  (no group)",
+                            hex::encode(ch),
+                            pdq_str,
+                            ts_str
+                        );
+                    }
+                }
+            }
+            Err(e) => eprintln!("Failed to read ignored list: {}", e),
+        }
+        return Ok(());
+    }
+
+    // --- UNIGNORE ---
+    if !args.unignore.is_empty() {
+        let ctx = AppContext::with_algorithm(hash_algorithm)?;
+
+        for value in &args.unignore {
+            eprintln!("[DEBUG-UNIGNORE] Processing: {}", value);
+
+            // Try 1: Parse as UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx or 32 hex chars)
+            if let Some(uuid) = AppContext::parse_uuid(value) {
+                eprintln!("[DEBUG-UNIGNORE] Parsed as UUID: {}", AppContext::format_uuid(&uuid));
+                match ctx.remove_ignored_by_uuid(&uuid) {
+                    Ok(count) => {
+                        println!(
+                            "Removed {} ignored entries matching UUID {}",
+                            count,
+                            AppContext::format_uuid(&uuid)
+                        );
+                        eprintln!(
+                            "[DEBUG-UNIGNORE] Removed {} entries for UUID {}",
+                            count,
+                            AppContext::format_uuid(&uuid)
+                        );
+                    }
+                    Err(e) => eprintln!("Failed to unignore by UUID: {}", e),
+                }
+                continue;
+            }
+
+            // Try 2: Parse as hex PDQ hash (64 hex chars = 32 bytes, but not a file path)
+            if value.len() == 64 && !std::path::Path::new(value).exists() {
+                if let Ok(bytes) = hex::decode(value) {
+                    if let Ok(pdqhash) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                        eprintln!("[DEBUG-UNIGNORE] Parsed as PDQ hash: {}", hex::encode(pdqhash));
+                        match ctx.remove_ignored_by_pdqhash(&pdqhash) {
+                            Ok(count) => {
+                                println!(
+                                    "Removed {} ignored entries matching PDQ hash {}",
+                                    count, value
+                                );
+                                eprintln!(
+                                    "[DEBUG-UNIGNORE] Removed {} entries for pdqhash {}",
+                                    count, value
+                                );
+                            }
+                            Err(e) => eprintln!("Failed to unignore by PDQ hash: {}", e),
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // Try 3: Treat as filename — compute keyed blake3 and look up
+            let file_path = std::path::Path::new(value);
+            if file_path.exists() {
+                eprintln!("[DEBUG-UNIGNORE] Treating as filename: {}", value);
+                match fs::read(file_path) {
+                    Ok(data) => {
+                        let content_hash = *blake3::keyed_hash(&ctx.content_key, &data).as_bytes();
+                        eprintln!(
+                            "[DEBUG-UNIGNORE] Computed keyed blake3: {}",
+                            hex::encode(content_hash)
+                        );
+                        match ctx.remove_ignored(&content_hash) {
+                            Ok(true) => {
+                                println!(
+                                    "Removed {} from ignore list (keyed blake3: {})",
+                                    value,
+                                    hex::encode(content_hash)
+                                );
+                                eprintln!(
+                                    "[DEBUG-UNIGNORE] Successfully removed keyed blake3={}",
+                                    hex::encode(content_hash)
+                                );
+                            }
+                            Ok(false) => {
+                                println!(
+                                    "File {} (keyed blake3: {}) was not in the ignore list",
+                                    value,
+                                    hex::encode(content_hash)
+                                );
+                            }
+                            Err(e) => eprintln!("Failed to unignore: {}", e),
+                        }
+                    }
+                    Err(e) => eprintln!("Failed to read file {}: {}", value, e),
+                }
+            } else {
+                eprintln!(
+                    "'{}' is not a valid UUID, PDQ hash (64 hex chars), or existing filename.",
+                    value
+                );
+            }
+        }
+
         return Ok(());
     }
 

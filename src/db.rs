@@ -22,6 +22,8 @@ const DB_FILE_NAME_PDQHASH: &str = "phdupes_pdqhash";
 const DB_FILE_NAME_FEATURES: &str = "phdupes_features";
 const DB_FILE_NAME_PIXELHASH: &str = "phdupes_pixelhash";
 const DB_FILE_NAME_COEFFICIENTS: &str = "phdupes_coefficients";
+const DB_FILE_NAME_IGNORED: &str = "phdupes_ignored";
+const DB_FILE_NAME_IGNORED_PDQMAP: &str = "phdupes_ignored_pdqmap";
 
 // Encryption overhead: 24-byte nonce + 16-byte Poly1305 tag
 const ENCRYPTION_OVERHEAD: usize = 24 + 16;
@@ -189,6 +191,28 @@ impl CachedCoefficients {
     }
 }
 
+/// Entry in the ignored files database.
+/// Key: blake3 content_hash (32 bytes).
+/// Every file in a duplicate group is registered here on scan completion
+/// with `ignored: false`. The flag is set to `true` when the user presses Q.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IgnoredEntry {
+    pub pdqhash: Option<[u8; 32]>,
+    pub group_uuid: [u8; 16], // 128-bit UUID grouping files by similarity
+    pub timestamp: u64,       // Unix epoch seconds when the entry was created/updated
+    pub ignored: bool,        // true = user explicitly ignored this file
+}
+
+impl IgnoredEntry {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_stdvec(self)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+}
+
 /// Result of background enrichment for a file.
 /// This struct is designed to be extensible - add new fields as needed.
 #[derive(Debug, Clone)]
@@ -207,6 +231,8 @@ pub struct AppContext {
     pub feature_db: Database,
     pub coeff_db: Database, // Separate DB for PDQ coefficients
     pub pixel_db: Database,
+    pub ignored_db: Database, // Registered/ignored files (duplicate finder)
+    pub ignored_pdqmap_db: Database, // Maps pdqhash → UUID for cross-session stability
     pub content_key: [u8; 32],
     pub meta_key: [u8; 32],
     pub grouping_config: GroupingConfig,
@@ -498,6 +524,9 @@ impl AppContext {
         let feature_db = env.create_db(Some(DB_FILE_NAME_FEATURES), DatabaseFlags::empty())?;
         let coeff_db = env.create_db(Some(DB_FILE_NAME_COEFFICIENTS), DatabaseFlags::empty())?;
         let pixel_db = env.create_db(Some(DB_FILE_NAME_PIXELHASH), DatabaseFlags::empty())?;
+        let ignored_db = env.create_db(Some(DB_FILE_NAME_IGNORED), DatabaseFlags::empty())?;
+        let ignored_pdqmap_db =
+            env.create_db(Some(DB_FILE_NAME_IGNORED_PDQMAP), DatabaseFlags::empty())?;
         // Convert the locations into runtime usable Points
         let locations: HashMap<String, Point<f64>> =
             config.locations.into_iter().map(|(name, option)| (name, option.into())).collect();
@@ -509,6 +538,8 @@ impl AppContext {
             feature_db,
             coeff_db,
             pixel_db,
+            ignored_db,
+            ignored_pdqmap_db,
             content_key,
             meta_key,
             grouping_config: config.grouping,
@@ -1080,6 +1111,372 @@ impl AppContext {
         }
 
         Ok(count)
+    }
+
+    // --- Ignored Files Database ---
+
+    /// Check if a file has been explicitly ignored (ignored flag == true).
+    pub fn is_ignored(&self, content_hash: &[u8; 32]) -> bool {
+        let Ok(txn) = self.env.begin_ro_txn() else { return false };
+        match txn.get(self.ignored_db, content_hash) {
+            Ok(encrypted) => {
+                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted)
+                    && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                {
+                    entry.ignored
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Get the group UUID for a file (works for both ignored and registered-only files).
+    pub fn get_group_uuid(&self, content_hash: &[u8; 32]) -> Option<[u8; 16]> {
+        let txn = self.env.begin_ro_txn().ok()?;
+        let encrypted = txn.get(self.ignored_db, content_hash).ok()?;
+        let decrypted = self.decrypt_value(content_hash, encrypted)?;
+        let entry = IgnoredEntry::from_bytes(&decrypted).ok()?;
+        Some(entry.group_uuid)
+    }
+
+    /// Look up an existing UUID from the pdqmap by checking pdqhashes.
+    fn find_uuid_in_txn(
+        &self,
+        txn: &lmdb::RoTransaction,
+        pdqhashes: &[Option<[u8; 32]>],
+    ) -> Option<[u8; 16]> {
+        for pdqhash_opt in pdqhashes {
+            if let Some(pdqhash) = pdqhash_opt {
+                if let Ok(encrypted) = txn.get(self.ignored_pdqmap_db, pdqhash) {
+                    if let Some(decrypted) = self.decrypt_value(pdqhash, encrypted)
+                        && decrypted.len() == 16
+                    {
+                        let mut uuid = [0u8; 16];
+                        uuid.copy_from_slice(&decrypted);
+                        return Some(uuid);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Store pdqhash → UUID mappings for all pdqhashes in a group.
+    fn store_pdqmap_entries(
+        cipher: &XChaCha20Poly1305,
+        txn: &mut lmdb::RwTransaction,
+        pdqmap_db: Database,
+        pdqhashes: &[Option<[u8; 32]>],
+        uuid: &[u8; 16],
+    ) -> Result<(), lmdb::Error> {
+        for pdqhash_opt in pdqhashes {
+            if let Some(pdqhash) = pdqhash_opt {
+                let encrypted = Self::encrypt_value(cipher, pdqhash, uuid);
+                txn.put(pdqmap_db, pdqhash, &encrypted, WriteFlags::empty())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Register all duplicate groups in the database on scan completion.
+    /// Each file gets an IgnoredEntry with `ignored: false`.
+    /// Entries already marked `ignored: true` are NOT overwritten.
+    /// Returns the total number of newly registered entries.
+    pub fn register_duplicate_groups(
+        &self,
+        groups: &[Vec<([u8; 32], Option<[u8; 32]>)>], // Vec of groups, each (content_hash, pdqhash)
+    ) -> Result<usize, lmdb::Error> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut total_registered = 0;
+
+        // Use a read txn first to find existing UUIDs
+        let ro_txn = self.env.begin_ro_txn()?;
+        let mut group_uuids = Vec::with_capacity(groups.len());
+        for group in groups {
+            let all_pdqhashes: Vec<Option<[u8; 32]>> = group.iter().map(|(_, pdq)| *pdq).collect();
+            let uuid = self.find_uuid_in_txn(&ro_txn, &all_pdqhashes).unwrap_or_else(|| {
+                let mut uuid = [0u8; 16];
+                getrandom::fill(&mut uuid).expect("RNG failed");
+                uuid
+            });
+            group_uuids.push(uuid);
+        }
+        drop(ro_txn);
+
+        // Now do all writes in a single transaction
+        let mut txn = self.env.begin_rw_txn()?;
+
+        for (group, uuid) in groups.iter().zip(group_uuids.iter()) {
+            if group.is_empty() {
+                continue;
+            }
+
+            for (content_hash, pdqhash) in group {
+                // Don't overwrite entries that are already ignored=true
+                if let Ok(existing) = txn.get(self.ignored_db, content_hash) {
+                    if let Some(decrypted) = self.decrypt_value(content_hash, existing)
+                        && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                        && entry.ignored
+                    {
+                        continue;
+                    }
+                }
+
+                let entry = IgnoredEntry {
+                    pdqhash: *pdqhash,
+                    group_uuid: *uuid,
+                    timestamp: now,
+                    ignored: false,
+                };
+                let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
+                let encrypted = Self::encrypt_value(&self.cipher, content_hash, &bytes);
+                txn.put(self.ignored_db, content_hash, &encrypted, WriteFlags::empty())?;
+                total_registered += 1;
+            }
+
+            // Store pdqmap entries for cross-session UUID stability
+            let all_pdqhashes: Vec<Option<[u8; 32]>> = group.iter().map(|(_, pdq)| *pdq).collect();
+            Self::store_pdqmap_entries(
+                &self.cipher,
+                &mut txn,
+                self.ignored_pdqmap_db,
+                &all_pdqhashes,
+                uuid,
+            )?;
+        }
+
+        txn.commit()?;
+        eprintln!(
+            "[DEBUG-IGNORE] Registered {} files across {} groups",
+            total_registered,
+            groups.len()
+        );
+        Ok(total_registered)
+    }
+
+    /// Set the ignored flag to true for the given content hashes.
+    /// Returns the number of entries flipped from false to true.
+    pub fn set_files_ignored(&self, content_hashes: &[[u8; 32]]) -> Result<usize, lmdb::Error> {
+        let mut txn = self.env.begin_rw_txn()?;
+        let mut count = 0;
+
+        for ch in content_hashes {
+            if let Ok(encrypted) = txn.get(self.ignored_db, ch) {
+                if let Some(decrypted) = self.decrypt_value(ch, encrypted)
+                    && let Ok(mut entry) = IgnoredEntry::from_bytes(&decrypted)
+                {
+                    if !entry.ignored {
+                        entry.ignored = true;
+                        let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
+                        let new_encrypted = Self::encrypt_value(&self.cipher, ch, &bytes);
+                        txn.put(self.ignored_db, ch, &new_encrypted, WriteFlags::empty())?;
+                        count += 1;
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[WARN-IGNORE] set_files_ignored: no entry for blake3={}, skipping",
+                    hex::encode(ch)
+                );
+            }
+        }
+
+        txn.commit()?;
+        Ok(count)
+    }
+
+    /// Get an ignored entry by content_hash (returns any entry, regardless of flag).
+    pub fn get_ignored(
+        &self,
+        content_hash: &[u8; 32],
+    ) -> Result<Option<IgnoredEntry>, lmdb::Error> {
+        let txn = self.env.begin_ro_txn()?;
+        match txn.get(self.ignored_db, content_hash) {
+            Ok(encrypted_bytes) => {
+                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
+                    Ok(IgnoredEntry::from_bytes(&decrypted).ok())
+                } else {
+                    Err(lmdb::Error::Corrupted)
+                }
+            }
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Iterate all explicitly ignored entries (ignored == true).
+    pub fn get_all_ignored(&self) -> Result<Vec<([u8; 32], IgnoredEntry)>, lmdb::Error> {
+        let txn = self.env.begin_ro_txn()?;
+        let mut results = Vec::new();
+
+        if txn.stat(self.ignored_db)?.entries() > 0 {
+            let mut cursor = txn.open_ro_cursor(self.ignored_db)?;
+            for result in cursor.iter_start() {
+                if let Ok((key, encrypted)) = result
+                    && key.len() == 32
+                {
+                    let mut content_hash = [0u8; 32];
+                    content_hash.copy_from_slice(key);
+
+                    if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
+                        && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                        && entry.ignored
+                    {
+                        results.push((content_hash, entry));
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Remove a single entry by content_hash.
+    pub fn remove_ignored(&self, content_hash: &[u8; 32]) -> Result<bool, lmdb::Error> {
+        let mut txn = self.env.begin_rw_txn()?;
+        match txn.del(self.ignored_db, content_hash, None) {
+            Ok(()) => {
+                txn.commit()?;
+                Ok(true)
+            }
+            Err(lmdb::Error::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Remove all entries matching a group UUID (both ignored_db and pdqmap_db).
+    pub fn remove_ignored_by_uuid(&self, uuid: &[u8; 16]) -> Result<usize, lmdb::Error> {
+        let txn = self.env.begin_ro_txn()?;
+        let mut to_remove = Vec::new();
+        let mut pdqhashes_to_remove = Vec::new();
+
+        if txn.stat(self.ignored_db)?.entries() > 0 {
+            let mut cursor = txn.open_ro_cursor(self.ignored_db)?;
+            for result in cursor.iter_start() {
+                if let Ok((key, encrypted)) = result
+                    && key.len() == 32
+                {
+                    let mut content_hash = [0u8; 32];
+                    content_hash.copy_from_slice(key);
+                    if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
+                        && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                        && entry.group_uuid == *uuid
+                    {
+                        eprintln!(
+                            "[DEBUG-UNIGNORE] Removing blake3={} ignored={}",
+                            hex::encode(content_hash),
+                            entry.ignored,
+                        );
+                        to_remove.push(content_hash);
+                        if let Some(pdq) = entry.pdqhash {
+                            pdqhashes_to_remove.push(pdq);
+                        }
+                    }
+                }
+            }
+        }
+        // Also collect pdqmap entries pointing to this UUID
+        if txn.stat(self.ignored_pdqmap_db)?.entries() > 0 {
+            let mut cursor = txn.open_ro_cursor(self.ignored_pdqmap_db)?;
+            for result in cursor.iter_start() {
+                if let Ok((key, encrypted)) = result
+                    && key.len() == 32
+                {
+                    let mut pdqhash = [0u8; 32];
+                    pdqhash.copy_from_slice(key);
+                    if let Some(decrypted) = self.decrypt_value(&pdqhash, encrypted)
+                        && decrypted.len() == 16
+                    {
+                        let mut stored_uuid = [0u8; 16];
+                        stored_uuid.copy_from_slice(&decrypted);
+                        if stored_uuid == *uuid && !pdqhashes_to_remove.contains(&pdqhash) {
+                            pdqhashes_to_remove.push(pdqhash);
+                        }
+                    }
+                }
+            }
+        }
+        drop(txn);
+
+        let mut wtxn = self.env.begin_rw_txn()?;
+        let count = to_remove.len();
+        for ch in &to_remove {
+            let _ = wtxn.del(self.ignored_db, ch, None);
+        }
+        for pdq in &pdqhashes_to_remove {
+            let _ = wtxn.del(self.ignored_pdqmap_db, pdq, None);
+        }
+        wtxn.commit()?;
+        Ok(count)
+    }
+
+    /// Remove all entries matching a PDQ hash.
+    pub fn remove_ignored_by_pdqhash(&self, pdqhash: &[u8; 32]) -> Result<usize, lmdb::Error> {
+        let txn = self.env.begin_ro_txn()?;
+        let mut to_remove = Vec::new();
+        if txn.stat(self.ignored_db)?.entries() > 0 {
+            let mut cursor = txn.open_ro_cursor(self.ignored_db)?;
+            for result in cursor.iter_start() {
+                if let Ok((key, encrypted)) = result
+                    && key.len() == 32
+                {
+                    let mut content_hash = [0u8; 32];
+                    content_hash.copy_from_slice(key);
+                    if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
+                        && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                        && entry.pdqhash.as_ref() == Some(pdqhash)
+                    {
+                        to_remove.push(content_hash);
+                    }
+                }
+            }
+        }
+        drop(txn);
+
+        let mut wtxn = self.env.begin_rw_txn()?;
+        let count = to_remove.len();
+        for ch in &to_remove {
+            let _ = wtxn.del(self.ignored_db, ch, None);
+        }
+        let _ = wtxn.del(self.ignored_pdqmap_db, pdqhash, None);
+        wtxn.commit()?;
+        Ok(count)
+    }
+
+    /// Format a UUID as a hyphenated string
+    pub fn format_uuid(uuid: &[u8; 16]) -> String {
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            uuid[0],
+            uuid[1],
+            uuid[2],
+            uuid[3],
+            uuid[4],
+            uuid[5],
+            uuid[6],
+            uuid[7],
+            uuid[8],
+            uuid[9],
+            uuid[10],
+            uuid[11],
+            uuid[12],
+            uuid[13],
+            uuid[14],
+            uuid[15],
+        )
+    }
+
+    /// Parse a hyphenated UUID string back into bytes (accepts with or without hyphens).
+    pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
+        let hex_str: String = s.chars().filter(|c| *c != '-').collect();
+        if hex_str.len() != 32 {
+            return None;
+        }
+        let bytes = hex::decode(&hex_str).ok()?;
+        let arr: [u8; 16] = bytes.try_into().ok()?;
+        Some(arr)
     }
 
     pub fn save_map_selection(

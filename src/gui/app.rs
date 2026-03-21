@@ -656,12 +656,56 @@ impl GuiApp {
         let mut _added_any = false;
         for file in files {
             if let Some(pos) = file.gps_pos {
-                // add_marker returns true if it was new
                 if self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x(), file.exif_timestamp)
                 {
                     _added_any = true;
                 }
             }
+        }
+    }
+
+    /// Filter out ignored files from groups (duplicate finder mode only).
+    fn filter_ignored_groups(
+        &self,
+        groups: &mut Vec<Vec<FileMetadata>>,
+        infos: &mut Vec<GroupInfo>,
+    ) {
+        if self.state.view_mode {
+            return;
+        }
+        let mut total_removed = 0usize;
+        for group in groups.iter_mut() {
+            let before = group.len();
+            group.retain(|f| {
+                if f.content_hash != [0u8; 32] && self.ctx.is_ignored(&f.content_hash) {
+                    eprintln!(
+                        "[DEBUG-IGNORE] Filtering ignored file: {:?}",
+                        f.path.file_name().unwrap_or_default()
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            total_removed += before - group.len();
+        }
+        if total_removed > 0 {
+            let mut i = 0;
+            while i < groups.len() {
+                if groups[i].len() < 2 {
+                    groups.remove(i);
+                    if i < infos.len() {
+                        infos.remove(i);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            eprintln!(
+                "[DEBUG-IGNORE] Filtered {} ignored files, {} groups remain",
+                total_removed,
+                groups.len()
+            );
         }
     }
 
@@ -1059,8 +1103,6 @@ impl GuiApp {
                 }
 
                 // File finished being written (inotify CLOSE_WRITE).
-                // This is the safe moment to load the image — the writer has
-                // closed the file descriptor, so we won't hit Premature EOF.
                 notify::EventKind::Access(notify::event::AccessKind::Close(
                     notify::event::AccessMode::Write,
                 )) => {
@@ -1071,17 +1113,14 @@ impl GuiApp {
                             self.failed_images.remove(path);
                             self.retry_after.remove(path);
                             self.raw_loading.remove(path);
-
                             eprintln!("[DEBUG-NOTIFY] CloseWrite — loading image: {:?}", path);
                             self.enqueue_image_load(path);
-
                             if let Some(name) = path.file_name() {
                                 self.fs_mod_files.insert(name.to_string_lossy().to_string());
                             }
                         } else {
                             self.clear_failed_under(path);
                             self.retry_after.retain(|p, _| !p.starts_with(path));
-
                             if let Some(name) = path.file_name() {
                                 self.fs_mod_dirs.insert(name.to_string_lossy().to_string());
                             }
@@ -1092,24 +1131,18 @@ impl GuiApp {
                 notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
                     for path in &event.paths {
                         if classify(path) {
-                            // Invalidate cache so perform_preload re-fetches the image.
-                            // Do NOT enqueue a load here — the file may still be
-                            // incomplete (0-byte / partially written).  The actual
-                            // reload is triggered by Access(Close(Write)) above.
+                            // Invalidate cache — do NOT load here, file may be incomplete.
+                            // Actual reload triggered by Access(Close(Write)) above.
                             self.raw_cache.remove(path);
                             self.cached_histogram.remove(path);
-
-                            // Clear permanent failure so CloseWrite can retry
                             self.failed_images.remove(path);
                             self.retry_after.remove(path);
-
                             if let Some(name) = path.file_name() {
                                 self.fs_mod_files.insert(name.to_string_lossy().to_string());
                             }
                         } else {
                             self.clear_failed_under(path);
                             self.retry_after.retain(|p, _| !p.starts_with(path));
-
                             if let Some(name) = path.file_name() {
                                 self.fs_mod_dirs.insert(name.to_string_lossy().to_string());
                             }
@@ -1261,7 +1294,7 @@ impl GuiApp {
 
         // 4. Process Final Result
         if let Some(rx) = &self.scan_rx
-            && let Ok((mut new_groups, new_infos, new_subdirs)) = rx.try_recv()
+            && let Ok((mut new_groups, mut new_infos, new_subdirs)) = rx.try_recv()
         {
             eprintln!(
                 "[DEBUG-RELOAD] Replacing groups! Old groups count: {}, New groups count: {}",
@@ -1310,6 +1343,26 @@ impl GuiApp {
                         file.path.file_name().unwrap_or_default(),
                         file.orientation
                     );
+                }
+            }
+
+            // Filter out files on the ignored list (duplicate finder mode)
+            self.filter_ignored_groups(&mut new_groups, &mut new_infos);
+
+            // Register all duplicate groups in the ignored database (ignored=false).
+            // This generates UUIDs visible in tooltips and context menus.
+            if !self.state.view_mode {
+                let group_data: Vec<Vec<([u8; 32], Option<[u8; 32]>)>> = new_groups
+                    .iter()
+                    .map(|g| {
+                        g.iter()
+                            .filter(|f| f.content_hash != [0u8; 32])
+                            .map(|f| (f.content_hash, f.pdqhash))
+                            .collect()
+                    })
+                    .collect();
+                if let Err(e) = self.ctx.register_duplicate_groups(&group_data) {
+                    eprintln!("[ERROR-IGNORE] Failed to register groups: {:?}", e);
                 }
             }
 
@@ -1827,11 +1880,6 @@ impl eframe::App for GuiApp {
                         }
 
                         ImageLoadResult::Failed(err_msg) => {
-                            // Transient errors (incomplete file, premature EOF, zero
-                            // bytes) happen when we race a file still being written.
-                            // Schedule a retry instead of giving up permanently —
-                            // the CloseWrite event or the next preload pass will
-                            // re-enqueue the load after the delay expires.
                             let lower = err_msg.to_lowercase();
                             let is_transient = lower.contains("premature")
                                 || lower.contains("eof")
@@ -1839,10 +1887,9 @@ impl eframe::App for GuiApp {
                                 || lower.contains("0 bytes")
                                 || lower.contains("empty")
                                 || lower.contains("truncated");
-
                             if is_transient {
                                 eprintln!(
-                                    "[DEBUG-RETRY] transient failure for {:?}: {} — will retry",
+                                    "[DEBUG-RETRY] transient failure for {:?}: {}",
                                     path, err_msg
                                 );
                                 self.retry_after.insert(
@@ -1850,7 +1897,6 @@ impl eframe::App for GuiApp {
                                     Instant::now() + Duration::from_millis(500),
                                 );
                             } else {
-                                // Genuinely unsupported / corrupt — mark permanently failed
                                 self.failed_images.insert(path.clone(), err_msg);
                             }
                         }
@@ -2035,6 +2081,7 @@ impl eframe::App for GuiApp {
                 self.last_preload_pos = None;
             } else {
                 // Duplicate mode: trigger full rescan
+                self.state.marked_for_deletion.clear();
                 self.state.is_loading = true;
             }
         }
@@ -2554,6 +2601,7 @@ impl eframe::App for GuiApp {
                     let mut action_rename = false;
                     let mut action_delete = false;
                     let mut copy_path_target: Option<String> = None;
+                    let mut copy_extended_target: Option<String> = None;
 
                     // --- 6. RENDER LOOP ---
                     // Base absolute Y for the file list
@@ -2875,6 +2923,22 @@ impl eframe::App for GuiApp {
                                             .unwrap_or_else(|| "None".to_string())
                                     ));
 
+                                    // Keyed blake3 and group UUID
+                                    if file.content_hash != [0u8; 32] {
+                                        ui.label(format!(
+                                            "blake3: {}",
+                                            hex::encode(file.content_hash)
+                                        ));
+                                        if let Some(uuid) =
+                                            self.ctx.get_group_uuid(&file.content_hash)
+                                        {
+                                            ui.label(format!(
+                                                "group_uuid: {}",
+                                                crate::db::AppContext::format_uuid(&uuid)
+                                            ));
+                                        }
+                                    }
+
                                     // Calculate and display distance to location selected in GPS map
                                     if let Some((loc_name, loc_point)) =
                                         self.gps_map.selected_location.as_ref()
@@ -2896,12 +2960,15 @@ impl eframe::App for GuiApp {
                                 });
 
                                 // Context Menu (Shared)
+                                let ctx_arc = self.ctx.clone();
                                 let context_menu_logic =
                                     |ui: &mut egui::Ui,
                                      action_rename: &mut bool,
                                      action_delete: &mut bool,
                                      copy_target: &mut Option<String>,
-                                     path: &std::path::Path| {
+                                     copy_extended: &mut Option<String>,
+                                     path: &std::path::Path,
+                                     content_hash: &[u8; 32]| {
                                         if ui.button("Rename (R)").clicked() {
                                             ui.close();
                                             *action_rename = true;
@@ -2909,6 +2976,22 @@ impl eframe::App for GuiApp {
                                         if ui.button("Copy full path").clicked() {
                                             ui.close();
                                             *copy_target = Some(path.to_string_lossy().to_string());
+                                        }
+                                        if *content_hash != [0u8; 32] {
+                                            if ui.button("Copy path + UUID + b3sum").clicked() {
+                                                ui.close();
+                                                let b3 = hex::encode(content_hash);
+                                                let uuid_str = ctx_arc
+                                                    .get_group_uuid(content_hash)
+                                                    .map(|u| crate::db::AppContext::format_uuid(&u))
+                                                    .unwrap_or_else(|| "unknown".to_string());
+                                                *copy_extended = Some(format!(
+                                                    "{}\nuuid: {}\nblake3: {}",
+                                                    path.display(),
+                                                    uuid_str,
+                                                    b3
+                                                ));
+                                            }
                                         }
                                         if ui.button("Delete (Del)").clicked() {
                                             ui.close();
@@ -2923,7 +3006,9 @@ impl eframe::App for GuiApp {
                                         &mut action_rename,
                                         &mut action_delete,
                                         &mut copy_path_target,
+                                        &mut copy_extended_target,
                                         &file.path,
+                                        &file.content_hash,
                                     )
                                 });
                                 meta_resp.context_menu(|ui| {
@@ -2932,7 +3017,9 @@ impl eframe::App for GuiApp {
                                         &mut action_rename,
                                         &mut action_delete,
                                         &mut copy_path_target,
+                                        &mut copy_extended_target,
                                         &file.path,
+                                        &file.content_hash,
                                     )
                                 });
 
@@ -3047,7 +3134,9 @@ impl eframe::App for GuiApp {
                     }
 
                     // Execute Context Menu Actions (Outside Loop)
-                    if let Some(path) = copy_path_target {
+                    if let Some(text) = copy_extended_target {
+                        ctx.copy_text(text);
+                    } else if let Some(path) = copy_path_target {
                         ctx.copy_text(path);
                     }
                     if action_rename {

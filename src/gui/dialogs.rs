@@ -345,6 +345,21 @@ pub(super) fn handle_input(
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
             *intent.borrow_mut() = Some(InputIntent::DeleteImmediate);
         }
+        // Q key: Ignore files (duplicate mode only)
+        // Plain Q: ignore marked files (or current file if none marked)
+        // Ctrl+Q: ignore all files in current group (with confirmation)
+        if ctx.input(|i| i.key_pressed(egui::Key::Q))
+            && !app.state.view_mode
+            && !app.state.is_any_dialog_open()
+            && !app.show_move_input
+            && !app.show_dir_picker
+        {
+            if ctx.input(|i| i.modifiers.ctrl) {
+                *intent.borrow_mut() = Some(InputIntent::IgnoreGroup);
+            } else {
+                *intent.borrow_mut() = Some(InputIntent::IgnoreCurrent);
+            }
+        }
         // Intercept MoveMarked intent or Key::M
         if ctx.input(|i| i.key_pressed(egui::Key::M)) {
             // Check if there is anything to move at all.
@@ -636,6 +651,102 @@ pub(super) fn handle_dialogs(
                     }
                 }
             }
+            InputIntent::IgnoreCurrent => {
+                // Q key in duplicate finder mode:
+                // If files are marked → ignore all marked files
+                // If nothing marked → ignore just the current file
+                //
+                // Groups are pre-registered with UUIDs on scan completion,
+                // so we just flip the `ignored` flag to true.
+                if !app.state.view_mode {
+                    let has_marked = !app.state.marked_for_deletion.is_empty();
+
+                    // Collect content_hashes to ignore
+                    let mut hashes_to_ignore: Vec<[u8; 32]> = Vec::new();
+
+                    if has_marked {
+                        let marked_set: std::collections::HashSet<_> =
+                            app.state.marked_for_deletion.iter().cloned().collect();
+                        for group in &app.state.groups {
+                            for f in group {
+                                if marked_set.contains(&f.path) && f.content_hash != [0u8; 32] {
+                                    hashes_to_ignore.push(f.content_hash);
+                                }
+                            }
+                        }
+                    } else if let Some(group) = app.state.groups.get(app.state.current_group_idx)
+                        && let Some(file) = group.get(app.state.current_file_idx)
+                        && file.content_hash != [0u8; 32]
+                    {
+                        hashes_to_ignore.push(file.content_hash);
+                    }
+
+                    if hashes_to_ignore.is_empty() {
+                        app.set_status(
+                            "Cannot ignore: no files with content hash".to_string(),
+                            true,
+                        );
+                    } else {
+                        match app.ctx.set_files_ignored(&hashes_to_ignore) {
+                            Ok(count) => {
+                                for ch in &hashes_to_ignore {
+                                    let uuid_str = app
+                                        .ctx
+                                        .get_group_uuid(ch)
+                                        .map(|u| crate::db::AppContext::format_uuid(&u))
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    eprintln!(
+                                        "[DEBUG-IGNORE] Set ignored=true: blake3={} uuid={}",
+                                        hex::encode(ch),
+                                        uuid_str,
+                                    );
+                                }
+
+                                // Remove ignored files from groups
+                                let ignored_set: std::collections::HashSet<[u8; 32]> =
+                                    hashes_to_ignore.iter().cloned().collect();
+                                for group in app.state.groups.iter_mut() {
+                                    group.retain(|f| !ignored_set.contains(&f.content_hash));
+                                }
+                                // Remove groups with < 2 members
+                                let mut gi = 0;
+                                while gi < app.state.groups.len() {
+                                    if app.state.groups[gi].len() < 2 {
+                                        app.state.groups.remove(gi);
+                                        if gi < app.state.group_infos.len() {
+                                            app.state.group_infos.remove(gi);
+                                        }
+                                    } else {
+                                        gi += 1;
+                                    }
+                                }
+                                // Clamp indices
+                                if app.state.groups.is_empty() {
+                                    app.state.current_group_idx = 0;
+                                    app.state.current_file_idx = 0;
+                                } else {
+                                    if app.state.current_group_idx >= app.state.groups.len() {
+                                        app.state.current_group_idx = app.state.groups.len() - 1;
+                                    }
+                                    let glen = app.state.groups[app.state.current_group_idx].len();
+                                    if app.state.current_file_idx >= glen {
+                                        app.state.current_file_idx = glen.saturating_sub(1);
+                                    }
+                                }
+                                app.state.marked_for_deletion.clear();
+                                app.state.selection_changed = true;
+                                app.cache_dirty = true;
+                                app.state.last_file_count =
+                                    app.state.groups.iter().map(|g| g.len()).sum();
+                                app.set_status(format!("Ignored {} files", count), false);
+                            }
+                            Err(e) => {
+                                app.set_status(format!("Ignore failed: {}", e), true);
+                            }
+                        }
+                    }
+                }
+            }
             _ => app.state.handle_input(i),
         }
     }
@@ -686,6 +797,28 @@ pub(super) fn handle_dialogs(
             }
             if ui.button("No (n)").clicked() {
                 app.state.handle_input(InputIntent::Cancel);
+            }
+        });
+    }
+
+    // Ignore Group Confirmation Dialog (Ctrl+Q in duplicate mode)
+    if app.state.show_ignore_group_confirmation {
+        let group_len =
+            app.state.groups.get(app.state.current_group_idx).map(|g| g.len()).unwrap_or(0);
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
+            perform_ignore_group(app);
+        } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
+            app.state.show_ignore_group_confirmation = false;
+        }
+        egui::Window::new("Confirm Ignore Group").collapsible(false).show(ctx, |ui| {
+            ui.label(format!("Ignore {} files? (y/n)", group_len));
+            ui.small("All files in this group will be added to the ignore list.");
+            if ui.button("Yes (y)").clicked() {
+                perform_ignore_group(app);
+            }
+            if ui.button("No (n)").clicked() {
+                app.state.show_ignore_group_confirmation = false;
             }
         });
     }
@@ -1359,6 +1492,74 @@ pub(super) fn handle_dialogs(
                 app.state.handle_input(InputIntent::Cancel);
             }
         });
+    }
+}
+
+/// Ignore all files in the current group (Ctrl+Q confirmation).
+/// Sets ignored=true for all files in the group, then removes the group from display.
+fn perform_ignore_group(app: &mut GuiApp) {
+    app.state.show_ignore_group_confirmation = false;
+
+    let g_idx = app.state.current_group_idx;
+    let group = match app.state.groups.get(g_idx) {
+        Some(g) => g,
+        None => return,
+    };
+
+    let hashes: Vec<[u8; 32]> =
+        group.iter().filter(|f| f.content_hash != [0u8; 32]).map(|f| f.content_hash).collect();
+
+    if hashes.is_empty() {
+        app.set_status("Cannot ignore: no files with content hash in group".to_string(), true);
+        return;
+    }
+
+    // Collect display info and paths before mutation
+    let file_info: Vec<(String, [u8; 32])> = group
+        .iter()
+        .filter(|f| f.content_hash != [0u8; 32])
+        .map(|f| (f.path.display().to_string(), f.content_hash))
+        .collect();
+    let group_paths: std::collections::HashSet<_> = group.iter().map(|f| f.path.clone()).collect();
+
+    match app.ctx.set_files_ignored(&hashes) {
+        Ok(count) => {
+            let uuid_str = app
+                .ctx
+                .get_group_uuid(&hashes[0])
+                .map(|u| crate::db::AppContext::format_uuid(&u))
+                .unwrap_or_else(|| "unknown".to_string());
+            eprintln!(
+                "[DEBUG-IGNORE] Ignored group {}: {} files (uuid={})",
+                g_idx, count, uuid_str,
+            );
+            for (path_display, ch) in &file_info {
+                eprintln!("[DEBUG-IGNORE]   {} blake3={}", path_display, hex::encode(ch),);
+            }
+
+            // Clear marks belonging to this group
+            app.state.marked_for_deletion.retain(|p| !group_paths.contains(p));
+
+            // Remove the group from display
+            app.state.groups.remove(g_idx);
+            app.state.group_infos.remove(g_idx);
+            if app.state.groups.is_empty() {
+                app.state.current_group_idx = 0;
+                app.state.current_file_idx = 0;
+            } else {
+                if app.state.current_group_idx >= app.state.groups.len() {
+                    app.state.current_group_idx = app.state.groups.len() - 1;
+                }
+                app.state.current_file_idx = 0;
+            }
+            app.state.selection_changed = true;
+            app.cache_dirty = true;
+            app.state.last_file_count = app.state.groups.iter().map(|g| g.len()).sum();
+            app.set_status(format!("Ignored {} files (group uuid: {})", count, uuid_str), false);
+        }
+        Err(e) => {
+            app.set_status(format!("Ignore group failed: {}", e), true);
+        }
     }
 }
 
