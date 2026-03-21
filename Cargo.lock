@@ -2576,9 +2576,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07d8a5e080cc7429956acf933caf1ef8d4880ae70cbb26eeaec3ae228c7c5f61"
 dependencies = [
  "fearless_simd",
- "image",
  "log",
- "moxcms 0.7.11",
+]
+
+[[package]]
+name = "hayro-jpeg2000"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1a74cfc18c0093ef8009a0d6c1ba3024df0cce228503a14c1372e1e23eed43e"
+dependencies = [
+ "fearless_simd",
+ "image",
+ "moxcms 0.8.1",
 ]
 
 [[package]]
@@ -2590,7 +2599,7 @@ dependencies = [
  "flate2",
  "hayro-ccitt",
  "hayro-jbig2",
- "hayro-jpeg2000",
+ "hayro-jpeg2000 0.2.0",
  "log",
  "rustc-hash 2.1.1",
  "smallvec",
@@ -3852,7 +3861,7 @@ version = "1.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0aeb26bf5e836cc1c341c8106051b573f1766dfa05aa87f0b98be5e51b02303"
 dependencies = [
- "nix",
+ "nix 0.29.0",
  "winapi",
 ]
 
@@ -4123,6 +4132,18 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d6d0705320c1e6ba1d912b5e37cf18071b6c2e9b7fa8215a1e8a7651966f5d3"
+dependencies = [
+ "bitflags 2.11.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -5863,7 +5884,7 @@ dependencies = [
  "geo",
  "getrandom 0.4.2",
  "hayro",
- "hayro-jpeg2000",
+ "hayro-jpeg2000 0.3.4",
  "hayro-syntax",
  "hex",
  "image",
@@ -5877,7 +5898,7 @@ dependencies = [
  "libheif-rs",
  "lmdb-rkv",
  "natord",
- "nix",
+ "nix 0.31.2",
  "notify",
  "oklab",
  "once_cell",
@@ -6662,7 +6683,7 @@ dependencies = [
  "libc",
  "log",
  "memmem",
- "nix",
+ "nix 0.29.0",
  "num-derive",
  "num-traits",
  "ordered-float 4.6.0",
