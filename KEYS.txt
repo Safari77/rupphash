@@ -62,6 +62,12 @@ VIEW MODE SPECIFIC (View Mode, --view)
 C                    : Open Directory Picker to change folders
 . (Period)           : Go up one directory level
 
+DUPLICATE MODE SPECIFIC (--use-gui)
+------------------------------------------------------------------------------
+Q                    : Adds selected/marked images into persistent ignore DB, these
+                       images are not shown in the Group list. See also --show-ignored --unignore
+Ctrl-Q               : Same as Q but for the whole Group.
+
 SYSTEM
 ------------------------------------------------------------------------------
 Esc                  : Cancel current action / Close dialogs / Quit app
