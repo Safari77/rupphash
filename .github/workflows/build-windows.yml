@@ -125,6 +125,7 @@ jobs:
             Write-Error "Could not find dav1d.pc in static path!"
             exit 1
         }
+        cargo check --locked
         cargo build --release --verbose --features staticbuild --target x86_64-pc-windows-msvc --bin phdupes
 
     - name: Stage Artifacts
@@ -143,5 +144,5 @@ jobs:
       with:
         tag_name: v${{ env.VERSION }}
         files: staging/*
-        draft: false
+        draft: true
         prerelease: false

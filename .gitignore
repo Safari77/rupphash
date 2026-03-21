@@ -2,4 +2,5 @@
 .*.sw?
 /target/
 /src/target/
+/assets/
 tags
