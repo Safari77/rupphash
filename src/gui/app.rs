@@ -1058,21 +1058,49 @@ impl GuiApp {
                     continue;
                 }
 
+                // File finished being written (inotify CLOSE_WRITE).
+                // This is the safe moment to load the image — the writer has
+                // closed the file descriptor, so we won't hit Premature EOF.
+                notify::EventKind::Access(notify::event::AccessKind::Close(
+                    notify::event::AccessMode::Write,
+                )) => {
+                    for path in &event.paths {
+                        if classify(path) {
+                            self.raw_cache.remove(path);
+                            self.cached_histogram.remove(path);
+                            self.failed_images.remove(path);
+                            self.retry_after.remove(path);
+                            self.raw_loading.remove(path);
+
+                            eprintln!("[DEBUG-NOTIFY] CloseWrite — loading image: {:?}", path);
+                            self.enqueue_image_load(path);
+
+                            if let Some(name) = path.file_name() {
+                                self.fs_mod_files.insert(name.to_string_lossy().to_string());
+                            }
+                        } else {
+                            self.clear_failed_under(path);
+                            self.retry_after.retain(|p, _| !p.starts_with(path));
+
+                            if let Some(name) = path.file_name() {
+                                self.fs_mod_dirs.insert(name.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+
                 notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
                     for path in &event.paths {
                         if classify(path) {
-                            // Invalidate cache so perform_preload re-fetches the image
+                            // Invalidate cache so perform_preload re-fetches the image.
+                            // Do NOT enqueue a load here — the file may still be
+                            // incomplete (0-byte / partially written).  The actual
+                            // reload is triggered by Access(Close(Write)) above.
                             self.raw_cache.remove(path);
                             self.cached_histogram.remove(path);
 
-                            if self.failed_images.remove(path).is_some() {
-                                eprintln!(
-                                    "[DEBUG-NOTIFY] cleared failed_image due to modify/create: {:?}",
-                                    path
-                                );
-                                self.enqueue_image_load(path);
-                            }
-
+                            // Clear permanent failure so CloseWrite can retry
+                            self.failed_images.remove(path);
                             self.retry_after.remove(path);
 
                             if let Some(name) = path.file_name() {
@@ -1799,8 +1827,32 @@ impl eframe::App for GuiApp {
                         }
 
                         ImageLoadResult::Failed(err_msg) => {
-                            // Mark permanently failed with error message
-                            self.failed_images.insert(path.clone(), err_msg);
+                            // Transient errors (incomplete file, premature EOF, zero
+                            // bytes) happen when we race a file still being written.
+                            // Schedule a retry instead of giving up permanently —
+                            // the CloseWrite event or the next preload pass will
+                            // re-enqueue the load after the delay expires.
+                            let lower = err_msg.to_lowercase();
+                            let is_transient = lower.contains("premature")
+                                || lower.contains("eof")
+                                || lower.contains("unexpected end")
+                                || lower.contains("0 bytes")
+                                || lower.contains("empty")
+                                || lower.contains("truncated");
+
+                            if is_transient {
+                                eprintln!(
+                                    "[DEBUG-RETRY] transient failure for {:?}: {} — will retry",
+                                    path, err_msg
+                                );
+                                self.retry_after.insert(
+                                    path.clone(),
+                                    Instant::now() + Duration::from_millis(500),
+                                );
+                            } else {
+                                // Genuinely unsupported / corrupt — mark permanently failed
+                                self.failed_images.insert(path.clone(), err_msg);
+                            }
                         }
                     }
 
