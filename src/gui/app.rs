@@ -918,6 +918,14 @@ impl GuiApp {
         }
 
         if rescan_fs {
+            // Save current selection so we can restore it after rebuilding the list
+            let prev_path = self
+                .state
+                .groups
+                .first()
+                .and_then(|g| g.get(self.state.current_file_idx))
+                .map(|f| f.path.clone());
+
             // Snapshot existing metadata by inode to preserve resolution/hashes across refreshes
             let existing: HashMap<u128, FileMetadata> = if !self.state.groups.is_empty() {
                 self.state.groups[0].iter().map(|f| (f.unique_file_id, f.clone())).collect()
@@ -1002,6 +1010,26 @@ impl GuiApp {
                 self.state.groups = vec![new_files];
                 self.state.group_infos = vec![GroupInfo { max_dist: 0, status: GroupStatus::None }];
                 self.state.last_file_count = self.state.groups.first().map_or(0, |g| g.len());
+
+                // File list changed — force layout cache + scroll area rebuild
+                self.cache_dirty = true;
+
+                // Restore selection: find the previously-viewed file in the new sorted list
+                let group_len = self.state.groups.first().map_or(0, |g| g.len());
+                if let Some(ref prev) = prev_path {
+                    if let Some(new_idx) = self.state.groups[0].iter().position(|f| f.path == *prev)
+                    {
+                        self.state.current_file_idx = new_idx;
+                    } else {
+                        // File was removed — clamp index to stay in bounds
+                        if self.state.current_file_idx >= group_len {
+                            self.state.current_file_idx = group_len.saturating_sub(1);
+                        }
+                    }
+                } else if self.state.current_file_idx >= group_len {
+                    self.state.current_file_idx = group_len.saturating_sub(1);
+                }
+                self.state.selection_changed = true;
             }
         }
 
