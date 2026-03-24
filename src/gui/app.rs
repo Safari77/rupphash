@@ -660,12 +660,11 @@ impl GuiApp {
     fn ingest_gps_markers(&mut self, files: &[FileMetadata]) {
         let mut _added_any = false;
         for file in files {
-            if let Some(pos) = file.gps_pos {
-                if self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x(), file.exif_timestamp)
+            if let Some(pos) = file.gps_pos
+                && self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x(), file.exif_timestamp)
                 {
                     _added_any = true;
                 }
-            }
         }
     }
 
@@ -3061,8 +3060,8 @@ impl eframe::App for GuiApp {
                                             ui.close();
                                             *copy_target = Some(path.to_string_lossy().to_string());
                                         }
-                                        if *content_hash != [0u8; 32] {
-                                            if ui.button("Copy path + UUID + b3sum").clicked() {
+                                        if *content_hash != [0u8; 32]
+                                            && ui.button("Copy path + UUID + b3sum").clicked() {
                                                 ui.close();
                                                 let b3 = hex::encode(content_hash);
                                                 let uuid_str = ctx_arc
@@ -3076,7 +3075,6 @@ impl eframe::App for GuiApp {
                                                     b3
                                                 ));
                                             }
-                                        }
                                         if ui.button("Delete (Del)").clicked() {
                                             ui.close();
                                             *action_delete = true;

@@ -107,8 +107,8 @@ pub(super) fn spawn_image_loader_pool(
                 let is_webp = ext_lower == "webp";
                 let is_gif = ext_lower == "gif";
 
-                if is_webp || is_gif {
-                    if let Ok(bytes) = std::fs::read(&path) {
+                if (is_webp || is_gif)
+                    && let Ok(bytes) = std::fs::read(&path) {
                         let animated_result = if is_webp && is_animated_webp(&bytes) {
                             Some(decode_animated_webp_frames(&path, &bytes))
                         } else if is_gif && is_animated_gif(&bytes) {
@@ -147,7 +147,6 @@ pub(super) fn spawn_image_loader_pool(
                             continue;
                         }
                     }
-                }
 
                 let result =
                     match load_and_process_image_with_hash(&path, use_thumbnails, &content_key) {

@@ -1148,17 +1148,15 @@ impl AppContext {
         pdqhashes: &[Option<[u8; 32]>],
     ) -> Option<[u8; 16]> {
         for pdqhash_opt in pdqhashes {
-            if let Some(pdqhash) = pdqhash_opt {
-                if let Ok(encrypted) = txn.get(self.ignored_pdqmap_db, pdqhash) {
-                    if let Some(decrypted) = self.decrypt_value(pdqhash, encrypted)
+            if let Some(pdqhash) = pdqhash_opt
+                && let Ok(encrypted) = txn.get(self.ignored_pdqmap_db, pdqhash)
+                    && let Some(decrypted) = self.decrypt_value(pdqhash, encrypted)
                         && decrypted.len() == 16
                     {
                         let mut uuid = [0u8; 16];
                         uuid.copy_from_slice(&decrypted);
                         return Some(uuid);
                     }
-                }
-            }
         }
         None
     }
@@ -1171,11 +1169,9 @@ impl AppContext {
         pdqhashes: &[Option<[u8; 32]>],
         uuid: &[u8; 16],
     ) -> Result<(), lmdb::Error> {
-        for pdqhash_opt in pdqhashes {
-            if let Some(pdqhash) = pdqhash_opt {
-                let encrypted = Self::encrypt_value(cipher, pdqhash, uuid);
-                txn.put(pdqmap_db, pdqhash, &encrypted, WriteFlags::empty())?;
-            }
+        for pdqhash in pdqhashes.iter().flatten() {
+            let encrypted = Self::encrypt_value(cipher, pdqhash, uuid);
+            txn.put(pdqmap_db, pdqhash, &encrypted, WriteFlags::empty())?;
         }
         Ok(())
     }
@@ -1215,14 +1211,13 @@ impl AppContext {
 
             for (content_hash, pdqhash) in group {
                 // Don't overwrite entries that are already ignored=true
-                if let Ok(existing) = txn.get(self.ignored_db, content_hash) {
-                    if let Some(decrypted) = self.decrypt_value(content_hash, existing)
+                if let Ok(existing) = txn.get(self.ignored_db, content_hash)
+                    && let Some(decrypted) = self.decrypt_value(content_hash, existing)
                         && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
                         && entry.ignored
                     {
                         continue;
                     }
-                }
 
                 let entry = IgnoredEntry {
                     pdqhash: *pdqhash,
@@ -1266,15 +1261,13 @@ impl AppContext {
             if let Ok(encrypted) = txn.get(self.ignored_db, ch) {
                 if let Some(decrypted) = self.decrypt_value(ch, encrypted)
                     && let Ok(mut entry) = IgnoredEntry::from_bytes(&decrypted)
-                {
-                    if !entry.ignored {
+                    && !entry.ignored {
                         entry.ignored = true;
                         let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
                         let new_encrypted = Self::encrypt_value(&self.cipher, ch, &bytes);
                         txn.put(self.ignored_db, ch, &new_encrypted, WriteFlags::empty())?;
                         count += 1;
                     }
-                }
             } else {
                 eprintln!(
                     "[WARN-IGNORE] set_files_ignored: no entry for blake3={}, skipping",

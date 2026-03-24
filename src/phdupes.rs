@@ -604,7 +604,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for (ch, entry) in group_entries {
                             let pdq_str = entry
                                 .pdqhash
-                                .map(|h| hex::encode(h))
+                                .map(hex::encode)
                                 .unwrap_or_else(|| "none".to_string());
                             let ts_str =
                                 chrono::DateTime::<Utc>::from_timestamp(entry.timestamp as i64, 0)
@@ -623,7 +623,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for (ch, entry) in &no_group {
                         let pdq_str = entry
                             .pdqhash
-                            .map(|h| hex::encode(h))
+                            .map(hex::encode)
                             .unwrap_or_else(|| "none".to_string());
                         let ts_str =
                             chrono::DateTime::<Utc>::from_timestamp(entry.timestamp as i64, 0)
@@ -672,9 +672,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Try 2: Parse as hex PDQ hash (64 hex chars = 32 bytes, but not a file path)
-            if value.len() == 64 && !std::path::Path::new(value).exists() {
-                if let Ok(bytes) = hex::decode(value) {
-                    if let Ok(pdqhash) = <[u8; 32]>::try_from(bytes.as_slice()) {
+            if value.len() == 64 && !std::path::Path::new(value).exists()
+                && let Ok(bytes) = hex::decode(value)
+                    && let Ok(pdqhash) = <[u8; 32]>::try_from(bytes.as_slice()) {
                         eprintln!("[DEBUG-UNIGNORE] Parsed as PDQ hash: {}", hex::encode(pdqhash));
                         match ctx.remove_ignored_by_pdqhash(&pdqhash) {
                             Ok(count) => {
@@ -691,8 +691,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     }
-                }
-            }
 
             // Try 3: Treat as filename — compute keyed blake3 and look up
             let file_path = std::path::Path::new(value);
