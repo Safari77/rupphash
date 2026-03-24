@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use super::app::GuiApp;
 use crate::exif_types::{
@@ -46,7 +47,23 @@ pub enum ImageLoadResult {
         Option<i64>,
         Option<([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>)>,
     ), // image, resolution, orientation, content_hash, exif_timestamp, histogram+palette
+    AnimatedLoaded {
+        frames: Vec<egui::ColorImage>,
+        durations: Vec<Duration>,
+        resolution: (u32, u32),
+        orientation: u8,
+        content_hash: [u8; 32],
+        exif_timestamp: Option<i64>,
+    },
     Failed(String), // Failure with error message
+}
+
+/// Playback state for an animated image (e.g. animated WebP)
+pub struct AnimationState {
+    pub frames: Vec<egui::TextureHandle>,
+    pub frame_durations: Vec<Duration>,
+    pub current_frame: usize,
+    pub last_frame_time: Instant,
 }
 
 impl Default for GroupViewState {
@@ -80,6 +97,58 @@ pub(super) fn spawn_image_loader_pool(
                 // Load & Process (Resize + Orientation)
                 // Note: We removed the "active window" check here because it caused race conditions
                 // where images would fail to load. The cache eviction handles cleanup instead.
+
+                // Check for animated WebP/GIF before standard loading
+                let ext_lower = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .unwrap_or_default();
+                let is_webp = ext_lower == "webp";
+                let is_gif = ext_lower == "gif";
+
+                if is_webp || is_gif {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        let animated_result = if is_webp && is_animated_webp(&bytes) {
+                            Some(decode_animated_webp_frames(&path, &bytes))
+                        } else if is_gif && is_animated_gif(&bytes) {
+                            Some(decode_animated_gif_frames(&path, &bytes))
+                        } else {
+                            None
+                        };
+
+                        if let Some(decode_result) = animated_result {
+                            let result = match decode_result {
+                                Ok((frames, durations, dims, orientation)) => {
+                                    // Compute content_hash
+                                    let content_hash = {
+                                        let mut hasher = blake3::Hasher::new_keyed(&content_key);
+                                        hasher.update(&bytes);
+                                        *hasher.finalize().as_bytes()
+                                    };
+                                    let exif_timestamp =
+                                        crate::exif_extract::read_exif_data(&path, Some(&bytes))
+                                            .and_then(|exif| {
+                                                crate::exif_extract::get_exif_timestamp(&exif)
+                                            });
+
+                                    ImageLoadResult::AnimatedLoaded {
+                                        frames,
+                                        durations,
+                                        resolution: dims,
+                                        orientation,
+                                        content_hash,
+                                        exif_timestamp,
+                                    }
+                                }
+                                Err(e) => ImageLoadResult::Failed(e),
+                            };
+                            let _ = tx_clone.send((path, result));
+                            continue;
+                        }
+                    }
+                }
+
                 let result =
                     match load_and_process_image_with_hash(&path, use_thumbnails, &content_key) {
                         Ok((img, dims, orientation, content_hash, exif_timestamp)) => {
@@ -287,6 +356,184 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<egui::Color
     );
 
     Some(egui::ColorImage::from_rgb([width as usize, height as usize], rgb.as_raw()))
+}
+
+/// Check if a WebP file contains animation by looking for the ANIM chunk in RIFF header
+fn is_animated_webp(bytes: &[u8]) -> bool {
+    // WebP files start with RIFF....WEBP
+    if bytes.len() < 21 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return false;
+    }
+    // VP8X extended header at offset 12, flags byte at offset 20
+    // Bit 1 (0x02) of flags indicates animation
+    if &bytes[12..16] == b"VP8X" && bytes.len() > 20 {
+        return bytes[20] & 0x02 != 0;
+    }
+    false
+}
+
+/// Check if a GIF file contains multiple frames (animation).
+/// Scans for more than one Image Descriptor block (0x2C) past the header.
+fn is_animated_gif(bytes: &[u8]) -> bool {
+    // GIF87a / GIF89a header is 6 bytes
+    if bytes.len() < 10 || (&bytes[0..4] != b"GIF8") {
+        return false;
+    }
+    // Count 0x2C (Image Descriptor) introducers; > 1 means animated
+    let mut count = 0u32;
+    let mut i = 6; // skip past header
+    while i < bytes.len() {
+        if bytes[i] == 0x2C {
+            count += 1;
+            if count > 1 {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Convert a slice of `image::Frame`s into egui ColorImages and durations,
+/// resizing any frame that exceeds MAX_TEXTURE_SIDE.
+fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImage>, Vec<Duration>) {
+    let mut frames = Vec::with_capacity(raw_frames.len());
+    let mut durations = Vec::with_capacity(raw_frames.len());
+
+    for frame in raw_frames {
+        let delay = frame.delay();
+        let (numer, denom) = delay.numer_denom_ms();
+        let ms = if denom == 0 { 100 } else { numer / denom };
+        // Clamp very short durations (some encoders use 0 or 10ms meaning ~100ms)
+        let ms = if ms < 20 { 100 } else { ms };
+        durations.push(Duration::from_millis(ms as u64));
+
+        let rgba = frame.buffer();
+        let w = rgba.width() as usize;
+        let h = rgba.height() as usize;
+        let pixels: Vec<egui::Color32> = rgba
+            .as_raw()
+            .chunks_exact(4)
+            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+            .collect();
+
+        let mut color_image =
+            egui::ColorImage { size: [w, h], pixels, source_size: egui::vec2(w as f32, h as f32) };
+
+        // Resize individual frames if they exceed texture limits
+        if w > MAX_TEXTURE_SIDE || h > MAX_TEXTURE_SIDE {
+            let scale = (MAX_TEXTURE_SIDE as f32) / (w.max(h) as f32);
+            let new_w = (w as f32 * scale).round() as usize;
+            let new_h = (h as f32 * scale).round() as usize;
+
+            let pixel_type = fast_image_resize::PixelType::U8x4;
+            if let Ok(src_image) = fast_image_resize::images::Image::from_vec_u8(
+                w as u32,
+                h as u32,
+                color_image.as_raw().to_vec(),
+                pixel_type,
+            ) {
+                let mut dst_image =
+                    fast_image_resize::images::Image::new(new_w as u32, new_h as u32, pixel_type);
+                let mut resizer = fast_image_resize::Resizer::new();
+                if resizer
+                    .resize(
+                        &src_image,
+                        &mut dst_image,
+                        &fast_image_resize::ResizeOptions::default(),
+                    )
+                    .is_ok()
+                {
+                    color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [new_w, new_h],
+                        dst_image.buffer(),
+                    );
+                }
+            }
+        }
+
+        frames.push(color_image);
+    }
+
+    (frames, durations)
+}
+
+/// Decode all frames from an animated WebP file using the image crate's decoder
+fn decode_animated_webp_frames(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(Vec<egui::ColorImage>, Vec<Duration>, (u32, u32), u8), String> {
+    use image::AnimationDecoder;
+    use image::ImageDecoder;
+    use image::codecs::webp::WebPDecoder;
+
+    let orientation = crate::exif_extract::get_orientation(path, Some(bytes));
+
+    let decoder = WebPDecoder::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("Failed to create WebP decoder: {}", e))?;
+
+    let (img_w, img_h) = decoder.dimensions();
+    let dims = (img_w, img_h);
+
+    let raw_frames: Vec<image::Frame> = decoder
+        .into_frames()
+        .collect_frames()
+        .map_err(|e| format!("Failed to decode animated WebP frames: {}", e))?;
+
+    if raw_frames.is_empty() {
+        return Err("Animated WebP has no frames".to_string());
+    }
+
+    let (frames, durations) = convert_animation_frames(&raw_frames);
+
+    eprintln!(
+        "[DEBUG] Decoded animated WebP {:?}: {} frames, dims={}x{}",
+        path.file_name().unwrap_or_default(),
+        frames.len(),
+        dims.0,
+        dims.1
+    );
+
+    Ok((frames, durations, dims, orientation))
+}
+
+/// Decode all frames from an animated GIF file using the image crate's decoder
+fn decode_animated_gif_frames(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(Vec<egui::ColorImage>, Vec<Duration>, (u32, u32), u8), String> {
+    use image::AnimationDecoder;
+    use image::ImageDecoder;
+    use image::codecs::gif::GifDecoder;
+
+    let orientation = crate::exif_extract::get_orientation(path, Some(bytes));
+
+    let decoder = GifDecoder::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("Failed to create GIF decoder: {}", e))?;
+
+    let (img_w, img_h) = decoder.dimensions();
+    let dims = (img_w, img_h);
+
+    let raw_frames: Vec<image::Frame> = decoder
+        .into_frames()
+        .collect_frames()
+        .map_err(|e| format!("Failed to decode animated GIF frames: {}", e))?;
+
+    if raw_frames.is_empty() {
+        return Err("Animated GIF has no frames".to_string());
+    }
+
+    let (frames, durations) = convert_animation_frames(&raw_frames);
+
+    eprintln!(
+        "[DEBUG] Decoded animated GIF {:?}: {} frames, dims={}x{}",
+        path.file_name().unwrap_or_default(),
+        frames.len(),
+        dims.0,
+        dims.1
+    );
+
+    Ok((frames, durations, dims, orientation))
 }
 
 fn load_and_process_image_from_bytes(

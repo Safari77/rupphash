@@ -191,6 +191,9 @@ pub struct GuiApp {
     pub(super) file_index: HashMap<u128, usize>,
     // View mode: Map of images that failed to load -> error message
     failed_images: HashMap<PathBuf, String>,
+
+    // Animation state for animated images (e.g. animated WebP)
+    animation_cache: HashMap<PathBuf, super::image::AnimationState>,
     // View mode: Track size of failed_images to detect changes
     last_failed_images_len: usize,
 
@@ -411,6 +414,7 @@ impl GuiApp {
             enrichment_rx: None,
             file_index: HashMap::new(),
             failed_images: HashMap::new(),
+            animation_cache: HashMap::new(),
             last_failed_images_len: 0,
             search_filename_input: String::new(),
             search_exif_input: String::new(),
@@ -615,6 +619,7 @@ impl GuiApp {
             enrichment_rx: None,
             file_index: HashMap::new(),
             failed_images: HashMap::new(),
+            animation_cache: HashMap::new(),
             last_failed_images_len: 0,
             search_filename_input: String::new(),
             search_exif_input: String::new(),
@@ -865,6 +870,7 @@ impl GuiApp {
 
             // Clear caches first
             self.raw_cache.clear();
+            self.animation_cache.clear();
             self.cached_histogram.clear();
             self.raw_loading.clear();
             self.exif_search_cache.clear();
@@ -1094,6 +1100,7 @@ impl GuiApp {
                     self.clear_failed_under(dest);
                     // Invalidate cache for the destination of the rename/exchange
                     self.raw_cache.remove(dest);
+                    self.animation_cache.remove(dest);
                     self.cached_histogram.remove(dest);
                 }
                 continue;
@@ -1108,6 +1115,7 @@ impl GuiApp {
 
                         // Remove from cache if file is deleted
                         self.raw_cache.remove(path);
+                        self.animation_cache.remove(path);
                         self.cached_histogram.remove(path);
 
                         if let Some(name) = path.file_name() {
@@ -1137,6 +1145,7 @@ impl GuiApp {
                     for path in &event.paths {
                         if classify(path) {
                             self.raw_cache.remove(path);
+                            self.animation_cache.remove(path);
                             self.cached_histogram.remove(path);
                             self.failed_images.remove(path);
                             self.retry_after.remove(path);
@@ -1162,6 +1171,7 @@ impl GuiApp {
                             // Invalidate cache — do NOT load here, file may be incomplete.
                             // Actual reload triggered by Access(Close(Write)) above.
                             self.raw_cache.remove(path);
+                            self.animation_cache.remove(path);
                             self.cached_histogram.remove(path);
                             self.failed_images.remove(path);
                             self.retry_after.remove(path);
@@ -1628,6 +1638,7 @@ impl GuiApp {
 
         // Evict from memory only if it falls completely outside the wider retention window
         self.raw_cache.retain(|k, _| retention_paths.contains(k));
+        self.animation_cache.retain(|k, _| retention_paths.contains(k));
         self.cached_histogram.retain(|k, _| retention_paths.contains(k));
 
         // Active worker tasks should still be cancelled strictly based on the active window
@@ -1905,6 +1916,51 @@ impl eframe::App for GuiApp {
                             let name = format!("img_{}", path.display());
                             let texture = ctx.load_texture(name, color_image, Default::default());
                             self.raw_cache.insert(path.clone(), texture);
+                        }
+
+                        ImageLoadResult::AnimatedLoaded {
+                            frames,
+                            durations,
+                            resolution,
+                            orientation,
+                            content_hash,
+                            exif_timestamp,
+                        } => {
+                            super::image::update_file_metadata(
+                                self,
+                                &path,
+                                resolution.0,
+                                resolution.1,
+                                orientation,
+                                content_hash,
+                                exif_timestamp,
+                            );
+
+                            // Upload all frames as textures
+                            let frame_textures: Vec<egui::TextureHandle> = frames
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, frame)| {
+                                    let name = format!("anim_{}_{}", path.display(), i);
+                                    ctx.load_texture(name, frame, Default::default())
+                                })
+                                .collect();
+
+                            // Also insert first frame into raw_cache so static
+                            // rendering paths (histogram, EXIF overlay) work
+                            if let Some(first) = frame_textures.first() {
+                                self.raw_cache.insert(path.clone(), first.clone());
+                            }
+
+                            self.animation_cache.insert(
+                                path.clone(),
+                                super::image::AnimationState {
+                                    frames: frame_textures,
+                                    frame_durations: durations,
+                                    current_frame: 0,
+                                    last_frame_time: Instant::now(),
+                                },
+                            );
                         }
 
                         ImageLoadResult::Failed(err_msg) => {
@@ -3320,8 +3376,45 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let available_rect = ui.available_rect_before_wrap();
             if let Some(path) = current_image_path {
-                // 1. Check Raw Cache
-                if let Some(texture) = self.raw_cache.get(&path) {
+                // 0. Check Animation Cache (animated WebP etc.)
+                // Extract animation frame data first to avoid borrow conflicts
+                let anim_frame_info = if let Some(anim) = self.animation_cache.get_mut(&path) {
+                    // Advance frame based on elapsed time
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(anim.last_frame_time);
+                    let current_duration = anim.frame_durations[anim.current_frame];
+                    if elapsed >= current_duration {
+                        anim.current_frame = (anim.current_frame + 1) % anim.frames.len();
+                        anim.last_frame_time = now;
+                    }
+
+                    let texture_id = anim.frames[anim.current_frame].id();
+                    let texture_size = anim.frames[anim.current_frame].size_vec2();
+                    let next_duration = anim.frame_durations[anim.current_frame];
+                    let last_frame_time = anim.last_frame_time;
+                    Some((texture_id, texture_size, next_duration, last_frame_time))
+                } else {
+                    None
+                };
+
+                if let Some((texture_id, texture_size, next_duration, last_frame_time)) =
+                    anim_frame_info
+                {
+                    super::image::render_image_texture(
+                        self,
+                        ui,
+                        texture_id,
+                        texture_size,
+                        available_rect,
+                        current_group_idx,
+                    );
+
+                    // Schedule repaint for next frame transition
+                    let since_last = Instant::now().duration_since(last_frame_time);
+                    let remaining = next_duration.saturating_sub(since_last);
+                    ctx.request_repaint_after(remaining);
+                } else if let Some(texture) = self.raw_cache.get(&path) {
+                    // 1. Check Raw Cache
                     super::image::render_image_texture(
                         self,
                         ui,
