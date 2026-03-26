@@ -26,15 +26,17 @@ Shift-M              : Force re-enter Move target directory even if already set
 Delete               : Delete the currently selected file immediately
 R                    : Rename the currently selected file
 Ctrl + L             : Reload/Rescan the file list
+Right-Click (List)   : Open context menu (Rename, Copy full path, Delete)
+
+SEARCH
+------------------------------------------------------------------------------
 Ctrl + F             : Open Advanced Search dialog
 F3                   : Jump to next search result
 Shift + F3           : Jump to previous search result
 
-Right-Click (List)   : Open context menu (Rename, Copy full path, Delete)
-
 IMAGE VIEWING & ZOOM
 ------------------------------------------------------------------------------
-A                    : Autozoom GPS Map to fit all markers into view
+A                    : Autozoom GPS Map to fit all markers in current group into view
 W                    : Cycle View Mode (Fit Window -> Fit Width -> Fit Height)
 Z                    : Cycle Zoom Level (1:1 -> 2x -> 4x -> 8x -> Fit)
 X                    : Toggle Zoom Type (Absolute vs Relative to window)
@@ -51,7 +53,8 @@ INFO OVERLAYS & DISPLAY
 ------------------------------------------------------------------------------
 I                    : Toggle Histogram overlay
 E                    : Toggle EXIF Info overlay
-N                    : Open GPS Map panel; Press again so connect markers with line
+N                    : Open GPS Map panel; Press again to connect markers with line;
+                       Press a third time to close
 G                    : Toggle EXIF Local time/GPS (UTC) in Solar Position calcs
 H                    : Toggle Relative Times (e.g., "1h 20s ago" vs absolute date)
 P                    : Toggle Path Visibility depth in the sidebar
