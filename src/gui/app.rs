@@ -662,9 +662,9 @@ impl GuiApp {
         for file in files {
             if let Some(pos) = file.gps_pos
                 && self.gps_map.add_marker(file.path.clone(), pos.y(), pos.x(), file.exif_timestamp)
-                {
-                    _added_any = true;
-                }
+            {
+                _added_any = true;
+            }
         }
     }
 
@@ -1809,6 +1809,13 @@ impl Drop for GuiApp {
 }
 
 impl eframe::App for GuiApp {
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // All rendering is handled in update() which overrides the default
+        // that would call this method via CentralPanel.
+    }
+
+    #[allow(deprecated)] // Panel::show(ctx) deprecated in egui 0.34; full migration to
+    // App::ui() deferred until walkers crate supports egui 0.34's new App trait.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_fs_events(ctx);
         // Initial setup for view mode: create watcher (but don't refresh while scanning)
@@ -1835,7 +1842,7 @@ impl eframe::App for GuiApp {
 
         // 3. Use the title string for the internal label (doesn't trigger OS events)
         if !cfg!(target_os = "windows") && !self.state.is_fullscreen {
-            egui::TopBottomPanel::top("custom_title_bar").show(ctx, |ui| {
+            egui::Panel::top("custom_title_bar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let height = 12.0;
                     ui.label(egui::RichText::new(&self.state.last_title).strong());
@@ -2176,7 +2183,7 @@ impl eframe::App for GuiApp {
             *self.group_views.get(&current_group_idx).unwrap_or(&GroupViewState::default());
 
         if !self.state.is_fullscreen {
-            egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            egui::Panel::bottom("status").show(ctx, |ui| {
                 if let Some((msg, is_error)) = &self.state.status_message {
                     ui.colored_label(
                         if *is_error { egui::Color32::RED } else { egui::Color32::GREEN },
@@ -2305,7 +2312,7 @@ impl eframe::App for GuiApp {
             // Get actual window width in logical points - try viewport rect first, fall back to used_rect
             let window_width = ctx
                 .input(|i| i.viewport().inner_rect.or(i.viewport().outer_rect).map(|r| r.width()))
-                .unwrap_or_else(|| ctx.used_rect().width());
+                .unwrap_or_else(|| ctx.globally_used_rect().width());
             let panel_max_width = window_width * 0.5;
 
             // Check for >100 to prevent clamping to 0.0 on the first frame if viewport isn't ready.
@@ -2316,20 +2323,19 @@ impl eframe::App for GuiApp {
                 self.initial_panel_width_applied = true;
             }
 
-            let panel_builder =
-                egui::SidePanel::left("list_panel").resizable(true).min_width(160.0);
+            let panel_builder = egui::Panel::left("list_panel").resizable(true).min_size(160.0);
 
             // Apply width logic to the builder
             let panel = if force_panel_resize {
                 // User pressed 'V' or 'B'
-                panel_builder.exact_width(self.panel_width)
+                panel_builder.exact_size(self.panel_width)
             } else if self.initial_panel_width_applied {
                 // Normal running state: Use saved width as default.
                 // Since we switched IDs to "list_panel_main", this will be respected on the first "applied" frame.
-                panel_builder.default_width(self.saved_panel_width).max_width(panel_max_width)
+                panel_builder.default_size(self.saved_panel_width).max_size(panel_max_width)
             } else {
                 // Startup state: just keep it functional
-                panel_builder.default_width(200.0).max_width(panel_max_width)
+                panel_builder.default_size(200.0).max_size(panel_max_width)
             };
 
             let panel_response = panel.show(ctx, |ui| {
@@ -3061,20 +3067,21 @@ impl eframe::App for GuiApp {
                                             *copy_target = Some(path.to_string_lossy().to_string());
                                         }
                                         if *content_hash != [0u8; 32]
-                                            && ui.button("Copy path + UUID + b3sum").clicked() {
-                                                ui.close();
-                                                let b3 = hex::encode(content_hash);
-                                                let uuid_str = ctx_arc
-                                                    .get_group_uuid(content_hash)
-                                                    .map(|u| crate::db::AppContext::format_uuid(&u))
-                                                    .unwrap_or_else(|| "unknown".to_string());
-                                                *copy_extended = Some(format!(
-                                                    "{}\nuuid: {}\nblake3: {}",
-                                                    path.display(),
-                                                    uuid_str,
-                                                    b3
-                                                ));
-                                            }
+                                            && ui.button("Copy path + UUID + b3sum").clicked()
+                                        {
+                                            ui.close();
+                                            let b3 = hex::encode(content_hash);
+                                            let uuid_str = ctx_arc
+                                                .get_group_uuid(content_hash)
+                                                .map(|u| crate::db::AppContext::format_uuid(&u))
+                                                .unwrap_or_else(|| "unknown".to_string());
+                                            *copy_extended = Some(format!(
+                                                "{}\nuuid: {}\nblake3: {}",
+                                                path.display(),
+                                                uuid_str,
+                                                b3
+                                            ));
+                                        }
                                         if ui.button("Delete (Del)").clicked() {
                                             ui.close();
                                             *action_delete = true;
@@ -3256,10 +3263,10 @@ impl eframe::App for GuiApp {
         // GPS Map Panel (right side, when visible)
         let mut map_clicked_path: Option<std::path::PathBuf> = None;
         if self.gps_map.visible {
-            egui::SidePanel::right("gps_map_panel")
+            egui::Panel::right("gps_map_panel")
                 .resizable(true)
-                .default_width(400.0)
-                .min_width(200.0)
+                .default_size(400.0)
+                .min_size(200.0)
                 .show(ctx, |ui| {
                     ui.heading("GPS Map");
                     ui.separator();
@@ -3519,8 +3526,8 @@ impl eframe::App for GuiApp {
                 self.last_window_size = Some(size);
             }
         } else {
-            // Fallback: use ctx.used_rect() which should include everything drawn
-            let used = ctx.used_rect();
+            // Fallback: use ctx.globally_used_rect() which should include everything drawn
+            let used = ctx.globally_used_rect();
             let size = ((used.width() * ppp) as u32, (used.height() * ppp) as u32);
 
             if size.0 > 100 && size.1 > 100 && ppp > 1.0 && !is_maximized {
