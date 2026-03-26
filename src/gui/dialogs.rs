@@ -92,6 +92,11 @@ pub(super) fn handle_input(
         && app.state.renaming.is_none()
         && !app.state.show_sort_selection
         && !app.state.show_search
+        && !app.state.show_confirmation
+        && !app.state.show_move_confirmation
+        && !app.state.show_delete_immediate_confirmation
+        && !app.state.show_ignore_group_confirmation
+        && app.state.error_popup.is_none()
     {
         // Calculate total directory count (parent + subdirs) for view mode navigation
         // In flatten mode, there are no directories to navigate
@@ -347,14 +352,14 @@ pub(super) fn handle_input(
         }
         // Q key: Ignore files (duplicate mode only)
         // Plain Q: ignore marked files (or current file if none marked)
-        // Ctrl+Q: ignore all files in current group (with confirmation)
+        // Shift+Q: ignore all files in current group (with confirmation)
         if ctx.input(|i| i.key_pressed(egui::Key::Q))
             && !app.state.view_mode
             && !app.state.is_any_dialog_open()
             && !app.show_move_input
             && !app.show_dir_picker
         {
-            if ctx.input(|i| i.modifiers.ctrl) {
+            if ctx.input(|i| i.modifiers.shift) {
                 *intent.borrow_mut() = Some(InputIntent::IgnoreGroup);
             } else {
                 *intent.borrow_mut() = Some(InputIntent::IgnoreCurrent);
@@ -423,6 +428,7 @@ pub(super) fn handle_input(
             && !app.state.show_confirmation
             && !app.state.show_move_confirmation
             && !app.state.show_delete_immediate_confirmation
+            && !app.state.show_ignore_group_confirmation
         {
             if !app.gps_map.visible {
                 // State 1: Map ON, Lines OFF

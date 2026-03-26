@@ -66,7 +66,7 @@ DUPLICATE MODE SPECIFIC (--use-gui)
 ------------------------------------------------------------------------------
 Q                    : Adds selected/marked images into persistent ignore DB, these
                        images are not shown in the Group list. See also --show-ignored --unignore
-Ctrl-Q               : Same as Q but for the whole Group.
+Shift + Q            : Same as Q but for the whole Group.
 
 SYSTEM
 ------------------------------------------------------------------------------
