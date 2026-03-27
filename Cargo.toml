@@ -65,7 +65,7 @@ unicode-width = "0.2"
 walkdir = "2.5"
 zerocopy = "0.8"
 zeroize = "1.8"
-zune-jpeg = "0.4"
+zune-jpeg = "0.5"
 oklab = "1"
 
 # GUI

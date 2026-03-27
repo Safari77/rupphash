@@ -426,7 +426,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
     match ext.as_str() {
         "jpg" | "jpeg" => {
             // TIER 1: Zune-JPEG
-            let mut zune = ZuneDecoder::new(bytes);
+            let mut zune = ZuneDecoder::new(std::io::Cursor::new(bytes));
             if let Ok(pixels) = zune.decode()
                 && let Some(info) = zune.info()
             {
@@ -680,7 +680,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
     }
 
     // Apply the dynamic memory limit
-    let mut custom_limits = image::io::Limits::default();
+    let mut custom_limits = image::Limits::default();
     custom_limits.max_alloc = Some(get_image_memory_limit());
     reader.limits(custom_limits);
 
