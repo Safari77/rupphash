@@ -1150,13 +1150,13 @@ impl AppContext {
         for pdqhash_opt in pdqhashes {
             if let Some(pdqhash) = pdqhash_opt
                 && let Ok(encrypted) = txn.get(self.ignored_pdqmap_db, pdqhash)
-                    && let Some(decrypted) = self.decrypt_value(pdqhash, encrypted)
-                        && decrypted.len() == 16
-                    {
-                        let mut uuid = [0u8; 16];
-                        uuid.copy_from_slice(&decrypted);
-                        return Some(uuid);
-                    }
+                && let Some(decrypted) = self.decrypt_value(pdqhash, encrypted)
+                && decrypted.len() == 16
+            {
+                let mut uuid = [0u8; 16];
+                uuid.copy_from_slice(&decrypted);
+                return Some(uuid);
+            }
         }
         None
     }
@@ -1213,11 +1213,11 @@ impl AppContext {
                 // Don't overwrite entries that are already ignored=true
                 if let Ok(existing) = txn.get(self.ignored_db, content_hash)
                     && let Some(decrypted) = self.decrypt_value(content_hash, existing)
-                        && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
-                        && entry.ignored
-                    {
-                        continue;
-                    }
+                    && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                    && entry.ignored
+                {
+                    continue;
+                }
 
                 let entry = IgnoredEntry {
                     pdqhash: *pdqhash,
@@ -1261,13 +1261,14 @@ impl AppContext {
             if let Ok(encrypted) = txn.get(self.ignored_db, ch) {
                 if let Some(decrypted) = self.decrypt_value(ch, encrypted)
                     && let Ok(mut entry) = IgnoredEntry::from_bytes(&decrypted)
-                    && !entry.ignored {
-                        entry.ignored = true;
-                        let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
-                        let new_encrypted = Self::encrypt_value(&self.cipher, ch, &bytes);
-                        txn.put(self.ignored_db, ch, &new_encrypted, WriteFlags::empty())?;
-                        count += 1;
-                    }
+                    && !entry.ignored
+                {
+                    entry.ignored = true;
+                    let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
+                    let new_encrypted = Self::encrypt_value(&self.cipher, ch, &bytes);
+                    txn.put(self.ignored_db, ch, &new_encrypted, WriteFlags::empty())?;
+                    count += 1;
+                }
             } else {
                 eprintln!(
                     "[WARN-IGNORE] set_files_ignored: no entry for blake3={}, skipping",

@@ -108,45 +108,46 @@ pub(super) fn spawn_image_loader_pool(
                 let is_gif = ext_lower == "gif";
 
                 if (is_webp || is_gif)
-                    && let Ok(bytes) = std::fs::read(&path) {
-                        let animated_result = if is_webp && is_animated_webp(&bytes) {
-                            Some(decode_animated_webp_frames(&path, &bytes))
-                        } else if is_gif && is_animated_gif(&bytes) {
-                            Some(decode_animated_gif_frames(&path, &bytes))
-                        } else {
-                            None
-                        };
+                    && let Ok(bytes) = std::fs::read(&path)
+                {
+                    let animated_result = if is_webp && is_animated_webp(&bytes) {
+                        Some(decode_animated_webp_frames(&path, &bytes))
+                    } else if is_gif && is_animated_gif(&bytes) {
+                        Some(decode_animated_gif_frames(&path, &bytes))
+                    } else {
+                        None
+                    };
 
-                        if let Some(decode_result) = animated_result {
-                            let result = match decode_result {
-                                Ok((frames, durations, dims, orientation)) => {
-                                    // Compute content_hash
-                                    let content_hash = {
-                                        let mut hasher = blake3::Hasher::new_keyed(&content_key);
-                                        hasher.update(&bytes);
-                                        *hasher.finalize().as_bytes()
-                                    };
-                                    let exif_timestamp =
-                                        crate::exif_extract::read_exif_data(&path, Some(&bytes))
-                                            .and_then(|exif| {
-                                                crate::exif_extract::get_exif_timestamp(&exif)
-                                            });
+                    if let Some(decode_result) = animated_result {
+                        let result = match decode_result {
+                            Ok((frames, durations, dims, orientation)) => {
+                                // Compute content_hash
+                                let content_hash = {
+                                    let mut hasher = blake3::Hasher::new_keyed(&content_key);
+                                    hasher.update(&bytes);
+                                    *hasher.finalize().as_bytes()
+                                };
+                                let exif_timestamp =
+                                    crate::exif_extract::read_exif_data(&path, Some(&bytes))
+                                        .and_then(|exif| {
+                                            crate::exif_extract::get_exif_timestamp(&exif)
+                                        });
 
-                                    ImageLoadResult::AnimatedLoaded {
-                                        frames,
-                                        durations,
-                                        resolution: dims,
-                                        orientation,
-                                        content_hash,
-                                        exif_timestamp,
-                                    }
+                                ImageLoadResult::AnimatedLoaded {
+                                    frames,
+                                    durations,
+                                    resolution: dims,
+                                    orientation,
+                                    content_hash,
+                                    exif_timestamp,
                                 }
-                                Err(e) => ImageLoadResult::Failed(e),
-                            };
-                            let _ = tx_clone.send((path, result));
-                            continue;
-                        }
+                            }
+                            Err(e) => ImageLoadResult::Failed(e),
+                        };
+                        let _ = tx_clone.send((path, result));
+                        continue;
                     }
+                }
 
                 let result =
                     match load_and_process_image_with_hash(&path, use_thumbnails, &content_key) {

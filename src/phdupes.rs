@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use geo::Point;
 use jiff::Timestamp;
-use libheif_rs::integration::image::register_all_decoding_hooks;
+use libheif_rs::integration::image::{register_heic_decoding_hook, register_heif_decoding_hook};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -509,7 +509,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     windows_security::enable_heap_termination();
 
     hayro_jpeg2000::integration::register_decoding_hook();
-    register_all_decoding_hooks();
+    register_heif_decoding_hook();
+    register_heic_decoding_hook();
     image_extras::register();
     let args = Cli::parse();
 
@@ -621,10 +622,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     for (ch, entry) in &no_group {
-                        let pdq_str = entry
-                            .pdqhash
-                            .map(hex::encode)
-                            .unwrap_or_else(|| "none".to_string());
+                        let pdq_str =
+                            entry.pdqhash.map(hex::encode).unwrap_or_else(|| "none".to_string());
                         let ts_str =
                             chrono::DateTime::<Utc>::from_timestamp(entry.timestamp as i64, 0)
                                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
@@ -672,25 +671,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Try 2: Parse as hex PDQ hash (64 hex chars = 32 bytes, but not a file path)
-            if value.len() == 64 && !std::path::Path::new(value).exists()
+            if value.len() == 64
+                && !std::path::Path::new(value).exists()
                 && let Ok(bytes) = hex::decode(value)
-                    && let Ok(pdqhash) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                        eprintln!("[DEBUG-UNIGNORE] Parsed as PDQ hash: {}", hex::encode(pdqhash));
-                        match ctx.remove_ignored_by_pdqhash(&pdqhash) {
-                            Ok(count) => {
-                                println!(
-                                    "Removed {} ignored entries matching PDQ hash {}",
-                                    count, value
-                                );
-                                eprintln!(
-                                    "[DEBUG-UNIGNORE] Removed {} entries for pdqhash {}",
-                                    count, value
-                                );
-                            }
-                            Err(e) => eprintln!("Failed to unignore by PDQ hash: {}", e),
-                        }
-                        continue;
+                && let Ok(pdqhash) = <[u8; 32]>::try_from(bytes.as_slice())
+            {
+                eprintln!("[DEBUG-UNIGNORE] Parsed as PDQ hash: {}", hex::encode(pdqhash));
+                match ctx.remove_ignored_by_pdqhash(&pdqhash) {
+                    Ok(count) => {
+                        println!("Removed {} ignored entries matching PDQ hash {}", count, value);
+                        eprintln!(
+                            "[DEBUG-UNIGNORE] Removed {} entries for pdqhash {}",
+                            count, value
+                        );
                     }
+                    Err(e) => eprintln!("Failed to unignore by PDQ hash: {}", e),
+                }
+                continue;
+            }
 
             // Try 3: Treat as filename — compute keyed blake3 and look up
             let file_path = std::path::Path::new(value);
