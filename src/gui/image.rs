@@ -1206,38 +1206,39 @@ fn kmeans_palette(
         }
     }
 
-    // 2. Oklch distance metric
-    let calc_dist = |p: &Oklab, c: &Oklab| -> f32 {
-        let p_c = (p.a.powi(2) + p.b.powi(2)).sqrt();
-        let c_c = (c.a.powi(2) + c.b.powi(2)).sqrt();
+    // 2. Pre-pack data (Array of Structs) & Precompute expensive math
+    // This entirely removes millions of .sqrt() and .atan2() calls from the inner loops
+    // and guarantees sequential L1 cache access.
+    #[derive(Clone, Copy)]
+    struct PackedPixel {
+        l: f32,
+        a: f32,
+        b: f32,
+        c: f32,
+        h: f32,
+        weight: f32,
+        is_dark: bool,
+    }
 
-        let mut d_h_angle = (p.b.atan2(p.a) - c.b.atan2(c.a)).abs();
-        if d_h_angle > std::f32::consts::PI {
-            d_h_angle = std::f32::consts::PI * 2.0 - d_h_angle;
-        }
-
-        let mut effective_chroma = p_c.max(c_c);
-
-        // Only apply the wedge to dark colors if they ACTUALLY have some color.
-        // If it's practically pure grey (chroma < 0.015), let it stay grey!
-        if p.l < 0.6 && c.l < 0.6 && effective_chroma > 0.015 {
-            effective_chroma = effective_chroma.max(0.04);
-        }
-        effective_chroma = effective_chroma.min(0.25);
-
-        // Lightness
-        let dl = (p.l - c.l) * 2.0;
-        // Chroma distance
-        let dc = (p_c - c_c) * 4.0;
-
-        // Multiply hue distance by the boosted effective_chroma
-        let dh_weighted = d_h_angle * effective_chroma * 3.0;
-
-        dl.powi(2) + dc.powi(2) + dh_weighted.powi(2)
-    };
+    let packed_pixels: Vec<PackedPixel> = working_pixels
+        .iter()
+        .zip(weights.iter())
+        .map(|(p, &w)| PackedPixel {
+            l: p.l,
+            a: p.a,
+            b: p.b,
+            c: (p.a.powi(2) + p.b.powi(2)).sqrt(),
+            h: p.b.atan2(p.a),
+            weight: w,
+            is_dark: p.l < 0.6,
+        })
+        .collect();
 
     // 3. K-Means++ initialization
     let mut centroids = vec![working_pixels[0]; k];
+    let mut centroid_chromas = vec![0.0f32; k];
+    let mut centroid_hues = vec![0.0f32; k];
+    let mut min_dists = vec![f32::MAX; packed_pixels.len()]; // Cache nearest distance
 
     let mut rng_state: u64 = 0x5EED_C0DE_1234_5678;
     let mut xorshift = || -> u64 {
@@ -1247,47 +1248,116 @@ fn kmeans_palette(
         rng_state
     };
 
-    let total_w: f32 = weights.iter().sum();
+    let total_w: f32 = packed_pixels.iter().map(|p| p.weight).sum();
     let mut threshold = (xorshift() as f32 / u64::MAX as f32) * total_w;
-    for (i, &w) in weights.iter().enumerate() {
-        threshold -= w;
+    for (i, p) in packed_pixels.iter().enumerate() {
+        threshold -= p.weight;
         if threshold <= 0.0 {
             centroids[0] = working_pixels[i];
             break;
         }
     }
 
-    for ki in 1..k {
-        let dists: Vec<f32> = working_pixels
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let mut min_d = f32::MAX;
-                for c in &centroids[..ki] {
-                    let d = calc_dist(p, c);
-                    if d < min_d {
-                        min_d = d;
-                    }
-                }
-                min_d * weights[i]
-            })
-            .collect();
+    // Helper data struct for centroid comparisons
+    #[derive(Clone, Copy)]
+    struct CentroidData {
+        l: f32,
+        a: f32,
+        b: f32,
+        c: f32,
+        h: f32,
+        is_dark: bool,
+    }
 
-        let total: f32 = dists.iter().sum();
+    centroid_chromas[0] = (centroids[0].a.powi(2) + centroids[0].b.powi(2)).sqrt();
+    centroid_hues[0] = centroids[0].b.atan2(centroids[0].a);
+    let mut new_cd = CentroidData {
+        l: centroids[0].l,
+        a: centroids[0].a,
+        b: centroids[0].b,
+        c: centroid_chromas[0],
+        h: centroid_hues[0],
+        is_dark: centroids[0].l < 0.6,
+    };
+
+    // Fast packed distance calculator for initialization
+    let calc_packed_dist = |p: &PackedPixel, cd: &CentroidData| -> f32 {
+        let dl = (p.l - cd.l) * 2.0;
+        let dc = (p.c - cd.c) * 4.0;
+        let mut d_h_angle = (p.h - cd.h).abs();
+        if d_h_angle > std::f32::consts::PI {
+            d_h_angle = std::f32::consts::PI * 2.0 - d_h_angle;
+        }
+        let mut eff_chroma = p.c.max(cd.c);
+        if p.is_dark && cd.is_dark && eff_chroma > 0.015 {
+            eff_chroma = eff_chroma.max(0.04);
+        }
+        eff_chroma = eff_chroma.min(0.25);
+        let dh_weighted = d_h_angle * eff_chroma * 3.0;
+
+        dl * dl + dc * dc + dh_weighted * dh_weighted
+    };
+
+    // Initial pass: populate min_dists for the first centroid
+    for (i, p) in packed_pixels.iter().enumerate() {
+        min_dists[i] = calc_packed_dist(p, &new_cd);
+    }
+
+    for ki in 1..k {
+        let total: f32 =
+            min_dists.iter().zip(packed_pixels.iter()).map(|(&d, p)| d * p.weight).sum();
+
         if total <= 0.0 {
             centroids[ki] = working_pixels[(xorshift() as usize) % working_pixels.len()];
-            continue;
+        } else {
+            let mut target = (xorshift() as f32 / u64::MAX as f32) * total;
+            for i in 0..packed_pixels.len() {
+                target -= min_dists[i] * packed_pixels[i].weight;
+                if target <= 0.0 {
+                    centroids[ki] = working_pixels[i];
+                    break;
+                }
+            }
         }
 
-        let mut target = (xorshift() as f32 / u64::MAX as f32) * total;
-        for (i, &d) in dists.iter().enumerate() {
-            target -= d;
-            if target <= 0.0 {
-                centroids[ki] = working_pixels[i];
-                break;
+        // Only check pixels against the newly added centroid
+        centroid_chromas[ki] = (centroids[ki].a.powi(2) + centroids[ki].b.powi(2)).sqrt();
+        centroid_hues[ki] = centroids[ki].b.atan2(centroids[ki].a);
+        new_cd = CentroidData {
+            l: centroids[ki].l,
+            a: centroids[ki].a,
+            b: centroids[ki].b,
+            c: centroid_chromas[ki],
+            h: centroid_hues[ki],
+            is_dark: centroids[ki].l < 0.6,
+        };
+
+        for (i, p) in packed_pixels.iter().enumerate() {
+            let d = calc_packed_dist(p, &new_cd);
+            if d < min_dists[i] {
+                min_dists[i] = d;
             }
         }
     }
+
+    // Helper for shift checking and deduplication later
+    let calc_dist_centroids = |p: &Oklab, c: &Oklab| -> f32 {
+        let p_c = (p.a.powi(2) + p.b.powi(2)).sqrt();
+        let c_c = (c.a.powi(2) + c.b.powi(2)).sqrt();
+        let mut d_h_angle = (p.b.atan2(p.a) - c.b.atan2(c.a)).abs();
+        if d_h_angle > std::f32::consts::PI {
+            d_h_angle = std::f32::consts::PI * 2.0 - d_h_angle;
+        }
+        let mut effective_chroma = p_c.max(c_c);
+        if p.l < 0.6 && c.l < 0.6 && effective_chroma > 0.015 {
+            effective_chroma = effective_chroma.max(0.04);
+        }
+        effective_chroma = effective_chroma.min(0.25);
+        let dl = (p.l - c.l) * 2.0;
+        let dc = (p_c - c_c) * 4.0;
+        let dh_weighted = d_h_angle * effective_chroma * 3.0;
+        dl * dl + dc * dc + dh_weighted * dh_weighted
+    };
 
     // 4. K-Means iterations
     let mut final_counts = vec![0.0f32; k];
@@ -1295,22 +1365,65 @@ fn kmeans_palette(
         let mut counts = vec![0.0f32; k];
         let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
 
-        for (idx, &p) in working_pixels.iter().enumerate() {
+        // Pre-pack ONLY the centroids to save billions of operations
+        let cent_data: Vec<CentroidData> = centroids
+            .iter()
+            .map(|c| CentroidData {
+                l: c.l,
+                a: c.a,
+                b: c.b,
+                c: (c.a.powi(2) + c.b.powi(2)).sqrt(),
+                h: c.b.atan2(c.a),
+                is_dark: c.l < 0.6,
+            })
+            .collect();
+        let cd_slice = &cent_data[..];
+
+        for p in &packed_pixels {
             let mut min_dist = f32::MAX;
             let mut best_idx = 0;
-            for (i, c) in centroids.iter().enumerate() {
-                let dist_sq = calc_dist(&p, c);
+
+            for (i, cd) in cd_slice.iter().enumerate() {
+                // ── EARLY EXIT 1: Lightness ──
+                let dl = (p.l - cd.l) * 2.0;
+                let dl_sq = dl * dl;
+                if dl_sq >= min_dist {
+                    continue;
+                }
+
+                // ── EARLY EXIT 2: Chroma ──
+                let dc = (p.c - cd.c) * 4.0;
+                let dc_sq = dc * dc;
+                let base_dist = dl_sq + dc_sq;
+                if base_dist >= min_dist {
+                    continue;
+                }
+
+                // ── EXPENSIVE MATH ──
+                let mut d_h_angle = (p.h - cd.h).abs();
+                if d_h_angle > std::f32::consts::PI {
+                    d_h_angle = std::f32::consts::PI * 2.0 - d_h_angle;
+                }
+
+                let mut eff_chroma = p.c.max(cd.c);
+                if p.is_dark && cd.is_dark && eff_chroma > 0.015 {
+                    eff_chroma = eff_chroma.max(0.04);
+                }
+                eff_chroma = eff_chroma.min(0.25);
+
+                let dh_weighted = d_h_angle * eff_chroma * 3.0;
+                let dist_sq = base_dist + dh_weighted * dh_weighted;
+
                 if dist_sq < min_dist {
                     min_dist = dist_sq;
                     best_idx = i;
                 }
             }
 
-            let w = weights[idx];
-            counts[best_idx] += w;
-            sums[best_idx].0 += p.l * w;
-            sums[best_idx].1 += p.a * w;
-            sums[best_idx].2 += p.b * w;
+            counts[best_idx] += p.weight;
+            sums[best_idx].0 += p.l * p.weight;
+            sums[best_idx].1 += p.a * p.weight;
+            sums[best_idx].2 += p.b * p.weight;
         }
 
         let mut max_shift = 0.0f32;
@@ -1320,7 +1433,8 @@ fn kmeans_palette(
                 let new_a = sums[i].1 / counts[i];
                 let new_b = sums[i].2 / counts[i];
 
-                let shift = calc_dist(&centroids[i], &Oklab { l: new_l, a: new_a, b: new_b });
+                let shift =
+                    calc_dist_centroids(&centroids[i], &Oklab { l: new_l, a: new_a, b: new_b });
 
                 max_shift = max_shift.max(shift);
                 centroids[i].l = new_l;
@@ -1354,7 +1468,7 @@ fn kmeans_palette(
         let is_tiny_spot = count < (total_pixels * 0.015);
 
         for &(kept_count, kept_c) in &unique_centroids {
-            let dist = calc_dist(&c, &kept_c);
+            let dist = calc_dist_centroids(&c, &kept_c);
 
             // Give dark colors a "shield" against aggressive merging.
             // If both colors are dark, they must be VERY close to merge.
