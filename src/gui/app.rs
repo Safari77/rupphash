@@ -327,6 +327,10 @@ impl GuiApp {
         state.is_loading = true;
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
+
+        // Initialize memory limits early, before any parallel image work
+        scanner::init_smart_limits();
+
         let palette_config = crate::db::PaletteConfig::from_gui_config(&ctx.gui_config);
         let histogram_enabled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = super::image::spawn_image_loader_pool(
@@ -481,6 +485,10 @@ impl GuiApp {
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
         let ctx = crate::db::AppContext::new().expect("Failed to create context");
+
+        // Initialize memory limits early, before any parallel image work
+        scanner::init_smart_limits();
+
         let palette_config = crate::db::PaletteConfig::from_gui_config(&ctx.gui_config);
         let histogram_enabled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = super::image::spawn_image_loader_pool(

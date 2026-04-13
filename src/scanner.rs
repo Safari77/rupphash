@@ -52,22 +52,52 @@ macro_rules! img_debug {
     };
 }
 
-// Create an empty lock to hold our calculated byte limit.
-static IMAGE_MEMORY_LIMIT: OnceLock<u64> = OnceLock::new();
+const BUDGET_PER_THREAD_BYTES: u64 = 1_500 * 1024 * 1024;
+// Create an empty lock to hold our calculated thread count and byte limit.
+static SMART_LIMITS: OnceLock<(usize, u64)> = OnceLock::new();
 
-/// Gets the 75% RAM limit
-fn get_image_memory_limit() -> u64 {
-    *IMAGE_MEMORY_LIMIT.get_or_init(|| {
+/// Calculates the safe number of threads and initializes the per-thread memory limit.
+/// Uses OnceLock so the heavy computation only runs on the first call.
+/// Must be called once during app startup, before any parallel image work.
+pub fn init_smart_limits() -> usize {
+    let &(threads, _) = SMART_LIMITS.get_or_init(|| {
         let mut sys = System::new();
         sys.refresh_memory();
 
         let total_ram_bytes = sys.total_memory();
-        // Limit to 75% of RAM divided by the number of Rayon threads
-        let threads = rayon::current_num_threads().max(1) as u64;
-        let limit_bytes = ((total_ram_bytes * 3) / 4) / threads;
+        let max_allowed_ram = (total_ram_bytes * 3) / 4; // 75% global limit
 
-        limit_bytes
-    })
+        // How many 1.5GB decodes can fit in 75% of RAM?
+        let mut target_threads = (max_allowed_ram / BUDGET_PER_THREAD_BYTES) as usize;
+
+        // Get actual CPU cores
+        let cpu_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+
+        // Clamp the threads between 1 and max CPU cores
+        target_threads = target_threads.clamp(1, cpu_cores);
+
+        // Calculate the new, highly accurate per-thread limit
+        let limit_per_thread = max_allowed_ram / (target_threads as u64);
+
+        eprintln!(
+            "[SYSTEM] Smart Limits: Limiting to {}/{} cores. {} MB limit per thread.",
+            target_threads,
+            cpu_cores,
+            limit_per_thread / 1_000_000
+        );
+
+        (target_threads, limit_per_thread)
+    });
+    threads
+}
+
+/// Returns the cached safe thread count (falls back to init if not yet called).
+pub fn get_safe_thread_count() -> usize {
+    SMART_LIMITS.get().map(|&(t, _)| t).unwrap_or_else(|| init_smart_limits())
+}
+
+pub fn get_image_memory_limit() -> u64 {
+    SMART_LIMITS.get().map(|&(_, l)| l).unwrap_or(BUDGET_PER_THREAD_BYTES)
 }
 
 pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exif::Exif> {
@@ -1094,291 +1124,310 @@ pub fn scan_and_group(
         let _ = tx.send((0, total_files));
     }
 
+    // 1. Get safe thread count based on RAM (initialized at app startup)
+    let safe_threads = get_safe_thread_count();
+
+    // 2. Build a custom Rayon thread pool
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(safe_threads)
+        .build()
+        .expect("Failed to build smart thread pool");
+
     let hash_start = Instant::now();
     let (tx, rx) = unbounded();
     let db_handle = ctx.start_db_writer(rx);
     let processed_count = AtomicUsize::new(0);
 
-    let mut valid_files: Vec<ScannedFile> = all_files
-        .par_iter()
-        .filter_map(|path| {
-            if let Some(prog_tx) = &progress_tx {
-                let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                if current.is_multiple_of(10) || current == total_files {
-                    let _ = prog_tx.send((current, total_files));
-                }
-            }
-
-            let metadata = fs::metadata(path).ok()?;
-            let size = metadata.len();
-            let mtime = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
-            let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
-            let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-            let unique_file_id = fileops::get_file_key(path)?;
-
-            let meta_key = compute_meta_key(&ctx_ref.meta_key, mtime_ns, size, unique_file_id);
-            if false {
-                eprintln!(
-                    "[DEBUG] mtime_ns/size/unique_file_id {} = {} {} {}",
-                    path.display(),
-                    mtime_ns,
-                    size,
-                    unique_file_id
-                );
-            }
-            let mut pdqhash: Option<[u8; 32]> = None;
-            let mut pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>> = None;
-            // IMPORTANT: new_meta tracks updates to the file_metadata DB.
-            // Even if we hit the cache, we MUST set this to refresh the timestamp.
-            let mut new_meta = None;
-
-            let mut new_hash = None;
-            let mut new_features = None;
-            let mut new_coeffs = None; // Coefficients stored separately
-            let mut resolution = None;
-            let mut ck = [0u8; 32];
-            let mut orientation = 1;
-            let mut gps_pos = None;
-            let mut exif_timestamp: Option<i64> = None;
-            let mut cache_hit_full = false;
-            let mut pixel_hash: Option<[u8; 32]> = None; // Init
-            let mut new_pixel = None; // For DB update
-
-            let mut metadata_hit = false;
-            if !force_rehash && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
-                metadata_hit = true;
-                ck = ch;
-                // Refresh timestamp
-                new_meta = Some((meta_key, ck));
-                if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
-                    pdqhash = Some(h);
-                    if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
-                        resolution = Some((feats.width, feats.height));
-                        orientation = feats.orientation();
-                        gps_pos = feats.gps_pos();
-
-                        // Get coefficients from separate db
-                        if let Ok(Some(coeff_vec)) = ctx_ref.get_coefficients(&ch)
-                            && coeff_vec.len() == 256
-                        {
-                            let mut coeffs = [0.0; 256];
-                            coeffs.copy_from_slice(&coeff_vec);
-                            pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures {
-                                coefficients: coeffs,
-                            }));
-                            cache_hit_full = true;
-                        }
+    // 3. Run the heavy parsing inside the constrained pool
+    let mut valid_files: Vec<ScannedFile> = pool.install(|| {
+        all_files
+            .par_iter()
+            .filter_map(|path| {
+                if let Some(prog_tx) = &progress_tx {
+                    let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if current.is_multiple_of(10) || current == total_files {
+                        let _ = prog_tx.send((current, total_files));
                     }
                 }
-                // If user wants pixel hash, try to fetch it from DB.
-                if config.calc_pixel_hash {
-                    if let Ok(Some(ph)) = ctx_ref.get_pixel_hash(&ch) {
-                        pixel_hash = Some(ph);
-                    } else {
-                        // Missing in DB! Force load below to calculate it.
-                        cache_hit_full = false;
-                    }
-                }
-                if cache_hit_full {
-                    eprintln!("[CACHE-FULL] {:?}", path.display());
-                } else {
+
+                let metadata = fs::metadata(path).ok()?;
+                let size = metadata.len();
+                let mtime = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
+                let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
+                let mtime_ns =
+                    mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+                let unique_file_id = fileops::get_file_key(path)?;
+
+                let meta_key = compute_meta_key(&ctx_ref.meta_key, mtime_ns, size, unique_file_id);
+                if false {
                     eprintln!(
-                        "[CACHE-PARTIAL] Metadata found, but features missing for {:?}",
-                        path.display()
+                        "[DEBUG] mtime_ns/size/unique_file_id {} = {} {} {}",
+                        path.display(),
+                        mtime_ns,
+                        size,
+                        unique_file_id
                     );
                 }
-            }
+                let mut pdqhash: Option<[u8; 32]> = None;
+                let mut pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>> = None;
+                // IMPORTANT: new_meta tracks updates to the file_metadata DB.
+                // Even if we hit the cache, we MUST set this to refresh the timestamp.
+                let mut new_meta = None;
 
-            if !cache_hit_full {
-                if !metadata_hit {
-                    eprintln!("[CACHE-MISS] New file: {:?}", path.display());
-                }
-                let bytes = fs::read(path).ok();
+                let mut new_hash = None;
+                let mut new_features = None;
+                let mut new_coeffs = None; // Coefficients stored separately
+                let mut resolution = None;
+                let mut ck = [0u8; 32];
+                let mut orientation = 1;
+                let mut gps_pos = None;
+                let mut exif_timestamp: Option<i64> = None;
+                let mut cache_hit_full = false;
+                let mut pixel_hash: Option<[u8; 32]> = None; // Init
+                let mut new_pixel = None; // For DB update
 
-                if let Some(ref b) = bytes {
-                    // 1. PRE-PARSE rsraw if it's a RAW file to avoid doing it multiple times
-                    let is_raw = is_raw_ext(path);
-                    let mut parsed_raw = if is_raw { rsraw::RawImage::open(b).ok() } else { None };
+                let mut metadata_hit = false;
+                if !force_rehash && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
+                    metadata_hit = true;
+                    ck = ch;
+                    // Refresh timestamp
+                    new_meta = Some((meta_key, ck));
+                    if let Ok(Some(h)) = ctx_ref.get_pdqhash(&ch) {
+                        pdqhash = Some(h);
+                        if let Ok(Some(feats)) = ctx_ref.get_features(&ch) {
+                            resolution = Some((feats.width, feats.height));
+                            orientation = feats.orientation();
+                            gps_pos = feats.gps_pos();
 
-                    // Read Orientation, GPS location, and EXIF timestamp
-                    // For RAW files, we may need to fall back to rsraw if kamadak-exif fails
-                    let exif_data = read_exif_data(path, Some(b));
-
-                    if let Some(ref exif) = exif_data {
-                        // kamadak-exif succeeded - extract data the normal way
-                        if let Some((lat, lon)) = extract_gps_lat_lon(exif) {
-                            gps_pos = Some(Point::new(lon, lat)); // Geo uses (x, y) = (lon, lat)
-                        }
-                        if let Some(field) =
-                            exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-                            && let Some(v @ 1..=8) = field.value.get_uint(0)
-                        {
-                            orientation = v as u8;
-                        }
-                        exif_timestamp = get_exif_timestamp(exif);
-                    } else if is_raw {
-                        // kamadak-exif failed on RAW file - try rsraw as fallback
-                        if let Some(ref raw) = parsed_raw {
-                            // Get GPS from rsraw
-                            if let Some(point) = raw_exif::get_gps_point_from_raw(raw) {
-                                gps_pos = Some(point);
-                            }
-                            // Get timestamp from rsraw
-                            exif_timestamp = raw_exif::get_timestamp_from_raw(raw);
-                            // Note: orientation is NOT available from rsraw
-                            // It will remain at the default value of 1
-                        }
-                    }
-
-                    // 2. Calculate file hash if needed
-                    if ck == [0u8; 32] {
-                        let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
-                        ck = *ch.as_bytes();
-                        new_meta = Some((meta_key, ck));
-                    }
-
-                    // 3. Load Image ONCE using the FAST loader
-                    let mut img_for_hashing: Option<image::DynamicImage> = None;
-
-                    if is_raw {
-                        // RAW FILE: Extract Largest JPEG Thumbnail
-                        // We need the image for PDQ even if pixel_hash is disabled.
-                        if let Some(mut raw) = parsed_raw
-                            && let Ok(thumbs) = raw.extract_thumbs()
-                        {
-                            // Find largest JPEG thumbnail
-                            if let Some(thumb) = thumbs
-                                .into_iter()
-                                .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
-                                .max_by_key(|t| t.width * t.height)
+                            // Get coefficients from separate db
+                            if let Ok(Some(coeff_vec)) = ctx_ref.get_coefficients(&ch)
+                                && coeff_vec.len() == 256
                             {
-                                // Decode using our robust fast loader.
-                                img_for_hashing =
-                                    load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data).ok();
+                                let mut coeffs = [0.0; 256];
+                                coeffs.copy_from_slice(&coeff_vec);
+                                pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures {
+                                    coefficients: coeffs,
+                                }));
+                                cache_hit_full = true;
+                            }
+                        }
+                    }
+                    // If user wants pixel hash, try to fetch it from DB.
+                    if config.calc_pixel_hash {
+                        if let Ok(Some(ph)) = ctx_ref.get_pixel_hash(&ch) {
+                            pixel_hash = Some(ph);
+                        } else {
+                            // Missing in DB! Force load below to calculate it.
+                            cache_hit_full = false;
+                        }
+                    }
+                    if cache_hit_full {
+                        eprintln!("[CACHE-FULL] {:?}", path.display());
+                    } else {
+                        eprintln!(
+                            "[CACHE-PARTIAL] Metadata found, but features missing for {:?}",
+                            path.display()
+                        );
+                    }
+                }
 
-                                if let Some(img) = &img_for_hashing
-                                    && resolution.is_none()
+                if !cache_hit_full {
+                    if !metadata_hit {
+                        eprintln!("[CACHE-MISS] New file: {:?}", path.display());
+                    }
+                    let bytes = fs::read(path).ok();
+
+                    if let Some(ref b) = bytes {
+                        // 1. PRE-PARSE rsraw if it's a RAW file to avoid doing it multiple times
+                        let is_raw = is_raw_ext(path);
+                        let mut parsed_raw =
+                            if is_raw { rsraw::RawImage::open(b).ok() } else { None };
+
+                        // Read Orientation, GPS location, and EXIF timestamp
+                        // For RAW files, we may need to fall back to rsraw if kamadak-exif fails
+                        let exif_data = read_exif_data(path, Some(b));
+
+                        if let Some(ref exif) = exif_data {
+                            // kamadak-exif succeeded - extract data the normal way
+                            if let Some((lat, lon)) = extract_gps_lat_lon(exif) {
+                                gps_pos = Some(Point::new(lon, lat)); // Geo uses (x, y) = (lon, lat)
+                            }
+                            if let Some(field) =
+                                exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                                && let Some(v @ 1..=8) = field.value.get_uint(0)
+                            {
+                                orientation = v as u8;
+                            }
+                            exif_timestamp = get_exif_timestamp(exif);
+                        } else if is_raw {
+                            // kamadak-exif failed on RAW file - try rsraw as fallback
+                            if let Some(ref raw) = parsed_raw {
+                                // Get GPS from rsraw
+                                if let Some(point) = raw_exif::get_gps_point_from_raw(raw) {
+                                    gps_pos = Some(point);
+                                }
+                                // Get timestamp from rsraw
+                                exif_timestamp = raw_exif::get_timestamp_from_raw(raw);
+                                // Note: orientation is NOT available from rsraw
+                                // It will remain at the default value of 1
+                            }
+                        }
+
+                        // 2. Calculate file hash if needed
+                        if ck == [0u8; 32] {
+                            let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
+                            ck = *ch.as_bytes();
+                            new_meta = Some((meta_key, ck));
+                        }
+
+                        // 3. Load Image ONCE using the FAST loader
+                        let mut img_for_hashing: Option<image::DynamicImage> = None;
+
+                        if is_raw {
+                            // RAW FILE: Extract Largest JPEG Thumbnail
+                            // We need the image for PDQ even if pixel_hash is disabled.
+                            if let Some(mut raw) = parsed_raw
+                                && let Ok(thumbs) = raw.extract_thumbs()
+                            {
+                                // Find largest JPEG thumbnail
+                                if let Some(thumb) = thumbs
+                                    .into_iter()
+                                    .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
+                                    .max_by_key(|t| t.width * t.height)
                                 {
-                                    resolution = Some(img.dimensions());
+                                    // Decode using our robust fast loader.
+                                    img_for_hashing =
+                                        load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data)
+                                            .ok();
+
+                                    if let Some(img) = &img_for_hashing
+                                        && resolution.is_none()
+                                    {
+                                        resolution = Some(img.dimensions());
+                                    }
                                 }
                             }
-                        }
-                        // Fallback for resolution if thumbnail extraction failed or we didn't calculate hash
-                        if resolution.is_none() {
-                            resolution = get_resolution(path, Some(b));
-                        }
-                    } else {
-                        // STANDARD IMAGE: Use fast loader directly
-                        img_for_hashing = load_image_fast(path, b).ok();
-                    }
-
-                    if let Some(img) = &img_for_hashing {
-                        // Get resolution from the loaded image
-                        if resolution.is_none() {
-                            resolution = Some(img.dimensions());
+                            // Fallback for resolution if thumbnail extraction failed or we didn't calculate hash
+                            if resolution.is_none() {
+                                resolution = get_resolution(path, Some(b));
+                            }
+                        } else {
+                            // STANDARD IMAGE: Use fast loader directly
+                            img_for_hashing = load_image_fast(path, b).ok();
                         }
 
-                        // 4. Calculate Pixel Hash of 16bit RGBA (Content Identical Check)
-                        if config.calc_pixel_hash && pixel_hash.is_none() {
-                            // This ensures 16-bit PNGs != 8-bit PNGs unless the extra bits are purely padding.
-                            let rgba16 = img.to_rgba16();
-                            let raw_u16 = rgba16.as_raw();
-                            let raw_bytes: &[u8] = cast_slice(raw_u16);
-                            let ph = *blake3::hash(raw_bytes).as_bytes();
-                            eprintln!(
-                                "[DEBUG-PIXEL_HASH 16BIT] {:?} : {}",
-                                path.file_name().unwrap_or_default(),
-                                hex::encode(ph)
-                            );
-                            pixel_hash = Some(ph);
-                            new_pixel = Some((ck, ph));
-                        }
+                        if let Some(img) = &img_for_hashing {
+                            // Get resolution from the loaded image
+                            if resolution.is_none() {
+                                resolution = Some(img.dimensions());
+                            }
 
-                        // Use 'img' directly - do NOT call load_from_memory again
-                        if let Some((features, _)) = crate::pdqhash::generate_pdq_features(img) {
-                            let hash = features.to_hash();
-                            pdqhash = Some(hash);
-
-                            let mut coeffs = [0.0; 256];
-                            coeffs.copy_from_slice(&features.coefficients);
-                            let feats = crate::pdqhash::PdqFeatures { coefficients: coeffs };
-                            pdq_features = Some(Arc::new(feats.clone()));
-
-                            // Build ImageFeatures from the data we have
-                            let (w, h) = resolution.unwrap_or((0, 0));
-                            let mut img_features = if let Some(exif) = read_exif_data(path, Some(b))
-                            {
-                                crate::exif_extract::build_image_features(w, h, &exif, true, false)
-                            } else {
-                                ImageFeatures::new(w, h)
-                            };
-
-                            // Add orientation if not default
-                            if orientation != 1 {
-                                img_features.insert_tag(
-                                    TAG_ORIENTATION,
-                                    ExifValue::Short(orientation as u16),
+                            // 4. Calculate Pixel Hash of 16bit RGBA (Content Identical Check)
+                            if config.calc_pixel_hash && pixel_hash.is_none() {
+                                // This ensures 16-bit PNGs != 8-bit PNGs unless the extra bits are purely padding.
+                                let rgba16 = img.to_rgba16();
+                                let raw_u16 = rgba16.as_raw();
+                                let raw_bytes: &[u8] = cast_slice(raw_u16);
+                                let ph = *blake3::hash(raw_bytes).as_bytes();
+                                eprintln!(
+                                    "[DEBUG-PIXEL_HASH 16BIT] {:?} : {}",
+                                    path.file_name().unwrap_or_default(),
+                                    hex::encode(ph)
                                 );
+                                pixel_hash = Some(ph);
+                                new_pixel = Some((ck, ph));
                             }
 
-                            // Add GPS position if available
-                            if let Some(pos) = gps_pos {
-                                img_features
-                                    .insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y()));
-                                img_features
-                                    .insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(pos.x()));
-                            }
+                            // Use 'img' directly - do NOT call load_from_memory again
+                            if let Some((features, _)) = crate::pdqhash::generate_pdq_features(img)
+                            {
+                                let hash = features.to_hash();
+                                pdqhash = Some(hash);
 
-                            // Add timestamp if available
-                            if let Some(ts) = exif_timestamp {
-                                img_features
-                                    .insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(ts));
-                            }
+                                let mut coeffs = [0.0; 256];
+                                coeffs.copy_from_slice(&features.coefficients);
+                                let feats = crate::pdqhash::PdqFeatures { coefficients: coeffs };
+                                pdq_features = Some(Arc::new(feats.clone()));
 
-                            let cached_coeffs =
-                                CachedCoefficients { coefficients: features.coefficients.to_vec() };
+                                // Build ImageFeatures from the data we have
+                                let (w, h) = resolution.unwrap_or((0, 0));
+                                let mut img_features =
+                                    if let Some(exif) = read_exif_data(path, Some(b)) {
+                                        crate::exif_extract::build_image_features(
+                                            w, h, &exif, true, false,
+                                        )
+                                    } else {
+                                        ImageFeatures::new(w, h)
+                                    };
 
-                            if new_hash.is_none() {
-                                new_hash = Some((ck, HashValue::PdqHash(hash)));
+                                // Add orientation if not default
+                                if orientation != 1 {
+                                    img_features.insert_tag(
+                                        TAG_ORIENTATION,
+                                        ExifValue::Short(orientation as u16),
+                                    );
+                                }
+
+                                // Add GPS position if available
+                                if let Some(pos) = gps_pos {
+                                    img_features
+                                        .insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y()));
+                                    img_features
+                                        .insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(pos.x()));
+                                }
+
+                                // Add timestamp if available
+                                if let Some(ts) = exif_timestamp {
+                                    img_features
+                                        .insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(ts));
+                                }
+
+                                let cached_coeffs = CachedCoefficients {
+                                    coefficients: features.coefficients.to_vec(),
+                                };
+
+                                if new_hash.is_none() {
+                                    new_hash = Some((ck, HashValue::PdqHash(hash)));
+                                }
+                                new_features = Some((ck, img_features));
+                                new_coeffs = Some((ck, cached_coeffs));
                             }
-                            new_features = Some((ck, img_features));
-                            new_coeffs = Some((ck, cached_coeffs));
-                        }
-                    } else {
-                        // Fallback: If image failed to decode (e.g. corrupt),
-                        // but we might still get resolution from headers for RAWs
-                        if resolution.is_none() {
-                            resolution = get_resolution(path, Some(b));
+                        } else {
+                            // Fallback: If image failed to decode (e.g. corrupt),
+                            // but we might still get resolution from headers for RAWs
+                            if resolution.is_none() {
+                                resolution = get_resolution(path, Some(b));
+                            }
                         }
                     }
                 }
-            }
 
-            if new_meta.is_some()
-                || new_hash.is_some()
-                || new_features.is_some()
-                || new_coeffs.is_some()
-                || new_pixel.is_some()
-            {
-                let _ = tx.send((new_meta, new_hash, new_features, new_coeffs, new_pixel));
-            }
+                if new_meta.is_some()
+                    || new_hash.is_some()
+                    || new_features.is_some()
+                    || new_coeffs.is_some()
+                    || new_pixel.is_some()
+                {
+                    let _ = tx.send((new_meta, new_hash, new_features, new_coeffs, new_pixel));
+                }
 
-            Some(ScannedFile {
-                path: path.clone(),
-                size,
-                modified: mtime_utc,
-                resolution,
-                content_hash: ck,
-                orientation,
-                gps_pos,
-                unique_file_id,
-                pdqhash,
-                pdq_features,
-                pixel_hash,
-                exif_timestamp,
+                Some(ScannedFile {
+                    path: path.clone(),
+                    size,
+                    modified: mtime_utc,
+                    resolution,
+                    content_hash: ck,
+                    orientation,
+                    gps_pos,
+                    unique_file_id,
+                    pdqhash,
+                    pdq_features,
+                    pixel_hash,
+                    exif_timestamp,
+                })
             })
-        })
-        .collect();
+            .collect()
+    });
 
     drop(tx);
     db_handle.join().expect("DB writer thread panicked");
@@ -2118,7 +2167,14 @@ pub fn scan_for_view(
         return (Vec::new(), Vec::new(), subdirs);
     }
 
-    // 2. Parallel Processing with Streaming
+    // 2. Build a constrained thread pool (initialized at app startup)
+    let safe_threads = get_safe_thread_count();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(safe_threads)
+        .build()
+        .expect("Failed to build smart thread pool");
+
+    // 3. Parallel Processing with Streaming
     let chunk_size = 100;
     let processed_count = AtomicUsize::new(0);
 
@@ -2128,56 +2184,58 @@ pub fn scan_for_view(
     let mut all_files = Vec::new();
 
     for chunk in chunks {
-        let batch_results: Vec<FileMetadata> = chunk
-            .par_iter()
-            .filter_map(|path| {
-                if let Some(prog_tx) = &progress_tx {
-                    let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if current.is_multiple_of(50) || current == total_files {
-                        let _ = prog_tx.send((current, total_files));
+        let batch_results: Vec<FileMetadata> = pool.install(|| {
+            chunk
+                .par_iter()
+                .filter_map(|path| {
+                    if let Some(prog_tx) = &progress_tx {
+                        let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        if current.is_multiple_of(50) || current == total_files {
+                            let _ = prog_tx.send((current, total_files));
+                        }
                     }
-                }
 
-                let metadata = fs::metadata(path).ok()?;
-                let size = metadata.len();
-                let modified = DateTime::from(metadata.modified().ok().unwrap_or(UNIX_EPOCH));
+                    let metadata = fs::metadata(path).ok()?;
+                    let size = metadata.len();
+                    let modified = DateTime::from(metadata.modified().ok().unwrap_or(UNIX_EPOCH));
 
-                let mut gps_pos = None;
-                let mut exif_timestamp = None;
-                if let Some(exif) = read_exif_data(path, None) {
-                    if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
-                        gps_pos = Some(Point::new(lon, lat));
+                    let mut gps_pos = None;
+                    let mut exif_timestamp = None;
+                    if let Some(exif) = read_exif_data(path, None) {
+                        if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
+                            gps_pos = Some(Point::new(lon, lat));
+                        }
+                        exif_timestamp = get_exif_timestamp(&exif);
                     }
-                    exif_timestamp = get_exif_timestamp(&exif);
-                }
-                // Required for RAWs to look correct immediately.
-                // Streaming (batch_tx) ensures the UI is still responsive.
-                // Note: For RAW files, the actual orientation used depends on whether thumbnails
-                // or full decode is used. The image loader will return the correct value.
-                let orientation = get_orientation(path, None);
-                eprintln!(
-                    "[DEBUG-SCAN] scan_for_view get_orientation={} for {:?}",
-                    orientation,
-                    path.file_name().unwrap_or_default()
-                );
+                    // Required for RAWs to look correct immediately.
+                    // Streaming (batch_tx) ensures the UI is still responsive.
+                    // Note: For RAW files, the actual orientation used depends on whether thumbnails
+                    // or full decode is used. The image loader will return the correct value.
+                    let orientation = get_orientation(path, None);
+                    eprintln!(
+                        "[DEBUG-SCAN] scan_for_view get_orientation={} for {:?}",
+                        orientation,
+                        path.file_name().unwrap_or_default()
+                    );
 
-                let unique_file_id = get_file_key(path)?;
+                    let unique_file_id = get_file_key(path)?;
 
-                Some(FileMetadata {
-                    path: path.clone(),
-                    size,
-                    modified,
-                    pdqhash: None,
-                    resolution: None,
-                    content_hash: [0u8; 32],
-                    pixel_hash: None,
-                    orientation,
-                    gps_pos,
-                    unique_file_id,
-                    exif_timestamp,
+                    Some(FileMetadata {
+                        path: path.clone(),
+                        size,
+                        modified,
+                        pdqhash: None,
+                        resolution: None,
+                        content_hash: [0u8; 32],
+                        pixel_hash: None,
+                        orientation,
+                        gps_pos,
+                        unique_file_id,
+                        exif_timestamp,
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        });
 
         // Stream this batch to the GUI immediately
         if !batch_results.is_empty() {
@@ -2188,7 +2246,7 @@ pub fn scan_for_view(
         }
     }
 
-    // 3. Final Sort
+    // 4. Final Sort
     sort_files(&mut all_files, sort_order);
 
     let info = GroupInfo { max_dist: 0, status: GroupStatus::None };
