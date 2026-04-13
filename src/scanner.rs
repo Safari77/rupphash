@@ -62,9 +62,10 @@ fn get_image_memory_limit() -> u64 {
         sys.refresh_memory();
 
         let total_ram_bytes = sys.total_memory();
-        let limit_bytes = (total_ram_bytes * 3) / 4;
+        // Limit to 75% of RAM divided by the number of Rayon threads
+        let threads = rayon::current_num_threads().max(1) as u64;
+        let limit_bytes = ((total_ram_bytes * 3) / 4) / threads;
 
-        eprintln!("[SYSTEM] Set image-rs fallback memory limit to {} bytes", limit_bytes);
         limit_bytes
     })
 }
@@ -563,17 +564,16 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 let height = pixmap.height() as u32;
                 let pixel_slice = pixmap.data();
 
-                let raw_bytes = unsafe {
+                let raw_bytes: Vec<u8> = unsafe {
                     std::slice::from_raw_parts(
                         pixel_slice.as_ptr() as *const u8,
                         pixel_slice.len() * 4,
                     )
-                };
+                }
+                .to_vec();
 
                 // 6. Build the DynamicImage
-                if let Some(rgba_image) =
-                    image::RgbaImage::from_raw(width, height, raw_bytes.to_vec())
-                {
+                if let Some(rgba_image) = image::RgbaImage::from_raw(width, height, raw_bytes) {
                     img_debug!("[pdf] zero-copy decode successful");
                     return Ok(image::DynamicImage::ImageRgba8(rgba_image));
                 }
