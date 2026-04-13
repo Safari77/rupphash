@@ -1196,6 +1196,10 @@ pub fn scan_and_group(
                 let bytes = fs::read(path).ok();
 
                 if let Some(ref b) = bytes {
+                    // 1. PRE-PARSE rsraw if it's a RAW file to avoid doing it multiple times
+                    let is_raw = is_raw_ext(path);
+                    let mut parsed_raw = if is_raw { rsraw::RawImage::open(b).ok() } else { None };
+
                     // Read Orientation, GPS location, and EXIF timestamp
                     // For RAW files, we may need to fall back to rsraw if kamadak-exif fails
                     let exif_data = read_exif_data(path, Some(b));
@@ -1212,19 +1216,20 @@ pub fn scan_and_group(
                             orientation = v as u8;
                         }
                         exif_timestamp = get_exif_timestamp(exif);
-                    } else if is_raw_ext(path) {
+                    } else if is_raw {
                         // kamadak-exif failed on RAW file - try rsraw as fallback
-                        if let Ok(raw) = rsraw::RawImage::open(b) {
+                        if let Some(ref raw) = parsed_raw {
                             // Get GPS from rsraw
-                            if let Some(point) = raw_exif::get_gps_point_from_raw(&raw) {
+                            if let Some(point) = raw_exif::get_gps_point_from_raw(raw) {
                                 gps_pos = Some(point);
                             }
                             // Get timestamp from rsraw
-                            exif_timestamp = raw_exif::get_timestamp_from_raw(&raw);
+                            exif_timestamp = raw_exif::get_timestamp_from_raw(raw);
                             // Note: orientation is NOT available from rsraw
                             // It will remain at the default value of 1
                         }
                     }
+
                     // 2. Calculate file hash if needed
                     if ck == [0u8; 32] {
                         let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
@@ -1235,10 +1240,10 @@ pub fn scan_and_group(
                     // 3. Load Image ONCE using the FAST loader
                     let mut img_for_hashing: Option<image::DynamicImage> = None;
 
-                    if is_raw_ext(path) {
+                    if is_raw {
                         // RAW FILE: Extract Largest JPEG Thumbnail
                         // We need the image for PDQ even if pixel_hash is disabled.
-                        if let Ok(mut raw) = rsraw::RawImage::open(b)
+                        if let Some(mut raw) = parsed_raw
                             && let Ok(thumbs) = raw.extract_thumbs()
                         {
                             // Find largest JPEG thumbnail
