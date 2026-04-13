@@ -25,7 +25,7 @@ file-id = "0.2"
 flate2 = { version = "1.1", features = [
   "rust_backend",
 ], default-features = false }
-geo = { version = "0.32", features = ["serde"] }
+geo = { version = "0.33", features = ["serde"] }
 getrandom = "0.4"
 hayro = "0"
 hayro-syntax = "0"

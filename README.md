@@ -39,6 +39,9 @@ go-pmtiles extract https://build.protomaps.com/$(date --utc "+%Y%m%d" -d yesterd
 ```
 makes a 7 GiB world "overview" file with maxzoom 11. Every zoom level you add doubles the data.
 
+Another source is `https://data.source.coop/protomaps/openstreetmap/v4.pmtiles` (updated daily).
+These `*.pmtiles` can be downloaded locally and then go-pmtiles can be used to generate smaller pmtiles with a different zoom level.
+
 tileserver-gl needs configuration to make it serve raster maps.
 ```bash
 cd /data

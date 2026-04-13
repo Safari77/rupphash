@@ -264,7 +264,7 @@ pub(super) fn handle_input(
                 } else if app.state.current_file_idx < page_size && total_dirs > 0 {
                     // Would go past first file, jump to directories
                     let remaining = page_size - app.state.current_file_idx;
-                    app.dir_selection_idx = Some(total_dirs.saturating_sub(remaining).max(0));
+                    app.dir_selection_idx = Some(total_dirs.saturating_sub(remaining));
                     app.dir_scroll_to_selection = true;
                 } else {
                     // Normal file navigation

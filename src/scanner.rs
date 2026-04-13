@@ -93,7 +93,7 @@ pub fn init_smart_limits() -> usize {
 
 /// Returns the cached safe thread count (falls back to init if not yet called).
 pub fn get_safe_thread_count() -> usize {
-    SMART_LIMITS.get().map(|&(t, _)| t).unwrap_or_else(|| init_smart_limits())
+    SMART_LIMITS.get().map(|&(t, _)| t).unwrap_or_else(init_smart_limits)
 }
 
 pub fn get_image_memory_limit() -> u64 {
@@ -1240,7 +1240,7 @@ pub fn scan_and_group(
                     if let Some(ref b) = bytes {
                         // 1. PRE-PARSE rsraw if it's a RAW file to avoid doing it multiple times
                         let is_raw = is_raw_ext(path);
-                        let mut parsed_raw =
+                        let parsed_raw =
                             if is_raw { rsraw::RawImage::open(b).ok() } else { None };
 
                         // Read Orientation, GPS location, and EXIF timestamp
@@ -1899,9 +1899,9 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
             });
             files.reverse();
         }
-        "date" => files.sort_by(|a, b| a.modified.cmp(&b.modified)),
+        "date" => files.sort_by_key(|a| a.modified),
         "date-desc" => files.sort_by(|a, b| b.modified.cmp(&a.modified)),
-        "size" => files.sort_by(|a, b| a.size.cmp(&b.size)),
+        "size" => files.sort_by_key(|a| a.size),
         "size-desc" => files.sort_by(|a, b| b.size.cmp(&a.size)),
         "exif-date" => {
             // Sort by EXIF timestamp (oldest first).
