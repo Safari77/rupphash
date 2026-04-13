@@ -274,12 +274,20 @@ fn maybe_resize_image(
         let new_w = (w as f32 * scale).round() as usize;
         let new_h = (h as f32 * scale).round() as usize;
 
-        // Convert egui::ColorImage -> fast_image_resize::Image
         let pixel_type = PixelType::U8x4;
 
-        if let Ok(src_image) =
-            FastImage::from_vec_u8(w as u32, h as u32, color_image.as_raw().to_vec(), pixel_type)
-        {
+        // Take ownership of the memory directly instead of cloning it.
+        let pixels = std::mem::take(&mut color_image.pixels);
+
+        let raw_pixels: Vec<u8> = unsafe {
+            let mut p = std::mem::ManuallyDrop::new(pixels);
+            let ptr = p.as_mut_ptr() as *mut u8;
+            let length = p.len() * 4;
+            let capacity = p.capacity() * 4;
+            Vec::from_raw_parts(ptr, length, capacity)
+        };
+
+        if let Ok(src_image) = FastImage::from_vec_u8(w as u32, h as u32, raw_pixels, pixel_type) {
             let mut dst_image = FastImage::new(new_w as u32, new_h as u32, pixel_type);
             // Resize using default options (Lanczos3 for quality)
             let mut resizer = Resizer::new();
@@ -288,7 +296,7 @@ fn maybe_resize_image(
                     "[DEBUG] Fast-Resized {:?} from {}x{} to {}x{}",
                     path, w, h, new_w, new_h
                 );
-                // Convert back to egui
+                // Overwrite the empty color_image with the new resized one
                 color_image =
                     egui::ColorImage::from_rgba_unmultiplied([new_w, new_h], dst_image.buffer());
             }
