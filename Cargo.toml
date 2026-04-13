@@ -29,7 +29,7 @@ geo = { version = "0.32", features = ["serde"] }
 getrandom = "0.4"
 hayro = "0"
 hayro-syntax = "0"
-hayro-jpeg2000 = "0.3.4"
+hayro-jpeg2000 = "0.3"
 hex = "0.4"
 image-extras = { git = "https://github.com/image-rs/image-extras", branch = "main" }
 image = { version = "0.25", features = ["avif-native"] }

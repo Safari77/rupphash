@@ -499,6 +499,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 }
             }
         }
+
         "jxl" => {
             use image::ImageDecoder;
             use jxl_oxide::integration::JxlDecoder;
@@ -544,6 +545,8 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
             let pages = pdf.pages();
             if let Some(first_page) = pages.first() {
                 let interpreter_settings = hayro::hayro_interpret::InterpreterSettings::default();
+                let cache = hayro::RenderCache::new();
+
                 // Configure render settings with a solid white background
                 let render_settings = hayro::RenderSettings {
                     x_scale: 2.0,
@@ -553,7 +556,8 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 };
 
                 // Render the page to a pixmap
-                let pixmap = hayro::render(first_page, &interpreter_settings, &render_settings);
+                let pixmap =
+                    hayro::render(first_page, &cache, &interpreter_settings, &render_settings);
 
                 let width = pixmap.width() as u32;
                 let height = pixmap.height() as u32;
