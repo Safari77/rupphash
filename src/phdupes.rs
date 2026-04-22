@@ -36,6 +36,7 @@ mod exif_types;
 mod fileops;
 mod gui;
 mod hamminghash;
+mod hdr;
 #[allow(unused)]
 mod helper_exif;
 mod image_features;

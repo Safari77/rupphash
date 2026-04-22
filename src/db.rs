@@ -68,6 +68,18 @@ impl PaletteConfig {
     }
 }
 
+/// Bundled HDR→SDR tone-mapping configuration
+#[derive(Debug, Clone, Copy)]
+pub struct HdrConfig {
+    pub sdr_peak_nits: f32,
+}
+
+impl HdrConfig {
+    pub fn from_gui_config(gui: &GuiConfig) -> Self {
+        Self { sdr_peak_nits: gui.sdr_peak_nits.unwrap_or(203.0) }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GroupingConfig {
     pub ignore_same_stem: bool,
@@ -98,6 +110,9 @@ pub struct GuiConfig {
     pub height: Option<u32>,
     pub panel_width: Option<f32>,
     pub decimal_coords: Option<bool>,
+    /// Target display peak luminance (nits) for HDR→SDR tone mapping.
+    /// 100.0 = strict SDR reference; 203.0 = BT.2408 HDR reference white (default).
+    pub sdr_peak_nits: Option<f32>,
     #[serde(default = "default_exif_tags")]
     pub exif_tags: Vec<String>,
 }
@@ -131,6 +146,7 @@ impl Default for GuiConfig {
             height: Some(720),
             panel_width: Some(450.0),
             decimal_coords: Some(true),
+            sdr_peak_nits: Some(203.0),
             exif_tags: default_exif_tags(),
         }
     }
@@ -343,13 +359,14 @@ impl AppContext {
             let colors_clamped = original_colors != cfg.gui.dominant_colors;
 
             eprintln!(
-                "[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}, dominant_colors={:?}, saturation_bias={:?}, palette_sort={:?}",
+                "[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}, dominant_colors={:?}, saturation_bias={:?}, palette_sort={:?}, sdr_peak_nits={:?}",
                 cfg.gui.width,
                 cfg.gui.height,
                 cfg.gui.panel_width,
                 cfg.gui.dominant_colors,
                 cfg.gui.saturation_bias,
-                cfg.gui.palette_sort
+                cfg.gui.palette_sort,
+                cfg.gui.sdr_peak_nits
             );
             eprintln!("[DEBUG-DB] LMDB map size: {} MiB", cfg.db_size_mb);
             eprintln!("[DEBUG-DB] Locations loaded: {}", cfg.locations.len());

@@ -332,11 +332,13 @@ impl GuiApp {
         scanner::init_smart_limits();
 
         let palette_config = crate::db::PaletteConfig::from_gui_config(&ctx.gui_config);
+        let hdr_config = crate::db::HdrConfig::from_gui_config(&ctx.gui_config);
         let histogram_enabled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = super::image::spawn_image_loader_pool(
             use_raw_thumbnails,
             ctx.content_key,
             palette_config,
+            hdr_config,
             Arc::clone(&histogram_enabled),
         );
         // panel_width is saved in logical points (after font_scale applied)
@@ -490,11 +492,13 @@ impl GuiApp {
         scanner::init_smart_limits();
 
         let palette_config = crate::db::PaletteConfig::from_gui_config(&ctx.gui_config);
+        let hdr_config = crate::db::HdrConfig::from_gui_config(&ctx.gui_config);
         let histogram_enabled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = super::image::spawn_image_loader_pool(
             use_raw_thumbnails,
             ctx.content_key,
             palette_config,
+            hdr_config,
             Arc::clone(&histogram_enabled),
         );
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);

@@ -76,6 +76,7 @@ pub(super) fn spawn_image_loader_pool(
     use_thumbnails: bool,
     content_key: [u8; 32],
     palette_config: crate::db::PaletteConfig,
+    hdr_config: crate::db::HdrConfig,
     histogram_enabled: Arc<AtomicBool>,
 ) -> (Sender<PathBuf>, Receiver<(PathBuf, ImageLoadResult)>) {
     let (tx, rx) = unbounded::<PathBuf>();
@@ -92,6 +93,7 @@ pub(super) fn spawn_image_loader_pool(
         let hist_flag = Arc::clone(&histogram_enabled);
 
         let pcfg = palette_config;
+        let hcfg = hdr_config;
         thread::spawn(move || {
             while let Ok(path) = rx_clone.recv() {
                 // Load & Process (Resize + Orientation)
@@ -149,55 +151,53 @@ pub(super) fn spawn_image_loader_pool(
                     }
                 }
 
-                let result =
-                    match load_and_process_image_with_hash(&path, use_thumbnails, &content_key) {
-                        Ok((img, dims, orientation, content_hash, exif_timestamp)) => {
-                            // Only compute histogram + palette when the overlay is enabled;
-                            // the disk-based fallback in render_histogram handles cache misses
-                            // when the user toggles it on later.
-                            let hist_palette = if hist_flag.load(Ordering::Relaxed) {
-                                let hp = compute_histogram_from_colorimage(
-                                    &img,
-                                    pcfg,
-                                    img.size[0] != dims.0 as usize
-                                        || img.size[1] != dims.1 as usize,
-                                );
+                let result = match load_and_process_image_with_hash(
+                    &path,
+                    use_thumbnails,
+                    &content_key,
+                    hcfg,
+                ) {
+                    Ok((img, dims, orientation, content_hash, exif_timestamp)) => {
+                        // Only compute histogram + palette when the overlay is enabled;
+                        // the disk-based fallback in render_histogram handles cache misses
+                        // when the user toggles it on later.
+                        let hist_palette = if hist_flag.load(Ordering::Relaxed) {
+                            let hp = compute_histogram_from_colorimage(
+                                &img,
+                                pcfg,
+                                img.size[0] != dims.0 as usize || img.size[1] != dims.1 as usize,
+                            );
 
-                                // Log dominant colors as gamma-encoded sRGB values
-                                let colors_str: Vec<String> =
-                                    hp.3.iter()
-                                        .map(|(c, w)| {
-                                            format!(
-                                                "({}, {}, {} {:.0}%)",
-                                                c.r(),
-                                                c.g(),
-                                                c.b(),
-                                                w * 100.0
-                                            )
-                                        })
-                                        .collect();
-                                eprintln!(
-                                    "[PALETTE] {:?}: [{}]",
-                                    path.file_name().unwrap_or_default(),
-                                    colors_str.join(", ")
-                                );
+                            // Log dominant colors as gamma-encoded sRGB values
+                            let colors_str: Vec<String> = hp
+                                .3
+                                .iter()
+                                .map(|(c, w)| {
+                                    format!("({}, {}, {} {:.0}%)", c.r(), c.g(), c.b(), w * 100.0)
+                                })
+                                .collect();
+                            eprintln!(
+                                "[PALETTE] {:?}: [{}]",
+                                path.file_name().unwrap_or_default(),
+                                colors_str.join(", ")
+                            );
 
-                                Some(hp)
-                            } else {
-                                None
-                            };
+                            Some(hp)
+                        } else {
+                            None
+                        };
 
-                            ImageLoadResult::Loaded(
-                                img,
-                                dims,
-                                orientation,
-                                content_hash,
-                                exif_timestamp,
-                                hist_palette,
-                            )
-                        }
-                        Err(err_msg) => ImageLoadResult::Failed(err_msg),
-                    };
+                        ImageLoadResult::Loaded(
+                            img,
+                            dims,
+                            orientation,
+                            content_hash,
+                            exif_timestamp,
+                            hist_palette,
+                        )
+                    }
+                    Err(err_msg) => ImageLoadResult::Failed(err_msg),
+                };
                 let _ = tx_clone.send((path, result));
             }
         });
@@ -228,6 +228,7 @@ fn load_and_process_image_with_hash(
     path: &Path,
     use_thumbnails: bool,
     content_key: &[u8; 32],
+    hdr_config: crate::db::HdrConfig,
 ) -> Result<(egui::ColorImage, (u32, u32), u8, [u8; 32], Option<i64>), String> {
     // Read file once for both hashing and image processing
     let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
@@ -254,7 +255,8 @@ fn load_and_process_image_with_hash(
         });
 
     // Process the image using existing logic
-    let (img, dims, orientation) = load_and_process_image_from_bytes(path, &bytes, use_thumbnails)?;
+    let (img, dims, orientation) =
+        load_and_process_image_from_bytes(path, &bytes, use_thumbnails, hdr_config)?;
 
     Ok((img, dims, orientation, content_hash, exif_timestamp))
 }
@@ -548,6 +550,7 @@ fn load_and_process_image_from_bytes(
     path: &Path,
     bytes: &[u8],
     use_thumbnails: bool,
+    hdr_config: crate::db::HdrConfig,
 ) -> Result<(egui::ColorImage, (u32, u32), u8), String> {
     // ---------------------------------------------------------------------
     // RAW FILES
@@ -670,15 +673,52 @@ fn load_and_process_image_from_bytes(
     let format_name =
         reader.format().map(|f| format!("{:?}", f)).unwrap_or_else(|| "unknown".to_string());
 
+    // Detect HDR cICP before decoding. PNG is the main current carrier of
+    // cICP in still images; AVIF/HEIC/JXL signal their color space through
+    // their own container metadata which the image crate may or may not
+    // surface depending on version, so for now we only parse PNG cICP here.
+    // If `detect_cicp_png` returns None (non-PNG or no chunk), we fall
+    // through to the standard 8-bit path.
+    let cicp = crate::hdr::detect_cicp_png(bytes);
+
     let dyn_img =
         reader.decode().map_err(|e| format!("Failed to decode {}: {}", format_name, e))?;
     let dims = (dyn_img.width(), dyn_img.height());
 
-    let rgba = dyn_img.to_rgba8();
-    let img = egui::ColorImage::from_rgba_unmultiplied(
-        [dims.0 as usize, dims.1 as usize],
-        rgba.as_flat_samples().as_slice(),
-    );
+    // HDR path: if cICP advertised PQ or HLG transfer and the decoder gave
+    // us at least 16-bit precision, run the full tone-mapping / gamut
+    // conversion pipeline. Otherwise fall back to the original 8-bit path.
+    let needs_hdr_processing = cicp.map(|c| c.is_hdr()).unwrap_or(false)
+        && matches!(
+            dyn_img,
+            image::DynamicImage::ImageRgb16(_) | image::DynamicImage::ImageRgba16(_)
+        );
+
+    let img = if needs_hdr_processing {
+        let cicp = cicp.unwrap(); // guarded above
+        eprintln!(
+            "[DEBUG-HDR] {:?}: cICP primaries={} transfer={} matrix={} full_range={} -> tone-mapping to SDR",
+            path,
+            cicp.color_primaries,
+            cicp.transfer_characteristics,
+            cicp.matrix_coefficients,
+            cicp.full_range,
+        );
+        // TODO: expose sdr_peak_nits in the UI. 203 nits is the ITU-R BT.2408
+        // HDR reference white and gives a bright, pleasant mapping on normal
+        // desktop monitors. 100 nits matches mpv's strict SDR reference.
+        let rgba = crate::hdr::process_hdr_to_sdr(&dyn_img, cicp, hdr_config.sdr_peak_nits);
+        egui::ColorImage::from_rgba_unmultiplied(
+            [dims.0 as usize, dims.1 as usize],
+            rgba.as_flat_samples().as_slice(),
+        )
+    } else {
+        let rgba = dyn_img.to_rgba8();
+        egui::ColorImage::from_rgba_unmultiplied(
+            [dims.0 as usize, dims.1 as usize],
+            rgba.as_flat_samples().as_slice(),
+        )
+    };
 
     Ok(maybe_resize_image(img, dims, orientation, path))
 }
