@@ -20,7 +20,7 @@
 //!   6. Apply the sRGB OETF (gamma encoding).
 //!   7. Quantize to u8.
 
-use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage};
+use image::{DynamicImage, ImageBuffer, ImageDecoder, Rgba, RgbaImage};
 use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -51,6 +51,10 @@ impl Cicp {
 /// Scan a PNG byte stream for the `cICP` chunk. Returns `None` if the file
 /// is not a PNG or the chunk is absent. Reads only as far as necessary —
 /// stops at the first `IDAT` (image data) chunk.
+///
+/// The PNG `cICP` chunk is a dedicated PNG-only chunk, not an ICC profile —
+/// so `image::ImageDecoder::icc_profile` does not surface it. PNGs with an
+/// `iCCP` (ICC profile) chunk instead are picked up by the ICC path below.
 pub fn detect_cicp_png(bytes: &[u8]) -> Option<Cicp> {
     // PNG signature: 8 bytes.
     const PNG_SIG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -89,6 +93,105 @@ pub fn detect_cicp_png(bytes: &[u8]) -> Option<Cicp> {
         i = next;
     }
     None
+}
+
+/// Detect cICP from an embedded ICC profile by asking the image crate's
+/// decoders to extract it. `ImageDecoder::icc_profile` handles the format-
+/// specific packaging for free — JPEG APP2 `ICC_PROFILE` segment reassembly,
+/// PNG `iCCP` zlib decompression, WebP `ICCP` chunks, TIFF tag 34675, etc.
+/// Returns `None` if the format isn't supported, the file has no ICC
+/// profile, or the profile lacks a v4.4 `cicp` tag.
+fn detect_cicp_from_icc_profile(bytes: &[u8]) -> Option<Cicp> {
+    // Dispatch to a concrete decoder based on magic bytes. Using the
+    // specific decoder types (instead of the generic `ImageReader` path)
+    // avoids any lifetime gymnastics around borrowed byte slices and keeps
+    // the set of supported formats explicit.
+    let icc: Vec<u8> = match image::guess_format(bytes).ok()? {
+        image::ImageFormat::Jpeg => {
+            let mut d = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+            d.icc_profile().ok().flatten()?
+        }
+        image::ImageFormat::Png => {
+            let mut d = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+            d.icc_profile().ok().flatten()?
+        }
+        _ => return None,
+    };
+    detect_cicp_icc(&icc)
+}
+
+/// Extract cICP values from a reassembled ICC profile buffer. Looks up the
+/// v4.4 `cicp` tag in the tag table and decodes its 12-byte body:
+///
+/// ```text
+///   4 bytes   signature 'cicp'
+///   4 bytes   reserved (0)
+///   1 byte    ColourPrimaries
+///   1 byte    TransferCharacteristics
+///   1 byte    MatrixCoefficients
+///   1 byte    VideoFullRangeFlag
+/// ```
+fn detect_cicp_icc(icc: &[u8]) -> Option<Cicp> {
+    // ICC layout: 128-byte header, then u32 tag count, then (tag_count * 12)
+    // bytes of tag table entries.
+    if icc.len() < 132 {
+        return None;
+    }
+    let tag_count = u32::from_be_bytes([icc[128], icc[129], icc[130], icc[131]]) as usize;
+    let tag_table_start = 132usize;
+    let tag_table_end = tag_table_start.checked_add(tag_count.checked_mul(12)?)?;
+    if tag_table_end > icc.len() {
+        return None;
+    }
+
+    for idx in 0..tag_count {
+        let entry = tag_table_start + idx * 12;
+        if &icc[entry..entry + 4] != b"cicp" {
+            continue;
+        }
+        let offset =
+            u32::from_be_bytes([icc[entry + 4], icc[entry + 5], icc[entry + 6], icc[entry + 7]])
+                as usize;
+        let size =
+            u32::from_be_bytes([icc[entry + 8], icc[entry + 9], icc[entry + 10], icc[entry + 11]])
+                as usize;
+        let end = offset.checked_add(size)?;
+        if end > icc.len() || size < 12 {
+            return None;
+        }
+        let data = &icc[offset..end];
+        if &data[0..4] != b"cicp" {
+            return None;
+        }
+        return Some(Cicp {
+            color_primaries: data[8],
+            transfer_characteristics: data[9],
+            matrix_coefficients: data[10],
+            full_range: data[11] != 0,
+        });
+    }
+    None
+}
+
+/// Dispatcher: detect cICP values from any supported still-image byte
+/// stream. Tries the PNG `cICP` chunk first (HDR PNGs normally signal
+/// through this dedicated chunk rather than an ICC profile), then falls
+/// back to extracting the ICC profile via `image::ImageDecoder::icc_profile`
+/// and looking up its v4.4 `cicp` tag — which covers JPEG APP2 ICC_PROFILE
+/// segments, PNG `iCCP` chunks, and any other format the image crate
+/// exposes an ICC profile for.
+pub fn detect_cicp(bytes: &[u8]) -> Option<Cicp> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    // PNG signature: 89 50 4E 47 — try the dedicated cICP chunk first,
+    // since it can't be reached through `.icc_profile()`.
+    if bytes[0..4] == [0x89, 0x50, 0x4E, 0x47]
+        && let Some(c) = detect_cicp_png(bytes)
+    {
+        return Some(c);
+    }
+    detect_cicp_from_icc_profile(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +490,39 @@ mod tests {
         let c = detect_cicp_png(&b).expect("cICP found");
         assert_eq!(c.color_primaries, 9);
         assert_eq!(c.transfer_characteristics, 16);
+        assert_eq!(c.matrix_coefficients, 0);
+        assert!(c.full_range);
+        assert!(c.is_hdr());
+    }
+
+    #[test]
+    fn cicp_icc_profile_parse() {
+        // Build a minimal ICC profile containing only a cicp tag, and feed
+        // it directly to the ICC parser. (The previous version of this test
+        // wrapped the profile in a handcrafted APP2-only JPEG, but now that
+        // we rely on the image crate's `icc_profile()`, the JPEG has to be
+        // a real decodable image — which is cumbersome to synthesize. The
+        // ICC parser itself is format-agnostic, so test it directly.)
+        let mut icc = vec![0u8; 128]; // empty header
+        let tag_count: u32 = 1;
+        icc.extend_from_slice(&tag_count.to_be_bytes());
+        // Single tag table entry pointing to the cicp data.
+        let cicp_data_offset: u32 = 128 + 4 + 12; // header + count + one entry
+        let cicp_data_size: u32 = 12;
+        icc.extend_from_slice(b"cicp");
+        icc.extend_from_slice(&cicp_data_offset.to_be_bytes());
+        icc.extend_from_slice(&cicp_data_size.to_be_bytes());
+        // cicpType body
+        icc.extend_from_slice(b"cicp"); // signature
+        icc.extend_from_slice(&[0u8; 4]); // reserved
+        icc.push(9); //  BT.2020 primaries
+        icc.push(18); // HLG transfer
+        icc.push(0); //  identity matrix
+        icc.push(1); //  full range
+
+        let c = detect_cicp_icc(&icc).expect("cicp from ICC profile");
+        assert_eq!(c.color_primaries, 9);
+        assert_eq!(c.transfer_characteristics, 18);
         assert_eq!(c.matrix_coefficients, 0);
         assert!(c.full_range);
         assert!(c.is_hdr());

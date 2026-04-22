@@ -676,23 +676,15 @@ fn load_and_process_image_from_bytes(
     // Detect HDR cICP before decoding. PNG is the main current carrier of
     // cICP in still images; AVIF/HEIC/JXL signal their color space through
     // their own container metadata which the image crate may or may not
-    // surface depending on version, so for now we only parse PNG cICP here.
-    // If `detect_cicp_png` returns None (non-PNG or no chunk), we fall
-    // through to the standard 8-bit path.
-    let cicp = crate::hdr::detect_cicp_png(bytes);
+    // surface depending on version.
+    let cicp = crate::hdr::detect_cicp(bytes);
 
     let dyn_img =
         reader.decode().map_err(|e| format!("Failed to decode {}: {}", format_name, e))?;
     let dims = (dyn_img.width(), dyn_img.height());
 
-    // HDR path: if cICP advertised PQ or HLG transfer and the decoder gave
-    // us at least 16-bit precision, run the full tone-mapping / gamut
-    // conversion pipeline. Otherwise fall back to the original 8-bit path.
-    let needs_hdr_processing = cicp.map(|c| c.is_hdr()).unwrap_or(false)
-        && matches!(
-            dyn_img,
-            image::DynamicImage::ImageRgb16(_) | image::DynamicImage::ImageRgba16(_)
-        );
+    // HDR path: cICP advertised PQ or HLG transfer
+    let needs_hdr_processing = cicp.map(|c| c.is_hdr()).unwrap_or(false);
 
     let img = if needs_hdr_processing {
         let cicp = cicp.unwrap(); // guarded above
@@ -704,9 +696,6 @@ fn load_and_process_image_from_bytes(
             cicp.matrix_coefficients,
             cicp.full_range,
         );
-        // TODO: expose sdr_peak_nits in the UI. 203 nits is the ITU-R BT.2408
-        // HDR reference white and gives a bright, pleasant mapping on normal
-        // desktop monitors. 100 nits matches mpv's strict SDR reference.
         let rgba = crate::hdr::process_hdr_to_sdr(&dyn_img, cicp, hdr_config.sdr_peak_nits);
         egui::ColorImage::from_rgba_unmultiplied(
             [dims.0 as usize, dims.1 as usize],
