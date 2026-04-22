@@ -20,6 +20,7 @@
 //!   6. Apply the sRGB OETF (gamma encoding).
 //!   7. Quantize to u8.
 
+use crate::img_debug;
 use image::{DynamicImage, ImageBuffer, ImageDecoder, Rgba, RgbaImage};
 use rayon::prelude::*;
 
@@ -46,6 +47,117 @@ impl Cicp {
     pub fn is_hdr(&self) -> bool {
         matches!(self.transfer_characteristics, 16 | 18)
     }
+}
+
+/// Extract `cICP` from ISOBMFF (AVIF/HEIC) files.
+/// Uses an ultra-fast byte-scanner to sidestep container parser failures,
+/// falling back to `mp4parse` only as a last resort.
+fn detect_cicp_isobmff(bytes: &[u8]) -> Option<Cicp> {
+    // Restrict the scan to the first 256 KiB
+    let search_limit = bytes.len().min(1024 * 256);
+    let haystack = &bytes[..search_limit];
+
+    // 1. Fast-scan for NCLX (cICP metadata)
+    // Layout: [size: 4] c o l r n c l x [prim: 2] [trans: 2] [matrix: 2] [flags: 1]
+    if let Some(pos) = haystack.windows(8).position(|w| w == b"colrnclx")
+        && pos + 15 <= haystack.len() {
+            let primaries = u16::from_be_bytes([haystack[pos + 8], haystack[pos + 9]]);
+            let transfer = u16::from_be_bytes([haystack[pos + 10], haystack[pos + 11]]);
+            let matrix = u16::from_be_bytes([haystack[pos + 12], haystack[pos + 13]]);
+            let flags = haystack[pos + 14];
+            let full_range = (flags & 0x80) != 0;
+
+            let tc = transfer as u8;
+            // H.273: 2 = Unspecified, 0 = Reserved
+            if tc != 2 && tc != 0 {
+                let cicp = Cicp {
+                    color_primaries: primaries as u8,
+                    transfer_characteristics: tc,
+                    matrix_coefficients: matrix as u8,
+                    full_range,
+                };
+                img_debug!("[DEBUG-CICP] Fast-scan successfully extracted NCLX: {:?}", cicp);
+                return Some(cicp);
+            } else {
+                img_debug!("[DEBUG-CICP] NCLX transfer is Unspecified. Looking for ICC profile...");
+            }
+        }
+
+    // 2. Fast-scan for embedded ICC profiles ('prof' or 'rICC')
+    // Layout: [size: 4] c o l r p r o f [ICC bytes...]
+    for icc_magic in [b"colrprof", b"colrrICC"] {
+        if let Some(pos) = haystack.windows(8).position(|w| w == icc_magic) {
+            // Ensure we can safely read the 4-byte box size preceding 'colr'
+            if pos >= 4 {
+                let box_size = u32::from_be_bytes([
+                    haystack[pos - 4],
+                    haystack[pos - 3],
+                    haystack[pos - 2],
+                    haystack[pos - 1],
+                ]) as usize;
+
+                // Normal box sizes include the 12-byte header.
+                // A size of 1 indicates a 64-bit extended size, which we skip.
+                if box_size > 12 && (pos - 4 + box_size) <= bytes.len() {
+                    let icc_start = pos + 8;
+                    let icc_end = pos - 4 + box_size;
+                    let icc_bytes = &bytes[icc_start..icc_end];
+
+                    img_debug!(
+                        "[DEBUG-CICP] Fast-scan extracted ICC profile ({} bytes)",
+                        icc_bytes.len()
+                    );
+                    if let Some(cicp) = detect_cicp_icc(icc_bytes) {
+                        return Some(cicp);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Last-ditch fallback: Let the strict parser attempt to read it
+    let mut cursor = std::io::Cursor::new(bytes);
+    if let Ok(ctx) = mp4parse::read_avif(&mut cursor, mp4parse::ParseStrictness::Permissive)
+        && let Some(Ok(icc_bytes)) = ctx.icc_colour_information() {
+            img_debug!(
+                "[DEBUG-CICP] mp4parse fallback extracted ICC profile ({} bytes)",
+                icc_bytes.len()
+            );
+            if let Some(cicp) = detect_cicp_icc(icc_bytes) {
+                return Some(cicp);
+            }
+        }
+
+    None
+}
+
+/// Dispatcher: detect cICP values from any supported still-image byte stream.
+pub fn detect_cicp(bytes: &[u8]) -> Option<Cicp> {
+    if bytes.len() < 12 {
+        img_debug!("[DEBUG-CICP] File too small ({} bytes)", bytes.len());
+        return None;
+    }
+
+    let brand = std::str::from_utf8(&bytes[4..8]).unwrap_or("????");
+    img_debug!("[DEBUG-CICP] File signature: {}", brand);
+
+    // 1. Check for ISOBMFF (AVIF / HEIC).
+    if &bytes[4..8] == b"ftyp" {
+        img_debug!("[DEBUG-CICP] Routing to ISOBMFF parser...");
+        if let Some(c) = detect_cicp_isobmff(bytes) {
+            return Some(c);
+        }
+        img_debug!("[DEBUG-CICP] ISOBMFF parser returned None. Falling through...");
+    }
+
+    // 2. PNG signature: 89 50 4E 47
+    if bytes[0..4] == [0x89, 0x50, 0x4E, 0x47]
+        && let Some(c) = detect_cicp_png(bytes) {
+            return Some(c);
+        }
+
+    // 3. Fallback (JPEG, WebP, etc.)
+    detect_cicp_from_icc_profile(bytes)
 }
 
 /// Scan a PNG byte stream for the `cICP` chunk. Returns `None` if the file
@@ -173,27 +285,6 @@ fn detect_cicp_icc(icc: &[u8]) -> Option<Cicp> {
     None
 }
 
-/// Dispatcher: detect cICP values from any supported still-image byte
-/// stream. Tries the PNG `cICP` chunk first (HDR PNGs normally signal
-/// through this dedicated chunk rather than an ICC profile), then falls
-/// back to extracting the ICC profile via `image::ImageDecoder::icc_profile`
-/// and looking up its v4.4 `cicp` tag — which covers JPEG APP2 ICC_PROFILE
-/// segments, PNG `iCCP` chunks, and any other format the image crate
-/// exposes an ICC profile for.
-pub fn detect_cicp(bytes: &[u8]) -> Option<Cicp> {
-    if bytes.len() < 4 {
-        return None;
-    }
-    // PNG signature: 89 50 4E 47 — try the dedicated cICP chunk first,
-    // since it can't be reached through `.icc_profile()`.
-    if bytes[0..4] == [0x89, 0x50, 0x4E, 0x47]
-        && let Some(c) = detect_cicp_png(bytes)
-    {
-        return Some(c);
-    }
-    detect_cicp_from_icc_profile(bytes)
-}
-
 // ---------------------------------------------------------------------------
 // Transfer functions
 // ---------------------------------------------------------------------------
@@ -229,7 +320,7 @@ fn hlg_eotf(e: f32, peak_nits: f32) -> f32 {
     // grayscale but not ideal for saturated colors). Kept for completeness.
     const A: f32 = 0.17883277;
     const B: f32 = 1.0 - 4.0 * A; // 0.28466892
-    const C: f32 = 0.55991073; // 0.5 - A * ln(4.0 * A)
+    const C: f32 = 0.559_910_7; // 0.5 - A * ln(4.0 * A)
     let e = e.max(0.0);
     let scene = if e <= 0.5 { (e * e) / 3.0 } else { (((e - C) / A).exp() + B) / 12.0 };
     // System gamma for nominal 1000 nit display.
@@ -252,8 +343,8 @@ fn srgb_oetf(v: f32) -> f32 {
 // Source: ITU-R BT.2087 / commonly reproduced in e.g. libplacebo.
 const BT2020_TO_BT709: [[f32; 3]; 3] = [
     [1.660_491, -0.587_641, -0.072_850],
-    [-0.124_550, 1.132_900, -0.008_349],
-    [-0.018_151, -0.100_579, 1.118_730],
+    [-0.124_550, 1.132_9, -0.008_349],
+    [-0.018_151, -0.100_579, 1.118_73],
 ];
 
 #[inline]

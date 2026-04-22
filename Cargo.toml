@@ -67,6 +67,7 @@ zerocopy = "0.8"
 zeroize = "1.8"
 zune-jpeg = "0.5"
 oklab = "1"
+mp4parse = "0.17"
 
 # GUI
 eframe = { version = "0.34", default-features = false, features = [

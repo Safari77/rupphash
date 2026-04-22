@@ -18,6 +18,7 @@ use crate::exif_types::{
     ExifValue, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE, TAG_ORIENTATION,
 };
 use crate::image_features::ImageFeatures;
+use crate::img_debug;
 use crate::raw_exif;
 use crate::scanner;
 
@@ -674,20 +675,29 @@ fn load_and_process_image_from_bytes(
         reader.format().map(|f| format!("{:?}", f)).unwrap_or_else(|| "unknown".to_string());
 
     // Detect HDR cICP before decoding. PNG is the main current carrier of
-    // cICP in still images; AVIF/HEIC/JXL signal their color space through
-    // their own container metadata which the image crate may or may not
-    // surface depending on version.
+    // cICP in still images; AVIF/HEIC signal their color space through
+    // ISOBMFF container metadata.
     let cicp = crate::hdr::detect_cicp(bytes);
+    eprintln!("[DEBUG-IMAGE] Final detected cICP: {:?}", cicp);
 
     let dyn_img =
         reader.decode().map_err(|e| format!("Failed to decode {}: {}", format_name, e))?;
+
+    img_debug!("[DEBUG-IMAGE] Decoded DynamicImage format: {:?}", dyn_img.color());
     let dims = (dyn_img.width(), dyn_img.height());
 
     // HDR path: cICP advertised PQ or HLG transfer
     let needs_hdr_processing = cicp.map(|c| c.is_hdr()).unwrap_or(false);
+    if needs_hdr_processing {
+        img_debug!("[DEBUG-IMAGE] needs_hdr_processing is TRUE. Entering process_hdr_to_sdr...");
+    } else {
+        img_debug!(
+            "[DEBUG-IMAGE] needs_hdr_processing is FALSE. Falling back to standard SDR pass."
+        );
+    }
 
     let img = if needs_hdr_processing {
-        let cicp = cicp.unwrap(); // guarded above
+        let cicp = cicp.unwrap();
         eprintln!(
             "[DEBUG-HDR] {:?}: cICP primaries={} transfer={} matrix={} full_range={} -> tone-mapping to SDR",
             path,

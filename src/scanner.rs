@@ -45,6 +45,7 @@ pub const RAW_EXTS: &[&str] = &[
 trait BufReadSeek: std::io::BufRead + std::io::Seek {}
 impl<T: std::io::BufRead + std::io::Seek> BufReadSeek for T {}
 
+#[macro_export]
 macro_rules! img_debug {
     ($($arg:tt)*) => {
         #[cfg(debug_assertions)]
@@ -1240,8 +1241,7 @@ pub fn scan_and_group(
                     if let Some(ref b) = bytes {
                         // 1. PRE-PARSE rsraw if it's a RAW file to avoid doing it multiple times
                         let is_raw = is_raw_ext(path);
-                        let parsed_raw =
-                            if is_raw { rsraw::RawImage::open(b).ok() } else { None };
+                        let parsed_raw = if is_raw { rsraw::RawImage::open(b).ok() } else { None };
 
                         // Read Orientation, GPS location, and EXIF timestamp
                         // For RAW files, we may need to fall back to rsraw if kamadak-exif fails
