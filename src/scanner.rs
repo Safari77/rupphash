@@ -2105,7 +2105,7 @@ pub fn is_image_ext(path: &Path) -> bool {
             matches!(
                 e.as_str(),
                 "dds"|"exr"|"ff"|"hdr"|"ico"|"pnm"|"qoi"|"gif"|"jpg"|"jpeg"|"png"|"webp"
-            |"bmp"|"tiff"|"tif"|"avif"|"heic"|"heif"|"tga"
+            |"bmp"|"tiff"|"tif"|"avif"|"heic"|"heif"|"tga"|"pbm"
             // hayro-jpeg2000
             |"jp2"|"j2k"
             // image-extras
