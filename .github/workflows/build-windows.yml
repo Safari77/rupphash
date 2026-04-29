@@ -3,6 +3,8 @@ name: Build and Release Windows (static binary)
 on:
   workflow_dispatch:
 
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
   VCPKG_ROOT: "C:/vcpkg"
@@ -35,8 +37,14 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         # 1. Extract Version
+        # perl -ne 'print "$1\n" if /^version\s*=\s*"([^"\r\n]+)"/' Cargo.toml
         $Content = Get-Content Cargo.toml
-        $Version = ($Content | Select-String -Pattern '^version\s*=\s*"(.*)"').Matches.Groups[1].Value
+        $Version = ($Content | Select-String -Pattern '^version\s*=\s*"([^"\r\n]+)"').Matches.Groups[1].Value.Trim()
+        if (-not $Version) {
+            Write-Error "Failed to extract a valid version string"
+            exit 1
+        }
+
         $TagName = "v$Version"
         $TargetAsset = "phdupes-v$Version-windows-static.exe"
 
@@ -64,7 +72,7 @@ jobs:
         }
 
         # 3. Export version to ENV for later steps
-        echo "VERSION=$Version" >> $env:GITHUB_ENV
+        "VERSION=$Version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
     - name: Install Dependencies
       run: |
@@ -95,16 +103,19 @@ jobs:
             $HeifVer = "Unknown"
         }
 
+        $Dav1dVer = $Dav1dVer -replace "`r|`n",""
+        $HeifVer = $HeifVer -replace "`r|`n",""
+
         Write-Host "Detected dav1d: $Dav1dVer"
         Write-Host "Detected libheif: $HeifVer"
 
-        echo "EXT_DAV1D_VER=$Dav1dVer" >> $env:GITHUB_ENV
-        echo "EXT_HEIF_VER=$HeifVer" >> $env:GITHUB_ENV
-        echo "EXT_DAV1D_HASH=Managed by vcpkg (x64-windows-static)" >> $env:GITHUB_ENV
-        echo "EXT_HEIF_HASH=Managed by vcpkg (x64-windows-static)" >> $env:GITHUB_ENV
+        "EXT_DAV1D_VER=$Dav1dVer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "EXT_HEIF_VER=$HeifVer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "EXT_DAV1D_HASH=Managed by vcpkg (x64-windows-static)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "EXT_HEIF_HASH=Managed by vcpkg (x64-windows-static)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-    - name: Install Rust 1.94.1
-      uses: dtolnay/rust-toolchain@1.94.1
+    - name: Install Rust 1.95.0
+      uses: dtolnay/rust-toolchain@1.95.0
       with:
         targets: "x86_64-pc-windows-msvc"
 
