@@ -1942,6 +1942,19 @@ pub(super) fn render_histogram(
         egui::vec2(hist_width, hist_height),
     );
 
+    // Shield: register a click_and_drag widget covering the entire histogram
+    // overlay (hist + palette below) so image-pan drags don't bleed through.
+    // Allocated BEFORE the inner hist_rect/swatch interactions so those land
+    // on top of it in egui's z-order and keep working (hover for scroll wheel,
+    // hover for swatch tooltips). The shield catches everything else.
+    let shield_rect =
+        egui::Rect::from_min_size(hist_rect.min, egui::vec2(hist_rect.width(), total_height + 4.0));
+    let _ = ui.interact(
+        shield_rect,
+        egui::Id::new("histogram_overlay_shield"),
+        egui::Sense::click_and_drag(),
+    );
+
     // Check cache first (HashMap keyed by path, populated during preload)
     let histogram_data = app.cached_histogram.get(path).cloned();
 
@@ -2324,4 +2337,10 @@ pub(super) fn render_exif(
         egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
         egui::StrokeKind::Outside,
     );
+
+    // Shield: register a click_and_drag widget over the entire overlay so that
+    // image-pan drags (allocated earlier in this frame) don't bleed through.
+    // Allocated last on this Ui, so it wins egui's hit-test against the pan rect.
+    let _ =
+        ui.interact(exif_rect, egui::Id::new("exif_overlay_shield"), egui::Sense::click_and_drag());
 }

@@ -60,28 +60,29 @@ fn detect_cicp_isobmff(bytes: &[u8]) -> Option<Cicp> {
     // 1. Fast-scan for NCLX (cICP metadata)
     // Layout: [size: 4] c o l r n c l x [prim: 2] [trans: 2] [matrix: 2] [flags: 1]
     if let Some(pos) = haystack.windows(8).position(|w| w == b"colrnclx")
-        && pos + 15 <= haystack.len() {
-            let primaries = u16::from_be_bytes([haystack[pos + 8], haystack[pos + 9]]);
-            let transfer = u16::from_be_bytes([haystack[pos + 10], haystack[pos + 11]]);
-            let matrix = u16::from_be_bytes([haystack[pos + 12], haystack[pos + 13]]);
-            let flags = haystack[pos + 14];
-            let full_range = (flags & 0x80) != 0;
+        && pos + 15 <= haystack.len()
+    {
+        let primaries = u16::from_be_bytes([haystack[pos + 8], haystack[pos + 9]]);
+        let transfer = u16::from_be_bytes([haystack[pos + 10], haystack[pos + 11]]);
+        let matrix = u16::from_be_bytes([haystack[pos + 12], haystack[pos + 13]]);
+        let flags = haystack[pos + 14];
+        let full_range = (flags & 0x80) != 0;
 
-            let tc = transfer as u8;
-            // H.273: 2 = Unspecified, 0 = Reserved
-            if tc != 2 && tc != 0 {
-                let cicp = Cicp {
-                    color_primaries: primaries as u8,
-                    transfer_characteristics: tc,
-                    matrix_coefficients: matrix as u8,
-                    full_range,
-                };
-                img_debug!("[DEBUG-CICP] Fast-scan successfully extracted NCLX: {:?}", cicp);
-                return Some(cicp);
-            } else {
-                img_debug!("[DEBUG-CICP] NCLX transfer is Unspecified. Looking for ICC profile...");
-            }
+        let tc = transfer as u8;
+        // H.273: 2 = Unspecified, 0 = Reserved
+        if tc != 2 && tc != 0 {
+            let cicp = Cicp {
+                color_primaries: primaries as u8,
+                transfer_characteristics: tc,
+                matrix_coefficients: matrix as u8,
+                full_range,
+            };
+            img_debug!("[DEBUG-CICP] Fast-scan successfully extracted NCLX: {:?}", cicp);
+            return Some(cicp);
+        } else {
+            img_debug!("[DEBUG-CICP] NCLX transfer is Unspecified. Looking for ICC profile...");
         }
+    }
 
     // 2. Fast-scan for embedded ICC profiles ('prof' or 'rICC')
     // Layout: [size: 4] c o l r p r o f [ICC bytes...]
@@ -118,15 +119,16 @@ fn detect_cicp_isobmff(bytes: &[u8]) -> Option<Cicp> {
     // 3. Last-ditch fallback: Let the strict parser attempt to read it
     let mut cursor = std::io::Cursor::new(bytes);
     if let Ok(ctx) = mp4parse::read_avif(&mut cursor, mp4parse::ParseStrictness::Permissive)
-        && let Some(Ok(icc_bytes)) = ctx.icc_colour_information() {
-            img_debug!(
-                "[DEBUG-CICP] mp4parse fallback extracted ICC profile ({} bytes)",
-                icc_bytes.len()
-            );
-            if let Some(cicp) = detect_cicp_icc(icc_bytes) {
-                return Some(cicp);
-            }
+        && let Some(Ok(icc_bytes)) = ctx.icc_colour_information()
+    {
+        img_debug!(
+            "[DEBUG-CICP] mp4parse fallback extracted ICC profile ({} bytes)",
+            icc_bytes.len()
+        );
+        if let Some(cicp) = detect_cicp_icc(icc_bytes) {
+            return Some(cicp);
         }
+    }
 
     None
 }
@@ -152,9 +154,10 @@ pub fn detect_cicp(bytes: &[u8]) -> Option<Cicp> {
 
     // 2. PNG signature: 89 50 4E 47
     if bytes[0..4] == [0x89, 0x50, 0x4E, 0x47]
-        && let Some(c) = detect_cicp_png(bytes) {
-            return Some(c);
-        }
+        && let Some(c) = detect_cicp_png(bytes)
+    {
+        return Some(c);
+    }
 
     // 3. Fallback (JPEG, WebP, etc.)
     detect_cicp_from_icc_profile(bytes)

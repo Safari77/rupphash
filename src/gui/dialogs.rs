@@ -385,6 +385,7 @@ pub(super) fn handle_input(
                     *intent.borrow_mut() = Some(InputIntent::MoveMarked);
                 } else {
                     app.show_move_input = true;
+                    app.move_focus_requested = false;
                     // Pre-fill with existing target if we have one
                     if let Some(ref current) = app.state.move_target {
                         app.move_input = current.to_string_lossy().to_string();
@@ -546,18 +547,30 @@ pub(super) fn handle_input(
             *intent.borrow_mut() = Some(InputIntent::ShowSortSelection);
         }
 
-        let window_width =
-            ctx.input(|i| i.viewport().inner_rect.map(|r| r.width()).unwrap_or(1000.0));
+        // Use InputState::screen_rect (always populated) instead of
+        // viewport().inner_rect (None on Wayland — egui issue #5215).
+        let window_width = ctx.input(|i| i.screen_rect().width());
+        let window_width = if window_width > 100.0 { window_width } else { 1000.0 };
         let delta = window_width * 0.02;
 
         // V to Shrink panel
         if ctx.input(|i| i.key_pressed(egui::Key::V)) {
-            app.panel_width = (app.panel_width - delta).max(96.0);
+            let old = app.panel_width;
+            app.panel_width = (app.panel_width - delta).max(160.0);
+            eprintln!(
+                "[PANEL-DBG] V pressed: window_width={:.1}, delta={:.1}, panel_width {:.1} -> {:.1}",
+                window_width, delta, old, app.panel_width
+            );
             *force_panel_resize = true;
         }
         // B to Expand
         if ctx.input(|i| i.key_pressed(egui::Key::B)) {
+            let old = app.panel_width;
             app.panel_width = (app.panel_width + delta).min(window_width * 0.8);
+            eprintln!(
+                "[PANEL-DBG] B pressed: window_width={:.1}, delta={:.1}, panel_width {:.1} -> {:.1}",
+                window_width, delta, old, app.panel_width
+            );
             *force_panel_resize = true;
         }
         // Search
@@ -634,6 +647,7 @@ pub(super) fn handle_dialogs(
                         path.file_name().unwrap_or_default().to_string_lossy().to_string();
                     app.completion_candidates.clear();
                     app.completion_index = 0;
+                    app.rename_focus_requested = false;
                     app.state.handle_input(i);
                 }
             }
@@ -867,6 +881,7 @@ pub(super) fn handle_dialogs(
                     app.state.show_move_confirmation = false;
                     // Open input dialog
                     app.show_move_input = true;
+                    app.move_focus_requested = false;
                     // Pre-fill input with the bad target so it can be edited
                     app.move_input = target;
                 }
@@ -897,8 +912,12 @@ pub(super) fn handle_dialogs(
                     .desired_width(300.0),
             );
 
-            if !app.state.show_sort_selection && !app.state.show_confirmation {
+            if !app.move_focus_requested
+                && !app.state.show_sort_selection
+                && !app.state.show_confirmation
+            {
                 res.request_focus();
+                app.move_focus_requested = true;
             }
 
             // Tab Completion (DIRECTORIES ONLY)
@@ -1174,8 +1193,12 @@ pub(super) fn handle_dialogs(
 
         egui::Window::new("Rename").collapsible(false).show(ctx, |ui| {
             let res = ui.text_edit_singleline(&mut app.rename_input);
-            if !app.state.show_sort_selection && !app.state.show_confirmation {
+            if !app.rename_focus_requested
+                && !app.state.show_sort_selection
+                && !app.state.show_confirmation
+            {
                 res.request_focus();
+                app.rename_focus_requested = true;
             }
 
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -1492,8 +1515,10 @@ pub(super) fn handle_dialogs(
     }
 
     if let Some(err_text) = app.state.error_popup.clone() {
-        egui::Window::new("Error").show(ctx, |ui| {
-            ui.label(err_text);
+        egui::Window::new("Error").max_width(400.0).show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                ui.label(err_text);
+            });
             if ui.button("OK").clicked() {
                 app.state.handle_input(InputIntent::Cancel);
             }
