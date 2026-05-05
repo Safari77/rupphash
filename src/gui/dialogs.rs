@@ -547,9 +547,9 @@ pub(super) fn handle_input(
             *intent.borrow_mut() = Some(InputIntent::ShowSortSelection);
         }
 
-        // Use InputState::screen_rect (always populated) instead of
+        // Use InputState::content_rect (always populated) instead of
         // viewport().inner_rect (None on Wayland — egui issue #5215).
-        let window_width = ctx.input(|i| i.screen_rect().width());
+        let window_width = ctx.input(|i| i.content_rect().width());
         let window_width = if window_width > 100.0 { window_width } else { 1000.0 };
         let delta = window_width * 0.02;
 

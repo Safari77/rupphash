@@ -1828,12 +1828,15 @@ impl Drop for GuiApp {
 }
 
 impl eframe::App for GuiApp {
-    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // All rendering is handled in update() which overrides the default
-        // that would call this method via CentralPanel.
-    }
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // egui 0.34 deprecated App::update in favor of App::ui (which provides
+        // a root &mut Ui). We bind ctx from ui.ctx() so the rest of the body —
+        // and all closures below — keep using `ctx: &egui::Context` unchanged.
+        // ctx_owned keeps the cloned Context alive for the whole frame; ctx is
+        // just a reference into it.
+        let ctx_owned = ui.ctx().clone();
+        let ctx = &ctx_owned;
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_fs_events(ctx);
         // Initial setup for view mode: create watcher (but don't refresh while scanning)
         if self.state.view_mode && self.current_dir.is_some() && self.watcher.is_none() {
@@ -1859,7 +1862,7 @@ impl eframe::App for GuiApp {
 
         // 3. Use the title string for the internal label (doesn't trigger OS events)
         if !cfg!(target_os = "windows") && !self.state.is_fullscreen {
-            egui::TopBottomPanel::top("custom_title_bar").show(ctx, |ui| {
+            egui::Panel::top("custom_title_bar").show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     let height = 12.0;
                     ui.label(egui::RichText::new(&self.state.last_title).strong());
@@ -2200,7 +2203,7 @@ impl eframe::App for GuiApp {
             *self.group_views.get(&current_group_idx).unwrap_or(&GroupViewState::default());
 
         if !self.state.is_fullscreen {
-            egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            egui::Panel::bottom("status").show_inside(ui, |ui| {
                 if let Some((msg, is_error)) = &self.state.status_message {
                     ui.colored_label(
                         if *is_error { egui::Color32::RED } else { egui::Color32::GREEN },
@@ -2326,15 +2329,15 @@ impl eframe::App for GuiApp {
             });
 
             // Restore Detailed File List
-            // Get actual window width in logical points. Use InputState::screen_rect
+            // Get actual window width in logical points. Use InputState::content_rect
             // because viewport().inner_rect/outer_rect can be None on Wayland and
-            // some other platforms (egui issue #5215). screen_rect is always populated.
+            // some other platforms (egui issue #5215). content_rect is always populated.
             // We still filter for sane values just in case.
-            let window_width = ctx.input(|i| i.screen_rect().width());
+            let window_width = ctx.input(|i| i.content_rect().width());
             let window_width = if window_width > 100.0 {
                 window_width
             } else {
-                // Final fallback for first frames before screen_rect is set.
+                // Final fallback for first frames before content_rect is set.
                 ctx.globally_used_rect().width()
             };
 
@@ -2360,7 +2363,7 @@ impl eframe::App for GuiApp {
             // via the inner content's response.rect, which interacts badly with our
             // ScrollArea contents and made the panel collapse to width_range.min every
             // frame. Rather than fight egui's internal state machine, we drive the
-            // panel width ourselves: always pass `exact_width(self.panel_width)` and
+            // panel width ourselves: always pass `exact_size(self.panel_width)` and
             // detect mouse-drag resize manually by reading the resize handle response.
             //
             // 1. Detect & apply mouse-drag resize from the previous frame BEFORE building
@@ -2418,14 +2421,13 @@ impl eframe::App for GuiApp {
                 );
             }
 
-            // 2. Always pin the panel to our authoritative width. exact_width sets
+            // 2. Always pin the panel to our authoritative width. exact_size sets
             //    width_range = point(width), so egui cannot shrink or grow it.
-            let panel =
-                egui::SidePanel::left(panel_id).resizable(true).exact_width(self.panel_width);
+            let panel = egui::Panel::left(panel_id).resizable(true).exact_size(self.panel_width);
 
-            let panel_response = panel.show(ctx, |ui| {
+            let panel_response = panel.show_inside(ui, |ui| {
                 // Belt-and-suspenders: force the inner ui to fill the panel width.
-                // (Not strictly necessary with exact_width, but cheap insurance.)
+                // (Not strictly necessary with exact_size, but cheap insurance.)
                 ui.set_min_width(ui.available_width());
 
                 // Show current directory header in view mode
@@ -3427,11 +3429,11 @@ impl eframe::App for GuiApp {
         // GPS Map Panel (right side, when visible)
         let mut map_clicked_path: Option<std::path::PathBuf> = None;
         if self.gps_map.visible {
-            egui::SidePanel::right("gps_map_panel")
+            egui::Panel::right("gps_map_panel")
                 .resizable(true)
                 .default_size(400.0)
                 .min_size(200.0)
-                .show(ctx, |ui| {
+                .show_inside(ui, |ui| {
                     ui.heading("GPS Map");
                     ui.separator();
 
@@ -3542,7 +3544,7 @@ impl eframe::App for GuiApp {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             let available_rect = ui.available_rect_before_wrap();
             if let Some(path) = current_image_path {
                 // 0. Check Animation Cache (animated WebP etc.)
@@ -3665,7 +3667,7 @@ impl eframe::App for GuiApp {
         });
 
         // Track window size for saving on exit
-        // Use InputState::screen_rect because viewport().inner_rect/outer_rect can
+        // Use InputState::content_rect because viewport().inner_rect/outer_rect can
         // be None on Wayland and some other platforms (egui issue #5215).
         let ppp = ctx.pixels_per_point();
 
@@ -3674,8 +3676,8 @@ impl eframe::App for GuiApp {
             i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)
         });
 
-        // screen_rect is in logical points; multiply by ppp to get physical pixels.
-        let screen = ctx.input(|i| i.screen_rect());
+        // content_rect is in logical points; multiply by ppp to get physical pixels.
+        let screen = ctx.input(|i| i.content_rect());
         let size = ((screen.width() * ppp) as u32, (screen.height() * ppp) as u32);
 
         // Gate on ppp > 0.0 (was ppp > 1.0, which silently disabled saves whenever
