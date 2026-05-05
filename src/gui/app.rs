@@ -134,6 +134,8 @@ pub struct GuiApp {
     pub(super) current_dir: Option<std::path::PathBuf>,
     pub(super) show_dir_picker: bool,
     pub(super) dir_list: Vec<std::path::PathBuf>,
+    /// Cached modification times for `dir_list`, populated alongside it in `open_dir_picker`.
+    pub(super) dir_list_mtime: Vec<Option<chrono::DateTime<chrono::Utc>>>,
     pub(super) dir_picker_selection: usize,
     pub(super) dir_picker_scroll_to_selection: bool, // True when keyboard nav should scroll to selection
     pub(super) subdirs: Vec<std::path::PathBuf>,     // Subdirectories in current directory
@@ -391,6 +393,7 @@ impl GuiApp {
             current_dir: None,
             show_dir_picker: false,
             dir_list: Vec::new(),
+            dir_list_mtime: Vec::new(),
             dir_picker_selection: 0,
             dir_picker_scroll_to_selection: false,
             subdirs: Vec::new(),
@@ -604,6 +607,7 @@ impl GuiApp {
             current_dir,
             show_dir_picker: false,
             dir_list: Vec::new(),
+            dir_list_mtime: Vec::new(),
             dir_picker_selection: 0,
             dir_picker_scroll_to_selection: false,
             subdirs,
@@ -924,6 +928,19 @@ impl GuiApp {
             // Refresh directory cache for display
             self.refresh_dir_cache(false);
             self.cache_dirty = true;
+
+            // If this directory has no files, position the sidebar selection on a directory entry
+            if count == 0 {
+                let has_parent = self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+                if !self.subdirs.is_empty() {
+                    self.dir_selection_idx = Some(if has_parent { 1 } else { 0 });
+                    self.dir_scroll_to_selection = true;
+                } else if has_parent {
+                    self.dir_selection_idx = Some(0);
+                    self.dir_scroll_to_selection = true;
+                }
+                // No subdirs and no parent: leave dir_selection_idx alone.
+            }
         }
     }
 
@@ -1683,6 +1700,13 @@ impl GuiApp {
     /// Open directory picker dialog
     pub(super) fn open_dir_picker(&mut self) {
         self.dir_list = self.get_subdirectories();
+        // Stat each entry once here so the dialog doesn't have to stat every
+        // entry every frame just to render the mtime column.
+        self.dir_list_mtime = self
+            .dir_list
+            .iter()
+            .map(|p| fs::metadata(p).ok().and_then(|m| m.modified().ok()).map(|t| t.into()))
+            .collect();
         self.dir_picker_selection = 0;
         self.show_dir_picker = true;
     }

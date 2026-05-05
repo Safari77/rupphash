@@ -140,8 +140,8 @@ pub fn detect_cicp(bytes: &[u8]) -> Option<Cicp> {
         return None;
     }
 
-    let brand = std::str::from_utf8(&bytes[4..8]).unwrap_or("????");
-    img_debug!("[DEBUG-CICP] File signature: {}", brand);
+    let _brand = std::str::from_utf8(&bytes[4..8]).unwrap_or("????");
+    img_debug!("[DEBUG-CICP] File signature: {}", _brand);
 
     // 1. Check for ISOBMFF (AVIF / HEIC).
     if &bytes[4..8] == b"ftyp" {

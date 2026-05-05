@@ -36,6 +36,9 @@ pub(super) fn handle_input(
         } else if app.state.show_search {
             *intent.borrow_mut() = Some(InputIntent::CancelSearch);
         } else if app.state.show_confirmation
+            || app.state.show_move_confirmation
+            || app.state.show_delete_immediate_confirmation
+            || app.state.show_ignore_group_confirmation
             || app.state.error_popup.is_some()
             || app.state.renaming.is_some()
             || app.state.show_sort_selection
@@ -205,7 +208,7 @@ pub(super) fn handle_input(
         }
 
         // PageDown - in view mode, handle directories too (disabled in flatten mode)
-        if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
+        if ctx.input(|i| !i.modifiers.shift && i.key_pressed(egui::Key::PageDown)) {
             if app.state.view_mode && !app.state.view_mode_flatten {
                 let has_parent = app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
                 let total_dirs = (if has_parent { 1 } else { 0 }) + app.subdirs.len();
@@ -242,7 +245,7 @@ pub(super) fn handle_input(
         }
 
         // PageUp - in view mode, handle directories too (disabled in flatten mode)
-        if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
+        if ctx.input(|i| !i.modifiers.shift && i.key_pressed(egui::Key::PageUp)) {
             if app.state.view_mode && !app.state.view_mode_flatten {
                 let has_parent = app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
                 let total_dirs = (if has_parent { 1 } else { 0 }) + app.subdirs.len();
@@ -776,6 +779,7 @@ pub(super) fn handle_dialogs(
     if app.state.show_confirmation {
         if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
             app.state.handle_input(InputIntent::ConfirmDelete);
+            app.cache_dirty = true;
         } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
             app.state.handle_input(InputIntent::Cancel);
         }
@@ -787,13 +791,15 @@ pub(super) fn handle_dialogs(
                 if use_trash { "trash" } else { "permanently delete" },
                 marked_count
             ));
-            if ui.button("Yes (y)").clicked() {
-                app.state.handle_input(InputIntent::ConfirmDelete);
-                app.cache_dirty = true;
-            }
-            if ui.button("No (n)").clicked() {
-                app.state.handle_input(InputIntent::Cancel);
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Yes (y)").clicked() {
+                    app.state.handle_input(InputIntent::ConfirmDelete);
+                    app.cache_dirty = true;
+                }
+                if ui.button("No (n)").clicked() {
+                    app.state.handle_input(InputIntent::Cancel);
+                }
+            });
         });
     }
 
@@ -811,13 +817,15 @@ pub(super) fn handle_dialogs(
                 .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
                 .unwrap_or_default();
             ui.label(format!("Delete current file?\n{}", filename));
-            if ui.button("Yes (y)").clicked() {
-                app.state.handle_input(InputIntent::ConfirmDeleteImmediate);
-                app.cache_dirty = true;
-            }
-            if ui.button("No (n)").clicked() {
-                app.state.handle_input(InputIntent::Cancel);
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Yes (y)").clicked() {
+                    app.state.handle_input(InputIntent::ConfirmDeleteImmediate);
+                    app.cache_dirty = true;
+                }
+                if ui.button("No (n)").clicked() {
+                    app.state.handle_input(InputIntent::Cancel);
+                }
+            });
         });
     }
 
@@ -834,12 +842,14 @@ pub(super) fn handle_dialogs(
         egui::Window::new("Confirm Ignore Group").collapsible(false).show(ctx, |ui| {
             ui.label(format!("Ignore {} files? (y/n)", group_len));
             ui.small("All files in this group will be added to the ignore list.");
-            if ui.button("Yes (y)").clicked() {
-                perform_ignore_group(app);
-            }
-            if ui.button("No (n)").clicked() {
-                app.state.show_ignore_group_confirmation = false;
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Yes (y)").clicked() {
+                    perform_ignore_group(app);
+                }
+                if ui.button("No (n)").clicked() {
+                    app.state.show_ignore_group_confirmation = false;
+                }
+            });
         });
     }
 
@@ -850,6 +860,7 @@ pub(super) fn handle_dialogs(
         } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
             app.state.handle_input(InputIntent::Cancel);
         }
+        let mut switch_to_change_target = false;
         egui::Window::new("Confirm Move").collapsible(false).show(ctx, |ui| {
             let target =
                 app.state.move_target.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
@@ -877,16 +888,20 @@ pub(super) fn handle_dialogs(
 
                 // Add "Change Target" button
                 if ui.button("Change Target...").clicked() {
-                    // Close this confirmation
-                    app.state.show_move_confirmation = false;
-                    // Open input dialog
-                    app.show_move_input = true;
-                    app.move_focus_requested = false;
-                    // Pre-fill input with the bad target so it can be edited
-                    app.move_input = target;
+                    switch_to_change_target = true;
                 }
             });
         });
+        if switch_to_change_target {
+            // Pre-fill input with the current (bad) target so it can be edited
+            app.move_input =
+                app.state.move_target.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+            // Close this confirmation
+            app.state.show_move_confirmation = false;
+            // Open input dialog
+            app.show_move_input = true;
+            app.move_focus_requested = false;
+        }
     }
 
     // Move Input Dialog
@@ -1305,9 +1320,13 @@ pub(super) fn handle_dialogs(
                 ("L. Location (Spatial)", "location", egui::Key::L),
             ];
 
+            // Read all candidate keys with a single input lock
+            let pressed_key: Option<egui::Key> =
+                ctx.input(|i| options.iter().map(|(_, _, k)| *k).find(|k| i.key_pressed(*k)));
+
             for (label, value, key) in options {
                 // Check if button clicked OR corresponding number key pressed
-                if ui.button(label).clicked() || ctx.input(|i| i.key_pressed(key)) {
+                if ui.button(label).clicked() || pressed_key == Some(key) {
                     selected_sort = Some(value.to_string());
                 }
             }
@@ -1369,21 +1388,18 @@ pub(super) fn handle_dialogs(
                             let is_parent = idx == 0
                                 && app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
 
-                            // Get modification time
-                            let mod_time_str = if let Ok(meta) = fs::metadata(dir_path) {
-                                if let Ok(modified) = meta.modified() {
-                                    let dt: chrono::DateTime<chrono::Utc> = modified.into();
+                            // Use the mtime cache populated in open_dir_picker.
+                            let mod_time_str = match app.dir_list_mtime.get(idx).copied().flatten()
+                            {
+                                Some(dt) => {
                                     if show_relative {
                                         let ts = Timestamp::from_second(dt.timestamp()).unwrap();
                                         format_relative_time(ts)
                                     } else {
                                         dt.format("%Y-%m-%d %H:%M").to_string()
                                     }
-                                } else {
-                                    String::new()
                                 }
-                            } else {
-                                String::new()
+                                None => String::new(),
                             };
 
                             let dir_name = if is_parent {
@@ -1399,7 +1415,6 @@ pub(super) fn handle_dialogs(
                             };
 
                             // Layout: directory name (2/3) + modification time (1/3)
-                            let _row_rect = ui.available_rect_before_wrap();
                             let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
                             let (rect, resp) = ui.allocate_exact_size(
                                 egui::vec2(available_w, row_height),
