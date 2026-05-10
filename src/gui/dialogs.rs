@@ -1512,10 +1512,20 @@ pub(super) fn handle_dialogs(
     }
 
     // Slideshow
+    // Suspend the slideshow entirely while any dialog or input box is open.
+    // Otherwise this block runs every frame, calls `request_repaint_after(0.1s)`,
+    // and silently advances `next_item()` behind the user's confirmation —
+    // which both burns CPU (the scroll_to_rect smooth-scroll triggered by
+    // `selection_changed = true` repaints at full frame rate for a few hundred
+    // ms after each advance) and changes the file the user is about to confirm.
+    let dialog_blocking_slideshow =
+        app.state.is_any_dialog_open() || app.show_move_input || app.show_dir_picker;
+
     if let Some(interval) = app.state.slideshow_interval
         && !app.state.slideshow_paused
         && !app.state.is_loading
         && !app.state.groups.is_empty()
+        && !dialog_blocking_slideshow
     {
         let should_advance = match app.slideshow_last_advance {
             Some(last) => last.elapsed().as_secs_f32() >= interval,
@@ -1527,6 +1537,10 @@ pub(super) fn handle_dialogs(
             app.state.selection_changed = true;
         }
         ctx.request_repaint_after(std::time::Duration::from_secs_f32(0.1));
+    } else if dialog_blocking_slideshow && app.state.slideshow_interval.is_some() {
+        // Reset the timer so the slideshow doesn't immediately fire and skip
+        // a file the moment the user dismisses the dialog.
+        app.slideshow_last_advance = Some(std::time::Instant::now());
     }
 
     if let Some(err_text) = app.state.error_popup.clone() {

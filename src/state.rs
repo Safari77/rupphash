@@ -774,7 +774,11 @@ impl AppState {
                 fs::remove_file(path).map_err(|e| e.to_string())
             };
             match res {
-                Ok(_) => success_count += 1,
+                Ok(_) => {
+                    success_count += 1;
+                    let action = if self.use_trash { "TRASHED " } else { "DELETED " };
+                    eprintln!("[DELETE] {}{}", action, path.display());
+                }
                 Err(e) => {
                     error_details.push(format!(
                         "• {:?}: {}",
@@ -846,6 +850,8 @@ impl AppState {
         match res {
             Ok(_) => {
                 let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let action_log = if self.use_trash { "TRASHED " } else { "DELETED " };
+                eprintln!("[DELETE] {}{}", action_log, path.display());
 
                 // Remove from current group
                 if let Some(group) = self.groups.get_mut(self.current_group_idx) {
@@ -983,6 +989,9 @@ impl AppState {
         let mut success_count = 0;
         let mut failed_paths = HashSet::new();
         let mut error_details = Vec::new();
+        // Track per-path outcomes so we can log them after the command completes.
+        let mut moved_ok: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut moved_failed: Vec<(PathBuf, PathBuf, String)> = Vec::new();
 
         for path in &paths_to_move {
             let filename = path.file_name().unwrap_or_default();
@@ -991,15 +1000,47 @@ impl AppState {
             match fileops::perform_atomic_move(path, &dest) {
                 Ok(_) => {
                     success_count += 1;
+                    moved_ok.push((path.clone(), dest.clone()));
                 }
                 Err(e) => {
                     // e is now a standard std::io::Error with a descriptive message
                     error_details.push(format!("• {:?}: {}", filename, e));
+                    moved_failed.push((path.clone(), dest.clone(), e.to_string()));
                     failed_paths.insert(path.clone());
                 }
             }
         }
         self.marked_for_deletion.retain(|p| failed_paths.contains(p));
+
+        // Report what happened. Source dirs come from each input path's parent;
+        // destination dir is `target_dir` for every entry. We list each unique
+        // source dir once, then enumerate moved/failed files with full paths.
+        {
+            let mut src_dirs: Vec<PathBuf> =
+                paths_to_move.iter().filter_map(|p| p.parent().map(|p| p.to_path_buf())).collect();
+            src_dirs.sort();
+            src_dirs.dedup();
+
+            if src_dirs.is_empty() {
+                eprintln!("[MOVE] source dir(s): (none)");
+            } else {
+                for d in &src_dirs {
+                    eprintln!("[MOVE] source dir:      {}", d.display());
+                }
+            }
+            eprintln!("[MOVE] destination dir: {}", target_dir.display());
+            eprintln!(
+                "[MOVE] moved {} file(s) successfully, {} failed:",
+                moved_ok.len(),
+                moved_failed.len()
+            );
+            for (src, dst) in &moved_ok {
+                eprintln!("[MOVE]   OK   {}  ->  {}", src.display(), dst.display());
+            }
+            for (src, dst, err) in &moved_failed {
+                eprintln!("[MOVE]   FAIL {}  ->  {}  ({})", src.display(), dst.display(), err);
+            }
+        }
 
         if success_count > 0 {
             // Remove moved files from groups
