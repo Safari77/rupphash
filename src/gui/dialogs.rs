@@ -876,7 +876,21 @@ pub(super) fn handle_dialogs(
                 format!("Move {} marked files to:\n{}", app.state.marked_for_deletion.len(), target)
             };
 
-            ui.label(msg);
+            // Append destination directory metadata read from the kept-open
+            // dirfd: modification time and filesystem type. Lets the user
+            // confirm they're actually about to write to the directory they
+            // think they are.
+            let info = if let Some(d) = app.state.move_dest_info.as_ref() {
+                let modified = d
+                    .mtime_timestamp()
+                    .map(format_relative_time)
+                    .unwrap_or_else(|| "?".to_string());
+                format!("\nDest modified: {}\nFilesystem: {}", modified, d.fs_type)
+            } else {
+                String::new()
+            };
+
+            ui.label(format!("{}{}", msg, info));
             ui.horizontal(|ui| {
                 if ui.button("Yes (y)").clicked() {
                     app.state.handle_input(InputIntent::ConfirmMoveMarked);
@@ -898,6 +912,9 @@ pub(super) fn handle_dialogs(
                 app.state.move_target.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
             // Close this confirmation
             app.state.show_move_confirmation = false;
+            // Drop the open dirfd; we'll reopen against whatever target the
+            // user picks next.
+            app.state.move_dest_info = None;
             // Open input dialog
             app.show_move_input = true;
             app.move_focus_requested = false;

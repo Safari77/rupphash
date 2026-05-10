@@ -147,6 +147,12 @@ pub struct AppState {
     pub status_set_time: Option<std::time::Instant>,
     pub show_confirmation: bool,
     pub show_move_confirmation: bool,
+    /// Open handle to the move target directory plus its cached metadata.
+    /// Populated when the user triggers MoveMarked, kept alive while the
+    /// confirmation dialog is up, consumed by perform_move_marked or
+    /// dropped when the user cancels / changes target. Keeping the dirfd
+    /// open across the dialog is what makes the move TOCTOU-safe.
+    pub move_dest_info: Option<fileops::DestinationDir>,
     pub show_delete_immediate_confirmation: bool,
     pub show_sort_selection: bool,
     pub show_ignore_group_confirmation: bool,
@@ -200,6 +206,7 @@ impl AppState {
             status_set_time: None,
             show_confirmation: false,
             show_move_confirmation: false,
+            move_dest_info: None,
             show_delete_immediate_confirmation: false,
             show_sort_selection: false,
             show_ignore_group_confirmation: false,
@@ -272,6 +279,8 @@ impl AppState {
                 }
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_move_confirmation = false;
+                    // Drop the open dirfd so we don't hold it longer than needed.
+                    self.move_dest_info = None;
                 }
                 _ => {}
             }
@@ -374,7 +383,22 @@ impl AppState {
                 } else if self.marked_for_deletion.is_empty() {
                     self.set_status("No files marked.".to_string(), false);
                 } else {
-                    self.show_move_confirmation = true;
+                    // Open the destination directory now (before the dialog) so
+                    // the same fd survives confirm + move, closing the TOCTOU
+                    // window between display and the actual rename/copy.
+                    let target = self.move_target.clone().unwrap();
+                    match fileops::DestinationDir::open(&target) {
+                        Ok(dest) => {
+                            self.move_dest_info = Some(dest);
+                            self.show_move_confirmation = true;
+                        }
+                        Err(e) => {
+                            self.error_popup = Some(format!(
+                                "Could not open move target {:?}:\n{}\n\n(Press any key to dismiss)",
+                                target, e
+                            ));
+                        }
+                    }
                 }
             }
             InputIntent::ConfirmMoveMarked => {}
@@ -968,10 +992,14 @@ impl AppState {
     }
 
     fn perform_move_marked(&mut self) {
-        let Some(ref target_dir) = self.move_target.clone() else {
-            self.set_status("No move target set".to_string(), true);
+        // Take ownership of the open DestinationDir so its dirfd lives for the
+        // entire move operation and is dropped at the end of this function.
+        // Using take() also frees `self` for mutable access below.
+        let Some(dest) = self.move_dest_info.take() else {
+            self.set_status("No move target opened".to_string(), true);
             return;
         };
+        let target_dir = dest.path.clone();
 
         let paths_to_move = if self.marked_for_deletion.is_empty() {
             if let Some(p) = self.get_current_image_path() {
@@ -993,20 +1021,20 @@ impl AppState {
         let mut moved_ok: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut moved_failed: Vec<(PathBuf, PathBuf, String)> = Vec::new();
 
-        for path in &paths_to_move {
-            let filename = path.file_name().unwrap_or_default();
-            let dest = target_dir.join(filename);
-
-            match fileops::perform_atomic_move(path, &dest) {
-                Ok(_) => {
+        // Single batch call that reuses the kept-open dirfd for every file.
+        let results = fileops::move_files_into(&dest, &paths_to_move);
+        for result in results {
+            let filename = result.source.file_name().unwrap_or_default().to_os_string();
+            match result.outcome {
+                Ok(()) => {
                     success_count += 1;
-                    moved_ok.push((path.clone(), dest.clone()));
+                    moved_ok.push((result.source, result.destination));
                 }
                 Err(e) => {
-                    // e is now a standard std::io::Error with a descriptive message
+                    // e is a standard std::io::Error with a descriptive message
                     error_details.push(format!("• {:?}: {}", filename, e));
-                    moved_failed.push((path.clone(), dest.clone(), e.to_string()));
-                    failed_paths.insert(path.clone());
+                    moved_failed.push((result.source.clone(), result.destination, e.to_string()));
+                    failed_paths.insert(result.source);
                 }
             }
         }

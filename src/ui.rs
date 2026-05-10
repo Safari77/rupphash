@@ -585,12 +585,24 @@ impl TuiApp {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or("???".into());
+            // Metadata read from the kept-open destination dirfd: mtime + fs
+            // type. Same info as the GUI confirm dialog.
+            let info = if let Some(d) = self.state.move_dest_info.as_ref() {
+                let modified = d
+                    .mtime_timestamp()
+                    .map(format_relative_time)
+                    .unwrap_or_else(|| "?".to_string());
+                format!("\nDest modified: {}\nFilesystem: {}", modified, d.fs_type)
+            } else {
+                String::new()
+            };
             let text = format!(
-                "Move {} files to:\n{}\n\n(y) Yes / (n) No",
+                "Move {} files to:\n{}{}\n\n(y) Yes / (n) No",
                 self.state.marked_for_deletion.len(),
-                target
+                target,
+                info
             );
-            render_popup(frame, "Confirm Move", &text, 60, 20, Color::Cyan);
+            render_popup(frame, "Confirm Move", &text, 60, 25, Color::Cyan);
         }
 
         // 2. Sort Menu
