@@ -311,7 +311,7 @@ fn maybe_resize_image(
 
 /// Fallback: Manually carve out the largest embedded JPEG (PreviewImage)
 /// using EXIF/TIFF tags when the RAW decoder completely fails to open the file.
-fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<egui::ColorImage> {
+fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<(egui::ColorImage, u8)> {
     let mut cursor = std::io::Cursor::new(bytes);
     let reader = exif::Reader::new().read_from_container(&mut cursor).ok()?;
 
@@ -352,6 +352,8 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<egui::Color
     }
 
     let jpeg_bytes = &bytes[best_offset..best_offset + max_length];
+    // Parse orientation directly from the embedded JPEG bytes
+    let orientation = crate::exif_extract::get_orientation(Path::new(""), Some(jpeg_bytes));
 
     let img = image::load_from_memory(jpeg_bytes).ok()?;
     let rgb = img.to_rgb8();
@@ -366,7 +368,7 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<egui::Color
         path, best_ifd, best_offset, max_length, width, height
     );
 
-    Some(egui::ColorImage::from_rgb([width as usize, height as usize], rgb.as_raw()))
+    Some((egui::ColorImage::from_rgb([width as usize, height as usize], rgb.as_raw()), orientation))
 }
 
 /// Check if a WebP file contains animation by looking for the ANIM chunk in RIFF header
@@ -563,9 +565,13 @@ fn load_and_process_image_from_bytes(
             Ok(r) => r,
             Err(e) => {
                 // rsraw failed (likely unsupported RAW/ARW)
-                if use_thumbnails && let Some(thumb) = extract_biggest_exif_preview(path, bytes) {
+                if use_thumbnails
+                    && let Some((thumb, thumb_orient)) = extract_biggest_exif_preview(path, bytes)
+                {
                     let dims = (thumb.width() as u32, thumb.height() as u32);
-                    return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
+                    let actual_orientation =
+                        if thumb_orient != 1 { thumb_orient } else { exif_orientation };
+                    return Ok(maybe_resize_image(thumb, dims, actual_orientation, path));
                 }
 
                 // If the fallback fails or we aren't using thumbnails, return the original error
@@ -576,9 +582,10 @@ fn load_and_process_image_from_bytes(
         let dims = (raw.width(), raw.height());
 
         // Try standard rsraw thumbnail extraction first if it managed to open
-        if use_thumbnails && let Some(thumb) = extract_best_thumbnail(&mut raw) {
-            // Thumbnails are typically small, but resize if needed
-            return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
+        if use_thumbnails && let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
+            let actual_orientation =
+                if thumb_orient != 1 { thumb_orient } else { exif_orientation };
+            return Ok(maybe_resize_image(thumb, dims, actual_orientation, path));
         }
 
         // 2. Full RAW decode mode
@@ -610,16 +617,20 @@ fn load_and_process_image_from_bytes(
                 }
                 Err(e) => {
                     // Fallback to thumbnail on process error
-                    if let Some(thumb) = extract_best_thumbnail(&mut raw) {
-                        return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
+                    if let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
+                        let actual_orientation =
+                            if thumb_orient != 1 { thumb_orient } else { exif_orientation };
+                        return Ok(maybe_resize_image(thumb, dims, actual_orientation, path));
                     }
                     return Err(format!("Failed to process RAW: {}", e));
                 }
             },
             Err(e) => {
                 // Fallback to thumbnail on unpack error (unsupported full decode formats)
-                if let Some(thumb) = extract_best_thumbnail(&mut raw) {
-                    return Ok(maybe_resize_image(thumb, dims, exif_orientation, path));
+                if let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
+                    let actual_orientation =
+                        if thumb_orient != 1 { thumb_orient } else { exif_orientation };
+                    return Ok(maybe_resize_image(thumb, dims, actual_orientation, path));
                 }
                 return Err(format!("Failed to unpack RAW: {}", e));
             }
@@ -832,7 +843,7 @@ pub(super) fn update_file_metadata(
 }
 
 /// Extract the best (largest) thumbnail from a RAW file
-fn extract_best_thumbnail(raw: &mut rsraw::RawImage) -> Option<egui::ColorImage> {
+fn extract_best_thumbnail(raw: &mut rsraw::RawImage) -> Option<(egui::ColorImage, u8)> {
     let thumbs = raw.extract_thumbs().ok()?;
 
     // Find the largest JPEG thumbnail
@@ -841,12 +852,15 @@ fn extract_best_thumbnail(raw: &mut rsraw::RawImage) -> Option<egui::ColorImage>
         .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
         .max_by_key(|t| t.width * t.height)?;
 
+    // Parse orientation directly from the JPEG thumbnail's EXIF data
+    let orientation = crate::exif_extract::get_orientation(Path::new(""), Some(&best_thumb.data));
+
     // Decode JPEG thumbnail using image crate
     let img = image::load_from_memory(&best_thumb.data).ok()?;
     let rgb = img.to_rgb8();
     let (width, height) = rgb.dimensions();
 
-    Some(egui::ColorImage::from_rgb([width as usize, height as usize], rgb.as_raw()))
+    Some((egui::ColorImage::from_rgb([width as usize, height as usize], rgb.as_raw()), orientation))
 }
 
 // Helper to render texture with pan/zoom logic
@@ -1811,7 +1825,7 @@ fn compute_histogram_from_raw(
                 path, e
             );
             // Re-use the fallback from the main loader!
-            if let Some(color_img) = extract_biggest_exif_preview(path, &data) {
+            if let Some((color_img, _)) = extract_biggest_exif_preview(path, &data) {
                 eprintln!("[DEBUG-HISTOGRAM] EXIF fallback success for {:?}", path);
                 return Some(compute_histogram_from_colorimage(&color_img, palette_config, false));
             } else {
