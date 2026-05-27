@@ -79,12 +79,9 @@ pub(super) fn spawn_image_loader_pool(
     palette_config: crate::db::PaletteConfig,
     hdr_config: crate::db::HdrConfig,
     histogram_enabled: Arc<AtomicBool>,
-) -> (Sender<PathBuf>, Receiver<(PathBuf, ImageLoadResult)>) {
-    let (tx, rx) = unbounded::<PathBuf>();
-    let (result_tx, result_rx): (
-        Sender<(PathBuf, ImageLoadResult)>,
-        Receiver<(PathBuf, ImageLoadResult)>,
-    ) = unbounded();
+) -> (Sender<(PathBuf, usize, usize)>, Receiver<((PathBuf, usize, usize), ImageLoadResult)>) {
+    let (tx, rx) = unbounded::<(PathBuf, usize, usize)>();
+    let (result_tx, result_rx) = unbounded();
 
     let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
 
@@ -96,7 +93,7 @@ pub(super) fn spawn_image_loader_pool(
         let pcfg = palette_config;
         let hcfg = hdr_config;
         thread::spawn(move || {
-            while let Ok(path) = rx_clone.recv() {
+            while let Ok((path, g_idx, f_idx)) = rx_clone.recv() {
                 // Load & Process (Resize + Orientation)
                 // Note: We removed the "active window" check here because it caused race conditions
                 // where images would fail to load. The cache eviction handles cleanup instead.
@@ -147,7 +144,7 @@ pub(super) fn spawn_image_loader_pool(
                             }
                             Err(e) => ImageLoadResult::Failed(e),
                         };
-                        let _ = tx_clone.send((path, result));
+                        let _ = tx_clone.send(((path, g_idx, f_idx), result));
                         continue;
                     }
                 }
@@ -199,7 +196,7 @@ pub(super) fn spawn_image_loader_pool(
                     }
                     Err(err_msg) => ImageLoadResult::Failed(err_msg),
                 };
-                let _ = tx_clone.send((path, result));
+                let _ = tx_clone.send(((path, g_idx, f_idx), result));
             }
         });
     }
@@ -750,6 +747,8 @@ fn load_and_process_image_from_bytes(
 pub(super) fn update_file_metadata(
     app: &mut GuiApp,
     path: &Path,
+    g_idx_hint: usize,
+    f_idx_hint: usize,
     w: u32,
     h: u32,
     orientation: u8,
@@ -786,13 +785,24 @@ pub(super) fn update_file_metadata(
 
     // Check current file first (fast path)
     let mut found_info: Option<(u128, Option<geo::Point<f64>>, Option<i64>, bool)> = None;
-    if let Some(group) = app.state.groups.get_mut(app.state.current_group_idx)
-        && let Some(file) = group.get_mut(app.state.current_file_idx)
+
+    // 1. FAST PATH: Check the hint provided by the background worker (O(1))
+    if let Some(group) = app.state.groups.get_mut(g_idx_hint)
+        && let Some(file) = group.get_mut(f_idx_hint)
     {
         found_info = update_file(file);
     }
 
-    // Fallback search if not found
+    // 2. BACKUP FAST PATH: Check current active file just in case (O(1))
+    if found_info.is_none() {
+        if let Some(group) = app.state.groups.get_mut(app.state.current_group_idx)
+            && let Some(file) = group.get_mut(app.state.current_file_idx)
+        {
+            found_info = update_file(file);
+        }
+    }
+
+    // 3. SLOW PATH FALLBACK: Iterate all (O(N)) - Only hits if the list was sorted/mutated mid-load
     if found_info.is_none() {
         for group in &mut app.state.groups {
             for file in group {

@@ -115,9 +115,10 @@ pub struct GuiApp {
     // Set of paths currently being processed by the worker to avoid dupes
     pub(super) raw_loading: HashSet<std::path::PathBuf>,
     // Channel to send paths to the worker
-    pub(super) image_preload_tx: Sender<std::path::PathBuf>,
+    pub(super) image_preload_tx: Sender<(std::path::PathBuf, usize, usize)>,
     // Channel to receive decoded images from the worker.
-    pub(super) image_preload_rx: Receiver<(std::path::PathBuf, super::image::ImageLoadResult)>,
+    pub(super) image_preload_rx:
+        Receiver<((std::path::PathBuf, usize, usize), super::image::ImageLoadResult)>,
     pub(super) scan_batch_rx: Option<Receiver<Vec<FileMetadata>>>,
 
     // Shared state to tell workers which files are still relevant.
@@ -666,7 +667,7 @@ impl GuiApp {
     }
 
     #[inline]
-    fn enqueue_image_load(&mut self, path: &std::path::Path) {
+    fn enqueue_image_load(&mut self, path: &std::path::Path, g_idx: usize, f_idx: usize) {
         if self.failed_images.contains_key(path) {
             return;
         }
@@ -676,7 +677,7 @@ impl GuiApp {
             return;
         }
         eprintln!("[DEBUG] enqueue_image_load sending to preload: {:?}", path);
-        let _ = self.image_preload_tx.send(path.to_path_buf());
+        let _ = self.image_preload_tx.send((path.to_path_buf(), g_idx, f_idx));
     }
 
     /// Helper to batch-process files and add them to the GPS map if they have coordinates.
@@ -1186,7 +1187,7 @@ impl GuiApp {
                             self.retry_after.remove(path);
                             self.raw_loading.remove(path);
                             eprintln!("[DEBUG-NOTIFY] CloseWrite — loading image: {:?}", path);
-                            self.enqueue_image_load(path);
+                            self.enqueue_image_load(path, 0, 0);
                             if let Some(name) = path.file_name() {
                                 self.fs_mod_files.insert(name.to_string_lossy().to_string());
                             }
@@ -1552,7 +1553,7 @@ impl GuiApp {
         let mut active_window_paths = HashSet::new();
 
         // Collect paths to preload, respecting preload_limit across all groups
-        let mut paths_to_preload: Vec<(std::path::PathBuf, bool)> = Vec::new(); // (path, is_current)
+        let mut paths_to_preload: Vec<(std::path::PathBuf, bool, usize, usize)> = Vec::new(); // (path, is_current)
 
         // Single group mode (--view) or multiple groups mode (duplicate finder)
         if self.state.groups.len() == 1 {
@@ -1565,7 +1566,7 @@ impl GuiApp {
                 if end - start < preload_limit { end.saturating_sub(preload_limit) } else { start };
 
             for i in start..end {
-                paths_to_preload.push((group[i].path.clone(), i == current_f));
+                paths_to_preload.push((group[i].path.clone(), i == current_f, 0, i));
             }
         } else {
             // Multiple groups: preload current group + files from nearby groups
@@ -1573,7 +1574,7 @@ impl GuiApp {
 
             // Add all files from current group (these are most important)
             for (i, file) in current_group.iter().enumerate() {
-                paths_to_preload.push((file.path.clone(), i == current_f));
+                paths_to_preload.push((file.path.clone(), i == current_f, current_g, i));
             }
 
             // Calculate remaining preload slots after current group
@@ -1588,8 +1589,8 @@ impl GuiApp {
                 let mut slots_left = remaining / 2 + remaining % 2; // Give slightly more to next
                 while next_g < self.state.groups.len() && slots_left > 0 {
                     let group = &self.state.groups[next_g];
-                    for file in group.iter().take(slots_left) {
-                        extra_paths.push((file.path.clone(), false));
+                    for (i, file) in group.iter().enumerate().take(slots_left) {
+                        extra_paths.push((file.path.clone(), false, next_g, i));
                         slots_left -= 1;
                     }
                     next_g += 1;
@@ -1600,8 +1601,8 @@ impl GuiApp {
                 let mut prev_g = current_g.saturating_sub(1);
                 while prev_g < current_g && slots_left > 0 {
                     let group = &self.state.groups[prev_g];
-                    for file in group.iter().take(slots_left) {
-                        extra_paths.push((file.path.clone(), false));
+                    for (i, file) in group.iter().enumerate().take(slots_left) {
+                        extra_paths.push((file.path.clone(), false, prev_g, i));
                         slots_left -= 1;
                     }
                     if prev_g == 0 {
@@ -1609,13 +1610,12 @@ impl GuiApp {
                     }
                     prev_g -= 1;
                 }
-
                 paths_to_preload.extend(extra_paths);
             }
         }
 
         // Build active window set
-        for (path, _) in &paths_to_preload {
+        for (path, _, _, _) in &paths_to_preload {
             active_window_paths.insert(path.clone());
         }
 
@@ -1624,25 +1624,25 @@ impl GuiApp {
             *w = active_window_paths.clone();
         }
 
-        for (path, is_current) in &paths_to_preload {
+        for (path, is_current, g_idx, f_idx) in &paths_to_preload {
             if *is_current {
                 // Load EVERYTHING via the pool, not just RAW
                 if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
                     self.raw_loading.insert(path.clone());
-                    self.enqueue_image_load(path);
+                    self.enqueue_image_load(path, *g_idx, *f_idx);
                 }
                 break;
             }
         }
 
         // Then other files
-        for (path, is_current) in &paths_to_preload {
+        for (path, is_current, g_idx, f_idx) in &paths_to_preload {
             if *is_current {
                 continue;
             }
             if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
                 self.raw_loading.insert(path.clone());
-                self.enqueue_image_load(path);
+                self.enqueue_image_load(path, *g_idx, *f_idx);
             }
         }
 
@@ -1938,7 +1938,7 @@ impl eframe::App for GuiApp {
         // Use try_recv() which returns Err on empty OR disconnected channel
         loop {
             match self.image_preload_rx.try_recv() {
-                Ok((path, result)) => {
+                Ok(((path, g_idx, f_idx), result)) => {
                     match result {
                         ImageLoadResult::Loaded(
                             color_image,
@@ -1951,6 +1951,8 @@ impl eframe::App for GuiApp {
                             super::image::update_file_metadata(
                                 self,
                                 &path,
+                                g_idx,
+                                f_idx,
                                 actual_resolution.0,
                                 actual_resolution.1,
                                 orientation,
@@ -1979,6 +1981,8 @@ impl eframe::App for GuiApp {
                             super::image::update_file_metadata(
                                 self,
                                 &path,
+                                g_idx,
+                                f_idx,
                                 resolution.0,
                                 resolution.1,
                                 orientation,
@@ -3654,7 +3658,11 @@ impl eframe::App for GuiApp {
                     // Trigger load if missed (failsafe)
                     if !self.raw_loading.contains(&path) {
                         self.raw_loading.insert(path.clone());
-                        self.enqueue_image_load(&path);
+                        self.enqueue_image_load(
+                            &path,
+                            current_group_idx,
+                            self.state.current_file_idx,
+                        );
                     }
                 }
 
