@@ -660,9 +660,9 @@ fn load_and_process_image_from_bytes(
         .unwrap_or_default();
 
     // ---------------------------------------------------------------------
-    // JXL / PDF FAST PATH
+    // JXL / PDF / JPEG / TIFF FAST PATH
     // ---------------------------------------------------------------------
-    if matches!(ext.as_str(), "jxl" | "pdf" | "tif" | "tiff") {
+    if matches!(ext.as_str(), "jpg" | "jpeg" | "jxl" | "pdf" | "tif" | "tiff") {
         eprintln!("[DEBUG-GUI] attempting scanner decode for {:?}", path);
 
         match crate::scanner::load_image_fast(path, bytes) {
