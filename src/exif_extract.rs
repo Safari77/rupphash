@@ -432,12 +432,18 @@ fn add_derived_values(
     }
 }
 
+static BOUNDARIES: std::sync::OnceLock<country_boundaries::CountryBoundaries> =
+    std::sync::OnceLock::new();
+
 /// Derive country name from GPS coordinates
 pub fn derive_country(lat: f64, lon: f64) -> Option<String> {
     use codes_iso_3166::part_1::CountryCode;
     use country_boundaries::{BOUNDARIES_ODBL_360X180, CountryBoundaries, LatLon};
 
-    let boundaries = CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).ok()?;
+    let boundaries = BOUNDARIES.get_or_init(|| {
+        CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180)
+            .expect("Failed to initialize country boundaries")
+    });
     let ids = boundaries.ids(LatLon::new(lat, lon).ok()?);
 
     ids.first().and_then(|id| {
@@ -450,7 +456,10 @@ pub fn derive_subdivision(lat: f64, lon: f64) -> Option<String> {
     use codes_iso_3166::part_2::SubdivisionCode;
     use country_boundaries::{BOUNDARIES_ODBL_360X180, CountryBoundaries, LatLon};
 
-    let boundaries = CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).ok()?;
+    let boundaries = BOUNDARIES.get_or_init(|| {
+        CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180)
+            .expect("Failed to initialize country boundaries")
+    });
     let ids = boundaries.ids(LatLon::new(lat, lon).ok()?);
 
     for id in ids {
