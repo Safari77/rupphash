@@ -110,11 +110,16 @@ fn optimize_2opt(markers: &mut [GpsMarker]) {
                 let p3 = (markers[j].lat, markers[j].lon);
                 let p4 = (markers[j + 1].lat, markers[j + 1].lon);
 
-                // Current distance: p1->p2 and p3->p4
-                let d_current = dist_sq_approx(p1, p2) + dist_sq_approx(p3, p4);
+                // Current edge lengths: p1->p2 and p3->p4.
+                // NOTE: 2-opt compares the SUM of two edge lengths, so the metric
+                // must be additive. dist_sq_approx returns *squared* distance, and
+                // a sum of squares is not monotonic w.r.t. a sum of lengths
+                // (e.g. 3,4 -> 25 beats 5,1 -> 26 even though 6 < 7), so we take
+                // the square root to get back to true (approx) distance before summing.
+                let d_current = dist_sq_approx(p1, p2).sqrt() + dist_sq_approx(p3, p4).sqrt();
 
-                // Swapped distance: p1->p3 and p2->p4 (uncrossing)
-                let d_swap = dist_sq_approx(p1, p3) + dist_sq_approx(p2, p4);
+                // Swapped edge lengths: p1->p3 and p2->p4 (uncrossing)
+                let d_swap = dist_sq_approx(p1, p3).sqrt() + dist_sq_approx(p2, p4).sqrt();
 
                 if d_swap < d_current {
                     // Reverse the segment between i+1 and j to uncross
