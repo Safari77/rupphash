@@ -114,6 +114,19 @@ impl SearchCriterion {
     }
 }
 
+/// Scalar numeric comparison, matching the semantics of the binary-search paths
+/// in `search_numeric`. Used by the linear fallback when the index is not sorted.
+fn numeric_value_matches(op: SearchOp, v: f64, value: f64, epsilon: f64) -> bool {
+    match op {
+        SearchOp::Equals => (v - value).abs() <= epsilon,
+        SearchOp::LessThan => v < value,
+        SearchOp::LessOrEqual => v <= value + epsilon,
+        SearchOp::GreaterThan => v > value,
+        SearchOp::GreaterOrEqual => v >= value - epsilon,
+        _ => false,
+    }
+}
+
 /// In-memory search index for fast EXIF-based queries.
 /// Uses RoaringBitmap for memory-efficient set operations.
 pub struct SearchIndex {
@@ -138,6 +151,11 @@ pub struct SearchIndex {
     /// Track which tags have been indexed
     indexed_tags: HashSet<u16>,
 
+    /// Indices freed by remove() that are excluded from queries and reused by
+    /// the next insert(). file_count stays at the high-water mark so that
+    /// indices already stored in other bitmaps remain valid.
+    free_slots: RoaringBitmap,
+
     /// Flag indicating if numeric indices are sorted
     is_finalized: bool,
 }
@@ -149,9 +167,10 @@ impl Default for SearchIndex {
 }
 
 impl SearchIndex {
-    /// Remove a file from the index before updating it
+    /// Remove a file from the index. Safe to call standalone or before
+    /// re-inserting the same id (the freed slot is reused by the next insert).
     pub fn remove(&mut self, unique_file_id: u128) {
-        if let Some(file_idx) = self.id_to_index.get(&unique_file_id).copied() {
+        if let Some(file_idx) = self.id_to_index.remove(&unique_file_id) {
             // Remove from string/exact index
             for tag_map in self.exact_index.values_mut() {
                 for bitmap in tag_map.values_mut() {
@@ -161,6 +180,11 @@ impl SearchIndex {
             for list in self.numeric_index.values_mut() {
                 list.retain(|&(_, idx)| idx != file_idx);
             }
+            // Retire the slot: it must be excluded from len()/all_files()/disabled
+            // criteria until reused, and the stale index_to_id entry must not be
+            // handed back. We keep file_count (the high-water mark) unchanged so
+            // every other file's index stays valid in the existing bitmaps.
+            self.free_slots.insert(file_idx);
             self.is_finalized = false;
         }
     }
@@ -174,6 +198,7 @@ impl SearchIndex {
             id_to_index: HashMap::new(),
             index_to_id: Vec::new(),
             indexed_tags: HashSet::new(),
+            free_slots: RoaringBitmap::new(),
             is_finalized: false,
         }
     }
@@ -187,22 +212,31 @@ impl SearchIndex {
         self.id_to_index.clear();
         self.index_to_id.clear();
         self.indexed_tags.clear();
+        self.free_slots.clear();
         self.is_finalized = false;
     }
 
-    /// Get the number of indexed files
+    /// Get the number of indexed files (excludes slots freed by remove())
     pub fn len(&self) -> usize {
-        self.file_count as usize
+        self.file_count as usize - self.free_slots.len() as usize
     }
 
     /// Check if index is empty
     pub fn is_empty(&self) -> bool {
-        self.file_count == 0
+        self.len() == 0
     }
 
     /// Get or create an index for a unique_file_id
     fn get_or_create_index(&mut self, unique_file_id: u128) -> u32 {
         if let Some(&idx) = self.id_to_index.get(&unique_file_id) {
+            idx
+        } else if let Some(idx) = self.free_slots.min() {
+            // Reuse a slot freed by a previous remove() instead of growing the
+            // index. The slot was already cleared of all bitmap/numeric entries.
+            self.free_slots.remove(idx);
+            self.id_to_index.insert(unique_file_id, idx);
+            self.index_to_id[idx as usize] = unique_file_id;
+            self.is_finalized = false;
             idx
         } else {
             let idx = self.file_count;
@@ -216,6 +250,9 @@ impl SearchIndex {
 
     /// Convert search index back to unique_file_id
     pub fn index_to_file_id(&self, index: u32) -> Option<u128> {
+        if self.free_slots.contains(index) {
+            return None;
+        }
         self.index_to_id.get(index as usize).copied()
     }
 
@@ -426,44 +463,67 @@ impl SearchIndex {
         let mut result = RoaringBitmap::new();
         let epsilon = SEARCH_VALUE_EPSILON;
 
-        if let Some(list) = self.numeric_index.get(&tag_id) {
-            match op {
-                SearchOp::Equals => {
-                    // Find start of potential equality range
-                    let start = list.partition_point(|&(v, _)| v < value - epsilon);
-                    for &(v, idx) in &list[start..] {
-                        if v > value + epsilon {
-                            break;
-                        }
-                        result.insert(idx);
-                    }
+        let Some(list) = self.numeric_index.get(&tag_id) else {
+            return result;
+        };
+
+        // The fast paths below use partition_point and therefore REQUIRE the list
+        // to be sorted, which only holds after finalize(). If the index was
+        // mutated since the last finalize(), fall back to a correct linear scan so
+        // callers can never get silently-wrong results.
+        debug_assert!(
+            self.is_finalized,
+            "search_numeric called on a non-finalized index; call finalize() first"
+        );
+        if !self.is_finalized {
+            for &(v, idx) in list {
+                if numeric_value_matches(op, v, value, epsilon) {
+                    result.insert(idx);
                 }
-                SearchOp::LessThan => {
-                    let end = list.partition_point(|&(v, _)| v < value);
-                    for &(_, idx) in &list[..end] {
-                        result.insert(idx);
-                    }
-                }
-                SearchOp::LessOrEqual => {
-                    let end = list.partition_point(|&(v, _)| v <= value + epsilon);
-                    for &(_, idx) in &list[..end] {
-                        result.insert(idx);
-                    }
-                }
-                SearchOp::GreaterThan => {
-                    let start = list.partition_point(|&(v, _)| v <= value);
-                    for &(_, idx) in &list[start..] {
-                        result.insert(idx);
-                    }
-                }
-                SearchOp::GreaterOrEqual => {
-                    let start = list.partition_point(|&(v, _)| v >= value - epsilon);
-                    for &(_, idx) in &list[start..] {
-                        result.insert(idx);
-                    }
-                }
-                _ => {}
             }
+            return result;
+        }
+
+        match op {
+            SearchOp::Equals => {
+                // Find start of potential equality range
+                let start = list.partition_point(|&(v, _)| v < value - epsilon);
+                for &(v, idx) in &list[start..] {
+                    if v > value + epsilon {
+                        break;
+                    }
+                    result.insert(idx);
+                }
+            }
+            SearchOp::LessThan => {
+                let end = list.partition_point(|&(v, _)| v < value);
+                for &(_, idx) in &list[..end] {
+                    result.insert(idx);
+                }
+            }
+            SearchOp::LessOrEqual => {
+                let end = list.partition_point(|&(v, _)| v <= value + epsilon);
+                for &(_, idx) in &list[..end] {
+                    result.insert(idx);
+                }
+            }
+            SearchOp::GreaterThan => {
+                let start = list.partition_point(|&(v, _)| v <= value);
+                for &(_, idx) in &list[start..] {
+                    result.insert(idx);
+                }
+            }
+            SearchOp::GreaterOrEqual => {
+                // partition_point needs the predicate true for the prefix and
+                // false for the suffix. The threshold test must therefore be
+                // `v < value - epsilon` (true for values below the cutoff); the
+                // returned index is the first entry with v >= value - epsilon.
+                let start = list.partition_point(|&(v, _)| v < value - epsilon);
+                for &(_, idx) in &list[start..] {
+                    result.insert(idx);
+                }
+            }
+            _ => {}
         }
         result
     }
@@ -473,14 +533,31 @@ impl SearchIndex {
         let mut result = RoaringBitmap::new();
         let epsilon = SEARCH_VALUE_EPSILON;
 
-        if let Some(list) = self.numeric_index.get(&tag_id) {
-            let start = list.partition_point(|&(v, _)| v < min - epsilon);
-            for &(v, idx) in &list[start..] {
-                if v > max + epsilon {
-                    break;
+        let Some(list) = self.numeric_index.get(&tag_id) else {
+            return result;
+        };
+
+        // See search_numeric: binary search requires a finalized (sorted) list,
+        // otherwise fall back to a correct linear scan.
+        debug_assert!(
+            self.is_finalized,
+            "search_range called on a non-finalized index; call finalize() first"
+        );
+        if !self.is_finalized {
+            for &(v, idx) in list {
+                if v >= min - epsilon && v <= max + epsilon {
+                    result.insert(idx);
                 }
-                result.insert(idx);
             }
+            return result;
+        }
+
+        let start = list.partition_point(|&(v, _)| v < min - epsilon);
+        for &(v, idx) in &list[start..] {
+            if v > max + epsilon {
+                break;
+            }
+            result.insert(idx);
         }
         result
     }
@@ -488,12 +565,8 @@ impl SearchIndex {
     /// Execute a single search criterion
     pub fn search_criterion(&self, criterion: &SearchCriterion) -> RoaringBitmap {
         if !criterion.enabled {
-            // Return all files if criterion is disabled
-            let mut all = RoaringBitmap::new();
-            for i in 0..self.file_count {
-                all.insert(i);
-            }
-            return all;
+            // Return all (live) files if criterion is disabled
+            return self.all_files();
         }
 
         match criterion.op {
@@ -579,7 +652,7 @@ impl SearchIndex {
         let total_numeric_entries: usize = self.numeric_index.values().map(|v| v.len()).sum();
 
         IndexStats {
-            file_count: self.file_count as usize,
+            file_count: self.len(),
             tag_count: self.indexed_tags.len(),
             string_table_size: self.string_table.len(),
             exact_entries: total_exact_entries,
@@ -587,11 +660,14 @@ impl SearchIndex {
         }
     }
 
-    /// Get a bitmap of all file indices
+    /// Get a bitmap of all live file indices (slots freed by remove() excluded)
     pub fn all_files(&self) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
         for i in 0..self.file_count {
             result.insert(i);
+        }
+        for idx in self.free_slots.iter() {
+            result.remove(idx);
         }
         result
     }
@@ -657,6 +733,16 @@ pub fn parse_search_query(query: &str) -> Result<Vec<SearchCriterion>, String> {
     Ok(criteria)
 }
 
+/// Whether a tag is treated as numeric (range/comparison search) vs. a string
+/// tag (exact/contains). Source of truth is the searchable-tag table so a value
+/// like "24-70mm" on a string tag (LensModel) is kept as a literal instead of
+/// being misread as a numeric range.
+fn is_numeric_tag(tag_id: u16) -> bool {
+    crate::exif_types::get_searchable_tags()
+        .iter()
+        .any(|&(id, _, _, is_numeric)| id == tag_id && is_numeric)
+}
+
 /// Parse a single search criterion
 fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
     let parts: Vec<&str> = query.splitn(3, ':').collect();
@@ -680,15 +766,22 @@ fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
 
     if parts.len() == 2 {
         let value = parts[1];
-        // Use extract_number_from_string to handle ranges like "f/2.8-f/11"
-        if let Some(range) = parse_range_value(value) {
-            return Ok(SearchCriterion::with_range(tag_id, range.0, range.1));
-        }
 
-        // Try to parse as number first using the robust extractor.
-        // This handles "f/2.8", "1/125", "ISO 100" -> converts to numeric Equals search.
-        if let Some(num) = extract_number_from_string(value) {
-            return Ok(SearchCriterion::new(tag_id, SearchOp::Equals, num.to_string()));
+        // Range/numeric interpretation only applies to numeric tags. For string
+        // tags a hyphen is part of the literal value (e.g. "LensModel:24-70mm"
+        // is a lens name, not a 24..70 range), so we skip straight to the
+        // string-search fallback below to avoid returning zero results.
+        if is_numeric_tag(tag_id) {
+            // Use extract_number_from_string to handle ranges like "f/2.8-f/11"
+            if let Some(range) = parse_range_value(value) {
+                return Ok(SearchCriterion::with_range(tag_id, range.0, range.1));
+            }
+
+            // Try to parse as number first using the robust extractor.
+            // This handles "f/2.8", "1/125", "ISO 100" -> converts to numeric Equals search.
+            if let Some(num) = extract_number_from_string(value) {
+                return Ok(SearchCriterion::new(tag_id, SearchOp::Equals, num.to_string()));
+            }
         }
 
         // Fallback to standard parse or contains
