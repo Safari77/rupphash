@@ -928,7 +928,7 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
                 && !rats.is_empty()
                 && rats[0].denom > 0
             {
-                return format!("{}mm", rats[0].num / rats[0].denom);
+                return format!("{}mm", rats[0].num as f64 / rats[0].denom as f64);
             }
             clean_exif_string(&value.display_as(tag).to_string())
         }
