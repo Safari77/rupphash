@@ -949,6 +949,13 @@ impl AppContext {
             let mut last_flush = Instant::now();
             let flush_interval = Duration::from_secs(1);
             let max_buffer = 1000;
+            // Hard cap on total buffered updates. These updates are a recomputable
+            // cache, so if writes keep failing (e.g. the LMDB map is full) we drop
+            // the backlog past this point rather than growing memory without bound.
+            let hard_cap = max_buffer * 16;
+            // Tracks whether the previous write_batch failed, so retries are
+            // throttled to the flush interval instead of spinning on the buffer.
+            let mut last_write_failed = false;
 
             loop {
                 let msg = rx.recv_timeout(Duration::from_millis(100));
@@ -971,39 +978,72 @@ impl AppContext {
                         }
                     }
                     Err(RecvTimeoutError::Disconnected) => {
-                        if let Err(e) = Self::write_batch(
-                            &cipher,
-                            &env,
-                            meta_db,
-                            hash_db,
-                            feature_db,
-                            coeff_db,
-                            pixel_db,
-                            &meta_updates,
-                            &hash_updates,
-                            &feature_updates,
-                            &coeff_updates,
-                            &pixel_updates,
-                        ) {
-                            eprintln!("[ERROR-DB] Final write_batch failed: {:?}", e);
+                        // Channel closed: attempt a final flush. Retry a few times
+                        // because losing the last batch loses cache entries that
+                        // would otherwise have to be recomputed on the next run.
+                        let mut attempts = 0;
+                        loop {
+                            match Self::write_batch(
+                                &cipher,
+                                &env,
+                                meta_db,
+                                hash_db,
+                                feature_db,
+                                coeff_db,
+                                pixel_db,
+                                &meta_updates,
+                                &hash_updates,
+                                &feature_updates,
+                                &coeff_updates,
+                                &pixel_updates,
+                            ) {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    attempts += 1;
+                                    eprintln!(
+                                        "[ERROR-DB] Final write_batch failed (attempt {}): {:?}",
+                                        attempts, e
+                                    );
+                                    if attempts >= 3 {
+                                        let lost = meta_updates.len()
+                                            + hash_updates.len()
+                                            + feature_updates.len()
+                                            + coeff_updates.len()
+                                            + pixel_updates.len();
+                                        eprintln!(
+                                            "[ERROR-DB] Giving up on final flush; {} cache updates lost",
+                                            lost
+                                        );
+                                        break;
+                                    }
+                                    thread::sleep(Duration::from_millis(50));
+                                }
+                            }
                         }
                         break;
                     }
                     _ => {}
                 }
 
-                if (last_flush.elapsed() >= flush_interval
-                    || meta_updates.len() >= max_buffer
+                let any_pending = !meta_updates.is_empty()
+                    || !hash_updates.is_empty()
+                    || !feature_updates.is_empty()
+                    || !coeff_updates.is_empty()
+                    || !pixel_updates.is_empty();
+                let buffer_full = meta_updates.len() >= max_buffer
                     || hash_updates.len() >= max_buffer
                     || feature_updates.len() >= max_buffer
                     || coeff_updates.len() >= max_buffer
-                    || pixel_updates.len() >= max_buffer)
-                    && (!meta_updates.is_empty()
-                        || !hash_updates.is_empty()
-                        || !feature_updates.is_empty()
-                        || !coeff_updates.is_empty()
-                        || !pixel_updates.is_empty())
-                {
+                    || pixel_updates.len() >= max_buffer;
+                let time_elapsed = last_flush.elapsed() >= flush_interval;
+
+                // After a failure, suppress the buffer-full trigger so we retry at
+                // most once per flush_interval instead of spinning on a
+                // persistently-failing write (the buffers stay >= max_buffer).
+                let should_flush =
+                    any_pending && (time_elapsed || (buffer_full && !last_write_failed));
+
+                if should_flush {
                     match Self::write_batch(
                         &cipher,
                         &env,
@@ -1024,10 +1064,31 @@ impl AppContext {
                             feature_updates.clear();
                             coeff_updates.clear();
                             pixel_updates.clear();
+                            last_write_failed = false;
                         }
                         Err(e) => {
-                            eprintln!("[ERROR-DB] write_batch failed: {:?}", e);
-                            // Don't clear - will retry on next flush
+                            eprintln!("[ERROR-DB] write_batch failed: {:?} (will retry)", e);
+                            last_write_failed = true;
+
+                            // Bound memory: if the backlog grows past the hard cap
+                            // while writes keep failing, drop it. The dropped
+                            // entries are a cache and are recomputed on next scan.
+                            let buffered = meta_updates.len()
+                                + hash_updates.len()
+                                + feature_updates.len()
+                                + coeff_updates.len()
+                                + pixel_updates.len();
+                            if buffered > hard_cap {
+                                eprintln!(
+                                    "[ERROR-DB] Dropping {} buffered cache updates after repeated write failures",
+                                    buffered
+                                );
+                                meta_updates.clear();
+                                hash_updates.clear();
+                                feature_updates.clear();
+                                coeff_updates.clear();
+                                pixel_updates.clear();
+                            }
                         }
                     }
                     last_flush = Instant::now();
