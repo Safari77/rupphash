@@ -1104,6 +1104,13 @@ fn compute_histogram_from_colorimage(
     let (src_w, src_h) = (img.size[0] as u32, img.size[1] as u32);
     let (dst_w, dst_h) = (128u32, 128u32);
 
+    // Guard against zero-dimension images (e.g. a corrupt decode): the sampling
+    // step below divides by the pixel count and the fallbacks index into the
+    // pixel buffer, both of which would panic on an empty image.
+    if src_w == 0 || src_h == 0 {
+        let k = dominant_colors.clamp(1, 25);
+        return ([0; 256], [0; 256], [0; 256], vec![(egui::Color32::BLACK, 1.0 / k as f32); k]);
+    }
     // Detect low-color images (1-bit, indexed, etc.) by sampling the pixels
     // for unique RGB values. If there are fewer unique colors than requested,
     // we return them directly and skip k-means entirely.
@@ -1692,6 +1699,13 @@ fn compute_histogram_from_dynamic_image(
     let (src_w, src_h) = rgba.dimensions();
     let (dst_w, dst_h) = (128u32, 128u32);
     let pixel_type = PixelType::U8x4;
+
+    // Guard against zero-dimension images (e.g. a corrupt decode): the sampling
+    // step below divides by the pixel count, which would panic on an empty image.
+    if src_w == 0 || src_h == 0 {
+        let k = dominant_colors.clamp(1, 25);
+        return ([0; 256], [0; 256], [0; 256], vec![(egui::Color32::BLACK, 1.0 / k as f32); k]);
+    }
 
     // Detect low-color images before Lanczos downsampling destroys the information.
     // This path always receives original (non-resized) pixels.
