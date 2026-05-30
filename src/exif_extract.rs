@@ -266,7 +266,7 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                 }
                 if v.len() == 1 {
                     if v[0].denom != 0 {
-                        ExifValue::Float((v[0].num / v[0].denom) as f64)
+                        ExifValue::Float(v[0].num as f64 / v[0].denom as f64)
                     } else {
                         continue;
                     }
