@@ -164,7 +164,7 @@ fn part1by1_scalar(mut n: u32) -> u64 {
 
 /// Sorts markers spatially using a Z-Order curve.
 /// Includes logic to handle International Date Line wrapping.
-pub fn sort_by_hilbert_curve(markers: &mut [GpsMarker]) {
+pub fn sort_by_zorder_curve(markers: &mut [GpsMarker]) {
     if markers.len() < 2 {
         return;
     }
@@ -475,7 +475,7 @@ impl GpsMapState {
             optimize_2opt(&mut self.markers);
         } else {
             // For massive datasets, stick to the instant spatial sort
-            sort_by_hilbert_curve(&mut self.markers);
+            sort_by_zorder_curve(&mut self.markers);
         }
 
         // Rebuild the lookup map
