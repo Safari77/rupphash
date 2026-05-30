@@ -1,6 +1,6 @@
 [package]
 name = "rupphash"
-version = "0.7.8"
+version = "0.7.9"
 publish = false
 edition = "2024"
 license = "GPL-3.0"
