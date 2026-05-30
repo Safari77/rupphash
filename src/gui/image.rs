@@ -1816,8 +1816,8 @@ fn compute_histogram_from_image(
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
 
-    // Fast path for formats the `image` crate doesn't support natively (PDF, JP2, JXL)
-    if matches!(ext.as_str(), "jp2" | "j2k" | "jxl" | "pdf" | "tif" | "tiff") {
+    // Fast path for formats the `image` crate doesn't support natively
+    if matches!(ext.as_str(), "heic" | "heif" | "jp2" | "j2k" | "jxl" | "pdf" | "tif" | "tiff") {
         if let Ok(bytes) = std::fs::read(path) {
             match crate::scanner::load_image_fast(path, &bytes) {
                 Ok(dyn_img) => {
