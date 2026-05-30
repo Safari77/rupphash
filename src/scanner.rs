@@ -113,7 +113,22 @@ pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exi
     exif::Reader::new().read_from_container(&mut reader).ok()
 }
 
+/// True for container formats whose decoder (libheif) bakes the orientation
+/// transform (irot/imir) into the decoded pixels. For these the embedded EXIF
+/// Orientation tag must NOT be applied again by the viewer, or the image gets
+/// rotated twice.
+pub(crate) fn orientation_baked_into_pixels(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("heic") | Some("heif")
+    )
+}
+
 pub fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
+    // HEIC/HEIF pixels come out of libheif already upright; report neutral 1.
+    if orientation_baked_into_pixels(path) {
+        return 1;
+    }
     if let Some(exif_data) = read_exif_data(path, preloaded_bytes)
         && let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         && let Some(v @ 1..=8) = field.value.get_uint(0)
@@ -1258,6 +1273,11 @@ pub fn scan_and_group(
                             {
                                 orientation = v as u8;
                             }
+                            // HEIC/HEIF: libheif bakes orientation into the decoded pixels,
+                            // so the embedded EXIF Orientation tag must not be applied again.
+                            if orientation_baked_into_pixels(path) {
+                                orientation = 1;
+                            }
                             exif_timestamp = get_exif_timestamp(exif);
                         } else if is_raw {
                             // kamadak-exif failed on RAW file - try rsraw as fallback
@@ -1360,8 +1380,13 @@ pub fn scan_and_group(
                                         ImageFeatures::new(w, h)
                                     };
 
-                                // Add orientation if not default
-                                if orientation != 1 {
+                                // Persist orientation. build_image_features copies the raw
+                                // EXIF Orientation tag, so for formats whose decoder bakes
+                                // orientation into the pixels (HEIC/HEIF) overwrite it with 1
+                                // to stop the viewer double-rotating an already-upright image.
+                                if orientation_baked_into_pixels(path) {
+                                    img_features.insert_tag(TAG_ORIENTATION, ExifValue::Short(1));
+                                } else if orientation != 1 {
                                     img_features.insert_tag(
                                         TAG_ORIENTATION,
                                         ExifValue::Short(orientation as u16),
@@ -2477,7 +2502,14 @@ pub fn spawn_background_enrichment(
 
                 // Enforce critical tags (Orientation, GPS) to ensure consistency
                 // (These might be redundant if build_image_features ran, but safe to ensure)
-                if orientation != 1 {
+                // For HEIC/HEIF the decoder bakes orientation into the pixels, so overwrite
+                // the EXIF Orientation tag copied by build_image_features with a neutral 1.
+                if orientation_baked_into_pixels(path) {
+                    features.insert_tag(
+                        crate::exif_types::TAG_ORIENTATION,
+                        crate::exif_types::ExifValue::Short(1),
+                    );
+                } else if orientation != 1 {
                     features.insert_tag(
                         crate::exif_types::TAG_ORIENTATION,
                         crate::exif_types::ExifValue::Short(orientation as u16),

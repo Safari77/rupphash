@@ -651,13 +651,22 @@ fn load_and_process_image_from_bytes(
     // ---------------------------------------------------------------------
     // STANDARD FILES (JPEG, PNG, HEIC, JP2, JXL, etc.)
     // ---------------------------------------------------------------------
-    let orientation = crate::exif_extract::get_orientation(path, Some(bytes));
-
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
+
+    // libheif applies the container orientation (irot/imir) while decoding, so
+    // HEIC/HEIF pixels come out already upright. The EXIF Orientation tag that
+    // iPhones additionally embed must therefore NOT be re-applied at render time
+    // or the image gets rotated twice. Unlike JPEG (whose pixels stay in their
+    // stored orientation and rely on the EXIF tag), HEIC needs a neutral 1.
+    let orientation = if crate::scanner::orientation_baked_into_pixels(path) {
+        1
+    } else {
+        crate::exif_extract::get_orientation(path, Some(bytes))
+    };
 
     // ---------------------------------------------------------------------
     // JXL / PDF / JPEG / TIFF FAST PATH
