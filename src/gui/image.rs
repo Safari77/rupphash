@@ -397,25 +397,27 @@ fn is_animated_webp(bytes: &[u8]) -> bool {
 }
 
 /// Check if a GIF file contains multiple frames (animation).
-/// Scans for more than one Image Descriptor block (0x2C) past the header.
+/// Asks the GIF decoder for frames and reports animation when a second frame
+/// exists. Lazily decodes at most two frames, so it stays cheap on stills.
 fn is_animated_gif(bytes: &[u8]) -> bool {
+    use image::AnimationDecoder;
+    use image::codecs::gif::GifDecoder;
+
     // GIF87a / GIF89a header is 6 bytes
     if bytes.len() < 10 || (&bytes[0..4] != b"GIF8") {
         return false;
     }
-    // Count 0x2C (Image Descriptor) introducers; > 1 means animated
-    let mut count = 0u32;
-    let mut i = 6; // skip past header
-    while i < bytes.len() {
-        if bytes[i] == 0x2C {
-            count += 1;
-            if count > 1 {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
+
+    let Ok(decoder) = GifDecoder::new(std::io::Cursor::new(bytes)) else {
+        return false;
+    };
+    // `into_frames()` is a lazy iterator: pull the first frame, then probe for a
+    // second; a present second frame means the GIF is animated. Counting raw
+    // 0x2C bytes was wrong because that value also occurs in color tables and
+    // LZW data, so most single-frame GIFs were misclassified as animated.
+    let mut frames = decoder.into_frames();
+    frames.next(); // first frame (None only for an empty/invalid GIF)
+    frames.next().is_some()
 }
 
 /// Convert a slice of `image::Frame`s into egui ColorImages and durations,
