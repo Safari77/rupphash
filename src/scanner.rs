@@ -368,14 +368,10 @@ fn get_exif_tags_from_rsraw(
                     None
                 }
             }
-            // TODO(rsraw-orientation): When rsraw exposes orientation, add:
-            // "orientation" => {
-            //     if let Some(orientation) = info.orientation { // or info.flip
-            //         Some(format!("{}", orientation))
-            //     } else {
-            //         None
-            //     }
-            // }
+            "orientation" => {
+                let o = raw_exif::get_orientation_from_raw(raw);
+                if o != 1 { Some(o.to_string()) } else { None }
+            }
             // Skip derived sun position for rsraw (requires full timestamp parsing)
             "derivedsunposition" => None,
             // Skip other tags not available in rsraw
@@ -1288,8 +1284,9 @@ pub fn scan_and_group(
                                 }
                                 // Get timestamp from rsraw
                                 exif_timestamp = raw_exif::get_timestamp_from_raw(raw);
-                                // Note: orientation is NOT available from rsraw
-                                // It will remain at the default value of 1
+                                // Orientation: kamadak couldn't parse this RAW container
+                                // (e.g. CR3/CRX), so take LibRaw's value via rsraw.
+                                orientation = raw_exif::get_orientation_from_raw(raw);
                             }
                         }
 
@@ -2453,13 +2450,18 @@ pub fn spawn_background_enrichment(
                     .map(|(lat, lon)| Point::new(lon, lat))
                     .or_else(|| raw_image.as_ref().and_then(raw_exif::get_gps_point_from_raw));
 
-                // Read orientation from EXIF (fresh, not from stale passed-in value)
-                // TODO(rsraw-orientation): rsraw does NOT currently provide orientation.
-                // When rsraw exposes it, add fallback like:
-                //   let orientation = get_orientation(path, Some(&data))
-                //       .or_else(|| raw_image.as_ref().and_then(raw_exif::get_orientation_from_raw))
-                //       .unwrap_or(1);
-                let orientation = get_orientation(path, Some(&data));
+                // Read orientation from EXIF (fresh, not from stale passed-in value).
+                // kamadak-exif can't parse some RAW containers (e.g. CR3/CRX); when it
+                // returns the neutral 1 for a RAW we have a handle to, fall back to
+                // LibRaw's value via rsraw so orientation-based search is correct.
+                let orientation = {
+                    let from_exif = get_orientation(path, Some(&data));
+                    if from_exif != 1 {
+                        from_exif
+                    } else {
+                        raw_image.as_ref().map(raw_exif::get_orientation_from_raw).unwrap_or(1)
+                    }
+                };
 
                 // Read EXIF timestamp, with rsraw fallback
                 let exif_timestamp = exif_data

@@ -4,15 +4,15 @@
 //
 // Orientation: rsraw's safe FullRawInfo struct does NOT expose orientation, but
 // LibRaw's value IS reachable via rsraw's AsRef<libraw_data_t> as
-// `raw.as_ref().sizes.flip`. get_orientation_from_raw() (below) surfaces it.
+// `raw.as_ref().sizes.flip`. get_orientation_from_raw() (below) surfaces it and
+// is now used by image.rs (RAW thumbnail view) and scanner.rs (scan_and_group,
+// spawn_background_enrichment, get_exif_tags_from_rsraw).
 //
-// Optional future integration points that still default to orientation 1:
-//   1. build_features_from_raw_image() - could insert TAG_ORIENTATION
-//   3. scanner.rs spawn_background_enrichment() - could use it as a fallback
-//   4. scanner.rs get_exif_tags_from_rsraw() - could add "orientation" handling
-// Caveat: process() bakes rotation into its output (and reports orientation 1)
-// while embedded thumbnails stay sensor-native, so any stored orientation is
-// only valid for the representation that is actually displayed.
+// build_features_from_raw_image() still does not insert TAG_ORIENTATION itself;
+// its callers compute orientation separately. Caveat: process() bakes rotation
+// into its output (and reports orientation 1) while embedded thumbnails stay
+// sensor-native, so a stored orientation is only valid for the representation
+// actually displayed - the viewer re-derives it on load.
 //
 // GPS Coordinate Handling:
 // - rsraw stores GPS as [f32; 3] arrays in DMS format (degrees, minutes, seconds)
