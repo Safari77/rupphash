@@ -2,12 +2,17 @@
 // Provides fallback when kamadak-exif fails to parse RAW files.
 // Maps rsraw structures to our ExifValue/ImageFeatures format.
 //
-// TODO(rsraw-orientation): Orientation is NOT currently available from rsraw/LibRaw.
-// When rsraw exposes orientation (e.g., info.flip or info.orientation), update:
-//   1. build_features_from_raw_image() - extract and insert TAG_ORIENTATION
-//   2. Add get_orientation_from_raw() helper function
-//   3. scanner.rs spawn_background_enrichment() - use rsraw orientation as fallback
-//   4. scanner.rs get_exif_tags_from_rsraw() - add "orientation" tag handling
+// Orientation: rsraw's safe FullRawInfo struct does NOT expose orientation, but
+// LibRaw's value IS reachable via rsraw's AsRef<libraw_data_t> as
+// `raw.as_ref().sizes.flip`. get_orientation_from_raw() (below) surfaces it.
+//
+// Optional future integration points that still default to orientation 1:
+//   1. build_features_from_raw_image() - could insert TAG_ORIENTATION
+//   3. scanner.rs spawn_background_enrichment() - could use it as a fallback
+//   4. scanner.rs get_exif_tags_from_rsraw() - could add "orientation" handling
+// Caveat: process() bakes rotation into its output (and reports orientation 1)
+// while embedded thumbnails stay sensor-native, so any stored orientation is
+// only valid for the representation that is actually displayed.
 //
 // GPS Coordinate Handling:
 // - rsraw stores GPS as [f32; 3] arrays in DMS format (degrees, minutes, seconds)
@@ -166,6 +171,44 @@ pub fn get_timestamp_from_raw(raw: &RawImage) -> Option<i64> {
     raw.full_info().datetime.as_ref().map(|dt| dt.timestamp())
 }
 
+/// Map LibRaw's `sizes.flip` orientation code to a standard EXIF Orientation
+/// value (1-8).
+///
+/// LibRaw inherits dcraw's flip numbering, which differs from the TIFF/EXIF
+/// Orientation tag. The mapping (libraw flip -> exif orientation) is:
+///   0 -> 1, 1 -> 2, 2 -> 4, 3 -> 3, 4 -> 5, 5 -> 8, 6 -> 6, 7 -> 7
+/// e.g. flip 5 (rotate 90 CCW) is EXIF 8 (Rotate 270 CW). A handful of old
+/// cameras store the angle (90/180/270) directly, which we also accept. -1
+/// (LibRaw's "take from RAW" default / unknown) and anything unexpected map to 1.
+fn libraw_flip_to_exif_orientation(flip: i32) -> u8 {
+    match flip {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 | 180 => 3,
+        4 => 5,
+        5 | 270 => 8,
+        6 | 90 => 6,
+        7 => 7,
+        _ => 1,
+    }
+}
+
+/// Get the EXIF orientation (1-8) for a RAW file from LibRaw's computed
+/// `sizes.flip` value. Returns 1 when no rotation is required or the value is
+/// unknown.
+///
+/// This works even for containers that kamadak-exif cannot parse (e.g. Canon
+/// CR3/CRX), because LibRaw populates `sizes.flip` on open. The full decode path
+/// (process()) already bakes this rotation into its output pixels, so this
+/// helper is meant for callers that display the *embedded thumbnail*, which is
+/// stored in the sensor's native orientation and must be rotated by the viewer.
+///
+/// Thread Safety: Only reads from RawImage.
+pub fn get_orientation_from_raw(raw: &RawImage) -> u8 {
+    libraw_flip_to_exif_orientation(raw.as_ref().sizes.flip as i32)
+}
+
 /// Merge rsraw EXIF data into existing ImageFeatures.
 /// Only fills in missing tags (doesn't overwrite existing ones from kamadak-exif).
 ///
@@ -277,5 +320,28 @@ mod tests {
         let dms_west = [-122.0, 24.0, 36.0];
         let decimal_west = dms_to_decimal(&dms_west);
         assert!(decimal_west < 0.0);
+    }
+
+    #[test]
+    fn test_libraw_flip_to_exif_orientation() {
+        // Canonical dcraw/LibRaw flip numbering -> EXIF Orientation tag.
+        assert_eq!(libraw_flip_to_exif_orientation(0), 1);
+        assert_eq!(libraw_flip_to_exif_orientation(1), 2);
+        assert_eq!(libraw_flip_to_exif_orientation(2), 4);
+        assert_eq!(libraw_flip_to_exif_orientation(3), 3);
+        assert_eq!(libraw_flip_to_exif_orientation(4), 5);
+        // flip 5 (90 CCW) == EXIF 8 (Rotate 270 CW)
+        assert_eq!(libraw_flip_to_exif_orientation(5), 8);
+        assert_eq!(libraw_flip_to_exif_orientation(6), 6);
+        assert_eq!(libraw_flip_to_exif_orientation(7), 7);
+
+        // Angle-encoded values used by a few legacy cameras.
+        assert_eq!(libraw_flip_to_exif_orientation(90), 6);
+        assert_eq!(libraw_flip_to_exif_orientation(180), 3);
+        assert_eq!(libraw_flip_to_exif_orientation(270), 8);
+
+        // -1 (LibRaw default "take from RAW") and unexpected values -> normal.
+        assert_eq!(libraw_flip_to_exif_orientation(-1), 1);
+        assert_eq!(libraw_flip_to_exif_orientation(42), 1);
     }
 }

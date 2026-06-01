@@ -594,10 +594,19 @@ fn load_and_process_image_from_bytes(
 
         let dims = (raw.width(), raw.height());
 
+        // LibRaw computes the sensor orientation (sizes.flip) even for RAW
+        // containers that kamadak-exif can't parse (e.g. CR3/CRX). The embedded
+        // thumbnails returned by extract_thumbs() are stored in the sensor's
+        // native orientation, so use this when neither the thumbnail's own EXIF
+        // nor the container EXIF supplied an orientation.
+        let raw_orientation = crate::raw_exif::get_orientation_from_raw(&raw);
+        let raw_fallback_orientation =
+            if exif_orientation != 1 { exif_orientation } else { raw_orientation };
+
         // Try standard rsraw thumbnail extraction first if it managed to open
         if use_thumbnails && let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
             let actual_orientation =
-                if thumb_orient != 1 { thumb_orient } else { exif_orientation };
+                if thumb_orient != 1 { thumb_orient } else { raw_fallback_orientation };
             return Ok(maybe_resize_image(thumb, dims, actual_orientation, path));
         }
 
@@ -632,7 +641,7 @@ fn load_and_process_image_from_bytes(
                     // Fallback to thumbnail on process error
                     if let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
                         let actual_orientation =
-                            if thumb_orient != 1 { thumb_orient } else { exif_orientation };
+                            if thumb_orient != 1 { thumb_orient } else { raw_fallback_orientation };
                         return Ok(maybe_resize_image(thumb, dims, actual_orientation, path));
                     }
                     return Err(format!("Failed to process RAW: {}", e));
@@ -642,7 +651,7 @@ fn load_and_process_image_from_bytes(
                 // Fallback to thumbnail on unpack error (unsupported full decode formats)
                 if let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
                     let actual_orientation =
-                        if thumb_orient != 1 { thumb_orient } else { exif_orientation };
+                        if thumb_orient != 1 { thumb_orient } else { raw_fallback_orientation };
                     return Ok(maybe_resize_image(thumb, dims, actual_orientation, path));
                 }
                 return Err(format!("Failed to unpack RAW: {}", e));
