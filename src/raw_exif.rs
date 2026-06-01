@@ -120,24 +120,24 @@ pub fn build_features_from_raw_image(raw: &RawImage) -> ImageFeatures {
 /// rsraw stores GPS as [f32; 3] arrays. This is different from kamadak-exif's
 /// Value::Rational format which is handled by exif_extract::parse_gps_coordinate().
 ///
-/// The sign (N/S, E/W) appears to be embedded in the degrees value by rsraw/LibRaw.
+/// rsraw folds the N/S/E/W sign into ALL THREE components, so each of
+/// degrees/minutes/seconds is negative for southern/western coordinates.
 #[inline]
 fn dms_to_decimal(dms: &[f32; 3]) -> f64 {
+    // Recover the hemisphere sign from any component (rsraw signs all three),
+    // then sum the magnitudes so minutes/seconds add instead of subtracting.
+    let sign = if dms[0] < 0.0 || dms[1] < 0.0 || dms[2] < 0.0 { -1.0 } else { 1.0 };
+    let degrees = dms[0].abs() as f64;
+    let minutes = dms[1].abs() as f64;
+    let seconds = dms[2].abs() as f64;
+
     // Check if coordinates are already in decimal format (minutes and seconds are 0)
     // Some cameras/formats store decimal degrees directly
-    if dms[1].abs() < 0.0001 && dms[2].abs() < 0.0001 {
-        return dms[0] as f64;
+    if minutes < 0.0001 && seconds < 0.0001 {
+        return sign * degrees;
     }
 
-    let degrees = dms[0] as f64;
-    let minutes = dms[1] as f64;
-    let seconds = dms[2] as f64;
-
-    // Handle negative degrees (southern/western hemispheres)
-    let sign = if degrees < 0.0 { -1.0 } else { 1.0 };
-    let abs_degrees = degrees.abs();
-
-    sign * (abs_degrees + minutes / 60.0 + seconds / 3600.0)
+    sign * (degrees + minutes / 60.0 + seconds / 3600.0)
 }
 
 /// Public version of dms_to_decimal for use by scanner.rs get_exif_tags_from_rsraw()
@@ -316,10 +316,11 @@ mod tests {
         let result = dms_to_decimal(&dms_decimal);
         assert!((result - 48.8567).abs() < 0.001);
 
-        // Negative (Western hemisphere)
-        let dms_west = [-122.0, 24.0, 36.0];
+        // Negative (Western hemisphere). rsraw folds the sign into ALL three
+        // components, so a real western coordinate looks like [-122, -24, -36].
+        let dms_west = [-122.0, -24.0, -36.0];
         let decimal_west = dms_to_decimal(&dms_west);
-        assert!(decimal_west < 0.0);
+        assert!((decimal_west - (-122.41)).abs() < 0.001);
     }
 
     #[test]
