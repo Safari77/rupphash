@@ -206,7 +206,7 @@ fn libraw_flip_to_exif_orientation(flip: i32) -> u8 {
 ///
 /// Thread Safety: Only reads from RawImage.
 pub fn get_orientation_from_raw(raw: &RawImage) -> u8 {
-    libraw_flip_to_exif_orientation(raw.as_ref().sizes.flip as i32)
+    libraw_flip_to_exif_orientation(raw.as_ref().sizes.flip)
 }
 
 /// Merge rsraw EXIF data into existing ImageFeatures.

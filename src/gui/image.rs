@@ -279,7 +279,7 @@ fn maybe_resize_image(
         // Take ownership of the memory directly instead of cloning it.
         let pixels = std::mem::take(&mut color_image.pixels);
 
-        let mut raw_pixels: Vec<u8> = unsafe {
+        let raw_pixels: Vec<u8> = unsafe {
             let mut p = std::mem::ManuallyDrop::new(pixels);
             let ptr = p.as_mut_ptr() as *mut u8;
             let length = p.len() * 4;
@@ -814,13 +814,12 @@ pub(super) fn update_file_metadata(
     }
 
     // 2. BACKUP FAST PATH: Check current active file just in case (O(1))
-    if found_info.is_none() {
-        if let Some(group) = app.state.groups.get_mut(app.state.current_group_idx)
+    if found_info.is_none()
+        && let Some(group) = app.state.groups.get_mut(app.state.current_group_idx)
             && let Some(file) = group.get_mut(app.state.current_file_idx)
         {
             found_info = update_file(file);
         }
-    }
 
     // 3. SLOW PATH FALLBACK: Iterate all (O(N)) - Only hits if the list was sorted/mutated mid-load
     if found_info.is_none() {
