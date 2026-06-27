@@ -29,7 +29,7 @@ geo = { version = "0.33", features = ["serde"] }
 getrandom = "0.4"
 hayro = "0"
 hayro-syntax = "0"
-hayro-jpeg2000 = "0.3"
+hayro-jpeg2000 = "0.4"
 hex = "0.4"
 image-extras = { git = "https://github.com/image-rs/image-extras", branch = "main" }
 image = { version = "0.25", features = ["avif-native"] }
@@ -70,17 +70,17 @@ mp4parse = "0.17"
 rustix = { version = "1", features = ["fs"] }
 
 # GUI
-eframe = { version = "0.34", default-features = false, features = [
+eframe = { version = "0.35", default-features = false, features = [
   "default_fonts",
   "wgpu",
   "wayland",
   "x11",
 ] }
-egui = "0.34"
-egui_extras = { version = "0.34", features = ["all_loaders"] }
+egui = "0.35"
+egui_extras = { version = "0.35", features = ["all_loaders"] }
 wgpu = "29"
 delaunator = "1.0.2"
-walkers = "0.53"
+walkers = "0.56"
 roaring = { version = "0.11", features = ["serde"] }
 ttf-parser = "0.25"
 

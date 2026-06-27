@@ -1886,7 +1886,7 @@ impl eframe::App for GuiApp {
 
         // 3. Use the title string for the internal label (doesn't trigger OS events)
         if !cfg!(target_os = "windows") && !self.state.is_fullscreen {
-            egui::Panel::top("custom_title_bar").show_inside(ui, |ui| {
+            egui::Panel::top("custom_title_bar").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let height = 12.0;
                     ui.label(egui::RichText::new(&self.state.last_title).strong());
@@ -2231,7 +2231,7 @@ impl eframe::App for GuiApp {
             *self.group_views.get(&current_group_idx).unwrap_or(&GroupViewState::default());
 
         if !self.state.is_fullscreen {
-            egui::Panel::bottom("status").show_inside(ui, |ui| {
+            egui::Panel::bottom("status").show(ui, |ui| {
                 if let Some((msg, is_error)) = &self.state.status_message {
                     ui.colored_label(
                         if *is_error { egui::Color32::RED } else { egui::Color32::GREEN },
@@ -2453,7 +2453,7 @@ impl eframe::App for GuiApp {
             //    width_range = point(width), so egui cannot shrink or grow it.
             let panel = egui::Panel::left(panel_id).resizable(true).exact_size(self.panel_width);
 
-            let panel_response = panel.show_inside(ui, |ui| {
+            let panel_response = panel.show(ui, |ui| {
                 // Belt-and-suspenders: force the inner ui to fill the panel width.
                 // (Not strictly necessary with exact_size, but cheap insurance.)
                 ui.set_min_width(ui.available_width());
@@ -3461,7 +3461,7 @@ impl eframe::App for GuiApp {
                 .resizable(true)
                 .default_size(400.0)
                 .min_size(200.0)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     ui.heading("GPS Map");
                     ui.separator();
 
@@ -3572,7 +3572,7 @@ impl eframe::App for GuiApp {
             }
         }
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let available_rect = ui.available_rect_before_wrap();
             if let Some(path) = current_image_path {
                 // 0. Check Animation Cache (animated WebP etc.)
