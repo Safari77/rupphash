@@ -476,9 +476,10 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 let w = info.width as u32;
                 let h = info.height as u32;
                 let len = pixels.len();
+                let wh = w as usize * h as usize;
 
                 // Robustly handle Grayscale vs RGB based on buffer size
-                if len == (w * h) as usize {
+                if len == wh {
                     if let Some(buf) =
                         image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels)
                     {
@@ -488,7 +489,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                         );
                         return Ok(image::DynamicImage::ImageLuma8(buf));
                     }
-                } else if len == (w * h * 3) as usize {
+                } else if len == wh * 3 {
                     if let Some(buf) =
                         image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels)
                     {
@@ -498,7 +499,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                         );
                         return Ok(image::DynamicImage::ImageRgb8(buf));
                     }
-                } else if len == (w * h * 4) as usize {
+                } else if len == wh * 4 {
                     // CMYK or RGBA (Zune might output RGBA for CMYK)
                     if let Some(buf) =
                         image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, pixels)
@@ -514,13 +515,16 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
 
             // TIER 2: jpeg-decoder (Fallback)
             let mut decoder = Tier2Decoder::new(std::io::Cursor::new(bytes));
-            if let Ok(pixels) = decoder.decode() {
-                let info = decoder.info();
-                let w = info.unwrap().width as u32;
-                let h = info.unwrap().height as u32;
+            if let Ok(pixels) = decoder.decode()
+                && let Some(info) = decoder.info()
+            {
+                let w = info.width as u32;
+                let h = info.height as u32;
                 let len = pixels.len();
+                // Multiply in usize to avoid u32 overflow on very large images
+                let wh = w as usize * h as usize;
 
-                if len == (w * h) as usize {
+                if len == wh {
                     if let Some(buf) =
                         image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels)
                     {
@@ -530,7 +534,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                         );
                         return Ok(image::DynamicImage::ImageLuma8(buf));
                     }
-                } else if len == (w * h * 3) as usize
+                } else if len == wh * 3
                     && let Some(buf) =
                         image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels)
                 {
@@ -665,8 +669,8 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                             && let Ok(tiff::decoder::DecodingResult::U8(mut data)) =
                                 native_decoder.read_image()
                         {
-                            let expected_rgb_len = (w * h * 3) as usize;
-                            let expected_rgba_len = (w * h * 4) as usize;
+                            let expected_rgb_len = w as usize * h as usize * 3;
+                            let expected_rgba_len = w as usize * h as usize * 4;
 
                             if data.len() == expected_rgb_len {
                                 if is_ycbcr {
@@ -893,22 +897,24 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
             clean_exif_string(&value.display_as(tag).to_string())
         }
         exif::Tag::ExposureTime => {
-            if let Some(r) = value.get_uint(0) {
-                if let exif::Value::Rational(rats) = value
-                    && !rats.is_empty()
-                {
-                    let num = rats[0].num;
-                    let denom = rats[0].denom;
-                    if denom > num && num > 0 {
-                        return format!("1/{}s", denom / num);
-                    } else if denom > 0 {
-                        return format!("{:.1}s", num as f64 / denom as f64);
-                    }
+            // ExposureTime is stored as Rational; check that first because
+            // Value::get_uint() returns None for Rational values.
+            if let exif::Value::Rational(rats) = value
+                && !rats.is_empty()
+            {
+                let num = rats[0].num;
+                let denom = rats[0].denom;
+                if denom > num && num > 0 {
+                    return format!("1/{}s", denom / num);
+                } else if denom > 0 {
+                    return format!("{:.1}s", num as f64 / denom as f64);
                 }
-                format!("{}s", r)
-            } else {
-                clean_exif_string(&value.display_as(tag).to_string())
             }
+            // Integer-typed fallback (some writers store plain integers)
+            if let Some(r) = value.get_uint(0) {
+                return format!("{}s", r);
+            }
+            clean_exif_string(&value.display_as(tag).to_string())
         }
         exif::Tag::FNumber => {
             if let exif::Value::Rational(rats) = value

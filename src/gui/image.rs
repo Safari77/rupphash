@@ -816,10 +816,10 @@ pub(super) fn update_file_metadata(
     // 2. BACKUP FAST PATH: Check current active file just in case (O(1))
     if found_info.is_none()
         && let Some(group) = app.state.groups.get_mut(app.state.current_group_idx)
-            && let Some(file) = group.get_mut(app.state.current_file_idx)
-        {
-            found_info = update_file(file);
-        }
+        && let Some(file) = group.get_mut(app.state.current_file_idx)
+    {
+        found_info = update_file(file);
+    }
 
     // 3. SLOW PATH FALLBACK: Iterate all (O(N)) - Only hits if the list was sorted/mutated mid-load
     if found_info.is_none() {

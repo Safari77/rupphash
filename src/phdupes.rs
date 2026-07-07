@@ -341,6 +341,22 @@ impl Cli {
 }
 
 // --- CLI Helpers ---
+
+/// Convert a chrono UTC time to a relative-time string via jiff.
+/// Falls back to absolute formatting when the value is outside jiff's supported timestamp range.
+fn relative_time_str(modified: &DateTime<Utc>) -> String {
+    Timestamp::from_second(modified.timestamp())
+        .ok()
+        .and_then(|ts| {
+            ts.checked_add(jiff::SignedDuration::from_nanos(
+                modified.timestamp_subsec_nanos() as i64
+            ))
+            .ok()
+        })
+        .map(format_relative_time)
+        .unwrap_or_else(|| modified.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         return format!("{} B", bytes);
@@ -350,7 +366,11 @@ fn format_size(bytes: u64) -> String {
         return format!("{:.1} KB", kb);
     }
     let mb = kb / 1024.0;
-    format!("{:.1} MB", mb)
+    if mb < 1024.0 {
+        return format!("{:.1} MB", mb);
+    }
+    let gb = mb / 1024.0;
+    format!("{:.2} GB", gb)
 }
 
 fn run_interactive_cli_delete(
@@ -389,13 +409,7 @@ fn run_interactive_cli_delete(
 
         for (i, file) in group.iter().enumerate() {
             let time_str = if show_relative_times {
-                let ts = Timestamp::from_second(file.modified.timestamp())
-                    .unwrap()
-                    .checked_add(jiff::SignedDuration::from_nanos(
-                        file.modified.timestamp_subsec_nanos() as i64,
-                    ))
-                    .unwrap();
-                format_relative_time(ts)
+                relative_time_str(&file.modified)
             } else {
                 file.modified.format("%Y-%m-%d %H:%M:%S").to_string()
             };
@@ -430,12 +444,15 @@ fn run_interactive_cli_delete(
             if line.is_empty() {
                 continue;
             }
-            let indices: Vec<usize> = line
+            let mut indices: Vec<usize> = line
                 .split_whitespace()
                 .filter_map(|s| s.parse::<usize>().ok())
                 .filter(|&idx| idx >= 1 && idx <= group.len())
                 .map(|idx| idx - 1)
                 .collect();
+            // Deduplicate the input
+            indices.sort_unstable();
+            indices.dedup();
 
             if indices.is_empty() {
                 println!("No valid selections.");
@@ -563,7 +580,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(seconds) = args.prune {
         let ctx = AppContext::with_algorithm(hash_algorithm)?;
 
-        println!("Pruning entries older than {} seconds) from PDQ hash database...", seconds);
+        println!("Pruning entries older than {} seconds from PDQ hash database...", seconds);
 
         match ctx.prune(seconds) {
             Ok((meta_count, hash_count)) => {
@@ -867,13 +884,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for file in group {
                 let time_str = if args.relative_times {
-                    let ts = Timestamp::from_second(file.modified.timestamp())
-                        .unwrap()
-                        .checked_add(jiff::SignedDuration::from_nanos(
-                            file.modified.timestamp_subsec_nanos() as i64,
-                        ))
-                        .unwrap();
-                    format_relative_time(ts)
+                    relative_time_str(&file.modified)
                 } else {
                     file.modified.format("%Y-%m-%d %H:%M:%S.%f").to_string()
                 };
