@@ -25,6 +25,12 @@ pub(super) fn handle_input(
     intent: &RefCell<Option<InputIntent>>,
     force_panel_resize: &mut bool,
 ) {
+    // Universal Quit shortcut (Ctrl+Q or Cmd+Q)
+    if ctx.input(|i| i.key_pressed(egui::Key::Q) && (i.modifiers.ctrl || i.modifiers.command)) {
+        *intent.borrow_mut() = Some(InputIntent::Quit);
+        return;
+    }
+
     // Input handling
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         if app.show_move_input {
