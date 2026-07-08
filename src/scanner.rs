@@ -1600,27 +1600,65 @@ where
 
                         for k in 0..H::NUM_CHUNKS {
                             let q_chunk = variant.get_chunk(k);
-                            let check_neighbors = config.similarity / H::NUM_CHUNKS as u32 >= 1;
-                            let limit =
-                                if check_neighbors { 1 + H::bit_width_per_chunk() } else { 1 };
+                            let bits = H::bit_width_per_chunk();
 
-                            for pass in 0..limit {
-                                let query_val =
-                                    if pass == 0 { q_chunk } else { q_chunk ^ (1 << (pass - 1)) };
+                            // Zero-allocation closure to handle bucket checks
+                            let mut check_bucket =
+                                |val: u16, v: &mut SparseBitSet, edges: &mut Vec<(u32, u32)>| {
+                                    let bucket = mih.bucket(k, val);
+                                    for dense in bucket {
+                                        let dense_id = dense.index();
+                                        let cand_idx = dense_to_sparse[dense_id];
 
-                                let bucket = mih.bucket(k, query_val);
+                                        if cand_idx <= i || v.set(cand_idx) {
+                                            continue;
+                                        }
 
-                                for dense in bucket {
-                                    let dense_id = dense.index();
-                                    let cand_idx = dense_to_sparse[dense_id];
-
-                                    if cand_idx <= i || visited.set(cand_idx) {
-                                        continue;
+                                        let cand_hash = mih.hash(*dense);
+                                        if variant.hamming_distance(cand_hash) <= config.similarity
+                                        {
+                                            edges.push((i as u32, cand_idx as u32));
+                                        }
                                     }
+                                };
 
-                                    let cand_hash = mih.hash(*dense);
-                                    if variant.hamming_distance(cand_hash) <= config.similarity {
-                                        local_edges.push((i as u32, cand_idx as u32));
+                            // R=0: Exact chunk match
+                            check_bucket(q_chunk, visited, local_edges);
+
+                            // R=1: 1-bit flips (exhaustive up to dist 31 for 16 chunks)
+                            if config.similarity >= H::NUM_CHUNKS as u32 {
+                                for i_bit in 0..bits {
+                                    check_bucket(q_chunk ^ (1 << i_bit), visited, local_edges);
+                                }
+                            }
+
+                            // R=2: 2-bit flips (exhaustive up to dist 47 for 16 chunks)
+                            if config.similarity >= (H::NUM_CHUNKS * 2) as u32 {
+                                for i_bit in 0..bits {
+                                    for j_bit in (i_bit + 1)..bits {
+                                        check_bucket(
+                                            q_chunk ^ (1 << i_bit) ^ (1 << j_bit),
+                                            visited,
+                                            local_edges,
+                                        );
+                                    }
+                                }
+                            }
+
+                            // R=3: 3-bit flips (exhaustive up to dist 63 - safely covers 60)
+                            if config.similarity >= (H::NUM_CHUNKS * 3) as u32 {
+                                for i_bit in 0..bits {
+                                    for j_bit in (i_bit + 1)..bits {
+                                        for m_bit in (j_bit + 1)..bits {
+                                            check_bucket(
+                                                q_chunk
+                                                    ^ (1 << i_bit)
+                                                    ^ (1 << j_bit)
+                                                    ^ (1 << m_bit),
+                                                visited,
+                                                local_edges,
+                                            );
+                                        }
                                     }
                                 }
                             }
