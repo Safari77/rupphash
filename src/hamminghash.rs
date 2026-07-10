@@ -3,9 +3,9 @@ use rayon::prelude::*;
 // 15 bits for 64-bit hash (approx 23% difference)
 #[allow(unused)]
 pub const MAX_SIMILARITY_64: u32 = 15;
-// 60 bits for 256-bit hash (approx 23% difference to match pHash strictness)
-// Note: If you want strictly "near duplicates", use 30. If you want "visually similar", use 60.
-pub const MAX_SIMILARITY_256: u32 = 60;
+// 63 bits for 256-bit hash
+// Note: If you want strictly "near duplicates", use 30.
+pub const MAX_SIMILARITY_256: u32 = 63;
 
 /// Trait to support generic Hamming distance indexes.
 pub trait HammingHash: Copy + Send + Sync + 'static {
@@ -465,7 +465,7 @@ mod tests {
             );
 
             // Pixel-domain rotation causes resampling artifacts that can flip bits.
-            // A distance of < 20 is still considered a "Match" in PDQ terms (threshold is usually ~30-60).
+            // A distance of < 20 is still considered a "Match" in PDQ terms (threshold is usually ~30-63).
             let tolerance = 22;
 
             assert!(

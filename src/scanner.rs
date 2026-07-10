@@ -1559,6 +1559,14 @@ where
     H: HammingHash + std::fmt::Debug + Clone + Copy + Default,
     S: GroupingStrategy<H>,
 {
+    // The current MIH implementation only guarantees 100% recall up to distance 63 (R=3).
+    let maxsim = crate::hamminghash::MAX_SIMILARITY_256;
+    assert!(
+        config.similarity <= maxsim,
+        "Similarity distances above {} require R=4 bit-flip checks, which are not implemented.",
+        maxsim
+    );
+
     // Collect hashes AND their original indices
     let valid_entries: Vec<(usize, H)> = valid_files
         .iter()
