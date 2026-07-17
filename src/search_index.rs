@@ -720,9 +720,9 @@ pub fn parse_search_query(query: &str) -> Result<Vec<SearchCriterion>, String> {
             continue;
         }
 
-        match parse_single_criterion(part) {
-            Ok(c) => criteria.push(c),
-            Err(e) => return Err(e),
+        {
+            let c = parse_single_criterion(part)?;
+            criteria.push(c)
         }
     }
 

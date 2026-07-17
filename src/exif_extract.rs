@@ -484,10 +484,9 @@ fn derive_sun_position(
     let (date_str, is_utc) = if use_gps_utc {
         if let Some(d) = get_date_str(exif_data, true) {
             (d, true)
-        } else if let Some(d) = get_date_str(exif_data, false) {
-            (d, false)
         } else {
-            return None;
+            let d = get_date_str(exif_data, false)?;
+            (d, false)
         }
     } else {
         (get_date_str(exif_data, false)?, false)
