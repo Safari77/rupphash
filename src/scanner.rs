@@ -7,6 +7,7 @@ use geo::Point;
 use image::{DynamicImage, GenericImageView};
 use jpeg_decoder::Decoder as Tier2Decoder;
 use libheif_rs::HeifContext;
+use num_integer::gcd;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -876,6 +877,21 @@ pub fn get_supported_exif_tags() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// Format seconds as human-readable time with up to three-decimal accuracy,
+/// trimming trailing zeros: 1.22 -> "1.22s", 1.20 -> "1.2s", 2.00 -> "2s",
+/// 0.023 -> "0.023s"; sub-millisecond times switch to ms: 0.0001 -> "0.1ms"
+fn format_seconds(secs: f64) -> String {
+    if secs < 0.001 {
+        let s = format!("{:.3}", secs * 1000.0);
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        format!("{}ms", s)
+    } else {
+        let s = format!("{:.3}", secs);
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        format!("{}s", s)
+    }
+}
+
 /// Format an EXIF value for display
 fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) -> String {
     match tag {
@@ -894,18 +910,47 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
             // Value::get_uint() returns None for Rational values.
             if let exif::Value::Rational(rats) = value
                 && !rats.is_empty()
+                && rats[0].num > 0
+                && rats[0].denom > 0
             {
-                let num = rats[0].num;
-                let denom = rats[0].denom;
-                if denom > num && num > 0 {
-                    return format!("1/{}s", denom / num);
-                } else if denom > 0 {
-                    return format!("{:.1}s", num as f64 / denom as f64);
+                let g = gcd(rats[0].num, rats[0].denom);
+                let (n, d) = (rats[0].num / g, rats[0].denom / g);
+                if d == 1 {
+                    // Whole seconds, e.g. "2s"
+                    return format_seconds(n as f64);
                 }
+                // Exact reduced fraction plus human-readable time, always
+                let secs = n as f64 / d as f64;
+                return format!("{}/{}s ({})", n, d, format_seconds(secs));
             }
             // Integer-typed fallback (some writers store plain integers)
             if let Some(r) = value.get_uint(0) {
                 return format!("{}s", r);
+            }
+            clean_exif_string(&value.display_as(tag).to_string())
+        }
+        exif::Tag::ExposureBiasValue => {
+            // ExposureBias is stored as SRational; reduce with gcd and print
+            // in the conventional "+1/3 EV" style instead of a long decimal
+            if let exif::Value::SRational(rats) = value
+                && !rats.is_empty()
+                && rats[0].denom != 0
+            {
+                let (mut n, mut d) = (rats[0].num, rats[0].denom);
+                if d < 0 {
+                    // Normalize sign into the numerator
+                    n = -n;
+                    d = -d;
+                }
+                let g = gcd(n, d);
+                let (n, d) = (n / g, d / g);
+                return if n == 0 {
+                    "0 EV".to_string()
+                } else if d == 1 {
+                    format!("{:+} EV", n)
+                } else {
+                    format!("{:+}/{} EV", n, d)
+                };
             }
             clean_exif_string(&value.display_as(tag).to_string())
         }
