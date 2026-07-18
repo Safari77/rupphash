@@ -1420,6 +1420,10 @@ pub fn scan_and_group(
                                 resolution = get_resolution(path, Some(b));
                             }
                         }
+                    } else if ck == [0u8; 32] {
+                        // bytes is None and ck is still zero (unreadable file)
+                        eprintln!("[ERROR] Failed to read file, skipping: {:?}", path.display());
+                        return None;
                     }
                 }
 
