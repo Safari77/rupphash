@@ -609,14 +609,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 let width = pixmap.width() as u32;
                 let height = pixmap.height() as u32;
                 let pixel_slice = pixmap.data();
-
-                let raw_bytes: Vec<u8> = unsafe {
-                    std::slice::from_raw_parts(
-                        pixel_slice.as_ptr() as *const u8,
-                        pixel_slice.len() * 4,
-                    )
-                }
-                .to_vec();
+                let raw_bytes: Vec<u8> = bytemuck::cast_slice(pixel_slice).to_vec();
 
                 // 6. Build the DynamicImage
                 if let Some(rgba_image) = image::RgbaImage::from_raw(width, height, raw_bytes) {
