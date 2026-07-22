@@ -1225,9 +1225,10 @@ impl AppContext {
     }
 
     /// Look up an existing UUID from the pdqmap by checking pdqhashes.
-    fn find_uuid_in_txn(
+    /// Generic over any `lmdb::Transaction` (works for both `RoTransaction` and `RwTransaction`).
+    fn find_uuid_in_txn<T: Transaction>(
         &self,
-        txn: &lmdb::RoTransaction,
+        txn: &T,
         pdqhashes: &[Option<[u8; 32]>],
     ) -> Option<[u8; 16]> {
         for pdqhash_opt in pdqhashes {
@@ -1270,27 +1271,20 @@ impl AppContext {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut total_registered = 0;
 
-        // Use a read txn first to find existing UUIDs
-        let ro_txn = self.env.begin_ro_txn()?;
-        let mut group_uuids = Vec::with_capacity(groups.len());
+        let mut txn = self.env.begin_rw_txn()?;
+
         for group in groups {
+            if group.is_empty() {
+                continue;
+            }
+
+            // Use the write transaction as a reader; it sees the same snapshot.
             let all_pdqhashes: Vec<Option<[u8; 32]>> = group.iter().map(|(_, pdq)| *pdq).collect();
-            let uuid = self.find_uuid_in_txn(&ro_txn, &all_pdqhashes).unwrap_or_else(|| {
+            let uuid = self.find_uuid_in_txn(&txn, &all_pdqhashes).unwrap_or_else(|| {
                 let mut uuid = [0u8; 16];
                 getrandom::fill(&mut uuid).expect("RNG failed");
                 uuid
             });
-            group_uuids.push(uuid);
-        }
-        drop(ro_txn);
-
-        // Now do all writes in a single transaction
-        let mut txn = self.env.begin_rw_txn()?;
-
-        for (group, uuid) in groups.iter().zip(group_uuids.iter()) {
-            if group.is_empty() {
-                continue;
-            }
 
             for (content_hash, pdqhash) in group {
                 // Don't overwrite entries that are already ignored=true
@@ -1304,7 +1298,7 @@ impl AppContext {
 
                 let entry = IgnoredEntry {
                     pdqhash: *pdqhash,
-                    group_uuid: *uuid,
+                    group_uuid: uuid,
                     timestamp: now,
                     ignored: false,
                 };
@@ -1315,13 +1309,12 @@ impl AppContext {
             }
 
             // Store pdqmap entries for cross-session UUID stability
-            let all_pdqhashes: Vec<Option<[u8; 32]>> = group.iter().map(|(_, pdq)| *pdq).collect();
             Self::store_pdqmap_entries(
                 &self.cipher,
                 &mut txn,
                 self.ignored_pdqmap_db,
                 &all_pdqhashes,
-                uuid,
+                &uuid,
             )?;
         }
 
