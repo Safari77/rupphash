@@ -11,10 +11,14 @@ use lmdb::{Cursor, Database, DatabaseFlags, Environment, Transaction, WriteFlags
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 use zeroize::Zeroize;
 
 const CONFIG_FILE_NAME: &str = "phdupes.conf";
@@ -328,6 +332,34 @@ pub fn create_feature_update(
 }
 
 impl AppContext {
+    /// Atomically write the config file: serialize `config` to TOML, write it
+    /// to a `<file>.tmp` sibling first, then rename it over the original so a
+    /// crash mid-write can never leave a truncated/corrupt config behind.
+    fn write_config(config_path: &Path, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+        let toml_str = toml::to_string_pretty(config)?;
+
+        // Build "<config_path>.tmp", keeping the original file name intact
+        let mut tmp_os = config_path.as_os_str().to_owned();
+        tmp_os.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_os);
+
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(toml_str.as_bytes())?;
+            // Flush to disk before the rename makes the new file visible
+            file.sync_all()?;
+            // Atomic on POSIX; on Windows fs::rename also replaces the target
+            fs::rename(&tmp_path, config_path)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            // Best-effort cleanup; the original config is untouched on failure
+            let _ = fs::remove_file(&tmp_path);
+        }
+        result
+    }
+
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         Self::with_algorithm(HashAlgorithm::PdqHash)
     }
@@ -412,8 +444,7 @@ impl AppContext {
                     missing_locations,
                     colors_clamped
                 );
-                let toml_str = toml::to_string_pretty(&cfg)?;
-                fs::write(&config_path, toml_str)?;
+                Self::write_config(&config_path, &cfg)?;
             }
             cfg
         } else {
@@ -444,8 +475,7 @@ impl AppContext {
                 selected_provider: Some("OpenStreetMap".to_string()),
             };
 
-            let toml_str = toml::to_string_pretty(&cfg)?;
-            fs::write(&config_path, toml_str)?;
+            Self::write_config(&config_path, &cfg)?;
             println!("Generated new master key in {:?}", config_path);
             cfg
         };
@@ -461,8 +491,7 @@ impl AppContext {
                 config.master_key = hex::encode(new_key);
 
                 // Save updated config with new key
-                let toml_str = toml::to_string_pretty(&config)?;
-                fs::write(&config_path, &toml_str)?;
+                Self::write_config(&config_path, &config)?;
                 eprintln!(
                     "[DEBUG-DB] Saved new master_key to config file. Cache will be invalidated."
                 );
@@ -1563,8 +1592,7 @@ impl AppContext {
 
             cfg.selected_provider = Some(provider_name.to_string());
 
-            let toml_str = toml::to_string_pretty(&cfg)?;
-            fs::write(&config_path, toml_str)?;
+            Self::write_config(&config_path, &cfg)?;
         }
         Ok(())
     }
@@ -1581,8 +1609,7 @@ impl AppContext {
             let mut cfg: Config = toml::from_str(&content)?;
             cfg.gui = gui_config.clone();
 
-            let toml_str = toml::to_string_pretty(&cfg)?;
-            fs::write(&config_path, toml_str)?;
+            Self::write_config(&config_path, &cfg)?;
         } else {
             eprintln!("[DEBUG-DB] Config file does not exist at {:?}", config_path);
         }
