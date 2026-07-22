@@ -595,10 +595,10 @@ impl AppContext {
         // XChaCha20Poly1305 uses a 24-byte nonce.
         let mut nonce_bytes = [0u8; 24];
         getrandom::fill(&mut nonce_bytes).expect("RNG failed");
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        let nonce = XNonce::try_from(&nonce_bytes[..]).expect("nonce is exactly 24 bytes");
 
         // Encrypt with AAD = db_key
-        let ciphertext = match cipher.encrypt(nonce, Payload { msg: data, aad: db_key }) {
+        let ciphertext = match cipher.encrypt(&nonce, Payload { msg: data, aad: db_key }) {
             Ok(ct) => ct,
             Err(_) => panic!("Encryption failed - implementation error"),
         };
@@ -618,11 +618,12 @@ impl AppContext {
             return None;
         }
 
-        let nonce = XNonce::from_slice(&data[0..24]);
+        let nonce = XNonce::try_from(&data[0..24]).expect("length already verified >= 40 bytes");
         let ciphertext = &data[24..];
+
         // Decrypt with AAD = db_key
         // This validates that the ciphertext belongs to this specific db_key
-        self.cipher.decrypt(nonce, Payload { msg: ciphertext, aad: db_key }).ok()
+        self.cipher.decrypt(&nonce, Payload { msg: ciphertext, aad: db_key }).ok()
     }
 
     // --- DATABASE ACCESS ---
