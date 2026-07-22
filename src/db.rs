@@ -655,7 +655,9 @@ impl AppContext {
         match txn.get(self.feature_db, content_hash) {
             Ok(encrypted_bytes) => {
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    Ok(ImageFeatures::from_bytes(&decrypted).ok())
+                    ImageFeatures::from_bytes(&decrypted)
+                        .map(Some)
+                        .map_err(|_| lmdb::Error::Corrupted)
                 } else {
                     eprintln!("[ERROR] get_features Corrupted ch={:x?}", content_hash);
                     Err(lmdb::Error::Corrupted)
@@ -678,7 +680,7 @@ impl AppContext {
                     if let Ok(cached) = CachedCoefficients::from_bytes(&decrypted) {
                         Ok(Some(cached.coefficients))
                     } else {
-                        Ok(None)
+                        Err(lmdb::Error::Corrupted)
                     }
                 } else {
                     Err(lmdb::Error::Corrupted)
