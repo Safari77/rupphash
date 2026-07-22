@@ -1,5 +1,6 @@
 mod app;
 mod dialogs;
+mod fonts;
 pub mod gps_map;
 mod image;
 

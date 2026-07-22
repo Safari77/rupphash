@@ -1746,80 +1746,47 @@ impl GuiApp {
                 egui_extras::install_image_loaders(&cc.egui_ctx);
                 let mut fonts = egui::FontDefinitions::default();
 
+                // Orthography preference, e.g. font_orthography = "j,sc" in the config.
+                let orth_owned: Vec<String> = self
+                    .ctx
+                    .gui_config
+                    .font_orthography
+                    .as_deref()
+                    .map(|s| s.split(',').map(|t| t.trim().to_ascii_lowercase()).collect())
+                    .unwrap_or_default();
+                let orthography: Vec<&str> = if orth_owned.is_empty() {
+                    super::fonts::DEFAULT_ORTHOGRAPHY.to_vec()
+                } else {
+                    orth_owned.iter().map(String::as_str).collect()
+                };
+
                 #[cfg(feature = "embed-fonts")]
                 {
                     const SARASA_TTC: &[u8] =
                         include_bytes!("../../assets/fonts/Sarasa-Regular.ttc");
-
                     eprintln!("[INFO] Compiling with embedded Sarasa fonts.");
-                    // Setup Proportional Font (Sarasa UI SC, Index 7)
-                    let mut font_ui = egui::FontData::from_static(SARASA_TTC);
-                    font_ui.index = 7;
-                    fonts.font_data.insert("Sarasa UI SC".to_owned(), Arc::new(font_ui));
-
-                    // Setup Monospace Font (Sarasa Term SC, Index 25)
-                    let mut font_mono = egui::FontData::from_static(SARASA_TTC);
-                    font_mono.index = 25;
-                    fonts.font_data.insert("Sarasa Term SC".to_owned(), Arc::new(font_mono));
-
-                    // Insert at 0 to make them the primary font for that family
-                    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                        family.insert(0, "Sarasa UI SC".to_owned());
-                    }
-                    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                        family.insert(0, "Sarasa Term SC".to_owned());
-                    }
+                    super::fonts::install_font_file(
+                        &mut fonts,
+                        "sarasa-embedded",
+                        SARASA_TTC,
+                        &orthography,
+                    );
                 }
 
-                let _configure_font = |path: &str, family: egui::FontFamily| {
-                    if let Ok(data) = fs::read(path) {
-                        let mut selected_index = 0;
-
-                        // Compile regex for whole-word matching (case-insensitive)
-                        let re = regex::Regex::new(r"(?i)\b(term|mono|fixed)\b").unwrap();
-
-                        if let Some(count) = ttf_parser::fonts_in_collection(&data) {
-                            for i in 0..count {
-                                if let Ok(face) = ttf_parser::Face::parse(&data, i) {
-                                    let is_monospace = face.is_monospaced();
-
-                                    if family == egui::FontFamily::Monospace {
-                                        if is_monospace {
-                                            selected_index = i;
-
-                                            let name = face
-                                                .names()
-                                                .into_iter()
-                                                .find(|n| {
-                                                    n.name_id == ttf_parser::name_id::FULL_NAME
-                                                })
-                                                .and_then(|n| n.to_string())
-                                                .unwrap_or_default();
-
-                                            // Use regex to ensure we match whole words only
-                                            if re.is_match(&name) {
-                                                break;
-                                            }
-                                        }
-                                    } else if !is_monospace {
-                                        selected_index = i;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        let mut font_data = egui::FontData::from_owned(data);
-                        font_data.index = selected_index;
-
-                        fonts.font_data.insert(path.to_owned(), std::sync::Arc::new(font_data));
-                        if let Some(vec) = fonts.families.get_mut(&family) {
-                            vec.insert(0, path.to_owned());
-                        } else {
-                            fonts.families.insert(family, vec![path.to_owned()]);
-                        }
+                // User-specified fonts win over the embedded one (installed later => inserted in front).
+                for (role, cfg_path) in [
+                    (super::fonts::FontRole::Proportional, self.ctx.gui_config.font_ui.as_deref()),
+                    (
+                        super::fonts::FontRole::Monospace,
+                        self.ctx.gui_config.font_monospace.as_deref(),
+                    ),
+                ] {
+                    if let Some(path) = cfg_path
+                        && let Some(data) = super::fonts::load_font_data(std::path::Path::new(path))
+                    {
+                        super::fonts::install_role(&mut fonts, path, data, role, &orthography);
                     }
-                };
+                }
 
                 cc.egui_ctx.set_fonts(fonts);
                 Ok(Box::new(self))
@@ -3377,8 +3344,12 @@ impl eframe::App for GuiApp {
                                     } else {
                                         egui::Color32::GRAY
                                     };
-                                    let make_text =
-                                        |s| egui::RichText::new(s).size(10.0).color(meta_color);
+                                    let make_text = |s| {
+                                        egui::RichText::new(s)
+                                            .size(10.0)
+                                            .family(egui::FontFamily::Monospace)
+                                            .color(meta_color)
+                                    };
 
                                     ui.scope_builder(
                                         egui::UiBuilder::new().max_rect(r_date).layout(
