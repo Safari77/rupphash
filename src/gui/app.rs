@@ -1,5 +1,6 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
+use egui_wgpu::wgpu;
 use geo::Point;
 use jiff::Timestamp;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
@@ -7,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, channel};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -15,7 +16,6 @@ use std::time::{Duration, Instant};
 
 use super::gps_map::GpsMapState;
 use super::image::{GroupViewState, ViewMode};
-
 use crate::GroupStatus;
 use crate::db::{AppContext, EnrichmentResult};
 use crate::format_relative_time;
@@ -59,22 +59,18 @@ fn truncate_to_width(
     // 3. Iterate over glyphs to find the cut-off point
     if let Some(row) = full_galley.rows.first() {
         let mut byte_offset = 0;
-
         for glyph in &row.glyphs {
             let right_edge = glyph.pos.x + glyph.advance_width;
 
             // Check if this character + estimated ellipsis exceeds the width
             if right_edge + estimated_ellipsis_width > max_width {
                 let cut_index = byte_offset;
-
                 if cut_index == 0 {
                     return ("…".to_string(), true);
                 }
-
                 let truncated = format!("{}…", &text[..cut_index]);
                 return (truncated, true);
             }
-
             byte_offset += glyph.chr.len_utf8();
         }
     }
@@ -89,12 +85,10 @@ pub struct GuiApp {
     pub(super) initial_panel_width_applied: bool,
     pub(super) ctx: Arc<AppContext>,
     pub(super) scan_config: ScanConfig,
-
     pub(super) scan_rx:
         Option<Receiver<(Vec<Vec<FileMetadata>>, Vec<GroupInfo>, Vec<std::path::PathBuf>)>>,
     pub(super) scan_progress_rx: Option<Receiver<(usize, usize)>>,
     pub(super) scan_progress: (usize, usize),
-
     pub(super) rename_input: String,
     pub(super) show_move_input: bool,
     pub(super) move_input: String,
@@ -102,10 +96,8 @@ pub struct GuiApp {
     pub(super) move_completion_index: usize,
     pub(super) last_preload_pos: Option<(usize, usize)>,
     pub(super) slideshow_last_advance: Option<std::time::Instant>,
-
     // View mode: if Some, use scan_for_view with this sort order instead of scan_and_group
     pub(super) view_mode_sort: Option<String>,
-
     // View mode: if true, recursive scanning is enabled (flatten mode)
     pub(super) view_mode_flatten: bool,
 
@@ -121,16 +113,24 @@ pub struct GuiApp {
         Receiver<((std::path::PathBuf, usize, usize), super::image::ImageLoadResult)>,
     pub(super) scan_batch_rx: Option<Receiver<Vec<FileMetadata>>>,
 
+    // --- 10-bit GPU image path ---
+    // wgpu handles captured in run(). None when the wgpu backend is unavailable
+    // or the swapchain turned out to be 8-bit, in which case everything stays on
+    // the dithered ColorImage path.
+    pub(super) render_state: Option<egui_wgpu::RenderState>,
+    // Textures for images decoded at 10 bits. Same lifecycle as raw_cache.
+    pub(super) gpu_cache: HashMap<std::path::PathBuf, super::image::GpuImage>,
+    // Shared flag so worker threads only pack Rgb10a2 when it can actually be shown.
+    pub(super) prefer_10bit: Arc<AtomicBool>,
+
     // Shared state to tell workers which files are still relevant.
     // If a file is not in this set, workers will skip decoding it.
     pub(super) active_window: Arc<RwLock<HashSet<std::path::PathBuf>>>,
-
     // Track window size and panel width for saving on exit
     pub(super) last_window_size: Option<(u32, u32)>,
     pub(super) panel_width: f32,
     pub(super) saved_panel_width: f32, // Original loaded value, preserved until applied
     pub(super) last_row_height: f32,
-
     // Directory browsing (view mode only)
     pub(super) current_dir: Option<std::path::PathBuf>,
     pub(super) show_dir_picker: bool,
@@ -142,19 +142,15 @@ pub struct GuiApp {
     pub(super) subdirs: Vec<std::path::PathBuf>,     // Subdirectories in current directory
     pub(super) dir_selection_idx: Option<usize>, // None = files selected, Some(idx) = directory idx selected
     pub(super) dir_scroll_to_selection: bool, // True when keyboard nav should scroll to dir in main panel
-
     // Tab Completion State
     pub(super) completion_candidates: Vec<String>,
     pub(super) completion_index: usize,
-
     // Histogram display
     pub(super) histogram_mode: u8,
     // Shared flag so worker threads skip histogram+palette when disabled
     pub(super) histogram_enabled: Arc<AtomicBool>,
-
     // EXIF info display
     pub(super) show_exif: bool,
-
     // Cache for histogram and palette data, keyed by path (lifecycle matches raw_cache)
     pub(super) cached_histogram: HashMap<
         std::path::PathBuf,
@@ -166,10 +162,8 @@ pub struct GuiApp {
     pub(super) search_focus_requested: bool,
     pub(super) rename_focus_requested: bool,
     pub(super) move_focus_requested: bool,
-
     // EXIF cache for search (persists across searches)
     pub(super) exif_search_cache: HashMap<std::path::PathBuf, Vec<(String, String)>>,
-
     // GPS Map state
     pub(super) gps_map: GpsMapState,
 
@@ -189,32 +183,25 @@ pub struct GuiApp {
     pub(super) fs_rem_files: HashSet<String>,
     pub(super) fs_rem_dirs: HashSet<String>,
     pub(super) last_fs_refresh: Instant,
-
     // View mode: Channel to receive enrichment results (content_hash, GPS, etc.)
     pub(super) enrichment_rx: Option<Receiver<EnrichmentResult>>,
-
     // View mode: Maps unique_file_id -> file_idx within the single group
     pub(super) file_index: HashMap<u128, usize>,
     // View mode: Map of images that failed to load -> error message
     failed_images: HashMap<PathBuf, String>,
-
     // Animation state for animated images (e.g. animated WebP)
     animation_cache: HashMap<PathBuf, super::image::AnimationState>,
     // View mode: Track size of failed_images to detect changes
     last_failed_images_len: usize,
-
     // Search index for EXIF-based filtering
     pub(super) search_filename_input: String,
     pub(super) search_exif_input: String,
     pub(super) search_index: crate::search_index::SearchIndex,
     pub(super) search_index_dirty: bool,
-
     // View mode: Map of paths to Instant when retry is allowed
     retry_after: HashMap<PathBuf, Instant>,
-
     // Channel to send database updates (view mode caches features without coefficients)
     pub(super) db_tx: Option<Sender<crate::db::DbUpdate>>,
-
     // Channel to receive file batches from background directory scan
     pub(super) dir_scan_rx: Option<Receiver<Vec<FileMetadata>>>,
     // Total file count from directory (for progress display)
@@ -340,18 +327,23 @@ impl GuiApp {
         let palette_config = crate::db::PaletteConfig::from_gui_config(&ctx.gui_config);
         let hdr_config = crate::db::HdrConfig::from_gui_config(&ctx.gui_config);
         let histogram_enabled = Arc::new(AtomicBool::new(false));
+        // Flipped on in run() once we know the swapchain is 10-bit.
+        let prefer_10bit = Arc::new(AtomicBool::new(false));
         let (tx, rx) = super::image::spawn_image_loader_pool(
             use_raw_thumbnails,
             ctx.content_key,
             palette_config,
             hdr_config,
             Arc::clone(&histogram_enabled),
+            Arc::clone(&prefer_10bit),
         );
+
         // panel_width is saved in logical points (after font_scale applied)
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
         // Initialize with configured size so we have a fallback if window size isn't captured
         let initial_window_size =
             Some((ctx.gui_config.width.unwrap_or(1280), ctx.gui_config.height.unwrap_or(720)));
+
         eprintln!(
             "[DEBUG-CONFIG] new() - config values: width={:?}, height={:?}, panel_width={:?}",
             ctx.gui_config.width, ctx.gui_config.height, ctx.gui_config.panel_width
@@ -386,6 +378,9 @@ impl GuiApp {
             scan_batch_rx: None,
             image_preload_tx: tx,
             image_preload_rx: rx,
+            render_state: None,
+            gpu_cache: HashMap::new(),
+            prefer_10bit,
             active_window,
             last_window_size: initial_window_size,
             panel_width,
@@ -495,6 +490,7 @@ impl GuiApp {
         };
 
         let active_window = Arc::new(RwLock::new(HashSet::new()));
+
         let ctx = crate::db::AppContext::new().expect("Failed to create context");
 
         // Initialize memory limits early, before any parallel image work
@@ -503,13 +499,17 @@ impl GuiApp {
         let palette_config = crate::db::PaletteConfig::from_gui_config(&ctx.gui_config);
         let hdr_config = crate::db::HdrConfig::from_gui_config(&ctx.gui_config);
         let histogram_enabled = Arc::new(AtomicBool::new(false));
+        // Flipped on in run() once we know the swapchain is 10-bit.
+        let prefer_10bit = Arc::new(AtomicBool::new(false));
         let (tx, rx) = super::image::spawn_image_loader_pool(
             use_raw_thumbnails,
             ctx.content_key,
             palette_config,
             hdr_config,
             Arc::clone(&histogram_enabled),
+            Arc::clone(&prefer_10bit),
         );
+
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
         let initial_window_size =
             Some((ctx.gui_config.width.unwrap_or(1280), ctx.gui_config.height.unwrap_or(720)));
@@ -526,7 +526,6 @@ impl GuiApp {
             // This uses database cache just like spawn_background_dir_scan
             let (progress_tx, progress_rx) = unbounded::<(usize, usize)>();
             let (batch_tx, batch_rx) = unbounded::<Vec<FileMetadata>>();
-
             let count = scanner::spawn_background_flatten_scan(
                 &paths_for_flatten,
                 sort_order.clone(),
@@ -534,7 +533,6 @@ impl GuiApp {
                 batch_tx,
                 Some(progress_tx),
             );
-
             // In flatten mode, subdirs is empty and directory navigation is disabled
             (Vec::new(), Some(count), Some(batch_rx), Some(progress_rx))
         } else if let Some(ref dir) = current_dir {
@@ -600,6 +598,9 @@ impl GuiApp {
             scan_batch_rx: None,
             image_preload_tx: tx,
             image_preload_rx: rx,
+            render_state: None,
+            gpu_cache: HashMap::new(),
+            prefer_10bit,
             active_window,
             last_window_size: initial_window_size,
             panel_width,
@@ -701,6 +702,7 @@ impl GuiApp {
         if self.state.view_mode {
             return;
         }
+
         let mut total_removed = 0usize;
         for group in groups.iter_mut() {
             let before = group.len();
@@ -717,6 +719,7 @@ impl GuiApp {
             });
             total_removed += before - group.len();
         }
+
         if total_removed > 0 {
             let mut i = 0;
             while i < groups.len() {
@@ -815,7 +818,6 @@ impl GuiApp {
         // Format the result
         let dist_str = super::gps_map::format_distance(distance);
         let bearing_str = super::gps_map::format_bearing(bearing);
-
         let direction_str = if self.gps_map.direction_to_image {
             format!("{} to image", loc_name)
         } else {
@@ -893,6 +895,7 @@ impl GuiApp {
 
             // Clear caches first
             self.raw_cache.clear();
+            self.gpu_cache.clear();
             self.animation_cache.clear();
             self.cached_histogram.clear();
             self.raw_loading.clear();
@@ -921,7 +924,6 @@ impl GuiApp {
             self.state.current_group_idx = 0;
             self.state.current_file_idx = 0;
             self.state.is_loading = count > 0;
-
             self.scan_rx = None;
             self.scan_progress_rx = None;
             self.scan_progress = (0, 0);
@@ -981,7 +983,6 @@ impl GuiApp {
             if let Ok(entries) = fs::read_dir(&current) {
                 for entry in entries.flatten() {
                     let entry_path = entry.path();
-
                     // Canonicalize each entry path to ensure absolute paths
                     if let Ok(canonical) = entry_path.canonicalize() {
                         if canonical.is_dir() {
@@ -992,6 +993,7 @@ impl GuiApp {
                         {
                             let size = meta.len();
                             let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH).into();
+
                             if let Some(unique_file_id) = crate::fileops::get_file_key(&canonical) {
                                 if let Some(old) = existing.get(&unique_file_id) {
                                     // Preserve resolution/hashes from session, update path/size/modified
@@ -1044,15 +1046,12 @@ impl GuiApp {
                 if let Some(sort_order) = &self.view_mode_sort {
                     crate::scanner::sort_files(&mut new_files, sort_order);
                 }
-
                 // Rebuild file_index for O(1) lookup
                 self.file_index =
                     new_files.iter().enumerate().map(|(idx, f)| (f.unique_file_id, idx)).collect();
-
                 self.state.groups = vec![new_files];
                 self.state.group_infos = vec![GroupInfo { max_dist: 0, status: GroupStatus::None }];
                 self.state.last_file_count = self.state.groups.first().map_or(0, |g| g.len());
-
                 // File list changed — force layout cache + scroll area rebuild
                 self.cache_dirty = true;
 
@@ -1071,6 +1070,7 @@ impl GuiApp {
                 } else if self.state.current_file_idx >= group_len {
                     self.state.current_file_idx = group_len.saturating_sub(1);
                 }
+
                 self.state.selection_changed = true;
             }
         }
@@ -1131,11 +1131,11 @@ impl GuiApp {
                             self.fs_mod_dirs.insert(name_str);
                         }
                     }
-
                     // Clear terminal failures under renamed directory or file
                     self.clear_failed_under(dest);
                     // Invalidate cache for the destination of the rename/exchange
                     self.raw_cache.remove(dest);
+                    self.gpu_cache.remove(dest);
                     self.animation_cache.remove(dest);
                     self.cached_histogram.remove(dest);
                 }
@@ -1148,9 +1148,9 @@ impl GuiApp {
                     for path in &event.paths {
                         self.failed_images.remove(path);
                         self.clear_failed_under(path);
-
                         // Remove from cache if file is deleted
                         self.raw_cache.remove(path);
+                        self.gpu_cache.remove(path);
                         self.animation_cache.remove(path);
                         self.cached_histogram.remove(path);
 
@@ -1167,13 +1167,11 @@ impl GuiApp {
                         }
                     }
                 }
-
                 notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
                     notify::event::MetadataKind::AccessTime,
                 )) => {
                     continue;
                 }
-
                 // File finished being written (inotify CLOSE_WRITE).
                 notify::EventKind::Access(notify::event::AccessKind::Close(
                     notify::event::AccessMode::Write,
@@ -1181,6 +1179,7 @@ impl GuiApp {
                     for path in &event.paths {
                         if classify(path) {
                             self.raw_cache.remove(path);
+                            self.gpu_cache.remove(path);
                             self.animation_cache.remove(path);
                             self.cached_histogram.remove(path);
                             self.failed_images.remove(path);
@@ -1200,13 +1199,13 @@ impl GuiApp {
                         }
                     }
                 }
-
                 notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
                     for path in &event.paths {
                         if classify(path) {
                             // Invalidate cache — do NOT load here, file may be incomplete.
                             // Actual reload triggered by Access(Close(Write)) above.
                             self.raw_cache.remove(path);
+                            self.gpu_cache.remove(path);
                             self.animation_cache.remove(path);
                             self.cached_histogram.remove(path);
                             self.failed_images.remove(path);
@@ -1253,7 +1252,6 @@ impl GuiApp {
                     let extra = if count > list_limit { ", ..." } else { "" };
                     parts.push(format!("{} files ({}{})", count, display.join(", "), extra));
                 }
-
                 if !self.fs_rem_files.is_empty() {
                     let count = self.fs_rem_files.len();
                     let mut sorted: Vec<_> = self.fs_rem_files.drain().collect();
@@ -1267,7 +1265,6 @@ impl GuiApp {
                         extra
                     ));
                 }
-
                 if !self.fs_mod_dirs.is_empty() {
                     let count = self.fs_mod_dirs.len();
                     let mut sorted: Vec<_> = self.fs_mod_dirs.drain().collect();
@@ -1276,7 +1273,6 @@ impl GuiApp {
                     let extra = if count > list_limit { ", ..." } else { "" };
                     parts.push(format!("{} dirs ({}{})", count, display.join(", "), extra));
                 }
-
                 if !self.fs_rem_dirs.is_empty() {
                     let count = self.fs_rem_dirs.len();
                     let mut sorted: Vec<_> = self.fs_rem_dirs.drain().collect();
@@ -1303,9 +1299,9 @@ impl GuiApp {
             let cfg = self.scan_config.clone();
             let (tx, rx) = unbounded();
             let (prog_tx, prog_rx) = unbounded();
-
             // Channel for streaming batch results (view mode)
             let (batch_tx, batch_rx) = unbounded();
+
             self.scan_rx = Some(rx);
             self.scan_progress_rx = Some(prog_rx);
             self.scan_batch_rx = Some(batch_rx);
@@ -1342,7 +1338,9 @@ impl GuiApp {
                         self.search_index.insert(file.unique_file_id, &features);
                     }
                 }
+
                 self.ingest_gps_markers(&new_files);
+
                 if self.state.groups.is_empty() {
                     self.state.groups.push(Vec::new());
                     self.state
@@ -1353,6 +1351,7 @@ impl GuiApp {
                 self.cache_dirty = true;
                 needs_repaint = true;
             }
+
             if needs_repaint {
                 self.state.last_file_count = self.state.groups[0].len();
             }
@@ -1435,6 +1434,7 @@ impl GuiApp {
                             .collect()
                     })
                     .collect();
+
                 if let Err(e) = self.ctx.register_duplicate_groups(&group_data) {
                     eprintln!("[ERROR-IGNORE] Failed to register groups: {:?}", e);
                 }
@@ -1455,12 +1455,14 @@ impl GuiApp {
             self.cache_dirty = true;
             self.state.group_infos = new_infos;
             self.subdirs = new_subdirs;
+
             if let Some(ref sort) = self.view_mode_sort
                 && sort == "location"
             {
                 // We must ingest markers first (already done by self.ingest_gps_markers)
                 self.apply_location_sort();
             }
+
             self.refresh_dir_cache(false);
             self.state.last_file_count = self.state.groups.iter().map(|g| g.len()).sum();
 
@@ -1485,7 +1487,6 @@ impl GuiApp {
             self.scan_rx = None;
             self.scan_progress_rx = None;
             self.scan_batch_rx = None;
-
             needs_repaint = true;
         }
 
@@ -1493,6 +1494,7 @@ impl GuiApp {
         if needs_repaint {
             ctx.request_repaint();
         }
+
         // Crucial: If we are still loading, request another frame soon
         // to keep polling the channels even if the user isn't moving the mouse.
         if self.state.is_loading {
@@ -1610,6 +1612,7 @@ impl GuiApp {
                     }
                     prev_g -= 1;
                 }
+
                 paths_to_preload.extend(extra_paths);
             }
         }
@@ -1627,7 +1630,7 @@ impl GuiApp {
         for (path, is_current, g_idx, f_idx) in &paths_to_preload {
             if *is_current {
                 // Load EVERYTHING via the pool, not just RAW
-                if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
+                if !self.is_cached(path) && !self.raw_loading.contains(path) {
                     self.raw_loading.insert(path.clone());
                     self.enqueue_image_load(path, *g_idx, *f_idx);
                 }
@@ -1640,7 +1643,7 @@ impl GuiApp {
             if *is_current {
                 continue;
             }
-            if !self.raw_cache.contains_key(path) && !self.raw_loading.contains(path) {
+            if !self.is_cached(path) && !self.raw_loading.contains(path) {
                 self.raw_loading.insert(path.clone());
                 self.enqueue_image_load(path, *g_idx, *f_idx);
             }
@@ -1671,13 +1674,21 @@ impl GuiApp {
             }
         }
 
-        // Evict from memory only if it falls completely outside the wider retention window
+        // Evict from memory only if it falls completely outside the wider retention window.
+        // Dropping a GpuImage releases its wgpu::Texture, and with it the VRAM.
         self.raw_cache.retain(|k, _| retention_paths.contains(k));
+        self.gpu_cache.retain(|k, _| retention_paths.contains(k));
         self.animation_cache.retain(|k, _| retention_paths.contains(k));
         self.cached_histogram.retain(|k, _| retention_paths.contains(k));
 
         // Active worker tasks should still be cancelled strictly based on the active window
         self.raw_loading.retain(|k| active_window_paths.contains(k));
+    }
+
+    /// True when the image is already decoded, in either backing store.
+    #[inline]
+    fn is_cached(&self, path: &std::path::Path) -> bool {
+        self.raw_cache.contains_key(path) || self.gpu_cache.contains_key(path)
     }
 
     /// Get list of subdirectories for directory picker (including "..")
@@ -1693,7 +1704,6 @@ impl GuiApp {
 
         // Add stored subdirectories
         dirs.extend(self.subdirs.clone());
-
         dirs
     }
 
@@ -1730,6 +1740,7 @@ impl GuiApp {
         //eprintln!("[DEBUG-RUN] Setting window size to {}x{} (physical pixels = logical points at ppp=1)", width, height);
 
         let is_windows = cfg!(target_os = "windows");
+
         let options = eframe::NativeOptions {
             renderer: eframe::Renderer::Wgpu,
             viewport: egui::ViewportBuilder::default()
@@ -1743,11 +1754,16 @@ impl GuiApp {
             "phdupes",
             options,
             Box::new(move |cc| {
+                // `self` is moved into this FnOnce; rebind so the wgpu setup below
+                // can mutate it before it becomes the boxed App.
+                let mut app = self;
+
                 egui_extras::install_image_loaders(&cc.egui_ctx);
+
                 let mut fonts = egui::FontDefinitions::default();
 
                 // Orthography preference, e.g. font_orthography = "j,sc" in the config.
-                let orth_owned: Vec<String> = self
+                let orth_owned: Vec<String> = app
                     .ctx
                     .gui_config
                     .font_orthography
@@ -1775,10 +1791,10 @@ impl GuiApp {
 
                 // User-specified fonts win over the embedded one (installed later => inserted in front).
                 for (role, cfg_path) in [
-                    (super::fonts::FontRole::Proportional, self.ctx.gui_config.font_ui.as_deref()),
+                    (super::fonts::FontRole::Proportional, app.ctx.gui_config.font_ui.as_deref()),
                     (
                         super::fonts::FontRole::Monospace,
-                        self.ctx.gui_config.font_monospace.as_deref(),
+                        app.ctx.gui_config.font_monospace.as_deref(),
                     ),
                 ] {
                     if let Some(path) = cfg_path
@@ -1789,7 +1805,24 @@ impl GuiApp {
                 }
 
                 cc.egui_ctx.set_fonts(fonts);
-                Ok(Box::new(self))
+
+                // --- 10-bit image path ---
+                // Only worth taking when the swapchain can actually carry 10 bits.
+                // On an 8-bit surface the GPU would truncate our 10-bit texture with
+                // no dither, which is worse than the dithered CPU path in hdr.rs.
+                if let Some(rs) = cc.wgpu_render_state.as_ref() {
+                    eprintln!("[GPU] target_format={:?}", rs.target_format);
+                    if rs.target_format == wgpu::TextureFormat::Rgb10a2Unorm {
+                        super::image::init_gpu_image_pipeline(rs);
+                        app.render_state = Some(rs.clone());
+                        app.prefer_10bit.store(true, Ordering::Relaxed);
+                        eprintln!("[GPU] 10-bit image path enabled");
+                    } else {
+                        eprintln!("[GPU] 8-bit surface; staying on the dithered ColorImage path");
+                    }
+                }
+
+                Ok(Box::new(app))
             }),
         )
     }
@@ -1799,17 +1832,21 @@ impl Drop for GuiApp {
     fn drop(&mut self) {
         // Save window size and panel width to config
         let mut gui_config = self.ctx.gui_config.clone();
+
         if let Some((w, h)) = self.last_window_size {
             gui_config.width = Some(w);
             gui_config.height = Some(h);
         }
+
         // panel_width is in current logical points (after font_scale)
         // Save it directly - we'll scale when loading
         gui_config.panel_width = Some(self.panel_width);
+
         eprintln!(
             "[DEBUG-EXIT] Calling save_gui_config with width={:?}, height={:?}, panel_width={:?}",
             gui_config.width, gui_config.height, gui_config.panel_width
         );
+
         if let Err(e) = self.ctx.save_gui_config(&gui_config) {
             eprintln!("Error saving config: {}", e);
         } else {
@@ -1829,6 +1866,7 @@ impl eframe::App for GuiApp {
         let ctx = &ctx_owned;
 
         self.check_fs_events(ctx);
+
         // Initial setup for view mode: create watcher (but don't refresh while scanning)
         if self.state.view_mode && self.current_dir.is_some() && self.watcher.is_none() {
             self.setup_watcher();
@@ -1857,12 +1895,14 @@ impl eframe::App for GuiApp {
                 ui.horizontal(|ui| {
                     let height = 12.0;
                     ui.label(egui::RichText::new(&self.state.last_title).strong());
+
                     // --- Window Dragging Logic ---
                     let available_width = ui.available_width() - 60.0;
                     let response = ui.allocate_response(
                         egui::vec2(available_width, height),
                         egui::Sense::click_and_drag(),
                     );
+
                     if response.dragged() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
@@ -1936,7 +1976,53 @@ impl eframe::App for GuiApp {
                             let texture = ctx.load_texture(name, color_image, Default::default());
                             self.raw_cache.insert(path.clone(), texture);
                         }
+                        ImageLoadResult::Loaded10 {
+                            data,
+                            width,
+                            height,
+                            resolution,
+                            orientation,
+                            content_hash,
+                            exif_timestamp,
+                            hist_palette,
+                        } => {
+                            super::image::update_file_metadata(
+                                self,
+                                &path,
+                                g_idx,
+                                f_idx,
+                                resolution.0,
+                                resolution.1,
+                                orientation,
+                                content_hash,
+                                exif_timestamp,
+                            );
 
+                            if let Some(hp) = hist_palette {
+                                self.cached_histogram.insert(path.clone(), hp);
+                            }
+
+                            // Hoisted out of the match so the borrow of
+                            // self.render_state ends before gpu_cache is touched.
+                            let uploaded = self.render_state.as_ref().and_then(|rs| {
+                                super::image::upload_gpu_image(rs, &data, width, height)
+                            });
+                            match uploaded {
+                                Some(gpu) => {
+                                    self.gpu_cache.insert(path.clone(), gpu);
+                                }
+                                None => {
+                                    eprintln!(
+                                        "[GPU] texture upload failed for {:?} ({}x{})",
+                                        path, width, height
+                                    );
+                                    self.failed_images.insert(
+                                        path.clone(),
+                                        "GPU texture upload failed".to_string(),
+                                    );
+                                }
+                            }
+                        }
                         ImageLoadResult::AnimatedLoaded {
                             frames,
                             durations,
@@ -1983,7 +2069,6 @@ impl eframe::App for GuiApp {
                                 },
                             );
                         }
-
                         ImageLoadResult::Failed(err_msg) => {
                             let lower = err_msg.to_lowercase();
                             let is_transient = lower.contains("premature")
@@ -1992,6 +2077,7 @@ impl eframe::App for GuiApp {
                                 || lower.contains("0 bytes")
                                 || lower.contains("empty")
                                 || lower.contains("truncated");
+
                             if is_transient {
                                 eprintln!(
                                     "[DEBUG-RETRY] transient failure for {:?}: {}",
@@ -2011,7 +2097,6 @@ impl eframe::App for GuiApp {
                     self.raw_loading.remove(&path);
                     ctx.request_repaint();
                 }
-
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     break;
                 }
@@ -2033,11 +2118,9 @@ impl eframe::App for GuiApp {
                     Ok(batch) => {
                         received_any = true;
                         self.ingest_gps_markers(&batch);
-
                         if let Some(group) = self.state.groups.first_mut() {
                             let start_idx = group.len();
                             group.extend(batch);
-
                             // Update file_index for new files
                             for (i, file) in group[start_idx..].iter().enumerate() {
                                 self.file_index.insert(file.unique_file_id, start_idx + i);
@@ -2068,6 +2151,7 @@ impl eframe::App for GuiApp {
                                 let f_idx = self.file_index.get(uid).copied().unwrap_or(0);
                                 (f_idx as i64 - current_idx as i64).abs()
                             });
+
                             if !files_to_enrich.is_empty() {
                                 let (result_tx, result_rx) = unbounded::<EnrichmentResult>();
                                 scanner::spawn_background_enrichment(
@@ -2080,6 +2164,7 @@ impl eframe::App for GuiApp {
                                 self.enrichment_rx = Some(result_rx);
                             }
                         }
+
                         self.dir_scan_rx = None;
                         break;
                     }
@@ -2096,12 +2181,14 @@ impl eframe::App for GuiApp {
         let mut enrichment_done = false;
         if let Some(ref rx) = self.enrichment_rx {
             let mut got_new_gps = false;
+
             loop {
                 match rx.try_recv() {
                     Ok(result) => {
                         if let Some(features) = &result.features {
                             self.search_index.remove(result.unique_file_id); // Prevent dupes
                             self.search_index.insert(result.unique_file_id, features);
+
                             // Re-sort numeric indices only if search is open
                             if self.state.show_search {
                                 self.search_index.finalize();
@@ -2131,8 +2218,7 @@ impl eframe::App for GuiApp {
                                     result.exif_timestamp,
                                 );
                             }
-                            // FIX: Use the features passed directly from scanner.
-                            // Do NOT call self.ctx.get_features() here, it is too slow/racy.
+
                             if let Some(features) = &result.features {
                                 self.search_index.insert(result.unique_file_id, features);
                             } else if let Ok(Some(features)) =
@@ -2150,6 +2236,7 @@ impl eframe::App for GuiApp {
                     }
                 }
             }
+
             // --- Debounced Spatial Sort ---
             // Only sort if we got new coordinates AND we are in location sort mode
             if got_new_gps && self.view_mode_sort.as_deref() == Some("location") {
@@ -2211,6 +2298,7 @@ impl eframe::App for GuiApp {
                         ViewMode::FitHeight => "Fit Height",
                         ViewMode::ManualZoom(_) => "Zoom",
                     };
+
                     let extra = match current_view_mode.mode {
                         ViewMode::ManualZoom(z) if (z - 1.0).abs() < 0.1 => {
                             if self.state.zoom_relative {
@@ -2222,7 +2310,9 @@ impl eframe::App for GuiApp {
                         ViewMode::ManualZoom(z) => format!(" {:.0}x", z),
                         _ => "".to_string(),
                     };
+
                     let rel_tag = if self.state.zoom_relative { " [REL]" } else { " [ABS]" };
+
                     let filename = current_image_path
                         .as_ref()
                         .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
@@ -2241,14 +2331,17 @@ impl eframe::App for GuiApp {
                     let move_status =
                         if self.state.move_target.is_some() { " | [M]ove" } else { "" };
                     let del_key = if self.state.view_mode { " | [Del]ete" } else { "" };
+
                     let rot_str = if !self.state.manual_rotation.is_multiple_of(4) {
                         format!(" | [O] Rot: {}°", (self.state.manual_rotation % 4) * 90)
                     } else {
                         "".to_string()
                     };
+
                     let sort_str = if self.state.view_mode { " | [T] Sort" } else { "" };
                     let hist_str = if self.histogram_mode > 0 { " | [I] Hist" } else { "" };
                     let exif_str = if self.show_exif { " | [E] EXIF" } else { "" };
+
                     let pos_str = if !self.state.groups.is_empty() {
                         let total: usize = self.state.groups.iter().map(|g| g.len()).sum();
                         let current: usize = self
@@ -2335,7 +2428,6 @@ impl eframe::App for GuiApp {
                 // Final fallback for first frames before content_rect is set.
                 ctx.globally_used_rect().width()
             };
-
             let window_ready = window_width > 100.0;
 
             // Safe upper bound: never below 160 (so clamp's max>=min holds), and never
@@ -2343,7 +2435,6 @@ impl eframe::App for GuiApp {
             let panel_max_width = (window_width * 0.5).max(160.0).max(self.panel_width);
 
             let should_apply_saved_width = !self.initial_panel_width_applied && window_ready;
-
             if should_apply_saved_width {
                 self.initial_panel_width_applied = true;
                 // On the very first ready frame, install saved_panel_width as the live width
@@ -2367,6 +2458,7 @@ impl eframe::App for GuiApp {
             //    can panic if max collapses to 0 mid-resize.
             let panel_id = egui::Id::new("list_panel");
             let resize_id = panel_id.with("__resize");
+
             if window_ready {
                 let resize_resp_opt = ctx.read_response(resize_id);
                 if let Some(resize_resp) = resize_resp_opt {
@@ -2464,6 +2556,7 @@ impl eframe::App for GuiApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
+
                         let no_files = self.state.groups.is_empty()
                             || self.state.groups.iter().all(|g| g.is_empty());
                         let no_dirs = self.subdirs.is_empty()
@@ -2507,6 +2600,7 @@ impl eframe::App for GuiApp {
                                     base_rect.min,
                                     egui::vec2(available_w, row_height),
                                 );
+
                                 let resp = ui.interact(
                                     rect,
                                     ui.id().with("dir_parent"),
@@ -2563,11 +2657,12 @@ impl eframe::App for GuiApp {
                                     egui::Sense::hover(),
                                 );
 
-                                // FIX 2b: Manually create interaction rect
+                                // Manually create interaction rect
                                 let rect = egui::Rect::from_min_size(
                                     base_rect.min,
                                     egui::vec2(available_w, row_height),
                                 );
+
                                 let resp = ui.interact(
                                     rect,
                                     ui.id().with("dir").with(dir_idx),
@@ -2681,6 +2776,7 @@ impl eframe::App for GuiApp {
                             }
 
                             self.dir_scroll_to_selection = false;
+
                             // Return the height consumed by directories
                             ui.cursor().min.y - start_cursor_y
                         } else {
@@ -2693,9 +2789,11 @@ impl eframe::App for GuiApp {
                         // --- 1. LAYOUT CONSTANTS ---
                         let spacing = ui.spacing().item_spacing.y;
                         let header_height = ui.text_style_height(&egui::TextStyle::Body) + spacing;
+
                         // Calculate precise row height
                         let font_id_main = egui::TextStyle::Monospace.resolve(ui.style());
                         let font_id_meta = egui::FontId::monospace(10.0);
+
                         let row_btn_h = ui
                             .painter()
                             .layout_no_wrap(
@@ -2706,6 +2804,7 @@ impl eframe::App for GuiApp {
                             .rect
                             .height()
                             + (ui.spacing().button_padding.y * 2.0);
+
                         let row_meta_h = ui
                             .painter()
                             .layout_no_wrap(
@@ -2715,6 +2814,7 @@ impl eframe::App for GuiApp {
                             )
                             .rect
                             .height();
+
                         let file_row_total_h = row_btn_h + spacing + row_meta_h + spacing;
                         let separator_h = 10.0;
 
@@ -2723,6 +2823,7 @@ impl eframe::App for GuiApp {
                             self.cache_dirty = true;
                             self.last_row_height = file_row_total_h;
                         }
+
                         let show_headers = !self.state.view_mode;
 
                         // --- 2. REBUILD LAYOUT CACHE (Once per update if dirty) ---
@@ -2730,8 +2831,8 @@ impl eframe::App for GuiApp {
                         {
                             self.group_y_offsets.clear();
                             self.group_y_offsets.reserve(self.state.groups.len());
-
                             let mut y = 0.0;
+
                             for group in &self.state.groups {
                                 self.group_y_offsets.push(y);
                                 let header = if show_headers { header_height } else { 0.0 };
@@ -2799,6 +2900,7 @@ impl eframe::App for GuiApp {
 
                         // --- 5. VISIBILITY CULLING ---
                         let clip_rect = ui.clip_rect();
+
                         // Calculate scroll relative to our safe, captured starting Y
                         let scroll_y = clip_rect.min.y - files_start_pos.y;
 
@@ -2875,12 +2977,14 @@ impl eframe::App for GuiApp {
                             let group_rel_scroll_y =
                                 (clip_rect.min.y - group_content_start_y).max(0.0);
                             let start_f_idx = (group_rel_scroll_y / file_row_total_h) as usize;
+
                             // Jump the cursor to the first visible file position
                             current_y += start_f_idx as f32 * file_row_total_h;
 
                             // Render Files
                             let counts = get_bit_identical_counts(group);
                             let hardlink_groups = get_hardlink_groups(group);
+
                             // Pre-calculate subgroups for this group
                             let content_subgroups = get_content_subgroups(group);
 
@@ -2936,12 +3040,14 @@ impl eframe::App for GuiApp {
                                     } else {
                                         "    ".to_string()
                                     };
+
                                     let marker_text = format!(
                                         "{} {} {} ",
                                         if is_marked { "M" } else { " " },
                                         if is_hardlinked { "L" } else { " " },
                                         c_label
                                     );
+
                                     let filename_text = format_path_depth(
                                         &file.path,
                                         self.state.path_display_depth,
@@ -3011,7 +3117,6 @@ impl eframe::App for GuiApp {
                                     }
 
                                     // --- RENDER ---
-
                                     // 1. Draw Selection Backgrounds
                                     if is_selected {
                                         // Draw one solid block for the header (Marker + Filename)
@@ -3101,7 +3206,6 @@ impl eframe::App for GuiApp {
                                         ui.id().with("hdr").with(g_idx).with(f_idx),
                                         egui::Sense::click(),
                                     );
-
                                     let meta_resp = ui.interact(
                                         meta_rect,
                                         ui.id().with("meta").with(g_idx).with(f_idx),
@@ -3252,6 +3356,7 @@ impl eframe::App for GuiApp {
                                             &file.content_hash,
                                         )
                                     });
+
                                     meta_resp.context_menu(|ui| {
                                         context_menu_logic(
                                             ui,
@@ -3306,6 +3411,7 @@ impl eframe::App for GuiApp {
                                     } else {
                                         display_time.format("%Y-%m-%d %H:%M:%S").to_string()
                                     };
+
                                     let res_str = file
                                         .resolution
                                         .map(|(w, h)| {
@@ -3323,6 +3429,7 @@ impl eframe::App for GuiApp {
                                     let h_meta = meta_rect.height();
                                     let x_meta = meta_rect.min.x;
                                     let y_meta = meta_rect.min.y;
+
                                     let w_date = w_meta * 0.50;
                                     let w_col = w_meta * 0.25;
 
@@ -3344,6 +3451,7 @@ impl eframe::App for GuiApp {
                                     } else {
                                         egui::Color32::GRAY
                                     };
+
                                     let make_text = |s| {
                                         egui::RichText::new(s)
                                             .size(10.0)
@@ -3359,6 +3467,7 @@ impl eframe::App for GuiApp {
                                             ui.label(make_text(time_str));
                                         },
                                     );
+
                                     ui.scope_builder(
                                         egui::UiBuilder::new().max_rect(r_size).layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -3367,6 +3476,7 @@ impl eframe::App for GuiApp {
                                             ui.label(make_text(size_str));
                                         },
                                     );
+
                                     ui.scope_builder(
                                         egui::UiBuilder::new().max_rect(r_res).layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -3376,6 +3486,7 @@ impl eframe::App for GuiApp {
                                         },
                                     );
                                 }
+
                                 current_y += file_row_total_h;
                             }
                         }
@@ -3386,6 +3497,7 @@ impl eframe::App for GuiApp {
                         } else if let Some(path) = copy_path_target {
                             ctx.copy_text(path);
                         }
+
                         if action_rename {
                             if let Some(path) = self.state.get_current_image_path() {
                                 self.rename_input = path
@@ -3398,7 +3510,6 @@ impl eframe::App for GuiApp {
                             self.completion_index = 0;
                             self.state.handle_input(InputIntent::StartRename);
                         }
-
                         if action_delete {
                             self.state.handle_input(InputIntent::ExecuteDelete);
                         }
@@ -3410,6 +3521,7 @@ impl eframe::App for GuiApp {
                         }
                     });
             });
+
             if window_width > 400.0 {
                 let egui_reported = panel_response.response.rect.width();
                 if (egui_reported - self.panel_width).abs() > 1.0 {
@@ -3440,7 +3552,6 @@ impl eframe::App for GuiApp {
                     ui.horizontal(|ui| {
                         ui.label("Provider:");
                         let current_provider = self.gps_map.provider_name.clone();
-
                         egui::ComboBox::from_id_salt("provider_selector")
                             .selected_text(&current_provider)
                             .show_ui(ui, |ui| {
@@ -3464,7 +3575,6 @@ impl eframe::App for GuiApp {
                             .as_ref()
                             .map(|(name, _)| name.clone())
                             .unwrap_or_else(|| "None".to_string());
-
                         egui::ComboBox::from_id_salt("location_selector")
                             .selected_text(&current_loc)
                             .show_ui(ui, |ui| {
@@ -3545,6 +3655,7 @@ impl eframe::App for GuiApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             let available_rect = ui.available_rect_before_wrap();
+
             if let Some(path) = current_image_path {
                 // 0. Check Animation Cache (animated WebP etc.)
                 // Extract animation frame data first to avoid borrow conflicts
@@ -3553,6 +3664,7 @@ impl eframe::App for GuiApp {
                     let now = Instant::now();
                     let elapsed = now.duration_since(anim.last_frame_time);
                     let current_duration = anim.frame_durations[anim.current_frame];
+
                     if elapsed >= current_duration {
                         anim.current_frame = (anim.current_frame + 1) % anim.frames.len();
                         anim.last_frame_time = now;
@@ -3562,6 +3674,7 @@ impl eframe::App for GuiApp {
                     let texture_size = anim.frames[anim.current_frame].size_vec2();
                     let next_duration = anim.frame_durations[anim.current_frame];
                     let last_frame_time = anim.last_frame_time;
+
                     Some((texture_id, texture_size, next_duration, last_frame_time))
                 } else {
                     None
@@ -3570,11 +3683,11 @@ impl eframe::App for GuiApp {
                 if let Some((texture_id, texture_size, next_duration, last_frame_time)) =
                     anim_frame_info
                 {
+                    // Animations are always 8-bit, so they stay on the egui path.
                     super::image::render_image_texture(
                         self,
                         ui,
-                        texture_id,
-                        texture_size,
+                        super::image::ImageSource::Egui { id: texture_id, size: texture_size },
                         available_rect,
                         current_group_idx,
                     );
@@ -3583,13 +3696,30 @@ impl eframe::App for GuiApp {
                     let since_last = Instant::now().duration_since(last_frame_time);
                     let remaining = next_duration.saturating_sub(since_last);
                     ctx.request_repaint_after(remaining);
-                } else if let Some(texture) = self.raw_cache.get(&path) {
-                    // 1. Check Raw Cache
+                } else if let Some(src) = self.gpu_cache.get(&path).map(|gpu| {
+                    // Cloned out of the map so the borrow of self ends here and
+                    // render_image_texture can take &mut self.
+                    super::image::ImageSource::Gpu {
+                        bind_group: gpu.bind_group.clone(),
+                        size: gpu.size,
+                    }
+                }) {
+                    // 1a. 10-bit texture, drawn via a wgpu paint callback
                     super::image::render_image_texture(
                         self,
                         ui,
-                        texture.id(),
-                        texture.size_vec2(),
+                        src,
+                        available_rect,
+                        current_group_idx,
+                    );
+                } else if let Some(src) = self.raw_cache.get(&path).map(|texture| {
+                    super::image::ImageSource::Egui { id: texture.id(), size: texture.size_vec2() }
+                }) {
+                    // 1b. 8-bit egui texture
+                    super::image::render_image_texture(
+                        self,
+                        ui,
+                        src,
                         available_rect,
                         current_group_idx,
                     );

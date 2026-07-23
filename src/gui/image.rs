@@ -1,10 +1,12 @@
 use crate::scanner::is_raw_ext;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
+use egui_wgpu::wgpu;
 use fast_image_resize::images::Image as FastImage;
 use fast_image_resize::{PixelType, ResizeOptions, Resizer};
 use image::GenericImageView;
 use oklab::{LinearRgb, Oklab, linear_srgb_to_oklab, oklab_to_linear_srgb};
+use std::borrow::Cow;
 use std::f32::consts::PI;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,15 +41,39 @@ pub(super) struct GroupViewState {
     pub(super) pan_center: egui::Pos2,
 }
 
+/// Histogram + dominant-colour palette, as produced by the worker pool.
+pub type HistPalette = ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>);
+
+/// The pixel representation a decode produced.
+///
+/// Sources with more than 8 bits per channel are packed straight to 10-bit when
+/// the swapchain can carry them; everything else stays on the 8-bit `ColorImage`
+/// path that egui uploads for us.
+pub(super) enum DecodedImage {
+    Srgb8(egui::ColorImage),
+    /// Packed for `wgpu::TextureFormat::Rgb10a2Unorm`, 4 bytes per pixel.
+    Rgb10a2 {
+        width: u32,
+        height: u32,
+        data: Vec<u32>,
+    },
+}
+
 pub enum ImageLoadResult {
-    Loaded(
-        egui::ColorImage,
-        (u32, u32),
-        u8,
-        [u8; 32],
-        Option<i64>,
-        Option<([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>)>,
-    ), // image, resolution, orientation, content_hash, exif_timestamp, histogram+palette
+    Loaded(egui::ColorImage, (u32, u32), u8, [u8; 32], Option<i64>, Option<HistPalette>), // image, resolution, orientation, content_hash, exif_timestamp, histogram+palette
+    /// 10-bit variant of `Loaded`. `width`/`height` are the texture dimensions
+    /// (possibly downscaled to MAX_TEXTURE_SIDE); `resolution` is the file's
+    /// true resolution, as for `Loaded`.
+    Loaded10 {
+        data: Vec<u32>,
+        width: u32,
+        height: u32,
+        resolution: (u32, u32),
+        orientation: u8,
+        content_hash: [u8; 32],
+        exif_timestamp: Option<i64>,
+        hist_palette: Option<HistPalette>,
+    },
     AnimatedLoaded {
         frames: Vec<egui::ColorImage>,
         durations: Vec<Duration>,
@@ -73,12 +99,384 @@ impl Default for GroupViewState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 10-bit GPU image path
+// ---------------------------------------------------------------------------
+//
+// egui's own texture API is 8-bit only (`ColorImage` is `Vec<Color32>`), so
+// anything deeper has to bypass it. We keep the pixels in an `Rgb10a2Unorm`
+// texture and blit it with a paint callback into egui's own render pass.
+//
+// Both the texture and the surface hold sRGB-*encoded* values (neither format
+// is an `*Srgb` format, so no hardware transfer function is applied on either
+// read or write). The fragment shader is therefore a straight pass-through.
+
+/// Above this on-screen magnification, switch to nearest-neighbour sampling so
+/// individual pixels stay crisp when pixel-peeping. Below it, linear.
+const NEAREST_ZOOM_THRESHOLD: f32 = 2.0;
+
+const IMAGE_SHADER_WGSL: &str = r#"
+struct Uniforms {
+    // Row-major 2x2 matrix mapping quad space [0,1]^2 to texture UV, packed as
+    // [m00, m01, m10, m11]. Carries EXIF/manual rotation, flips, pan and zoom.
+    uv_mat: vec4<f32>,
+    uv_off: vec2<f32>,
+    _pad: vec2<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var samp: sampler;
+@group(1) @binding(0) var tex: texture_2d<f32>;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    // Triangle strip covering the callback viewport: (0,0) (1,0) (0,1) (1,1).
+    let q = vec2<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u));
+    var out: VsOut;
+    // Quad y grows downward (screen convention), clip y grows upward.
+    out.pos = vec4<f32>(q.x * 2.0 - 1.0, 1.0 - q.y * 2.0, 0.0, 1.0);
+    out.uv = vec2<f32>(
+        u.uv_mat.x * q.x + u.uv_mat.y * q.y + u.uv_off.x,
+        u.uv_mat.z * q.x + u.uv_mat.w * q.y + u.uv_off.y,
+    );
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // Outside the image: leave the panel background alone. This is what
+    // letterboxes a fitted image and crops a zoomed-in one.
+    if (in.uv.x < 0.0 || in.uv.x > 1.0 || in.uv.y < 0.0 || in.uv.y > 1.0) {
+        discard;
+    }
+    // Pass-through: no transfer function on either side of this sample.
+    return textureSample(tex, samp, in.uv);
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImageUniform {
+    uv_mat: [f32; 4],
+    uv_off: [f32; 2],
+    _pad: [f32; 2],
+}
+
+/// Pipeline and shared bindings, created once and stashed in
+/// `egui_wgpu::Renderer::callback_resources`.
+struct GpuImagePipeline {
+    pipeline: wgpu::RenderPipeline,
+    /// Layout of group 1 (the per-image texture view).
+    texture_layout: wgpu::BindGroupLayout,
+    uniform_buffer: wgpu::Buffer,
+    /// Group 0 with a linear sampler.
+    bind_linear: wgpu::BindGroup,
+    /// Group 0 with a nearest sampler.
+    bind_nearest: wgpu::BindGroup,
+}
+
+/// A decoded image living in VRAM as `Rgb10a2Unorm`.
+pub struct GpuImage {
+    /// Kept alive for as long as the bind group references it.
+    _texture: wgpu::Texture,
+    pub bind_group: Arc<wgpu::BindGroup>,
+    pub size: egui::Vec2,
+}
+
+/// What `render_image_texture` should draw.
+pub(super) enum ImageSource {
+    /// An ordinary 8-bit texture owned by egui.
+    Egui { id: egui::TextureId, size: egui::Vec2 },
+    /// A 10-bit texture owned by us, drawn through a wgpu paint callback.
+    Gpu { bind_group: Arc<wgpu::BindGroup>, size: egui::Vec2 },
+}
+
+impl ImageSource {
+    fn size(&self) -> egui::Vec2 {
+        match self {
+            Self::Egui { size, .. } | Self::Gpu { size, .. } => *size,
+        }
+    }
+}
+
+/// Build the 10-bit blit pipeline. Call once, from the `eframe` creation
+/// closure, and only when `target_format` is actually 10-bit.
+pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) {
+    let device = &rs.device;
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("phdupes_image_shader"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(IMAGE_SHADER_WGSL)),
+    });
+
+    let shared_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("phdupes_image_shared_layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("phdupes_image_texture_layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("phdupes_image_pipeline_layout"),
+        // wgpu 29 allows sparse layouts, hence the Option wrapper per entry.
+        bind_group_layouts: &[Some(&shared_layout), Some(&texture_layout)],
+        // Formerly push_constant_ranges. We use none.
+        immediate_size: 0,
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("phdupes_image_pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: rs.target_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        // eframe's NativeOptions defaults to depth_buffer: 0 and multisampling: 0,
+        // so egui's render pass has no depth attachment and one sample (which is
+        // what MultisampleState::default() gives). If either is ever enabled in
+        // run(), these two fields must be changed to match or wgpu will reject
+        // the pipeline at draw time.
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("phdupes_image_uniform"),
+        size: std::mem::size_of::<ImageUniform>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Both samplers declare a Linear mipmap filter purely so wgpu classifies
+    // them as "filtering" and they satisfy the SamplerBindingType::Filtering
+    // slot above. With a single mip level it has no effect on sampling.
+    let make_sampler = |label: &str, filter: wgpu::FilterMode| {
+        device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some(label),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: filter,
+            min_filter: filter,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        })
+    };
+    let sampler_linear = make_sampler("phdupes_sampler_linear", wgpu::FilterMode::Linear);
+    let sampler_nearest = make_sampler("phdupes_sampler_nearest", wgpu::FilterMode::Nearest);
+
+    let make_shared_bind = |label: &str, sampler: &wgpu::Sampler| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &shared_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
+    };
+    let bind_linear = make_shared_bind("phdupes_image_bind_linear", &sampler_linear);
+    let bind_nearest = make_shared_bind("phdupes_image_bind_nearest", &sampler_nearest);
+
+    rs.renderer.write().callback_resources.insert(GpuImagePipeline {
+        pipeline,
+        texture_layout,
+        uniform_buffer,
+        bind_linear,
+        bind_nearest,
+    });
+}
+
+/// Upload packed 10-bit pixels to VRAM. Returns `None` if the pipeline was
+/// never initialised or the dimensions are degenerate.
+pub(super) fn upload_gpu_image(
+    rs: &egui_wgpu::RenderState,
+    data: &[u32],
+    width: u32,
+    height: u32,
+) -> Option<GpuImage> {
+    if width == 0 || height == 0 || data.len() < (width as usize) * (height as usize) {
+        return None;
+    }
+
+    let renderer = rs.renderer.read();
+    let pipe = renderer.callback_resources.get::<GpuImagePipeline>()?;
+
+    let extent = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+    let texture = rs.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("phdupes_image_10bit"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgb10a2Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    // Queue::write_texture has no 256-byte row alignment requirement (that
+    // applies to buffer-to-texture copies), so a tight width*4 stride is fine.
+    rs.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(data),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        extent,
+    );
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = rs.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("phdupes_image_bind"),
+        layout: &pipe.texture_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }],
+    });
+
+    Some(GpuImage {
+        _texture: texture,
+        bind_group: Arc::new(bind_group),
+        size: egui::vec2(width as f32, height as f32),
+    })
+}
+
+/// One image blit. egui keeps this alive for the frame it was queued in.
+struct ImageCallback {
+    bind_group: Arc<wgpu::BindGroup>,
+    uv_mat: [f32; 4],
+    uv_off: [f32; 2],
+    nearest: bool,
+}
+
+impl egui_wgpu::CallbackTrait for ImageCallback {
+    fn prepare(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        // Only ever one image on screen at a time, so a single shared uniform
+        // buffer rewritten each frame is safe.
+        if let Some(pipe) = resources.get::<GpuImagePipeline>() {
+            let uniform = ImageUniform { uv_mat: self.uv_mat, uv_off: self.uv_off, _pad: [0.0; 2] };
+            queue.write_buffer(&pipe.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        }
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        resources: &egui_wgpu::CallbackResources,
+    ) {
+        let Some(pipe) = resources.get::<GpuImagePipeline>() else {
+            return;
+        };
+        let shared = if self.nearest { &pipe.bind_nearest } else { &pipe.bind_linear };
+        render_pass.set_pipeline(&pipe.pipeline);
+        render_pass.set_bind_group(0, shared, &[]);
+        render_pass.set_bind_group(1, self.bind_group.as_ref(), &[]);
+        render_pass.draw(0..4, 0..1);
+    }
+}
+
+/// Unpack 10-bit pixels into an 8-bit `ColorImage`.
+///
+/// Only for histogram and palette analysis, which downsamples to 128x128 and
+/// buckets into 256 bins — the discarded low bits cannot affect the result.
+fn rgb10a2_to_colorimage(data: &[u32], width: u32, height: u32) -> egui::ColorImage {
+    let pixels: Vec<egui::Color32> = data
+        .iter()
+        .map(|&p| {
+            let r = ((p & 0x3FF) >> 2) as u8;
+            let g = (((p >> 10) & 0x3FF) >> 2) as u8;
+            let b = (((p >> 20) & 0x3FF) >> 2) as u8;
+            // 2-bit alpha: 0..3 -> 0..255.
+            let a = (((p >> 30) & 0x3) * 85) as u8;
+            egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+        })
+        .collect();
+    egui::ColorImage {
+        size: [width as usize, height as usize],
+        pixels,
+        source_size: egui::vec2(width as f32, height as f32),
+    }
+}
+
 pub(super) fn spawn_image_loader_pool(
     use_thumbnails: bool,
     content_key: [u8; 32],
     palette_config: crate::db::PaletteConfig,
     hdr_config: crate::db::HdrConfig,
     histogram_enabled: Arc<AtomicBool>,
+    prefer_10bit: Arc<AtomicBool>,
 ) -> (Sender<(PathBuf, usize, usize)>, Receiver<((PathBuf, usize, usize), ImageLoadResult)>) {
     let (tx, rx) = unbounded::<(PathBuf, usize, usize)>();
     let (result_tx, result_rx) = unbounded();
@@ -89,6 +487,7 @@ pub(super) fn spawn_image_loader_pool(
         let rx_clone = rx.clone();
         let tx_clone = result_tx.clone();
         let hist_flag = Arc::clone(&histogram_enabled);
+        let deep_flag = Arc::clone(&prefer_10bit);
 
         let pcfg = palette_config;
         let hcfg = hdr_config;
@@ -154,17 +553,29 @@ pub(super) fn spawn_image_loader_pool(
                     use_thumbnails,
                     &content_key,
                     hcfg,
+                    deep_flag.load(Ordering::Relaxed),
                 ) {
-                    Ok((img, dims, orientation, content_hash, exif_timestamp)) => {
+                    Ok((decoded, dims, orientation, content_hash, exif_timestamp)) => {
                         // Only compute histogram + palette when the overlay is enabled;
                         // the disk-based fallback in render_histogram handles cache misses
                         // when the user toggles it on later.
                         let hist_palette = if hist_flag.load(Ordering::Relaxed) {
-                            let hp = compute_histogram_from_colorimage(
-                                &img,
-                                pcfg,
-                                img.size[0] != dims.0 as usize || img.size[1] != dims.1 as usize,
-                            );
+                            // The analysis code works on 8-bit ColorImages; a 10-bit
+                            // decode is unpacked to one here, which costs nothing in
+                            // accuracy since it downsamples to 128x128 anyway.
+                            let (analysis_img, pre_resized) = match &decoded {
+                                DecodedImage::Srgb8(img) => (
+                                    Cow::Borrowed(img),
+                                    img.size[0] != dims.0 as usize
+                                        || img.size[1] != dims.1 as usize,
+                                ),
+                                DecodedImage::Rgb10a2 { width, height, data } => (
+                                    Cow::Owned(rgb10a2_to_colorimage(data, *width, *height)),
+                                    *width != dims.0 || *height != dims.1,
+                                ),
+                            };
+                            let hp =
+                                compute_histogram_from_colorimage(&analysis_img, pcfg, pre_resized);
 
                             // Log dominant colors as gamma-encoded sRGB values
                             let colors_str: Vec<String> = hp
@@ -185,14 +596,28 @@ pub(super) fn spawn_image_loader_pool(
                             None
                         };
 
-                        ImageLoadResult::Loaded(
-                            img,
-                            dims,
-                            orientation,
-                            content_hash,
-                            exif_timestamp,
-                            hist_palette,
-                        )
+                        match decoded {
+                            DecodedImage::Srgb8(img) => ImageLoadResult::Loaded(
+                                img,
+                                dims,
+                                orientation,
+                                content_hash,
+                                exif_timestamp,
+                                hist_palette,
+                            ),
+                            DecodedImage::Rgb10a2 { width, height, data } => {
+                                ImageLoadResult::Loaded10 {
+                                    data,
+                                    width,
+                                    height,
+                                    resolution: dims,
+                                    orientation,
+                                    content_hash,
+                                    exif_timestamp,
+                                    hist_palette,
+                                }
+                            }
+                        }
                     }
                     Err(err_msg) => ImageLoadResult::Failed(err_msg),
                 };
@@ -227,7 +652,8 @@ fn load_and_process_image_with_hash(
     use_thumbnails: bool,
     content_key: &[u8; 32],
     hdr_config: crate::db::HdrConfig,
-) -> Result<(egui::ColorImage, (u32, u32), u8, [u8; 32], Option<i64>), String> {
+    prefer_10bit: bool,
+) -> Result<(DecodedImage, (u32, u32), u8, [u8; 32], Option<i64>), String> {
     // Read file once for both hashing and image processing
     let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
 
@@ -254,9 +680,68 @@ fn load_and_process_image_with_hash(
 
     // Process the image using existing logic
     let (img, dims, orientation) =
-        load_and_process_image_from_bytes(path, &bytes, use_thumbnails, hdr_config)?;
+        load_and_process_image_from_bytes(path, &bytes, use_thumbnails, hdr_config, prefer_10bit)?;
 
     Ok((img, dims, orientation, content_hash, exif_timestamp))
+}
+
+/// `maybe_resize_image` for the 8-bit path, wrapped as a `DecodedImage`.
+fn srgb8_result(
+    color_image: egui::ColorImage,
+    real_dims: (u32, u32),
+    orientation: u8,
+    path: &Path,
+) -> (DecodedImage, (u32, u32), u8) {
+    let (img, dims, orient) = maybe_resize_image(color_image, real_dims, orientation, path);
+    (DecodedImage::Srgb8(img), dims, orient)
+}
+
+/// MAX_TEXTURE_SIDE guard for the 10-bit path.
+///
+/// `fast_image_resize` cannot operate on packed 2:10:10:10, so oversized images
+/// are downscaled while still a `DynamicImage` — which also keeps the resample
+/// itself at the source bit depth.
+fn maybe_downscale_dynamic(img: image::DynamicImage, path: &Path) -> image::DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    if w as usize <= MAX_TEXTURE_SIDE && h as usize <= MAX_TEXTURE_SIDE {
+        return img;
+    }
+    let scale = MAX_TEXTURE_SIDE as f32 / w.max(h) as f32;
+    let new_w = ((w as f32 * scale).round() as u32).max(1);
+    let new_h = ((h as f32 * scale).round() as u32).max(1);
+    eprintln!("[DEBUG] Downscaled (deep) {:?} from {}x{} to {}x{}", path, w, h, new_w, new_h);
+    img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3)
+}
+
+/// True when the decoded image carries more than 8 bits per channel and is
+/// therefore worth keeping at 10 bits. An 8-bit source gains nothing from the
+/// deeper path — expanding 256 levels to 1023 adds no information.
+fn is_deep_color(img: &image::DynamicImage) -> bool {
+    matches!(
+        img.color(),
+        image::ColorType::L16
+            | image::ColorType::La16
+            | image::ColorType::Rgb16
+            | image::ColorType::Rgba16
+            | image::ColorType::Rgb32F
+            | image::ColorType::Rgba32F
+    )
+}
+
+/// Pick the final pixel representation for a plain (non-HDR) decoded image.
+fn finish_dynamic(
+    dyn_img: image::DynamicImage,
+    real_dims: (u32, u32),
+    orientation: u8,
+    prefer_10bit: bool,
+    path: &Path,
+) -> (DecodedImage, (u32, u32), u8) {
+    if prefer_10bit && is_deep_color(&dyn_img) {
+        let dyn_img = maybe_downscale_dynamic(dyn_img, path);
+        let (w, h, data) = crate::hdr::requantize_srgb16_to_rgb10a2(&dyn_img);
+        return (DecodedImage::Rgb10a2 { width: w, height: h, data }, real_dims, orientation);
+    }
+    srgb8_result(dynamic_image_to_egui(dyn_img), real_dims, orientation, path)
 }
 
 /// Resize image if it exceeds MAX_TEXTURE_SIDE to prevent egui panics
@@ -567,7 +1052,8 @@ fn load_and_process_image_from_bytes(
     bytes: &[u8],
     use_thumbnails: bool,
     hdr_config: crate::db::HdrConfig,
-) -> Result<(egui::ColorImage, (u32, u32), u8), String> {
+    prefer_10bit: bool,
+) -> Result<(DecodedImage, (u32, u32), u8), String> {
     // ---------------------------------------------------------------------
     // RAW FILES
     // ---------------------------------------------------------------------
@@ -584,7 +1070,7 @@ fn load_and_process_image_from_bytes(
                     let dims = (thumb.width() as u32, thumb.height() as u32);
                     let actual_orientation =
                         if thumb_orient != 1 { thumb_orient } else { exif_orientation };
-                    return Ok(maybe_resize_image(thumb, dims, actual_orientation, path));
+                    return Ok(srgb8_result(thumb, dims, actual_orientation, path));
                 }
 
                 // If the fallback fails or we aren't using thumbnails, return the original error
@@ -607,27 +1093,41 @@ fn load_and_process_image_from_bytes(
         if use_thumbnails && let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
             let actual_orientation =
                 if thumb_orient != 1 { thumb_orient } else { raw_fallback_orientation };
-            return Ok(maybe_resize_image(thumb, dims, actual_orientation, path));
+            return Ok(srgb8_result(thumb, dims, actual_orientation, path));
         }
 
         // 2. Full RAW decode mode
         raw.set_use_camera_wb(true);
         match raw.unpack() {
-            Ok(_) => match raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
+            Ok(_) => match raw.process::<{ rsraw::BIT_DEPTH_16 }>() {
                 Ok(processed) => {
-                    let w = processed.width() as usize;
-                    let h = processed.height() as usize;
-                    let total_pixels = w * h;
+                    let w = processed.width() as u32;
+                    let h = processed.height() as u32;
+                    let total_pixels = (w * h) as usize;
                     // Determine channels dynamically
-                    let img = if processed.len() == total_pixels {
-                        // Monochrome: 1 byte per pixel
-                        egui::ColorImage::from_gray([w, h], &processed)
+                    let dyn_img = if processed.len() == total_pixels {
+                        // Monochrome: 1 u16 per pixel
+                        let buf = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_vec(
+                            w,
+                            h,
+                            processed.to_vec(),
+                        )
+                        .ok_or_else(|| {
+                            "Failed to create 16-bit Mono buffer from RAW".to_string()
+                        })?;
+                        image::DynamicImage::ImageLuma16(buf)
                     } else if processed.len() == total_pixels * 3 {
-                        // RGB: 3 bytes per pixel
-                        egui::ColorImage::from_rgb([w, h], &processed)
+                        // RGB: 3 u16 per pixel
+                        let buf = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_vec(
+                            w,
+                            h,
+                            processed.to_vec(),
+                        )
+                        .ok_or_else(|| "Failed to create 16-bit RGB buffer from RAW".to_string())?;
+                        image::DynamicImage::ImageRgb16(buf)
                     } else {
                         return Err(format!(
-                            "RAW size mismatch: expected {} (Mono) or {} (RGB) bytes, got {}",
+                            "RAW size mismatch: expected {} (Mono) or {} (RGB) 16-bit values, got {}",
                             total_pixels,
                             total_pixels * 3,
                             processed.len()
@@ -635,14 +1135,14 @@ fn load_and_process_image_from_bytes(
                     };
 
                     // rsraw handles rotation, orientation=1
-                    return Ok(maybe_resize_image(img, dims, 1, path));
+                    return Ok(finish_dynamic(dyn_img, (w, h), 1, prefer_10bit, path));
                 }
                 Err(e) => {
                     // Fallback to thumbnail on process error
                     if let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
                         let actual_orientation =
                             if thumb_orient != 1 { thumb_orient } else { raw_fallback_orientation };
-                        return Ok(maybe_resize_image(thumb, dims, actual_orientation, path));
+                        return Ok(srgb8_result(thumb, dims, actual_orientation, path));
                     }
                     return Err(format!("Failed to process RAW: {}", e));
                 }
@@ -652,7 +1152,7 @@ fn load_and_process_image_from_bytes(
                 if let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
                     let actual_orientation =
                         if thumb_orient != 1 { thumb_orient } else { raw_fallback_orientation };
-                    return Ok(maybe_resize_image(thumb, dims, actual_orientation, path));
+                    return Ok(srgb8_result(thumb, dims, actual_orientation, path));
                 }
                 return Err(format!("Failed to unpack RAW: {}", e));
             }
@@ -688,10 +1188,11 @@ fn load_and_process_image_from_bytes(
         match crate::scanner::load_image_fast(path, bytes) {
             Ok(dyn_img) => {
                 let (w, h) = dyn_img.dimensions();
-                let color_image = dynamic_image_to_egui(dyn_img);
 
                 eprintln!("[DEBUG-GUI] scanner decode SUCCESS for {:?}", path);
-                return Ok(maybe_resize_image(color_image, (w, h), orientation, path));
+                // 16-bit TIFF and JXL reach this branch, so let finish_dynamic
+                // decide whether they are worth keeping at 10 bits.
+                return Ok(finish_dynamic(dyn_img, (w, h), orientation, prefer_10bit, path));
             }
             Err(err_msg) => {
                 eprintln!("[DEBUG-GUI] scanner decode FAILED for {:?}: {}", path, err_msg);
@@ -738,7 +1239,7 @@ fn load_and_process_image_from_bytes(
         );
     }
 
-    let img = if needs_hdr_processing {
+    if needs_hdr_processing {
         let cicp = cicp.unwrap();
         eprintln!(
             "[DEBUG-HDR] {:?}: cICP primaries={} transfer={} matrix={} full_range={} -> tone-mapping to SDR",
@@ -748,20 +1249,25 @@ fn load_and_process_image_from_bytes(
             cicp.matrix_coefficients,
             cicp.full_range,
         );
-        let rgba = crate::hdr::process_hdr_to_sdr(&dyn_img, cicp, hdr_config.sdr_peak_nits);
-        egui::ColorImage::from_rgba_unmultiplied(
-            [dims.0 as usize, dims.1 as usize],
-            rgba.as_flat_samples().as_slice(),
-        )
-    } else {
-        let rgba = dyn_img.to_rgba8();
-        egui::ColorImage::from_rgba_unmultiplied(
-            [dims.0 as usize, dims.1 as usize],
-            rgba.as_flat_samples().as_slice(),
-        )
-    };
 
-    Ok(maybe_resize_image(img, dims, orientation, path))
+        if prefer_10bit {
+            // The BT.2390 curve packs 10000 nits into the display range, so the
+            // extra 2 bits per channel matter most here of anywhere.
+            let dyn_img = maybe_downscale_dynamic(dyn_img, path);
+            let (w, h, data) =
+                crate::hdr::process_hdr_to_rgb10a2(&dyn_img, cicp, hdr_config.sdr_peak_nits);
+            return Ok((DecodedImage::Rgb10a2 { width: w, height: h, data }, dims, orientation));
+        }
+
+        let rgba = crate::hdr::process_hdr_to_sdr(&dyn_img, cicp, hdr_config.sdr_peak_nits);
+        let img = egui::ColorImage::from_rgba_unmultiplied(
+            [dims.0 as usize, dims.1 as usize],
+            rgba.as_flat_samples().as_slice(),
+        );
+        return Ok(srgb8_result(img, dims, orientation, path));
+    }
+
+    Ok(finish_dynamic(dyn_img, dims, orientation, prefer_10bit, path))
 }
 
 pub(super) fn update_file_metadata(
@@ -906,15 +1412,64 @@ fn extract_best_thumbnail(raw: &mut rsraw::RawImage) -> Option<(egui::ColorImage
     Some((egui::ColorImage::from_rgb([width as usize, height as usize], rgb.as_raw()), orientation))
 }
 
-// Helper to render texture with pan/zoom logic
+/// Compose the quad-space -> texture-UV transform for the 10-bit blit.
+///
+/// The callback rect is always `available_rect` (never the image rect), because
+/// egui clamps a callback viewport to the screen: handing it an off-screen rect
+/// when zoomed in would squash the image instead of cropping it. So quad space
+/// covers the viewport, and this maps it into the image, letting the shader
+/// discard whatever falls outside.
+fn image_uv_transform(
+    available_rect: egui::Rect,
+    target_rect: egui::Rect,
+    steps: u32,
+    flip_h: bool,
+    flip_v: bool,
+) -> ([f32; 4], [f32; 2]) {
+    // Stage 1: quad space -> normalised position within the on-screen image.
+    let sx = available_rect.width() / target_rect.width();
+    let sy = available_rect.height() / target_rect.height();
+    let ox = (available_rect.min.x - target_rect.min.x) / target_rect.width();
+    let oy = (available_rect.min.y - target_rect.min.y) / target_rect.height();
+
+    // Stage 2: rotation, as a 2x2 [r00, r01, r10, r11] plus offset. Clockwise,
+    // matching the EXIF convention (orientation 6 => one quarter turn CW).
+    let (r, roff) = match steps % 4 {
+        1 => ([0.0, 1.0, -1.0, 0.0], [0.0, 1.0]),
+        2 => ([-1.0, 0.0, 0.0, -1.0], [1.0, 1.0]),
+        3 => ([0.0, -1.0, 1.0, 0.0], [1.0, 0.0]),
+        _ => ([1.0, 0.0, 0.0, 1.0], [0.0, 0.0]),
+    };
+    let mut r: [f32; 4] = r;
+    let mut roff: [f32; 2] = roff;
+
+    // Stage 3: flips, applied after rotation (u -> 1-u negates that output row).
+    if flip_h {
+        r[0] = -r[0];
+        r[1] = -r[1];
+        roff[0] = 1.0 - roff[0];
+    }
+    if flip_v {
+        r[2] = -r[2];
+        r[3] = -r[3];
+        roff[1] = 1.0 - roff[1];
+    }
+
+    // Collapse both affine stages into one.
+    let mat = [r[0] * sx, r[1] * sy, r[2] * sx, r[3] * sy];
+    let off = [r[0] * ox + r[1] * oy + roff[0], r[2] * ox + r[3] * oy + roff[1]];
+    (mat, off)
+}
+
+// Helper to render an image with pan/zoom logic, from either backing store.
 pub(super) fn render_image_texture(
     app: &mut GuiApp,
     ui: &mut egui::Ui,
-    texture_id: egui::TextureId,
-    texture_size: egui::Vec2,
+    source: ImageSource,
     available_rect: egui::Rect,
     current_group_idx: usize,
 ) {
+    let texture_size = source.size();
     // --- 1. Calculate Rotation and Flip ---
     let orientation = if let Some(group) = app.state.groups.get(app.state.current_group_idx) {
         if let Some(file) = group.get(app.state.current_file_idx) { file.orientation } else { 1 }
@@ -1018,18 +1573,43 @@ pub(super) fn render_image_texture(
     let response = ui.allocate_rect(available_rect, egui::Sense::click_and_drag());
 
     // Clip to the available area so zoomed images don't spill out
-    let _painter = ui.painter().with_clip_rect(available_rect);
+    let painter = ui.painter().with_clip_rect(available_rect);
 
-    // Calculate UV coordinates for flipping
-    let (u_min, u_max) = if file_transform.flip_horizontal { (1.0, 0.0) } else { (0.0, 1.0) };
-    let (v_min, v_max) = if file_transform.flip_vertical { (1.0, 0.0) } else { (0.0, 1.0) };
-    let uv = egui::Rect::from_min_max(egui::pos2(u_min, v_min), egui::pos2(u_max, v_max));
+    match source {
+        ImageSource::Egui { id, size } => {
+            // Calculate UV coordinates for flipping
+            let (u_min, u_max) =
+                if file_transform.flip_horizontal { (1.0, 0.0) } else { (0.0, 1.0) };
+            let (v_min, v_max) = if file_transform.flip_vertical { (1.0, 0.0) } else { (0.0, 1.0) };
+            let uv = egui::Rect::from_min_max(egui::pos2(u_min, v_min), egui::pos2(u_max, v_max));
 
-    // Paint the image into the calculated paint_rect, applying rotation and flips.
-    egui::Image::from_texture((texture_id, texture_size))
-        .uv(uv)
-        .rotate(total_angle, egui::Vec2::splat(0.5))
-        .paint_at(ui, paint_rect);
+            // Paint the image into the calculated paint_rect, applying rotation and flips.
+            egui::Image::from_texture((id, size))
+                .uv(uv)
+                .rotate(total_angle, egui::Vec2::splat(0.5))
+                .paint_at(ui, paint_rect);
+        }
+        ImageSource::Gpu { bind_group, .. } => {
+            // Rotation and flips ride in the UV transform rather than the mesh,
+            // so the callback always covers the (on-screen) available_rect.
+            let (uv_mat, uv_off) = image_uv_transform(
+                available_rect,
+                target_rect,
+                total_steps as u32,
+                file_transform.flip_horizontal,
+                file_transform.flip_vertical,
+            );
+            painter.add(egui_wgpu::Callback::new_paint_callback(
+                available_rect,
+                ImageCallback {
+                    bind_group,
+                    uv_mat,
+                    uv_off,
+                    nearest: zoom_factor >= NEAREST_ZOOM_THRESHOLD,
+                },
+            ));
+        }
+    }
 
     // --- 7. Interaction ---
     if response.dragged() {

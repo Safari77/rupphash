@@ -10,7 +10,7 @@ repository = "https://github.com/Safari77/rupphash"
 [dependencies]
 anyhow = "1.0"
 blake3 = "1.5"
-bytemuck = "1"
+bytemuck = { version = "1", features = ["derive"] }
 chacha20poly1305 = "0.11"
 chrono = "0.4"
 clap = { version = "4.6", features = ["derive"] }
@@ -79,7 +79,7 @@ eframe = { version = "0.35", default-features = false, features = [
 ] }
 egui = "0.35"
 egui_extras = { version = "0.35", features = ["all_loaders"] }
-wgpu = "30"
+egui-wgpu = "0.35"
 delaunator = "1.0.2"
 walkers = "0.56"
 roaring = { version = "0.11", features = ["serde"] }
@@ -100,6 +100,9 @@ lto = false
 cargo-lock = "11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[patch.crates-io]
+egui-wgpu = { path = "vendor/egui-wgpu" }
 
 [[bin]]
 name = "phdupes"

@@ -2,5 +2,5 @@
 .*.sw?
 /target/
 /src/target/
-/assets/
+/assets/fonts/
 tags

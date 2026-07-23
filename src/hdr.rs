@@ -18,7 +18,7 @@
 //!      by default for HDR→SDR.
 //!   5. Normalize to [0, 1] relative to SDR peak.
 //!   6. Apply the sRGB OETF (gamma encoding).
-//!   7. Quantize to u8.
+//!   7. Quantize to u8 or Rgb10a2.
 
 use crate::img_debug;
 use image::{DynamicImage, ImageBuffer, ImageDecoder, Rgba, RgbaImage};
@@ -410,23 +410,39 @@ fn pq_inverse_eotf_nits(nits: f32) -> f32 {
 // Main conversion
 // ---------------------------------------------------------------------------
 
-/// Convert an HDR `DynamicImage` (expected to be 16-bit RGB or RGBA) with
-/// the given cICP signalling into an 8-bit sRGB RgbaImage ready for display.
-///
-/// `sdr_peak_nits` is the target display peak. Common values:
-///   * 100.0 — strict SDR reference (classic mpv default).
-///   * 203.0 — HDR reference white per ITU-R BT.2408; produces a brighter,
-///     more pleasant mapping on typical desktop monitors.
-pub fn process_hdr_to_sdr(img: &DynamicImage, cicp: Cicp, sdr_peak_nits: f32) -> RgbaImage {
-    // Source peak. For PQ we assume full 10000 nits unless we had MaxCLL
-    // (which PNG doesn't carry) — BT.2390 copes fine with this.
-    let src_peak_nits: f32 = 10000.0;
-    let src_peak_pq = pq_inverse_eotf_nits(src_peak_nits);
-    let dst_peak_pq = pq_inverse_eotf_nits(sdr_peak_nits);
+/// Per-image constants shared by every pixel, derived once from the cICP
+/// signalling and the target display peak.
+#[derive(Debug, Clone, Copy)]
+struct TonemapParams {
+    use_pq: bool,
+    use_hlg: bool,
+    /// BT.2020 primaries, needing conversion to BT.709.
+    wide_gamut: bool,
+    sdr_peak_nits: f32,
+    src_peak_pq: f32,
+    dst_peak_pq: f32,
+}
 
-    // Extract a flat [R,G,B,A] f32 iterator depending on the concrete image
-    // variant. Everything goes through the same math afterwards.
-    let (width, height, raw_rgba_u16): (u32, u32, Vec<u16>) = match img {
+impl TonemapParams {
+    fn new(cicp: Cicp, sdr_peak_nits: f32) -> Self {
+        // Source peak. For PQ we assume full 10000 nits unless we had MaxCLL
+        // (which PNG doesn't carry) — BT.2390 copes fine with this.
+        let src_peak_nits: f32 = 10000.0;
+        Self {
+            use_pq: cicp.transfer_characteristics == 16,
+            use_hlg: cicp.transfer_characteristics == 18,
+            wide_gamut: cicp.color_primaries == 9, // BT.2020
+            sdr_peak_nits,
+            src_peak_pq: pq_inverse_eotf_nits(src_peak_nits),
+            dst_peak_pq: pq_inverse_eotf_nits(sdr_peak_nits),
+        }
+    }
+}
+
+/// Flatten any `DynamicImage` into 16-bit RGBA. Everything goes through the
+/// same math afterwards regardless of the source variant.
+fn to_rgba16_flat(img: &DynamicImage) -> (u32, u32, Vec<u16>) {
+    match img {
         DynamicImage::ImageRgb16(buf) => {
             let (w, h) = (buf.width(), buf.height());
             let mut out = Vec::with_capacity((w * h * 4) as usize);
@@ -449,89 +465,195 @@ pub fn process_hdr_to_sdr(img: &DynamicImage, cicp: Cicp, sdr_peak_nits: f32) ->
             let (w, h) = (rgba16.width(), rgba16.height());
             (w, h, rgba16.into_raw())
         }
+    }
+}
+
+/// Tone-map one source pixel to display-encoded sRGB in [0, 1].
+///
+/// This is steps 1-6 of the pipeline described at the top of this module.
+/// Quantization (step 7) is left to the caller so the same math can feed
+/// both the 8-bit and the 10-bit output paths.
+#[inline]
+fn tonemap_px(src: &[u16], p: TonemapParams) -> (f32, f32, f32, f32) {
+    // Normalize to [0,1].
+    let mut r = src[0] as f32 / 65535.0;
+    let mut g = src[1] as f32 / 65535.0;
+    let mut b = src[2] as f32 / 65535.0;
+    let a = src[3] as f32 / 65535.0;
+
+    // 1. EOTF → linear light in nits.
+    if p.use_pq {
+        r = pq_eotf(r);
+        g = pq_eotf(g);
+        b = pq_eotf(b);
+    } else if p.use_hlg {
+        // Peak assumption of 1000 nits is a sensible default for HLG.
+        r = hlg_eotf(r, 1000.0);
+        g = hlg_eotf(g, 1000.0);
+        b = hlg_eotf(b, 1000.0);
+    } else {
+        // sRGB / BT.709 — no HDR processing; just treat as normal.
+        r = srgb_to_linear_simple(r) * p.sdr_peak_nits;
+        g = srgb_to_linear_simple(g) * p.sdr_peak_nits;
+        b = srgb_to_linear_simple(b) * p.sdr_peak_nits;
+    }
+
+    // 2. Primaries: BT.2020 → BT.709 in linear light.
+    if p.wide_gamut {
+        let (nr, ng, nb) = bt2020_to_bt709_linear(r, g, b);
+        r = nr;
+        g = ng;
+        b = nb;
+    }
+
+    // 3. Tone map via BT.2390 on MaxRGB, then scale channels.
+    // Convert each channel back to PQ space, take max, run EETF, and
+    // apply the resulting ratio to the linear-light triple. This
+    // preserves hue reasonably well.
+    let rp = pq_inverse_eotf_nits(r.max(0.0));
+    let gp = pq_inverse_eotf_nits(g.max(0.0));
+    let bp = pq_inverse_eotf_nits(b.max(0.0));
+    let max_pq = rp.max(gp).max(bp);
+    let mapped_pq = bt2390_eetf(max_pq, p.src_peak_pq, p.dst_peak_pq);
+    let scale = if max_pq > 1e-6 {
+        // Work out the linear-light ratio that corresponds to the PQ
+        // compression we just applied on the max channel.
+        let before = pq_eotf(max_pq);
+        let after = pq_eotf(mapped_pq);
+        if before > 1e-6 { after / before } else { 0.0 }
+    } else {
+        1.0
     };
+    r *= scale;
+    g *= scale;
+    b *= scale;
 
-    let use_pq = cicp.transfer_characteristics == 16;
-    let use_hlg = cicp.transfer_characteristics == 18;
-    let wide_gamut = cicp.color_primaries == 9; // BT.2020
+    // 4. Normalize to SDR display range [0,1].
+    let inv = 1.0 / p.sdr_peak_nits;
+    r = (r * inv).clamp(0.0, 1.0);
+    g = (g * inv).clamp(0.0, 1.0);
+    b = (b * inv).clamp(0.0, 1.0);
 
-    // Pre-allocate output and fill in parallel by zipping u16 input chunks
-    // with u8 output chunks. This avoids relying on arrays-as-iterators and
-    // gives the cleanest ownership story for rayon.
+    // 5. sRGB OETF (gamma encoding).
+    (srgb_oetf(r), srgb_oetf(g), srgb_oetf(b), a.clamp(0.0, 1.0))
+}
+
+const NOISE_DATA: &[u8] = include_bytes!("../assets/blue-noise-256.bin");
+const NOISE_DATA_WIDTH_AND_HEIGHT: usize = 256;
+/// Get the noise value at the given coordinates. If the coordinates are out of bounds,
+/// they will wrap around. Means we don't need a noise texture as large as the image.
+#[inline]
+fn get_noise(x: u32, y: u32) -> u8 {
+    let wrap_x = (x as usize) % NOISE_DATA_WIDTH_AND_HEIGHT;
+    let wrap_y = (y as usize) % NOISE_DATA_WIDTH_AND_HEIGHT;
+    NOISE_DATA[wrap_y * NOISE_DATA_WIDTH_AND_HEIGHT + wrap_x]
+}
+
+const _: () =
+    assert!(NOISE_DATA.len() == NOISE_DATA_WIDTH_AND_HEIGHT * NOISE_DATA_WIDTH_AND_HEIGHT);
+
+/// Blue-noise dither offset for the pixel at (x, y), in LSB units.
+/// The stored field is uniformly distributed. Remapping it through the inverse
+/// triangular CDF gives a triangular PDF over (-1, 1) — that is what makes the
+/// quantization error independent of the signal, where a plain uniform offset
+/// leaves a noise floor that pumps with input level. The remap is monotonic, so
+/// it preserves the field's rank ordering and therefore its blue spectrum.
+///
+/// One offset is shared by R, G and B: correlated dither reads as monochrome
+/// grain, which is much less objectionable than the chroma speckle you get from
+/// three independent draws.
+#[inline]
+fn blue_noise_dither(x: u32, y: u32) -> f32 {
+    // Map the byte to (0, 1), symmetric about 0.5. The +0.5 balances the two
+    // halves of the remap and keeps the sqrt away from zero at the extremes.
+    let u = (get_noise(x, y) as f32 + 0.5) / 256.0;
+    if u < 0.5 { (2.0 * u).sqrt() - 1.0 } else { 1.0 - (2.0 - 2.0 * u).sqrt() }
+}
+
+/// Convert an HDR `DynamicImage` (expected to be 16-bit RGB or RGBA) with
+/// the given cICP signalling into an 8-bit sRGB RgbaImage ready for display.
+///
+/// `sdr_peak_nits` is the target display peak. Common values:
+///   * 100.0 — strict SDR reference (classic mpv default).
+///   * 203.0 — HDR reference white per ITU-R BT.2408; produces a brighter,
+///     more pleasant mapping on typical desktop monitors.
+///
+/// Output is dithered: the tone curve packs 10000 nits into 256 codes, so
+/// plain rounding leaves visible banding across skies and gradients.
+pub fn process_hdr_to_sdr(img: &DynamicImage, cicp: Cicp, sdr_peak_nits: f32) -> RgbaImage {
+    let params = TonemapParams::new(cicp, sdr_peak_nits);
+    let (width, height, raw_rgba_u16) = to_rgba16_flat(img);
+
     let pixel_count = (width as usize) * (height as usize);
     let mut out: Vec<u8> = vec![0u8; pixel_count * 4];
-
-    raw_rgba_u16.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).for_each(|(src, dst)| {
-        // Normalize to [0,1].
-        let mut r = src[0] as f32 / 65535.0;
-        let mut g = src[1] as f32 / 65535.0;
-        let mut b = src[2] as f32 / 65535.0;
-        let a = src[3] as f32 / 65535.0;
-
-        // 1. EOTF → linear light in nits.
-        if use_pq {
-            r = pq_eotf(r);
-            g = pq_eotf(g);
-            b = pq_eotf(b);
-        } else if use_hlg {
-            // Peak assumption of 1000 nits is a sensible default for HLG.
-            r = hlg_eotf(r, 1000.0);
-            g = hlg_eotf(g, 1000.0);
-            b = hlg_eotf(b, 1000.0);
-        } else {
-            // sRGB / BT.709 — no HDR processing; just treat as normal.
-            r = srgb_to_linear_simple(r) * sdr_peak_nits;
-            g = srgb_to_linear_simple(g) * sdr_peak_nits;
-            b = srgb_to_linear_simple(b) * sdr_peak_nits;
-        }
-
-        // 2. Primaries: BT.2020 → BT.709 in linear light.
-        if wide_gamut {
-            let (nr, ng, nb) = bt2020_to_bt709_linear(r, g, b);
-            r = nr;
-            g = ng;
-            b = nb;
-        }
-
-        // 3. Tone map via BT.2390 on MaxRGB, then scale channels.
-        // Convert each channel back to PQ space, take max, run EETF, and
-        // apply the resulting ratio to the linear-light triple. This
-        // preserves hue reasonably well.
-        let rp = pq_inverse_eotf_nits(r.max(0.0));
-        let gp = pq_inverse_eotf_nits(g.max(0.0));
-        let bp = pq_inverse_eotf_nits(b.max(0.0));
-        let max_pq = rp.max(gp).max(bp);
-        let mapped_pq = bt2390_eetf(max_pq, src_peak_pq, dst_peak_pq);
-        let scale = if max_pq > 1e-6 {
-            // Work out the linear-light ratio that corresponds to the PQ
-            // compression we just applied on the max channel.
-            let before = pq_eotf(max_pq);
-            let after = pq_eotf(mapped_pq);
-            if before > 1e-6 { after / before } else { 0.0 }
-        } else {
-            1.0
-        };
-        r *= scale;
-        g *= scale;
-        b *= scale;
-
-        // 4. Normalize to SDR display range [0,1].
-        let inv = 1.0 / sdr_peak_nits;
-        r = (r * inv).clamp(0.0, 1.0);
-        g = (g * inv).clamp(0.0, 1.0);
-        b = (b * inv).clamp(0.0, 1.0);
-
-        // 5. sRGB OETF → quantize.
-        dst[0] = (srgb_oetf(r) * 255.0).round().clamp(0.0, 255.0) as u8;
-        dst[1] = (srgb_oetf(g) * 255.0).round().clamp(0.0, 255.0) as u8;
-        dst[2] = (srgb_oetf(b) * 255.0).round().clamp(0.0, 255.0) as u8;
-        dst[3] = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
-    });
+    let w = width as usize;
+    raw_rgba_u16.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).enumerate().for_each(
+        |(i, (src, dst))| {
+            let (r, g, b, a) = tonemap_px(src, params);
+            let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
+            let q = |v: f32| (v * 255.0 + d).round().clamp(0.0, 255.0) as u8;
+            dst[0] = q(r);
+            dst[1] = q(g);
+            dst[2] = q(b);
+            dst[3] = (a * 255.0).round() as u8;
+        },
+    );
 
     ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, out).unwrap_or_else(|| {
         // Extremely defensive: should never happen since length is exact.
         ImageBuffer::new(width, height)
     })
+}
+
+/// As `process_hdr_to_sdr`, but packed for `wgpu::TextureFormat::Rgb10a2Unorm`
+/// (Vulkan `A2B10G10R10_UNORM_PACK32`): a little-endian u32 laid out as
+/// `(a << 30) | (b << 20) | (g << 10) | r`.
+///
+/// Same 4 bytes per pixel as the 8-bit path, so cache memory is unchanged.
+/// Alpha is only 2 bits — fine for PQ/HLG stills, which are opaque, but do
+/// not route images with real transparency through this.
+///
+/// Returns `(width, height, packed)`. Use `bytemuck::cast_slice(&packed)` for
+/// `wgpu::Queue::write_texture`, with `bytes_per_row = width * 4`.
+pub fn process_hdr_to_rgb10a2(
+    img: &DynamicImage,
+    cicp: Cicp,
+    sdr_peak_nits: f32,
+) -> (u32, u32, Vec<u32>) {
+    let params = TonemapParams::new(cicp, sdr_peak_nits);
+    let (width, height, raw_rgba_u16) = to_rgba16_flat(img);
+
+    let mut out: Vec<u32> = vec![0u32; (width as usize) * (height as usize)];
+    let w = width as usize;
+    raw_rgba_u16.par_chunks_exact(4).zip(out.par_iter_mut()).enumerate().for_each(
+        |(i, (src, dst))| {
+            let (r, g, b, a) = tonemap_px(src, params);
+            // 1023 codes is close to the visible threshold, but the BT.2390
+            // curve is steep in the shadows, so dither still earns its keep.
+            let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
+            let q = |v: f32| (v * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
+            *dst = (((a * 3.0).round() as u32) << 30) | (q(b) << 20) | (q(g) << 10) | q(r);
+        },
+    );
+
+    (width, height, out)
+}
+
+/// Requantize a 16-bit sRGB image to packed Rgb10a2Unorm with blue-noise dither.
+/// No transfer or gamut conversion: source and target are both sRGB-encoded.
+pub fn requantize_srgb16_to_rgb10a2(img: &DynamicImage) -> (u32, u32, Vec<u32>) {
+    let (width, height, raw) = to_rgba16_flat(img);
+    let w = width as usize;
+    let mut out: Vec<u32> = vec![0u32; w * (height as usize)];
+
+    raw.par_chunks_exact(4).zip(out.par_iter_mut()).enumerate().for_each(|(i, (src, dst))| {
+        let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
+        let q = |v: u16| ((v as f32 / 65535.0) * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
+        let a = (src[3] as f32 / 65535.0 * 3.0).round() as u32;
+        *dst = (a << 30) | (q(src[2]) << 20) | (q(src[1]) << 10) | q(src[0]);
+    });
+
+    (width, height, out)
 }
 
 #[inline]
