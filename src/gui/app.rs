@@ -120,8 +120,9 @@ pub struct GuiApp {
     pub(super) render_state: Option<egui_wgpu::RenderState>,
     // Textures for images decoded at 10 bits. Same lifecycle as raw_cache.
     pub(super) gpu_cache: HashMap<std::path::PathBuf, super::image::GpuImage>,
-    // Shared flag so worker threads only pack Rgb10a2 when it can actually be shown.
-    pub(super) prefer_10bit: Arc<AtomicBool>,
+    // What the GPU can display, shared with the worker pool so it only packs
+    // formats that can actually be shown.
+    pub(super) deep_caps: Arc<super::image::DeepColorCaps>,
 
     // Shared state to tell workers which files are still relevant.
     // If a file is not in this set, workers will skip decoding it.
@@ -327,15 +328,15 @@ impl GuiApp {
         let palette_config = crate::db::PaletteConfig::from_gui_config(&ctx.gui_config);
         let hdr_config = crate::db::HdrConfig::from_gui_config(&ctx.gui_config);
         let histogram_enabled = Arc::new(AtomicBool::new(false));
-        // Flipped on in run() once we know the swapchain is 10-bit.
-        let prefer_10bit = Arc::new(AtomicBool::new(false));
+        // Populated in run() once the swapchain format and device features are known.
+        let deep_caps = Arc::new(super::image::DeepColorCaps::default());
         let (tx, rx) = super::image::spawn_image_loader_pool(
             use_raw_thumbnails,
             ctx.content_key,
             palette_config,
             hdr_config,
             Arc::clone(&histogram_enabled),
-            Arc::clone(&prefer_10bit),
+            Arc::clone(&deep_caps),
         );
 
         // panel_width is saved in logical points (after font_scale applied)
@@ -380,7 +381,7 @@ impl GuiApp {
             image_preload_rx: rx,
             render_state: None,
             gpu_cache: HashMap::new(),
-            prefer_10bit,
+            deep_caps,
             active_window,
             last_window_size: initial_window_size,
             panel_width,
@@ -499,15 +500,15 @@ impl GuiApp {
         let palette_config = crate::db::PaletteConfig::from_gui_config(&ctx.gui_config);
         let hdr_config = crate::db::HdrConfig::from_gui_config(&ctx.gui_config);
         let histogram_enabled = Arc::new(AtomicBool::new(false));
-        // Flipped on in run() once we know the swapchain is 10-bit.
-        let prefer_10bit = Arc::new(AtomicBool::new(false));
+        // Populated in run() once the swapchain format and device features are known.
+        let deep_caps = Arc::new(super::image::DeepColorCaps::default());
         let (tx, rx) = super::image::spawn_image_loader_pool(
             use_raw_thumbnails,
             ctx.content_key,
             palette_config,
             hdr_config,
             Arc::clone(&histogram_enabled),
-            Arc::clone(&prefer_10bit),
+            Arc::clone(&deep_caps),
         );
 
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
@@ -600,7 +601,7 @@ impl GuiApp {
             image_preload_rx: rx,
             render_state: None,
             gpu_cache: HashMap::new(),
-            prefer_10bit,
+            deep_caps,
             active_window,
             last_window_size: initial_window_size,
             panel_width,
@@ -1741,8 +1742,25 @@ impl GuiApp {
 
         let is_windows = cfg!(target_os = "windows");
 
+        // Ask for 16-bit normalized textures when the adapter offers them. They
+        // back the Rgba16Unorm path used for images with real transparency,
+        // which Rgb10a2Unorm's 2-bit alpha cannot represent. Absent support is
+        // handled at decode time by falling back to the dithered 8-bit path.
+        let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
+        if let egui_wgpu::WgpuSetup::CreateNew(ref mut setup) = wgpu_options.wgpu_setup {
+            let base = setup.device_descriptor.clone();
+            setup.device_descriptor = Arc::new(move |adapter: &wgpu::Adapter| {
+                let mut desc = base(adapter);
+                if adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+                    desc.required_features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+                }
+                desc
+            });
+        }
+
         let options = eframe::NativeOptions {
             renderer: eframe::Renderer::Wgpu,
+            wgpu_options,
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([width, height])
                 .with_decorations(is_windows)
@@ -1813,10 +1831,17 @@ impl GuiApp {
                 if let Some(rs) = cc.wgpu_render_state.as_ref() {
                     eprintln!("[GPU] target_format={:?}", rs.target_format);
                     if rs.target_format == wgpu::TextureFormat::Rgb10a2Unorm {
-                        super::image::init_gpu_image_pipeline(rs);
+                        let rgba16 = super::image::init_gpu_image_pipeline(rs);
                         app.render_state = Some(rs.clone());
-                        app.prefer_10bit.store(true, Ordering::Relaxed);
-                        eprintln!("[GPU] 10-bit image path enabled");
+                        app.deep_caps.enabled.store(true, Ordering::Relaxed);
+                        app.deep_caps.rgba16.store(rgba16, Ordering::Relaxed);
+                        eprintln!("[GPU] deep-colour image path enabled (Rgba16Unorm: {})", rgba16);
+                        if !rgba16 {
+                            eprintln!(
+                                "[GPU] no TEXTURE_FORMAT_16BIT_NORM; transparent 16-bit images \
+                                 will use the dithered 8-bit path"
+                            );
+                        }
                     } else {
                         eprintln!("[GPU] 8-bit surface; staying on the dithered ColorImage path");
                     }
@@ -1976,8 +2001,8 @@ impl eframe::App for GuiApp {
                             let texture = ctx.load_texture(name, color_image, Default::default());
                             self.raw_cache.insert(path.clone(), texture);
                         }
-                        ImageLoadResult::Loaded10 {
-                            data,
+                        ImageLoadResult::LoadedDeep {
+                            pixels,
                             width,
                             height,
                             resolution,
@@ -2005,7 +2030,7 @@ impl eframe::App for GuiApp {
                             // Hoisted out of the match so the borrow of
                             // self.render_state ends before gpu_cache is touched.
                             let uploaded = self.render_state.as_ref().and_then(|rs| {
-                                super::image::upload_gpu_image(rs, &data, width, height)
+                                super::image::upload_gpu_image(rs, &pixels, width, height)
                             });
                             match uploaded {
                                 Some(gpu) => {

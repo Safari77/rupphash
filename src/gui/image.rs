@@ -44,28 +44,58 @@ pub(super) struct GroupViewState {
 /// Histogram + dominant-colour palette, as produced by the worker pool.
 pub type HistPalette = ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>);
 
+/// Pixels for a texture with more than 8 bits per channel.
+///
+/// Both variants are filterable float formats that sample to `vec4<f32>`, so
+/// they share one pipeline, one bind group layout and one shader — only the
+/// format handed to `create_texture` differs.
+pub enum DeepPixels {
+    /// Packed 2:10:10:10 for `Rgb10a2Unorm`, 4 bytes per pixel. 10 bits of
+    /// colour but only 2 of alpha, so opaque images only.
+    Rgb10a2(Vec<u32>),
+    /// Four `u16` per pixel for `Rgba16Unorm`, 8 bytes per pixel. Full 16-bit
+    /// alpha, at double the VRAM. Needs the TEXTURE_FORMAT_16BIT_NORM feature.
+    Rgba16(Vec<u16>),
+}
+
 /// The pixel representation a decode produced.
 ///
-/// Sources with more than 8 bits per channel are packed straight to 10-bit when
-/// the swapchain can carry them; everything else stays on the 8-bit `ColorImage`
+/// Sources with more than 8 bits per channel go to a deep texture when the
+/// swapchain can carry them; everything else stays on the 8-bit `ColorImage`
 /// path that egui uploads for us.
 pub(super) enum DecodedImage {
     Srgb8(egui::ColorImage),
-    /// Packed for `wgpu::TextureFormat::Rgb10a2Unorm`, 4 bytes per pixel.
-    Rgb10a2 {
-        width: u32,
-        height: u32,
-        data: Vec<u32>,
-    },
+    Deep { width: u32, height: u32, pixels: DeepPixels },
+}
+
+/// What the GPU can actually do, resolved once at startup and shared with the
+/// worker pool so it only packs formats that can be displayed.
+#[derive(Default)]
+pub struct DeepColorCaps {
+    /// The swapchain is 10-bit, so a deep decode is worth producing at all.
+    pub enabled: AtomicBool,
+    /// The device has TEXTURE_FORMAT_16BIT_NORM, so `Rgba16Unorm` is usable.
+    pub rgba16: AtomicBool,
+}
+
+impl DeepColorCaps {
+    #[inline]
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+    #[inline]
+    pub fn rgba16(&self) -> bool {
+        self.rgba16.load(Ordering::Relaxed)
+    }
 }
 
 pub enum ImageLoadResult {
     Loaded(egui::ColorImage, (u32, u32), u8, [u8; 32], Option<i64>, Option<HistPalette>), // image, resolution, orientation, content_hash, exif_timestamp, histogram+palette
-    /// 10-bit variant of `Loaded`. `width`/`height` are the texture dimensions
-    /// (possibly downscaled to MAX_TEXTURE_SIDE); `resolution` is the file's
-    /// true resolution, as for `Loaded`.
-    Loaded10 {
-        data: Vec<u32>,
+    /// Deep-colour variant of `Loaded`. `width`/`height` are the texture
+    /// dimensions (possibly downscaled to MAX_TEXTURE_SIDE); `resolution` is
+    /// the file's true resolution, as for `Loaded`.
+    LoadedDeep {
+        pixels: DeepPixels,
         width: u32,
         height: u32,
         resolution: (u32, u32),
@@ -171,6 +201,8 @@ struct ImageUniform {
 /// `egui_wgpu::Renderer::callback_resources`.
 struct GpuImagePipeline {
     pipeline: wgpu::RenderPipeline,
+    /// Whether the device was created with TEXTURE_FORMAT_16BIT_NORM.
+    rgba16_supported: bool,
     /// Layout of group 1 (the per-image texture view).
     texture_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
@@ -206,8 +238,15 @@ impl ImageSource {
 
 /// Build the 10-bit blit pipeline. Call once, from the `eframe` creation
 /// closure, and only when `target_format` is actually 10-bit.
-pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) {
+///
+/// Returns true when the device also supports `Rgba16Unorm`, which is what
+/// backs images with real transparency (10-bit packing only has 2 alpha bits).
+pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) -> bool {
     let device = &rs.device;
+
+    // Requested in run() via WgpuConfiguration; absent on adapters that don't
+    // offer it, in which case transparent images stay on the 8-bit path.
+    let rgba16_supported = device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("phdupes_image_shader"),
@@ -335,22 +374,53 @@ pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) {
 
     rs.renderer.write().callback_resources.insert(GpuImagePipeline {
         pipeline,
+        rgba16_supported,
         texture_layout,
         uniform_buffer,
         bind_linear,
         bind_nearest,
     });
+
+    rgba16_supported
 }
 
 /// Upload packed 10-bit pixels to VRAM. Returns `None` if the pipeline was
 /// never initialised or the dimensions are degenerate.
 pub(super) fn upload_gpu_image(
     rs: &egui_wgpu::RenderState,
-    data: &[u32],
+    pixels: &DeepPixels,
     width: u32,
     height: u32,
 ) -> Option<GpuImage> {
-    if width == 0 || height == 0 || data.len() < (width as usize) * (height as usize) {
+    let px = (width as usize) * (height as usize);
+    // Both branches sample to vec4<f32>, so only the format and stride differ —
+    // the pipeline, layout, samplers and shader are shared.
+    let (label, format, stride, bytes): (&str, wgpu::TextureFormat, u32, &[u8]) = match pixels {
+        DeepPixels::Rgb10a2(v) => {
+            if v.len() < px {
+                return None;
+            }
+            (
+                "phdupes_image_rgb10a2",
+                wgpu::TextureFormat::Rgb10a2Unorm,
+                width * 4,
+                bytemuck::cast_slice(v),
+            )
+        }
+        DeepPixels::Rgba16(v) => {
+            if v.len() < px * 4 {
+                return None;
+            }
+            (
+                "phdupes_image_rgba16",
+                wgpu::TextureFormat::Rgba16Unorm,
+                width * 8,
+                bytemuck::cast_slice(v),
+            )
+        }
+    };
+
+    if width == 0 || height == 0 {
         return None;
     }
 
@@ -359,18 +429,18 @@ pub(super) fn upload_gpu_image(
 
     let extent = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
     let texture = rs.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("phdupes_image_10bit"),
+        label: Some(label),
         size: extent,
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgb10a2Unorm,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
 
     // Queue::write_texture has no 256-byte row alignment requirement (that
-    // applies to buffer-to-texture copies), so a tight width*4 stride is fine.
+    // applies to buffer-to-texture copies), so a tight stride is fine.
     rs.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
@@ -378,10 +448,10 @@ pub(super) fn upload_gpu_image(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        bytemuck::cast_slice(data),
+        bytes,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(width * 4),
+            bytes_per_row: Some(stride),
             rows_per_image: Some(height),
         },
         extent,
@@ -447,25 +517,38 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
     }
 }
 
-/// Unpack 10-bit pixels into an 8-bit `ColorImage`.
+/// Unpack deep pixels into an 8-bit `ColorImage`.
 ///
 /// Only for histogram and palette analysis, which downsamples to 128x128 and
 /// buckets into 256 bins — the discarded low bits cannot affect the result.
-fn rgb10a2_to_colorimage(data: &[u32], width: u32, height: u32) -> egui::ColorImage {
-    let pixels: Vec<egui::Color32> = data
-        .iter()
-        .map(|&p| {
-            let r = ((p & 0x3FF) >> 2) as u8;
-            let g = (((p >> 10) & 0x3FF) >> 2) as u8;
-            let b = (((p >> 20) & 0x3FF) >> 2) as u8;
-            // 2-bit alpha: 0..3 -> 0..255.
-            let a = (((p >> 30) & 0x3) * 85) as u8;
-            egui::Color32::from_rgba_unmultiplied(r, g, b, a)
-        })
-        .collect();
+fn deep_to_colorimage(pixels: &DeepPixels, width: u32, height: u32) -> egui::ColorImage {
+    let px: Vec<egui::Color32> = match pixels {
+        DeepPixels::Rgb10a2(data) => data
+            .iter()
+            .map(|&p| {
+                let r = ((p & 0x3FF) >> 2) as u8;
+                let g = (((p >> 10) & 0x3FF) >> 2) as u8;
+                let b = (((p >> 20) & 0x3FF) >> 2) as u8;
+                // 2-bit alpha: 0..3 -> 0..255.
+                let a = (((p >> 30) & 0x3) * 85) as u8;
+                egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+            })
+            .collect(),
+        DeepPixels::Rgba16(data) => data
+            .chunks_exact(4)
+            .map(|c| {
+                egui::Color32::from_rgba_unmultiplied(
+                    (c[0] >> 8) as u8,
+                    (c[1] >> 8) as u8,
+                    (c[2] >> 8) as u8,
+                    (c[3] >> 8) as u8,
+                )
+            })
+            .collect(),
+    };
     egui::ColorImage {
         size: [width as usize, height as usize],
-        pixels,
+        pixels: px,
         source_size: egui::vec2(width as f32, height as f32),
     }
 }
@@ -476,7 +559,7 @@ pub(super) fn spawn_image_loader_pool(
     palette_config: crate::db::PaletteConfig,
     hdr_config: crate::db::HdrConfig,
     histogram_enabled: Arc<AtomicBool>,
-    prefer_10bit: Arc<AtomicBool>,
+    deep_caps: Arc<DeepColorCaps>,
 ) -> (Sender<(PathBuf, usize, usize)>, Receiver<((PathBuf, usize, usize), ImageLoadResult)>) {
     let (tx, rx) = unbounded::<(PathBuf, usize, usize)>();
     let (result_tx, result_rx) = unbounded();
@@ -487,7 +570,7 @@ pub(super) fn spawn_image_loader_pool(
         let rx_clone = rx.clone();
         let tx_clone = result_tx.clone();
         let hist_flag = Arc::clone(&histogram_enabled);
-        let deep_flag = Arc::clone(&prefer_10bit);
+        let caps = Arc::clone(&deep_caps);
 
         let pcfg = palette_config;
         let hcfg = hdr_config;
@@ -553,7 +636,7 @@ pub(super) fn spawn_image_loader_pool(
                     use_thumbnails,
                     &content_key,
                     hcfg,
-                    deep_flag.load(Ordering::Relaxed),
+                    &caps,
                 ) {
                     Ok((decoded, dims, orientation, content_hash, exif_timestamp)) => {
                         // Only compute histogram + palette when the overlay is enabled;
@@ -569,8 +652,8 @@ pub(super) fn spawn_image_loader_pool(
                                     img.size[0] != dims.0 as usize
                                         || img.size[1] != dims.1 as usize,
                                 ),
-                                DecodedImage::Rgb10a2 { width, height, data } => (
-                                    Cow::Owned(rgb10a2_to_colorimage(data, *width, *height)),
+                                DecodedImage::Deep { width, height, pixels } => (
+                                    Cow::Owned(deep_to_colorimage(pixels, *width, *height)),
                                     *width != dims.0 || *height != dims.1,
                                 ),
                             };
@@ -605,9 +688,9 @@ pub(super) fn spawn_image_loader_pool(
                                 exif_timestamp,
                                 hist_palette,
                             ),
-                            DecodedImage::Rgb10a2 { width, height, data } => {
-                                ImageLoadResult::Loaded10 {
-                                    data,
+                            DecodedImage::Deep { width, height, pixels } => {
+                                ImageLoadResult::LoadedDeep {
+                                    pixels,
                                     width,
                                     height,
                                     resolution: dims,
@@ -652,7 +735,7 @@ fn load_and_process_image_with_hash(
     use_thumbnails: bool,
     content_key: &[u8; 32],
     hdr_config: crate::db::HdrConfig,
-    prefer_10bit: bool,
+    caps: &DeepColorCaps,
 ) -> Result<(DecodedImage, (u32, u32), u8, [u8; 32], Option<i64>), String> {
     // Read file once for both hashing and image processing
     let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
@@ -680,7 +763,7 @@ fn load_and_process_image_with_hash(
 
     // Process the image using existing logic
     let (img, dims, orientation) =
-        load_and_process_image_from_bytes(path, &bytes, use_thumbnails, hdr_config, prefer_10bit)?;
+        load_and_process_image_from_bytes(path, &bytes, use_thumbnails, hdr_config, caps)?;
 
     Ok((img, dims, orientation, content_hash, exif_timestamp))
 }
@@ -714,8 +797,8 @@ fn maybe_downscale_dynamic(img: image::DynamicImage, path: &Path) -> image::Dyna
 }
 
 /// True when the decoded image carries more than 8 bits per channel and is
-/// therefore worth keeping at 10 bits. An 8-bit source gains nothing from the
-/// deeper path — expanding 256 levels to 1023 adds no information.
+/// therefore worth keeping in a deep texture. An 8-bit source gains nothing —
+/// expanding 256 levels to 1023 adds no information.
 fn is_deep_color(img: &image::DynamicImage) -> bool {
     matches!(
         img.color(),
@@ -728,18 +811,63 @@ fn is_deep_color(img: &image::DynamicImage) -> bool {
     )
 }
 
+/// True when the image actually uses its alpha channel.
+///
+/// A fully opaque RGBA source is far more common than a genuinely transparent
+/// one, and opaque images can stay on the 4-bytes-per-pixel Rgb10a2 path, so
+/// the scan is worth it. Bails at the first non-opaque pixel.
+fn has_real_transparency(img: &image::DynamicImage) -> bool {
+    use image::DynamicImage as D;
+    match img {
+        D::ImageRgba16(b) => b.as_raw().chunks_exact(4).any(|p| p[3] != u16::MAX),
+        D::ImageLumaA16(b) => b.as_raw().chunks_exact(2).any(|p| p[1] != u16::MAX),
+        D::ImageRgba32F(b) => b.as_raw().chunks_exact(4).any(|p| p[3] < 1.0),
+        // DynamicImage is non_exhaustive; anything else either has no alpha
+        // channel at all or is 8-bit and never reaches the deep path.
+        _ => img.color().has_alpha(),
+    }
+}
+
+/// Choose the deep pixel format for an image that has already been established
+/// as deep-colour, or `None` if it has to fall back to the 8-bit path.
+///
+/// Transparent images cannot use Rgb10a2Unorm: two bits of alpha quantises
+/// every pixel to fully transparent, 1/3, 2/3 or opaque, which wrecks soft
+/// edges and gradients. They need Rgba16Unorm, and if the device lacks
+/// TEXTURE_FORMAT_16BIT_NORM the dithered 8-bit path — with a correct 8-bit
+/// alpha channel — is a far better answer than 2-bit alpha.
+fn deep_format_for(img: &image::DynamicImage, caps: &DeepColorCaps) -> Option<bool> {
+    if !has_real_transparency(img) {
+        return Some(false); // opaque -> Rgb10a2
+    }
+    if caps.rgba16() {
+        Some(true) // transparent -> Rgba16
+    } else {
+        None // transparent, no 16-bit norm support -> 8-bit fallback
+    }
+}
+
 /// Pick the final pixel representation for a plain (non-HDR) decoded image.
 fn finish_dynamic(
     dyn_img: image::DynamicImage,
     real_dims: (u32, u32),
     orientation: u8,
-    prefer_10bit: bool,
+    caps: &DeepColorCaps,
     path: &Path,
 ) -> (DecodedImage, (u32, u32), u8) {
-    if prefer_10bit && is_deep_color(&dyn_img) {
+    if caps.enabled()
+        && is_deep_color(&dyn_img)
+        && let Some(wide) = deep_format_for(&dyn_img, caps)
+    {
         let dyn_img = maybe_downscale_dynamic(dyn_img, path);
-        let (w, h, data) = crate::hdr::requantize_srgb16_to_rgb10a2(&dyn_img);
-        return (DecodedImage::Rgb10a2 { width: w, height: h, data }, real_dims, orientation);
+        let (w, h, pixels) = if wide {
+            let (w, h, data) = crate::hdr::requantize_srgb16_to_rgba16(&dyn_img);
+            (w, h, DeepPixels::Rgba16(data))
+        } else {
+            let (w, h, data) = crate::hdr::requantize_srgb16_to_rgb10a2(&dyn_img);
+            (w, h, DeepPixels::Rgb10a2(data))
+        };
+        return (DecodedImage::Deep { width: w, height: h, pixels }, real_dims, orientation);
     }
     srgb8_result(dynamic_image_to_egui(dyn_img), real_dims, orientation, path)
 }
@@ -1047,12 +1175,39 @@ fn decode_animated_gif_frames(
     Ok((frames, durations, dims, orientation))
 }
 
+/// Wrap a 16-bit LibRaw full decode as a `DynamicImage` so it can go through the
+/// same `finish_dynamic` path as every other deep-colour source.
+///
+/// The `to_vec` is a full copy (~360 MB for a 60 MP RGB decode), unavoidable
+/// unless rsraw grows a way to hand over the buffer.
+fn raw16_to_dynamic(w: usize, h: usize, samples: &[u16]) -> Result<image::DynamicImage, String> {
+    let total_pixels = w * h;
+    if samples.len() == total_pixels {
+        // Monochrome sensor
+        image::ImageBuffer::<image::Luma<u16>, _>::from_raw(w as u32, h as u32, samples.to_vec())
+            .map(image::DynamicImage::ImageLuma16)
+            .ok_or_else(|| "RAW: failed to build 16-bit grayscale buffer".to_string())
+    } else if samples.len() == total_pixels * 3 {
+        image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(w as u32, h as u32, samples.to_vec())
+            .map(image::DynamicImage::ImageRgb16)
+            .ok_or_else(|| "RAW: failed to build 16-bit RGB buffer".to_string())
+    } else {
+        Err(format!(
+            "RAW size mismatch: expected {} (Mono) or {} (RGB) u16 samples, got {}. \
+             If that is exactly double, ProcessedImage<BIT_DEPTH_16> is handing back \
+             bytes rather than u16 and needs a cast at the call site.",
+            total_pixels,
+            total_pixels * 3,
+            samples.len()
+        ))
+    }
+}
 fn load_and_process_image_from_bytes(
     path: &Path,
     bytes: &[u8],
     use_thumbnails: bool,
     hdr_config: crate::db::HdrConfig,
-    prefer_10bit: bool,
+    caps: &DeepColorCaps,
 ) -> Result<(DecodedImage, (u32, u32), u8), String> {
     // ---------------------------------------------------------------------
     // RAW FILES
@@ -1098,63 +1253,69 @@ fn load_and_process_image_from_bytes(
 
         // 2. Full RAW decode mode
         raw.set_use_camera_wb(true);
-        match raw.unpack() {
-            Ok(_) => match raw.process::<{ rsraw::BIT_DEPTH_16 }>() {
-                Ok(processed) => {
-                    let w = processed.width() as u32;
-                    let h = processed.height() as u32;
-                    let total_pixels = (w * h) as usize;
-                    // Determine channels dynamically
-                    let dyn_img = if processed.len() == total_pixels {
-                        // Monochrome: 1 u16 per pixel
-                        let buf = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_vec(
-                            w,
-                            h,
-                            processed.to_vec(),
-                        )
-                        .ok_or_else(|| {
-                            "Failed to create 16-bit Mono buffer from RAW".to_string()
-                        })?;
-                        image::DynamicImage::ImageLuma16(buf)
-                    } else if processed.len() == total_pixels * 3 {
-                        // RGB: 3 u16 per pixel
-                        let buf = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_vec(
-                            w,
-                            h,
-                            processed.to_vec(),
-                        )
-                        .ok_or_else(|| "Failed to create 16-bit RGB buffer from RAW".to_string())?;
-                        image::DynamicImage::ImageRgb16(buf)
-                    } else {
-                        return Err(format!(
-                            "RAW size mismatch: expected {} (Mono) or {} (RGB) 16-bit values, got {}",
-                            total_pixels,
-                            total_pixels * 3,
-                            processed.len()
-                        ));
-                    };
-
-                    // rsraw handles rotation, orientation=1
-                    return Ok(finish_dynamic(dyn_img, (w, h), 1, prefer_10bit, path));
+        // Decode at 16 bits only when a deep texture can actually show them.
+        // LibRaw works at 16 bits internally either way, but asking for a
+        // 16-bit buffer doubles peak memory (a 60 MP RGB decode is ~360 MB
+        // rather than ~180 MB), so there is no reason to pay that on an 8-bit
+        // surface. `process` is const-generic over the depth, hence two arms
+        // instead of a runtime flag.
+        //
+        // Either way the pixels come out gamma-encoded with LibRaw's default
+        // output curve, which we treat as sRGB — the same approximation the
+        // 8-bit path has always made. Only the bit depth changes here.
+        let full_decode: Result<DecodedImage, String> = match raw.unpack() {
+            Ok(_) => {
+                if caps.enabled() {
+                    raw.process::<{ rsraw::BIT_DEPTH_16 }>()
+                        .map_err(|e| format!("Failed to process RAW: {}", e))
+                        .and_then(|processed| {
+                            let w = processed.width() as usize;
+                            let h = processed.height() as usize;
+                            raw16_to_dynamic(w, h, &processed)
+                        })
+                        // RAW carries no alpha, so this always lands on the
+                        // 4-bytes-per-pixel Rgb10a2 path, never Rgba16.
+                        .map(|dyn_img| finish_dynamic(dyn_img, dims, 1, caps, path).0)
+                } else {
+                    raw.process::<{ rsraw::BIT_DEPTH_8 }>()
+                        .map_err(|e| format!("Failed to process RAW: {}", e))
+                        .and_then(|processed| {
+                            let w = processed.width() as usize;
+                            let h = processed.height() as usize;
+                            let total_pixels = w * h;
+                            // Determine channels dynamically
+                            if processed.len() == total_pixels {
+                                // Monochrome: 1 byte per pixel
+                                Ok(egui::ColorImage::from_gray([w, h], &processed))
+                            } else if processed.len() == total_pixels * 3 {
+                                // RGB: 3 bytes per pixel
+                                Ok(egui::ColorImage::from_rgb([w, h], &processed))
+                            } else {
+                                Err(format!(
+                                    "RAW size mismatch: expected {} (Mono) or {} (RGB) bytes, got {}",
+                                    total_pixels,
+                                    total_pixels * 3,
+                                    processed.len()
+                                ))
+                            }
+                        })
+                        .map(|img| DecodedImage::Srgb8(maybe_resize_image(img, dims, 1, path).0))
                 }
-                Err(e) => {
-                    // Fallback to thumbnail on process error
-                    if let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
-                        let actual_orientation =
-                            if thumb_orient != 1 { thumb_orient } else { raw_fallback_orientation };
-                        return Ok(srgb8_result(thumb, dims, actual_orientation, path));
-                    }
-                    return Err(format!("Failed to process RAW: {}", e));
-                }
-            },
+            }
+            Err(e) => Err(format!("Failed to unpack RAW: {}", e)),
+        };
+        // rsraw handles rotation, so orientation = 1 for a full decode.
+        match full_decode {
+            Ok(decoded) => return Ok((decoded, dims, 1)),
             Err(e) => {
-                // Fallback to thumbnail on unpack error (unsupported full decode formats)
+                // Fallback to thumbnail on unpack or process error
+                // (unsupported full-decode formats)
                 if let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
                     let actual_orientation =
                         if thumb_orient != 1 { thumb_orient } else { raw_fallback_orientation };
                     return Ok(srgb8_result(thumb, dims, actual_orientation, path));
                 }
-                return Err(format!("Failed to unpack RAW: {}", e));
+                return Err(e);
             }
         }
     }
@@ -1192,7 +1353,7 @@ fn load_and_process_image_from_bytes(
                 eprintln!("[DEBUG-GUI] scanner decode SUCCESS for {:?}", path);
                 // 16-bit TIFF and JXL reach this branch, so let finish_dynamic
                 // decide whether they are worth keeping at 10 bits.
-                return Ok(finish_dynamic(dyn_img, (w, h), orientation, prefer_10bit, path));
+                return Ok(finish_dynamic(dyn_img, (w, h), orientation, caps, path));
             }
             Err(err_msg) => {
                 eprintln!("[DEBUG-GUI] scanner decode FAILED for {:?}: {}", path, err_msg);
@@ -1250,13 +1411,21 @@ fn load_and_process_image_from_bytes(
             cicp.full_range,
         );
 
-        if prefer_10bit {
+        if caps.enabled()
+            && let Some(wide) = deep_format_for(&dyn_img, caps)
+        {
             // The BT.2390 curve packs 10000 nits into the display range, so the
-            // extra 2 bits per channel matter most here of anywhere.
+            // extra bits per channel matter more here than anywhere else.
             let dyn_img = maybe_downscale_dynamic(dyn_img, path);
-            let (w, h, data) =
-                crate::hdr::process_hdr_to_rgb10a2(&dyn_img, cicp, hdr_config.sdr_peak_nits);
-            return Ok((DecodedImage::Rgb10a2 { width: w, height: h, data }, dims, orientation));
+            let peak = hdr_config.sdr_peak_nits;
+            let (w, h, pixels) = if wide {
+                let (w, h, data) = crate::hdr::process_hdr_to_rgba16(&dyn_img, cicp, peak);
+                (w, h, DeepPixels::Rgba16(data))
+            } else {
+                let (w, h, data) = crate::hdr::process_hdr_to_rgb10a2(&dyn_img, cicp, peak);
+                (w, h, DeepPixels::Rgb10a2(data))
+            };
+            return Ok((DecodedImage::Deep { width: w, height: h, pixels }, dims, orientation));
         }
 
         let rgba = crate::hdr::process_hdr_to_sdr(&dyn_img, cicp, hdr_config.sdr_peak_nits);
@@ -1267,7 +1436,7 @@ fn load_and_process_image_from_bytes(
         return Ok(srgb8_result(img, dims, orientation, path));
     }
 
-    Ok(finish_dynamic(dyn_img, dims, orientation, prefer_10bit, path))
+    Ok(finish_dynamic(dyn_img, dims, orientation, caps, path))
 }
 
 pub(super) fn update_file_metadata(

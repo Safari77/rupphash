@@ -656,6 +656,41 @@ pub fn requantize_srgb16_to_rgb10a2(img: &DynamicImage) -> (u32, u32, Vec<u32>) 
     (width, height, out)
 }
 
+/// No dither and no math: source and target are both 16-bit sRGB-encoded, so
+/// this is a straight copy. Kept as its own function anyway so the call site
+/// reads the same as the other three and `to_rgba16_flat` stays private.
+pub fn requantize_srgb16_to_rgba16(img: &DynamicImage) -> (u32, u32, Vec<u16>) {
+    to_rgba16_flat(img)
+}
+
+/// As `process_hdr_to_rgb10a2`, but writing 16-bit RGBA.
+///
+/// Use for HDR sources that carry a real alpha channel — 2-bit alpha would
+/// quantise every pixel to fully transparent, 1/3, 2/3 or opaque. Costs 8 bytes
+/// per pixel instead of 4.
+pub fn process_hdr_to_rgba16(
+    img: &DynamicImage,
+    cicp: Cicp,
+    sdr_peak_nits: f32,
+) -> (u32, u32, Vec<u16>) {
+    let params = TonemapParams::new(cicp, sdr_peak_nits);
+    let (width, height, raw_rgba_u16) = to_rgba16_flat(img);
+
+    let mut out: Vec<u16> = vec![0u16; (width as usize) * (height as usize) * 4];
+
+    raw_rgba_u16.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).for_each(|(src, dst)| {
+        let (r, g, b, a) = tonemap_px(src, params);
+        // 65536 codes is far below the visible threshold, so no dither here.
+        let q = |v: f32| (v * 65535.0).round().clamp(0.0, 65535.0) as u16;
+        dst[0] = q(r);
+        dst[1] = q(g);
+        dst[2] = q(b);
+        dst[3] = q(a);
+    });
+
+    (width, height, out)
+}
+
 #[inline]
 fn srgb_to_linear_simple(v: f32) -> f32 {
     if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
