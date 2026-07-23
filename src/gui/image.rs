@@ -147,11 +147,18 @@ const NEAREST_ZOOM_THRESHOLD: f32 = 2.0;
 
 const IMAGE_SHADER_WGSL: &str = r#"
 struct Uniforms {
-    // Row-major 2x2 matrix mapping quad space [0,1]^2 to texture UV, packed as
-    // [m00, m01, m10, m11]. Carries EXIF/manual rotation, flips, pan and zoom.
+    // The image rect in normalized device coordinates: (x0, y0, x1, y1), with
+    // y0 the top edge. Absolute, not viewport-relative — see the note on
+    // ImageCallback::paint for why.
+    rect: vec4<f32>,
+    // Row-major 2x2 mapping quad space [0,1]^2 to texture UV, packed as
+    // [m00, m01, m10, m11]. Pure rotation and flip; the quad IS the image, so
+    // there is no scale or pan term here.
     uv_mat: vec4<f32>,
     uv_off: vec2<f32>,
-    _pad: vec2<f32>,
+    // 0 = normal, 1 = solid magenta, 2 = uv as red/green. See gpu_debug_mode().
+    debug_mode: f32,
+    _pad: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -165,11 +172,18 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
-    // Triangle strip covering the callback viewport: (0,0) (1,0) (0,1) (1,1).
+    // Triangle strip over the image: (0,0) (1,0) (0,1) (1,1) in quad space.
     let q = vec2<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u));
     var out: VsOut;
-    // Quad y grows downward (screen convention), clip y grows upward.
-    out.pos = vec4<f32>(q.x * 2.0 - 1.0, 1.0 - q.y * 2.0, 0.0, 1.0);
+    // Place the quad at absolute clip coordinates. Parts that fall outside the
+    // panel are removed by egui's scissor rect, exactly as for egui's own
+    // meshes — nothing here depends on the viewport matching a rect.
+    out.pos = vec4<f32>(
+        mix(u.rect.x, u.rect.z, q.x),
+        mix(u.rect.y, u.rect.w, q.y),
+        0.0,
+        1.0,
+    );
     out.uv = vec2<f32>(
         u.uv_mat.x * q.x + u.uv_mat.y * q.y + u.uv_off.x,
         u.uv_mat.z * q.x + u.uv_mat.w * q.y + u.uv_off.y,
@@ -179,12 +193,17 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Outside the image: leave the panel background alone. This is what
-    // letterboxes a fitted image and crops a zoomed-in one.
-    if (in.uv.x < 0.0 || in.uv.x > 1.0 || in.uv.y < 0.0 || in.uv.y > 1.0) {
-        discard;
+    if (u.debug_mode > 1.5) {
+        // Where in the texture each visible pixel came from. Black at uv 0,0
+        // (top-left of the image), yellow at 1,1.
+        return vec4<f32>(in.uv.x, in.uv.y, 0.0, 1.0);
     }
-    // Pass-through: no transfer function on either side of this sample.
+    if (u.debug_mode > 0.5) {
+        // The exact extent of the quad on screen, texture ignored.
+        return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    }
+    // uv is a rotation/flip of q, so it never leaves [0,1] and needs no bounds
+    // check. Pass-through: no transfer function on either side of this sample.
     return textureSample(tex, samp, in.uv);
 }
 "#;
@@ -192,9 +211,39 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ImageUniform {
+    rect: [f32; 4],
     uv_mat: [f32; 4],
     uv_off: [f32; 2],
-    _pad: [f32; 2],
+    debug_mode: f32,
+    _pad: f32,
+}
+
+/// Diagnostic level for the deep-colour blit, from `PHDUPES_GPU_DEBUG`:
+///
+/// * `1` — log the geometry every time it changes, and fill the quad with solid
+///   magenta. If the magenta block has a border, the quad itself is inset and
+///   the problem is the viewport, the scissor, or the clip rect. If the magenta
+///   reaches every edge, the quad is right and the border is coming from the
+///   texture or the UVs.
+/// * `2` — log, and render uv as red/green instead of sampling. Black is the
+///   image's top-left, yellow its bottom-right. Shows which part of the texture
+///   is landing where, independent of the texture's contents.
+fn gpu_debug_mode() -> u32 {
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("PHDUPES_GPU_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
+}
+
+/// Print `msg` only when it differs from the last one for this slot, so
+/// per-frame diagnostics don't flood the terminal.
+fn log_changed(slot: &std::sync::Mutex<String>, msg: String) {
+    if let Ok(mut last) = slot.lock()
+        && *last != msg
+    {
+        eprintln!("{}", msg);
+        *last = msg;
+    }
 }
 
 /// Pipeline and shared bindings, created once and stashed in
@@ -258,7 +307,10 @@ pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) -> bool {
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                // The vertex stage reads rect/uv_mat/uv_off; the fragment stage
+                // reads debug_mode. Both stages must be listed or wgpu rejects
+                // the pipeline at creation.
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -457,6 +509,17 @@ pub(super) fn upload_gpu_image(
         extent,
     );
 
+    if gpu_debug_mode() > 0 {
+        eprintln!(
+            "[GPU-DBG] upload   {} {}x{} stride={}B bytes={}",
+            label,
+            width,
+            height,
+            stride,
+            bytes.len()
+        );
+    }
+
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = rs.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("phdupes_image_bind"),
@@ -477,6 +540,9 @@ pub(super) fn upload_gpu_image(
 /// One image blit. egui keeps this alive for the frame it was queued in.
 struct ImageCallback {
     bind_group: Arc<wgpu::BindGroup>,
+    /// The image rect in egui points, in screen space. Converted to clip space
+    /// in `prepare`, once the screen size is known.
+    target_rect: egui::Rect,
     uv_mat: [f32; 4],
     uv_off: [f32; 2],
     nearest: bool,
@@ -487,28 +553,111 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
         &self,
         _device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
         _egui_encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         // Only ever one image on screen at a time, so a single shared uniform
         // buffer rewritten each frame is safe.
-        if let Some(pipe) = resources.get::<GpuImagePipeline>() {
-            let uniform = ImageUniform { uv_mat: self.uv_mat, uv_off: self.uv_off, _pad: [0.0; 2] };
-            queue.write_buffer(&pipe.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        let Some(pipe) = resources.get::<GpuImagePipeline>() else {
+            return Vec::new();
+        };
+
+        // Points -> clip space, against the whole framebuffer.
+        let [w_px, h_px] = screen_descriptor.size_in_pixels;
+        let ppp = screen_descriptor.pixels_per_point;
+        let (w_px, h_px) = (w_px.max(1) as f32, h_px.max(1) as f32);
+        let ndc_x = |x: f32| (x * ppp) / w_px * 2.0 - 1.0;
+        let ndc_y = |y: f32| 1.0 - (y * ppp) / h_px * 2.0;
+
+        let uniform = ImageUniform {
+            rect: [
+                ndc_x(self.target_rect.min.x),
+                ndc_y(self.target_rect.min.y),
+                ndc_x(self.target_rect.max.x),
+                ndc_y(self.target_rect.max.y),
+            ],
+            uv_mat: self.uv_mat,
+            uv_off: self.uv_off,
+            debug_mode: gpu_debug_mode() as f32,
+            _pad: 0.0,
+        };
+
+        if gpu_debug_mode() > 0 {
+            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+            log_changed(
+                &LAST,
+                format!(
+                    "[GPU-DBG] prepare  screen={}x{}px ppp={:.4}  screen_pts={:.1}x{:.1}\n\
+                     [GPU-DBG]          target_pts={:?}\n\
+                     [GPU-DBG]          ndc=[{:.5}, {:.5}, {:.5}, {:.5}]  uv_mat={:?} uv_off={:?}",
+                    w_px as u32,
+                    h_px as u32,
+                    ppp,
+                    w_px / ppp,
+                    h_px / ppp,
+                    self.target_rect,
+                    uniform.rect[0],
+                    uniform.rect[1],
+                    uniform.rect[2],
+                    uniform.rect[3],
+                    uniform.uv_mat,
+                    uniform.uv_off,
+                ),
+            );
         }
+
+        queue.write_buffer(&pipe.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         Vec::new()
     }
 
     fn paint(
         &self,
-        _info: egui::PaintCallbackInfo,
+        info: egui::PaintCallbackInfo,
         render_pass: &mut wgpu::RenderPass<'static>,
         resources: &egui_wgpu::CallbackResources,
     ) {
         let Some(pipe) = resources.get::<GpuImagePipeline>() else {
             return;
         };
+
+        // egui sets a "courtesy" viewport from the callback rect before calling
+        // us, which does not reliably match that rect. Since our vertices are in
+        // absolute clip space, override it with the full framebuffer; egui's
+        // scissor rect still crops us to the panel. egui restores both after the
+        // callback, so this does not leak into later primitives.
+        let [w_px, h_px] = info.screen_size_px;
+        render_pass.set_viewport(0.0, 0.0, w_px as f32, h_px as f32, 0.0, 1.0);
+
+        if gpu_debug_mode() > 0 {
+            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+            let vp = info.viewport_in_pixels();
+            let clip = info.clip_rect_in_pixels();
+
+            log_changed(
+                &LAST,
+                format!(
+                    "[GPU-DBG] paint    screen_size_px={:?} ppp={:.4}\n\
+                     [GPU-DBG]          info.viewport(pts)={:?}\n\
+                     [GPU-DBG]          info.clip_rect(pts)={:?}\n\
+                     [GPU-DBG]          viewport_in_pixels=[x: {}, y: {}, w: {}, h: {}]\n\
+                     [GPU-DBG]          clip_rect_in_pixels=[x: {}, y: {}, w: {}, h: {}]  (this becomes the scissor)",
+                    info.screen_size_px,
+                    info.pixels_per_point,
+                    info.viewport,
+                    info.clip_rect,
+                    vp.left_px,
+                    vp.top_px,
+                    vp.width_px,
+                    vp.height_px,
+                    clip.left_px,
+                    clip.top_px,
+                    clip.width_px,
+                    clip.height_px,
+                ),
+            );
+        }
+
         let shared = if self.nearest { &pipe.bind_nearest } else { &pipe.bind_linear };
         render_pass.set_pipeline(&pipe.pipeline);
         render_pass.set_bind_group(0, shared, &[]);
@@ -1581,28 +1730,18 @@ fn extract_best_thumbnail(raw: &mut rsraw::RawImage) -> Option<(egui::ColorImage
     Some((egui::ColorImage::from_rgb([width as usize, height as usize], rgb.as_raw()), orientation))
 }
 
-/// Compose the quad-space -> texture-UV transform for the 10-bit blit.
+/// Quad-space -> texture-UV transform for the deep-colour blit: rotation and
+/// flips only.
 ///
-/// The callback rect is always `available_rect` (never the image rect), because
-/// egui clamps a callback viewport to the screen: handing it an off-screen rect
-/// when zoomed in would squash the image instead of cropping it. So quad space
-/// covers the viewport, and this maps it into the image, letting the shader
-/// discard whatever falls outside.
-fn image_uv_transform(
-    available_rect: egui::Rect,
-    target_rect: egui::Rect,
-    steps: u32,
-    flip_h: bool,
-    flip_v: bool,
-) -> ([f32; 4], [f32; 2]) {
-    // Stage 1: quad space -> normalised position within the on-screen image.
-    let sx = available_rect.width() / target_rect.width();
-    let sy = available_rect.height() / target_rect.height();
-    let ox = (available_rect.min.x - target_rect.min.x) / target_rect.width();
-    let oy = (available_rect.min.y - target_rect.min.y) / target_rect.height();
-
-    // Stage 2: rotation, as a 2x2 [r00, r01, r10, r11] plus offset. Clockwise,
-    // matching the EXIF convention (orientation 6 => one quarter turn CW).
+/// The quad is placed directly over the image rect in clip space, so unlike an
+/// earlier version of this there is no scale or pan term to get wrong — `q` and
+/// `uv` are the same square, just possibly turned over. Cropping is left to
+/// egui's scissor rect, exactly as it is for egui's own meshes.
+///
+/// Returned as a row-major 2x2 `[m00, m01, m10, m11]` plus an offset.
+fn image_uv_transform(steps: u32, flip_h: bool, flip_v: bool) -> ([f32; 4], [f32; 2]) {
+    // Clockwise, matching the EXIF convention (orientation 6 => one quarter
+    // turn CW).
     let (r, roff) = match steps % 4 {
         1 => ([0.0, 1.0, -1.0, 0.0], [0.0, 1.0]),
         2 => ([-1.0, 0.0, 0.0, -1.0], [1.0, 1.0]),
@@ -1612,7 +1751,7 @@ fn image_uv_transform(
     let mut r: [f32; 4] = r;
     let mut roff: [f32; 2] = roff;
 
-    // Stage 3: flips, applied after rotation (u -> 1-u negates that output row).
+    // Flips are applied after rotation (u -> 1-u negates that output row).
     if flip_h {
         r[0] = -r[0];
         r[1] = -r[1];
@@ -1624,10 +1763,7 @@ fn image_uv_transform(
         roff[1] = 1.0 - roff[1];
     }
 
-    // Collapse both affine stages into one.
-    let mat = [r[0] * sx, r[1] * sy, r[2] * sx, r[3] * sy];
-    let off = [r[0] * ox + r[1] * oy + roff[0], r[2] * ox + r[3] * oy + roff[1]];
-    (mat, off)
+    (r, roff)
 }
 
 // Helper to render an image with pan/zoom logic, from either backing store.
@@ -1741,8 +1877,13 @@ pub(super) fn render_image_texture(
     // Allocate space for the WHOLE available area to catch mouse events everywhere
     let response = ui.allocate_rect(available_rect, egui::Sense::click_and_drag());
 
-    // Clip to the available area so zoomed images don't spill out
-    let painter = ui.painter().with_clip_rect(available_rect);
+    // NOTE: do NOT clip to available_rect here. `available_rect` comes from
+    // `ui.available_rect_before_wrap()`, which is the panel rect minus the
+    // CentralPanel frame's inner margin (8 points by default). `Image::paint_at`
+    // below paints through `ui.painter()`, whose clip rect is the full panel
+    // rect, so clipping the callback to available_rect insets it by that margin
+    // on every side — a uniform border on the deep path and not the 8-bit one.
+    // Both paths must use the same painter to line up.
 
     match source {
         ImageSource::Egui { id, size } => {
@@ -1759,24 +1900,59 @@ pub(super) fn render_image_texture(
                 .paint_at(ui, paint_rect);
         }
         ImageSource::Gpu { bind_group, .. } => {
-            // Rotation and flips ride in the UV transform rather than the mesh,
-            // so the callback always covers the (on-screen) available_rect.
-            let (uv_mat, uv_off) = image_uv_transform(
-                available_rect,
-                target_rect,
-                total_steps as u32,
-                file_transform.flip_horizontal,
-                file_transform.flip_vertical,
-            );
-            painter.add(egui_wgpu::Callback::new_paint_callback(
-                available_rect,
-                ImageCallback {
-                    bind_group,
-                    uv_mat,
-                    uv_off,
-                    nearest: zoom_factor >= NEAREST_ZOOM_THRESHOLD,
-                },
-            ));
+            // Same painter, and therefore the same clip rect, that paint_at
+            // uses in the branch above.
+            let painter = ui.painter();
+            let clip_rect = painter.clip_rect();
+
+            // The callback rect only has to be non-degenerate for egui to
+            // invoke us. The quad's actual position comes from target_rect in
+            // clip space, and cropping is the scissor's job.
+            let draw_rect = target_rect.intersect(clip_rect);
+
+            // Degenerate means nothing is visible. Skip the draw but fall
+            // through to the interaction handling below, so panning still works
+            // and the user can bring the image back.
+            if draw_rect.is_positive() {
+                if gpu_debug_mode() > 0 {
+                    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+                    log_changed(
+                        &LAST,
+                        format!(
+                            "[GPU-DBG] layout   tex={:?} visual={:?} zoom={:.4} steps={}\n\
+                             [GPU-DBG]          avail={:?}  (frame content, NOT the clip rect)\n\
+                             [GPU-DBG]          clip={:?}   (painter clip -> scissor)\n\
+                             [GPU-DBG]          target={:?}\n\
+                             [GPU-DBG]          draw={:?}",
+                            texture_size,
+                            visual_size,
+                            zoom_factor,
+                            total_steps,
+                            available_rect,
+                            clip_rect,
+                            target_rect,
+                            draw_rect,
+                        ),
+                    );
+                }
+
+                // Rotation and flips ride in the UV transform, not the mesh.
+                let (uv_mat, uv_off) = image_uv_transform(
+                    total_steps as u32,
+                    file_transform.flip_horizontal,
+                    file_transform.flip_vertical,
+                );
+                painter.add(egui_wgpu::Callback::new_paint_callback(
+                    draw_rect,
+                    ImageCallback {
+                        bind_group,
+                        target_rect,
+                        uv_mat,
+                        uv_off,
+                        nearest: zoom_factor >= NEAREST_ZOOM_THRESHOLD,
+                    },
+                ));
+            }
         }
     }
 
