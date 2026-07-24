@@ -8,11 +8,12 @@
 //! and desaturated in the default `image::DynamicImage::to_rgba8()` path).
 //!
 //! Pipeline (applied per pixel, in f32, in this order):
-//!   1. Normalize 16-bit code values to [0, 1].
+//!   1. Normalize 16-bit code values to [0, 1], expanding limited (video)
+//!      range RGB to full range when the cICP flags signal it.
 //!   2. Apply the inverse transfer function (PQ or HLG) to get linear light
 //!      in nits. PQ peak is 10000 nits; HLG is system-gamma-corrected.
-//!   3. Convert BT.2020 primaries → BT.709 primaries via a 3x3 matrix in
-//!      linear light.
+//!   3. Convert BT.2020 or Display-P3 primaries → BT.709 primaries via a
+//!      3x3 matrix in linear light.
 //!   4. Tone-map HDR (up to 10000 nits) → SDR peak (user-configurable, in
 //!      nits) using the ITU-R BT.2390 EETF. This is the algorithm mpv uses
 //!      by default for HDR→SDR.
@@ -32,7 +33,7 @@ use rayon::prelude::*;
 /// `cICP` chunk (and equivalent metadata in AVIF, HEIF, MKV, etc.).
 #[derive(Debug, Clone, Copy)]
 pub struct Cicp {
-    /// H.273 Table 2 — e.g. 1 = BT.709, 9 = BT.2020.
+    /// H.273 Table 2 — e.g. 1 = BT.709, 9 = BT.2020, 12 = Display P3.
     pub color_primaries: u8,
     /// H.273 Table 3 — e.g. 13 = sRGB, 16 = SMPTE 2084 (PQ), 18 = ARIB HLG.
     pub transfer_characteristics: u8,
@@ -334,12 +335,12 @@ fn hlg_eotf(e: f32, peak_nits: f32) -> f32 {
 // sRGB OETF (linear → non-linear, [0,1] → [0,1]).
 #[inline]
 fn srgb_oetf(v: f32) -> f32 {
-    let v = v.max(0.0).min(1.0);
+    // let v = v.clamp(0.0, 1.0);
     if v <= 0.0031308 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
 }
 
 // ---------------------------------------------------------------------------
-// Primaries conversion: BT.2020 linear → BT.709 linear
+// Primaries conversion: BT.2020 / Display-P3 linear → BT.709 linear
 // ---------------------------------------------------------------------------
 
 // Derived from the standard BT.2020 and BT.709 primaries + D65 white point.
@@ -353,6 +354,25 @@ const BT2020_TO_BT709: [[f32; 3]; 3] = [
 #[inline]
 fn bt2020_to_bt709_linear(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let m = &BT2020_TO_BT709;
+    (
+        m[0][0] * r + m[0][1] * g + m[0][2] * b,
+        m[1][0] * r + m[1][1] * g + m[1][2] * b,
+        m[2][0] * r + m[2][1] * g + m[2][2] * b,
+    )
+}
+
+// Display P3 (SMPTE EG 432-1 primaries, D65 white) → BT.709. Both spaces are
+// D65 so no chromatic adaptation is needed. Same values as e.g. the CSS
+// Color 4 linear-P3 → linear-sRGB conversion.
+const P3_TO_BT709: [[f32; 3]; 3] = [
+    [1.224_940_2, -0.224_940_2, 0.0],
+    [-0.042_056_955, 1.042_056_9, 0.0],
+    [-0.019_637_555, -0.078_636_04, 1.098_273_6],
+];
+
+#[inline]
+fn p3_to_bt709_linear(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let m = &P3_TO_BT709;
     (
         m[0][0] * r + m[0][1] * g + m[0][2] * b,
         m[1][0] * r + m[1][1] * g + m[1][2] * b,
@@ -377,10 +397,12 @@ fn bt2390_eetf(e: f32, src_peak_pq: f32, dst_peak_pq: f32) -> f32 {
     let e1 = (e / src_peak_pq).clamp(0.0, 1.0);
     let max_lum = dst_peak_pq / src_peak_pq;
 
-    // Knee point. BT.2390 uses ks = 1.5 * max_lum - 0.5.
-    let ks = 1.5 * max_lum - 0.5;
+    // Knee point. BT.2390 uses ks = 1.5 * max_lum - 0.5, clamped to [0, 1]:
+    // below max_lum = 1/3 the raw value goes negative (invalid spline start),
+    // and at max_lum >= 1 the target can carry the source unchanged.
+    let ks = (1.5 * max_lum - 0.5).clamp(0.0, 1.0);
 
-    let e2 = if e1 < ks {
+    let e2 = if e1 < ks || ks >= 1.0 {
         e1
     } else {
         // Hermite spline segment.
@@ -410,29 +432,61 @@ fn pq_inverse_eotf_nits(nits: f32) -> f32 {
 // Main conversion
 // ---------------------------------------------------------------------------
 
+/// Source colour primaries that need a linear-light matrix into BT.709.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceGamut {
+    /// BT.709/sRGB or unknown: no conversion.
+    Bt709,
+    /// H.273 code point 9 (BT.2020).
+    Bt2020,
+    /// H.273 code point 12 (Display P3, D65 white).
+    DisplayP3,
+}
+
 /// Per-image constants shared by every pixel, derived once from the cICP
 /// signalling and the target display peak.
 #[derive(Debug, Clone, Copy)]
 struct TonemapParams {
     use_pq: bool,
     use_hlg: bool,
-    /// BT.2020 primaries, needing conversion to BT.709.
-    wide_gamut: bool,
+    /// Which source primaries need conversion to BT.709.
+    gamut: SourceGamut,
+    /// RGB code values are limited (video) range and must be expanded to
+    /// full range before the EOTF. Only set when the cICP matrix is 0
+    /// (identity/RGB): for YCbCr-coded sources (AVIF/HEIC) the decoder has
+    /// already applied the range during its YCbCr → RGB conversion, so
+    /// expanding again here would double-stretch.
+    limited_range_rgb: bool,
     sdr_peak_nits: f32,
+    /// Source peak in nits: 10000 for PQ (absolute), 1000 for HLG (the
+    /// nominal BT.2100 display, matching the OOTF applied in `tonemap_px`).
+    src_peak_nits: f32,
     src_peak_pq: f32,
     dst_peak_pq: f32,
 }
 
 impl TonemapParams {
     fn new(cicp: Cicp, sdr_peak_nits: f32) -> Self {
-        // Source peak. For PQ we assume full 10000 nits unless we had MaxCLL
-        // (which PNG doesn't carry) — BT.2390 copes fine with this.
-        let src_peak_nits: f32 = 10000.0;
+        let use_pq = cicp.transfer_characteristics == 16;
+        let use_hlg = cicp.transfer_characteristics == 18;
+        // Source peak. PQ is absolute with a 10000 nit ceiling; assume the
+        // full range unless we had MaxCLL (which PNG doesn't carry) —
+        // BT.2390 copes fine with this. HLG is display-relative: use the
+        // nominal 1000 nit BT.2100 display, which must match the OOTF peak
+        // in `tonemap_px` or the EETF over-compresses HLG highlights.
+        let src_peak_nits: f32 = if use_hlg { 1000.0 } else { 10000.0 };
+        let gamut = match cicp.color_primaries {
+            9 => SourceGamut::Bt2020,
+            12 => SourceGamut::DisplayP3,
+            _ => SourceGamut::Bt709,
+        };
         Self {
-            use_pq: cicp.transfer_characteristics == 16,
-            use_hlg: cicp.transfer_characteristics == 18,
-            wide_gamut: cicp.color_primaries == 9, // BT.2020
+            use_pq,
+            use_hlg,
+            gamut,
+            limited_range_rgb: !cicp.full_range && cicp.matrix_coefficients == 0,
             sdr_peak_nits,
+            src_peak_nits,
             src_peak_pq: pq_inverse_eotf_nits(src_peak_nits),
             dst_peak_pq: pq_inverse_eotf_nits(sdr_peak_nits),
         }
@@ -481,16 +535,27 @@ fn tonemap_px(src: &[u16], p: TonemapParams) -> (f32, f32, f32, f32) {
     let mut b = src[2] as f32 / 65535.0;
     let a = src[3] as f32 / 65535.0;
 
+    // Limited (video) range → full range. 16-bit narrow range puts black at
+    // 16 << 8 = 4096 and white at 235 << 8 = 60160.
+    if p.limited_range_rgb {
+        const BLACK: f32 = 4096.0 / 65535.0;
+        const SCALE: f32 = 65535.0 / (60160.0 - 4096.0);
+        r = ((r - BLACK) * SCALE).clamp(0.0, 1.0);
+        g = ((g - BLACK) * SCALE).clamp(0.0, 1.0);
+        b = ((b - BLACK) * SCALE).clamp(0.0, 1.0);
+    }
+
     // 1. EOTF → linear light in nits.
     if p.use_pq {
         r = pq_eotf(r);
         g = pq_eotf(g);
         b = pq_eotf(b);
     } else if p.use_hlg {
-        // Peak assumption of 1000 nits is a sensible default for HLG.
-        r = hlg_eotf(r, 1000.0);
-        g = hlg_eotf(g, 1000.0);
-        b = hlg_eotf(b, 1000.0);
+        // The OOTF peak must match src_peak_nits (1000 for HLG) so the
+        // BT.2390 EETF below sees the same scale the OOTF produced.
+        r = hlg_eotf(r, p.src_peak_nits);
+        g = hlg_eotf(g, p.src_peak_nits);
+        b = hlg_eotf(b, p.src_peak_nits);
     } else {
         // sRGB / BT.709 — no HDR processing; just treat as normal.
         r = srgb_to_linear_simple(r) * p.sdr_peak_nits;
@@ -498,12 +563,21 @@ fn tonemap_px(src: &[u16], p: TonemapParams) -> (f32, f32, f32, f32) {
         b = srgb_to_linear_simple(b) * p.sdr_peak_nits;
     }
 
-    // 2. Primaries: BT.2020 → BT.709 in linear light.
-    if p.wide_gamut {
-        let (nr, ng, nb) = bt2020_to_bt709_linear(r, g, b);
-        r = nr;
-        g = ng;
-        b = nb;
+    // 2. Primaries: BT.2020 or Display P3 → BT.709 in linear light.
+    match p.gamut {
+        SourceGamut::Bt2020 => {
+            let (nr, ng, nb) = bt2020_to_bt709_linear(r, g, b);
+            r = nr;
+            g = ng;
+            b = nb;
+        }
+        SourceGamut::DisplayP3 => {
+            let (nr, ng, nb) = p3_to_bt709_linear(r, g, b);
+            r = nr;
+            g = ng;
+            b = nb;
+        }
+        SourceGamut::Bt709 => {}
     }
 
     // 3. Tone map via BT.2390 on MaxRGB, then scale channels.

@@ -924,6 +924,7 @@ fn srgb8_result(
     orientation: u8,
     path: &Path,
 ) -> (DecodedImage, (u32, u32), u8) {
+    eprintln!("[DEBUG-HDR] {:?}: srgb8_result (8-bit sRGB path)", path);
     let (img, dims, orient) = maybe_resize_image(color_image, real_dims, orientation, path);
     (DecodedImage::Srgb8(img), dims, orient)
 }
@@ -1038,46 +1039,46 @@ fn maybe_resize_image(
 
         let pixel_type = PixelType::U8x4;
 
-        // Take ownership of the memory directly instead of cloning it.
-        let pixels = std::mem::take(&mut color_image.pixels);
-
-        let raw_pixels: Vec<u8> = unsafe {
-            let mut p = std::mem::ManuallyDrop::new(pixels);
-            let ptr = p.as_mut_ptr() as *mut u8;
-            let length = p.len() * 4;
-            let capacity = p.capacity() * 4;
-            Vec::from_raw_parts(ptr, length, capacity)
+        let resized = {
+            // View the Color32 pixels as raw bytes in place — Color32 is a
+            // #[repr(C)] [u8; 4] with alignment 1, so the reinterpretation is
+            // sound and no copy or ownership juggling is needed. On any
+            // failure below the original pixels are simply left untouched.
+            let pixels = &mut color_image.pixels;
+            let raw_pixels: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u8, pixels.len() * 4)
+            };
+            FastImage::from_slice_u8(w as u32, h as u32, raw_pixels, pixel_type).ok().and_then(
+                |src_image| {
+                    let mut dst_image = FastImage::new(new_w as u32, new_h as u32, pixel_type);
+                    // Resize using default options (Lanczos3 for quality)
+                    let mut resizer = Resizer::new();
+                    resizer
+                        .resize(&src_image, &mut dst_image, &ResizeOptions::default())
+                        .ok()
+                        .map(|_| dst_image)
+                },
+            )
         };
 
-        let mut success = false;
-        if let Ok(src_image) =
-            FastImage::from_vec_u8(w as u32, h as u32, raw_pixels.clone(), pixel_type)
-        {
-            let mut dst_image = FastImage::new(new_w as u32, new_h as u32, pixel_type);
-            // Resize using default options (Lanczos3 for quality)
-            let mut resizer = Resizer::new();
-            if resizer.resize(&src_image, &mut dst_image, &ResizeOptions::default()).is_ok() {
-                eprintln!(
-                    "[DEBUG] Fast-Resized {:?} from {}x{} to {}x{}",
-                    path, w, h, new_w, new_h
-                );
-                // Overwrite the empty color_image with the new resized one
-                color_image =
-                    egui::ColorImage::from_rgba_unmultiplied([new_w, new_h], dst_image.buffer());
-                success = true;
-            }
-        }
-
-        // Recover original pixels if the fast resizer failed
-        if !success {
-            color_image.pixels = unsafe {
-                let mut p = std::mem::ManuallyDrop::new(raw_pixels);
-                let ptr = p.as_mut_ptr() as *mut egui::Color32;
-                let length = p.len() / 4;
-                let capacity = p.capacity() / 4;
-                Vec::from_raw_parts(ptr, length, capacity)
+        if let Some(dst_image) = resized {
+            eprintln!("[DEBUG] Fast-Resized {:?} from {}x{} to {}x{}", path, w, h, new_w, new_h);
+            // The resized bytes are already premultiplied Color32 values, so
+            // rebuild them verbatim: going through from_rgba_unmultiplied
+            // here would premultiply a second time and darken semi-
+            // transparent pixels.
+            color_image = egui::ColorImage {
+                size: [new_w, new_h],
+                pixels: dst_image
+                    .buffer()
+                    .chunks_exact(4)
+                    .map(|p| egui::Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3]))
+                    .collect(),
+                source_size: egui::vec2(new_w as f32, new_h as f32),
             };
         }
+        // If the fast resizer failed, color_image still holds the original
+        // oversized pixels, exactly as before the call.
     }
     (color_image, real_dims, orientation)
 }
@@ -1232,10 +1233,19 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
                     )
                     .is_ok()
                 {
-                    color_image = egui::ColorImage::from_rgba_unmultiplied(
-                        [new_w, new_h],
-                        dst_image.buffer(),
-                    );
+                    // The resized bytes are already premultiplied Color32
+                    // values, so rebuild them verbatim: from_rgba_unmultiplied
+                    // would premultiply a second time and darken semi-
+                    // transparent pixels.
+                    color_image = egui::ColorImage {
+                        size: [new_w, new_h],
+                        pixels: dst_image
+                            .buffer()
+                            .chunks_exact(4)
+                            .map(|p| egui::Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3]))
+                            .collect(),
+                        source_size: egui::vec2(new_w as f32, new_h as f32),
+                    };
                 }
             }
         }
@@ -1542,17 +1552,9 @@ fn load_and_process_image_from_bytes(
     // HDR path: cICP advertised PQ or HLG transfer
     let needs_hdr_processing = cicp.map(|c| c.is_hdr()).unwrap_or(false);
     if needs_hdr_processing {
-        img_debug!("[DEBUG-IMAGE] needs_hdr_processing is TRUE. Entering process_hdr_to_sdr...");
-    } else {
-        img_debug!(
-            "[DEBUG-IMAGE] needs_hdr_processing is FALSE. Falling back to standard SDR pass."
-        );
-    }
-
-    if needs_hdr_processing {
         let cicp = cicp.unwrap();
         eprintln!(
-            "[DEBUG-HDR] {:?}: cICP primaries={} transfer={} matrix={} full_range={} -> tone-mapping to SDR",
+            "[DEBUG-HDR] {:?}: cICP primaries={} transfer={} matrix={} full_range={}",
             path,
             cicp.color_primaries,
             cicp.transfer_characteristics,
@@ -1568,18 +1570,29 @@ fn load_and_process_image_from_bytes(
             let dyn_img = maybe_downscale_dynamic(dyn_img, path);
             let peak = hdr_config.sdr_peak_nits;
             let (w, h, pixels) = if wide {
+                eprintln!(
+                    "[DEBUG-HDR] {:?}: process_hdr_to_rgba16 (HDR -> deep Rgba16Unorm)",
+                    path
+                );
                 let (w, h, data) = crate::hdr::process_hdr_to_rgba16(&dyn_img, cicp, peak);
                 (w, h, DeepPixels::Rgba16(data))
             } else {
+                eprintln!(
+                    "[DEBUG-HDR] {:?}: process_hdr_to_rgb10a2 (HDR -> deep Rgb10a2Unorm)",
+                    path
+                );
                 let (w, h, data) = crate::hdr::process_hdr_to_rgb10a2(&dyn_img, cicp, peak);
                 (w, h, DeepPixels::Rgb10a2(data))
             };
             return Ok((DecodedImage::Deep { width: w, height: h, pixels }, dims, orientation));
         }
 
+        // Downscale while still 16-bit
+        let dyn_img = maybe_downscale_dynamic(dyn_img, path);
+        eprintln!("[DEBUG-HDR] {:?}: process_hdr_to_sdr (HDR tone-mapped to 8-bit sRGB)", path);
         let rgba = crate::hdr::process_hdr_to_sdr(&dyn_img, cicp, hdr_config.sdr_peak_nits);
         let img = egui::ColorImage::from_rgba_unmultiplied(
-            [dims.0 as usize, dims.1 as usize],
+            [rgba.width() as usize, rgba.height() as usize],
             rgba.as_flat_samples().as_slice(),
         );
         return Ok(srgb8_result(img, dims, orientation, path));
@@ -1788,23 +1801,32 @@ pub(super) fn render_image_texture(
     // Use per-file rotation instead of global manual_rotation
     let manual_rot = file_transform.rotation % 4;
 
-    let exif_angle = match orientation {
-        3 => PI,
-        6 => PI / 2.0,
-        8 => 3.0 * PI / 2.0,
-        _ => 0.0,
+    // Decompose the EXIF orientation into quarter-turns (clockwise) plus
+    // mirrors. The mirror applies in texture space before the rotation on
+    // both render paths, matching the EXIF convention: 2 = mirror H,
+    // 3 = rotate 180, 4 = mirror V, 5 = mirror H + rotate 270 CW,
+    // 6 = rotate 90 CW, 7 = mirror H + rotate 90 CW, 8 = rotate 270 CW.
+    let (exif_steps, exif_flip_h, exif_flip_v) = match orientation {
+        2 => (0, true, false),
+        3 => (2, false, false),
+        4 => (0, false, true),
+        5 => (3, true, false),
+        6 => (1, false, false),
+        7 => (1, true, false),
+        8 => (3, false, false),
+        _ => (0, false, false),
     };
-    let manual_angle = manual_rot as f32 * (PI / 2.0);
-    let total_angle = exif_angle + manual_angle;
 
-    let exif_steps = match orientation {
-        3 => 2,
-        6 => 1,
-        8 => 3,
-        _ => 0,
-    };
+    let manual_angle = manual_rot as f32 * (PI / 2.0);
+    let total_angle = exif_steps as f32 * (PI / 2.0) + manual_angle;
+
     let total_steps = (exif_steps + manual_rot) % 4;
     let is_rotated_90_270 = total_steps == 1 || total_steps == 3;
+
+    // EXIF mirrors combine with the user's manual flips; two flips on the
+    // same axis cancel out.
+    let flip_h = exif_flip_h ^ file_transform.flip_horizontal;
+    let flip_v = exif_flip_v ^ file_transform.flip_vertical;
 
     // --- 2. Determine Visual Size (Swapped if rotated) ---
     let visual_size =
@@ -1887,10 +1909,9 @@ pub(super) fn render_image_texture(
 
     match source {
         ImageSource::Egui { id, size } => {
-            // Calculate UV coordinates for flipping
-            let (u_min, u_max) =
-                if file_transform.flip_horizontal { (1.0, 0.0) } else { (0.0, 1.0) };
-            let (v_min, v_max) = if file_transform.flip_vertical { (1.0, 0.0) } else { (0.0, 1.0) };
+            // Calculate UV coordinates for flipping (EXIF mirror + manual)
+            let (u_min, u_max) = if flip_h { (1.0, 0.0) } else { (0.0, 1.0) };
+            let (v_min, v_max) = if flip_v { (1.0, 0.0) } else { (0.0, 1.0) };
             let uv = egui::Rect::from_min_max(egui::pos2(u_min, v_min), egui::pos2(u_max, v_max));
 
             // Paint the image into the calculated paint_rect, applying rotation and flips.
@@ -1937,11 +1958,7 @@ pub(super) fn render_image_texture(
                 }
 
                 // Rotation and flips ride in the UV transform, not the mesh.
-                let (uv_mat, uv_off) = image_uv_transform(
-                    total_steps as u32,
-                    file_transform.flip_horizontal,
-                    file_transform.flip_vertical,
-                );
+                let (uv_mat, uv_off) = image_uv_transform(total_steps as u32, flip_h, flip_v);
                 painter.add(egui_wgpu::Callback::new_paint_callback(
                     draw_rect,
                     ImageCallback {
