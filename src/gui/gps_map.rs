@@ -356,8 +356,27 @@ impl GpsMapState {
             max_lon = max_lon.max(pos.x());
         }
 
-        // 2. Center at the middle of the box
-        let center = walkers::lat_lon((min_lat + max_lat) / 2.0, (min_lon + max_lon) / 2.0);
+        // 1b. Same heuristic as sort_by_zorder_curve: a span wider than 180°
+        // almost always means the set straddles the antimeridian rather than
+        // genuinely wrapping the globe. Without this, -179 and +179 average to
+        // a centre of 0 — the opposite side of the planet — at zoom 2.
+        if (max_lon - min_lon) > 180.0 {
+            min_lon = f64::MAX;
+            max_lon = f64::MIN;
+            for pos in positions {
+                let eff_lon = if pos.x() < 0.0 { pos.x() + 360.0 } else { pos.x() };
+                min_lon = min_lon.min(eff_lon);
+                max_lon = max_lon.max(eff_lon);
+            }
+        }
+
+        // 2. Center at the middle of the box, wrapping back into -180..180 if
+        // the shift above pushed the centre past the antimeridian.
+        let mut center_lon = (min_lon + max_lon) / 2.0;
+        if center_lon > 180.0 {
+            center_lon -= 360.0;
+        }
+        let center = walkers::lat_lon((min_lat + max_lat) / 2.0, center_lon);
         self.map_memory.center_at(center);
 
         // 3. Heuristic for zoom level (simple version)
