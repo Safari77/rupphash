@@ -25,8 +25,8 @@ use crate::db::{
 };
 use crate::exif_extract::extract_gps_lat_lon;
 use crate::exif_types::{
-    ExifValue, TAG_DERIVED_PDQ_QUALITY, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE,
-    TAG_GPS_LONGITUDE, TAG_ORIENTATION,
+    ExifValue, TAG_DERIVED_PDQ_QUALITY, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE,
+    TAG_ORIENTATION,
 };
 use crate::fileops;
 use crate::fileops::get_file_key;
@@ -1587,6 +1587,12 @@ pub fn scan_and_group(
 /// group together.
 pub const PDQ_MIN_QUALITY: u16 = 50;
 
+/// True when a stored quality is below the fuzzy-matching cutoff. Unknown
+/// quality counts as good, so nothing silently stops matching after an upgrade.
+pub fn is_low_pdq_quality(quality: Option<u16>) -> bool {
+    quality.is_some_and(|q| q < PDQ_MIN_QUALITY)
+}
+
 // --- 1. Define Strategy Trait
 trait GroupingStrategy<H>: Sync + Send {
     fn extract_hash(&self, file: &ScannedFile) -> Option<H>;
@@ -1626,7 +1632,7 @@ impl GroupingStrategy<[u8; 32]> for PdqStrategy {
         // Unknown quality counts as good: records written before quality was
         // stored, and view-mode feature records, must not silently stop
         // matching after an upgrade.
-        file.pdq_quality.is_some_and(|q| q < PDQ_MIN_QUALITY)
+        is_low_pdq_quality(file.pdq_quality)
     }
 }
 
@@ -1712,8 +1718,7 @@ where
                                         }
 
                                         let cand_hash = mih.hash(*dense);
-                                        let limit =
-                                            if low_conf[cand_idx] { 0 } else { base_limit };
+                                        let limit = if low_conf[cand_idx] { 0 } else { base_limit };
                                         if variant.hamming_distance(cand_hash) <= limit {
                                             edges.push((i as u32, cand_idx as u32));
                                         }
@@ -2220,9 +2225,7 @@ fn analyze_group_with_features(
             .iter()
             .filter_map(|f| f.pdqhash)
             .map(|h| {
-                pivot_variants
-                    .iter()
-                    .fold(u32::MAX, |best, v| best.min(v.hamming_distance(&h)))
+                pivot_variants.iter().fold(u32::MAX, |best, v| best.min(v.hamming_distance(&h)))
             })
             .max()
             .unwrap_or(0)
