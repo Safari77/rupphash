@@ -14,11 +14,12 @@ use walkers::{HttpTiles, Map, MapMemory, Plugin, Position, Projector};
 pub struct CustomTileSource {
     pub name: String,
     pub url_pattern: String,
+    attribution_text: OnceLock<&'static str>,
 }
 
 impl CustomTileSource {
     pub fn new(name: String, url_pattern: String) -> Self {
-        Self { name, url_pattern }
+        Self { name, url_pattern, attribution_text: OnceLock::new() }
     }
 }
 
@@ -31,9 +32,9 @@ impl TileSource for CustomTileSource {
     }
 
     fn attribution(&self) -> Attribution {
-        // Attribution requires 'static lifetime, so we leak the string
-        // This is acceptable since providers are rarely changed
-        let text: &'static str = Box::leak(self.name.clone().into_boxed_str());
+        // Leak at most once per source; providers are rarely changed.
+        let text =
+            *self.attribution_text.get_or_init(|| &*Box::leak(self.name.clone().into_boxed_str()));
         Attribution { text, url: "", logo_light: None, logo_dark: None }
     }
 }
