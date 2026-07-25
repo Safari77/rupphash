@@ -1068,7 +1068,8 @@ pub fn format_distance(meters: f64) -> String {
 /// Format bearing for display (compass direction)
 pub fn format_bearing(degrees: f64) -> String {
     let directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
-    let idx = ((degrees + 22.5) / 45.0) as usize % 8;
+    let norm = if degrees.is_finite() { degrees.rem_euclid(360.0) } else { 0.0 };
+    let idx = ((norm + 22.5) / 45.0) as usize % 8;
     format!("{:.2}° {}", degrees, directions[idx])
 }
 
