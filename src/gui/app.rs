@@ -2972,7 +2972,7 @@ impl eframe::App for GuiApp {
                                 );
 
                                 if ui.is_rect_visible(header_rect) {
-                                    let (txt, col) = match info.status {
+                                    let (mut txt, col) = match info.status {
                                         GroupStatus::AllIdentical => (
                                             format!("Group {} - Bit-identical", g_idx + 1),
                                             egui::Color32::GREEN,
@@ -2990,6 +2990,17 @@ impl eframe::App for GuiApp {
                                             egui::Color32::YELLOW,
                                         ),
                                     };
+
+                                    // A featureless hash anywhere in the group means
+                                    // its members were only allowed to pair up on an
+                                    // exact match. Say so, so the distance is not read
+                                    // as evidence of a fuzzy match.
+                                    if group.iter().any(|f| {
+                                        crate::scanner::is_low_pdq_quality(f.pdq_quality)
+                                    }) {
+                                        txt.push_str("  [low quality: exact match only]");
+                                    }
+
                                     ui.put(
                                         header_rect,
                                         egui::Label::new(egui::RichText::new(txt).color(col)),
@@ -3037,6 +3048,8 @@ impl eframe::App for GuiApp {
                                         *counts.get(&file.content_hash).unwrap_or(&0) > 1;
                                     let is_hardlinked =
                                         hardlink_groups.contains_key(&file.unique_file_id);
+                                    let is_low_quality =
+                                        crate::scanner::is_low_pdq_quality(file.pdq_quality);
 
                                     // Content Group ID
                                     let content_id =
@@ -3074,6 +3087,10 @@ impl eframe::App for GuiApp {
                                         c_label
                                     );
 
+                                    // Fixed width so the filename column stays aligned
+                                    // whether or not the flag is present.
+                                    let quality_flag = if is_low_quality { "! " } else { "  " };
+
                                     let filename_text = format_path_depth(
                                         &file.path,
                                         self.state.path_display_depth,
@@ -3100,6 +3117,9 @@ impl eframe::App for GuiApp {
                                     // --- RICH TEXT ---
                                     let mut marker_rich = egui::RichText::new(&marker_text)
                                         .family(egui::FontFamily::Monospace);
+                                    let quality_rich = egui::RichText::new(quality_flag)
+                                        .family(egui::FontFamily::Monospace)
+                                        .color(egui::Color32::from_rgb(255, 150, 0));
                                     if let Some(col) = marker_color {
                                         marker_rich = marker_rich.color(col);
                                     }
@@ -3107,7 +3127,7 @@ impl eframe::App for GuiApp {
                                     // Calculate available width for filename (header_rect minus marker width minus padding)
                                     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
                                     let marker_galley = ui.painter().layout_no_wrap(
-                                        marker_text.clone(),
+                                        format!("{}{}", marker_text, quality_flag),
                                         font_id.clone(),
                                         egui::Color32::WHITE,
                                     );
@@ -3184,6 +3204,7 @@ impl eframe::App for GuiApp {
                                             ui.horizontal(|ui| {
                                                 ui.spacing_mut().item_spacing.x = 0.0;
                                                 ui.label(marker_rich);
+                                                ui.label(quality_rich);
                                                 if was_truncated && display_filename.ends_with('…')
                                                 {
                                                     let main_part: String = display_filename
@@ -3310,6 +3331,27 @@ impl eframe::App for GuiApp {
                                             }
                                         }
 
+                                        // PDQ hash and the quality that decides whether
+                                        // it is trusted for fuzzy matching.
+                                        ui.label(format!(
+                                            "pdqhash: {}",
+                                            file.pdqhash
+                                                .map(hex::encode)
+                                                .unwrap_or_else(|| "None".to_string())
+                                        ));
+                                        ui.label(format!(
+                                            "pdq_quality: {}",
+                                            match file.pdq_quality {
+                                                Some(q) if is_low_quality => format!(
+                                                    "{} (below {}, exact matches only)",
+                                                    q,
+                                                    crate::scanner::PDQ_MIN_QUALITY
+                                                ),
+                                                Some(q) => q.to_string(),
+                                                None => "n/a".to_string(),
+                                            }
+                                        ));
+
                                         // Calculate and display distance to location selected in GPS map
                                         if let Some((loc_name, loc_point)) =
                                             self.gps_map.selected_location.as_ref()
@@ -3339,7 +3381,8 @@ impl eframe::App for GuiApp {
                                      copy_target: &mut Option<String>,
                                      copy_extended: &mut Option<String>,
                                      path: &std::path::Path,
-                                     content_hash: &[u8; 32]| {
+                                     content_hash: &[u8; 32],
+                                     pdqhash: Option<[u8; 32]>| {
                                         if ui.button("Rename (R)").clicked() {
                                             ui.close();
                                             *action_rename = true;
@@ -3364,6 +3407,13 @@ impl eframe::App for GuiApp {
                                                 b3
                                             ));
                                         }
+                                        if let Some(pdq) = pdqhash
+                                            && ui.button("Copy PDQ hash").clicked()
+                                        {
+                                            // Accepted by `phdupes --unignore <hash>`.
+                                            ui.close();
+                                            *copy_target = Some(hex::encode(pdq));
+                                        }
                                         if ui.button("Delete (Del)").clicked() {
                                             ui.close();
                                             *action_delete = true;
@@ -3380,6 +3430,7 @@ impl eframe::App for GuiApp {
                                             &mut copy_extended_target,
                                             &file.path,
                                             &file.content_hash,
+                                            file.pdqhash,
                                         )
                                     });
 
@@ -3392,6 +3443,7 @@ impl eframe::App for GuiApp {
                                             &mut copy_extended_target,
                                             &file.path,
                                             &file.content_hash,
+                                            file.pdqhash,
                                         )
                                     });
 
