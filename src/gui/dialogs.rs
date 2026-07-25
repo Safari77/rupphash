@@ -1192,12 +1192,6 @@ pub(super) fn handle_dialogs(
 
                 ui.add_space(8.0);
 
-                // --- Submit on Enter ---
-                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if enter_pressed {
-                    submit = true;
-                }
-
                 // --- Buttons ---
                 ui.horizontal(|ui| {
                     if ui.button("🔍 Search").clicked() {
