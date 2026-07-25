@@ -35,6 +35,10 @@ pub(super) fn handle_input(
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         if app.show_move_input {
             app.show_move_input = false;
+            // Completion state is per-dialog-session; leaving it behind makes
+            // the next Tab resume mid-cycle on a stale candidate list.
+            app.move_completion_candidates.clear();
+            app.move_completion_index = 0;
             return;
         }
         if app.show_dir_picker {
@@ -118,6 +122,7 @@ pub(super) fn handle_input(
             0
         };
         let has_files = !app.state.groups.is_empty() && !app.state.groups[0].is_empty();
+        let plain = ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt);
 
         // Handle Up/Left navigation
         if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowLeft)) {
@@ -142,7 +147,8 @@ pub(super) fn handle_input(
             }
         }
 
-        if ctx.input(|i| i.key_pressed(egui::Key::A))
+        if plain
+            && ctx.input(|i| i.key_pressed(egui::Key::A))
             && !app.state.is_any_dialog_open()
             && !app.show_move_input
             && !app.show_dir_picker
@@ -332,28 +338,28 @@ pub(super) fn handle_input(
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             *intent.borrow_mut() = Some(InputIntent::ToggleMark);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::D)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::D)) {
             *intent.borrow_mut() = Some(InputIntent::ExecuteDelete);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::H)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::H)) {
             *intent.borrow_mut() = Some(InputIntent::ToggleRelativeTime);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::W)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::W)) {
             *intent.borrow_mut() = Some(InputIntent::CycleViewMode);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Z)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::Z)) {
             *intent.borrow_mut() = Some(InputIntent::CycleZoom);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::R)) {
             *intent.borrow_mut() = Some(InputIntent::StartRename);
         }
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::L)) {
+        if ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::L)) {
             *intent.borrow_mut() = Some(InputIntent::RefreshDirCache);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::X)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::X)) {
             *intent.borrow_mut() = Some(InputIntent::ToggleZoomRelative);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::P)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::P)) {
             *intent.borrow_mut() = Some(InputIntent::TogglePathVisibility);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
@@ -375,7 +381,7 @@ pub(super) fn handle_input(
             }
         }
         // Intercept MoveMarked intent or Key::M
-        if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::M)) {
             // Check if there is anything to move at all.
             // We need either Marked Files OR a Current File (fallback).
             let has_marked = !app.state.marked_for_deletion.is_empty();
@@ -404,37 +410,38 @@ pub(super) fn handle_input(
                 }
             }
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::S)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::S)) {
             *intent.borrow_mut() = Some(InputIntent::ToggleSlideshow);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::F)) {
             *intent.borrow_mut() = Some(InputIntent::ToggleFullscreen);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::O)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::O)) {
             *intent.borrow_mut() = Some(InputIntent::RotateCW);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::Y)) {
             *intent.borrow_mut() = Some(InputIntent::FlipHorizontal);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::U)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::U)) {
             *intent.borrow_mut() = Some(InputIntent::FlipVertical);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::Backspace)) {
             *intent.borrow_mut() = Some(InputIntent::ResetTransform);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::I)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::I)) {
             // Cycle: 0 (Off) -> 1 (Standard Grid) -> 2 (Proportional Strip) -> 0 (Off)
             app.histogram_mode = (app.histogram_mode + 1) % 3;
             app.histogram_enabled
                 .store(app.histogram_mode > 0, std::sync::atomic::Ordering::Relaxed);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::E)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::E)) {
             app.show_exif = !app.show_exif;
         }
 
         // N key: Toggle GPS Map panel
         // Logic: Off -> Map Only -> Map + Lines (Optimized) -> Off
-        if ctx.input(|i| i.key_pressed(egui::Key::N))
+        if plain
+            && ctx.input(|i| i.key_pressed(egui::Key::N))
             && !app.state.show_confirmation
             && !app.state.show_move_confirmation
             && !app.state.show_delete_immediate_confirmation
@@ -500,7 +507,7 @@ pub(super) fn handle_input(
             }
         }
 
-        if ctx.input(|i| i.key_pressed(egui::Key::G)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::G)) {
             // Toggle Time Source
             app.state.use_gps_utc = !app.state.use_gps_utc;
             app.cached_exif = None;
@@ -526,10 +533,10 @@ pub(super) fn handle_input(
         // View Mode Only
         // Directory navigation is disabled in flatten mode (--view-flatten)
         if app.state.view_mode && !app.state.view_mode_flatten {
-            if ctx.input(|i| i.key_pressed(egui::Key::C)) {
+            if plain && ctx.input(|i| i.key_pressed(egui::Key::C)) {
                 app.open_dir_picker();
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Period)) {
+            if plain && ctx.input(|i| i.key_pressed(egui::Key::Period)) {
                 let old_dir = app.current_dir.clone();
                 app.go_up_directory();
 
@@ -549,7 +556,7 @@ pub(super) fn handle_input(
         }
 
         // Sort selection is available in all view modes
-        if app.state.view_mode && ctx.input(|i| i.key_pressed(egui::Key::T)) {
+        if plain && app.state.view_mode && ctx.input(|i| i.key_pressed(egui::Key::T)) {
             *intent.borrow_mut() = Some(InputIntent::ShowSortSelection);
         }
 
@@ -560,7 +567,7 @@ pub(super) fn handle_input(
         let delta = window_width * 0.02;
 
         // V to Shrink panel
-        if ctx.input(|i| i.key_pressed(egui::Key::V)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::V)) {
             let old = app.panel_width;
             app.panel_width = (app.panel_width - delta).max(160.0);
             eprintln!(
@@ -570,7 +577,7 @@ pub(super) fn handle_input(
             *force_panel_resize = true;
         }
         // B to Expand
-        if ctx.input(|i| i.key_pressed(egui::Key::B)) {
+        if plain && ctx.input(|i| i.key_pressed(egui::Key::B)) {
             let old = app.panel_width;
             app.panel_width = (app.panel_width + delta).min(window_width * 0.8);
             eprintln!(
@@ -580,7 +587,7 @@ pub(super) fn handle_input(
             *force_panel_resize = true;
         }
         // Search
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
+        if ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::F)) {
             *intent.borrow_mut() = Some(InputIntent::StartSearch);
             app.search_input.clear();
             app.search_focus_requested = false;
@@ -958,12 +965,21 @@ pub(super) fn handle_dialogs(
             // Tab Completion (DIRECTORIES ONLY)
             if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
                 request_focus_back = true;
-                let path_buf = std::path::PathBuf::from(&app.move_input);
-                let (parent, prefix) = if app.move_input.ends_with(std::path::MAIN_SEPARATOR) {
-                    (Some(path_buf.as_path()), "".to_string())
+                // Resolve relative input against current_dir, the same way the
+                // submit handler below does. Previously a bare name like "Pic"
+                // gave Path::parent() == Some(""), read_dir("") failed, and Tab
+                // silently did nothing for every relative path.
+                let base = app.current_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("."));
+                let typed = std::path::PathBuf::from(&app.move_input);
+                let path_buf = if typed.is_absolute() { typed } else { base.join(&typed) };
+
+                let (parent, prefix) = if app.move_input.is_empty()
+                    || app.move_input.ends_with(std::path::MAIN_SEPARATOR)
+                {
+                    (Some(path_buf.clone()), String::new())
                 } else {
                     (
-                        path_buf.parent(),
+                        path_buf.parent().map(|p| p.to_path_buf()),
                         path_buf.file_name().unwrap_or_default().to_string_lossy().to_string(),
                     )
                 };
@@ -983,19 +999,16 @@ pub(super) fn handle_dialogs(
                     if app.move_completion_candidates.is_empty() || !input_matches_candidate {
                         app.move_completion_candidates.clear();
                         app.move_completion_index = 0;
-                        if let Ok(entries) = fs::read_dir(parent_dir) {
+                        if let Ok(entries) = fs::read_dir(&parent_dir) {
                             for entry in entries.flatten() {
                                 // Filter: ONLY DIRECTORIES
                                 if let Ok(ft) = entry.file_type()
                                     && ft.is_dir()
+                                    && entry.file_name().to_string_lossy().starts_with(&prefix)
                                 {
-                                    let name = entry.path().to_string_lossy().to_string();
-                                    if name.starts_with(&app.move_input)
-                                        || entry.file_name().to_string_lossy().starts_with(&prefix)
-                                    {
-                                        // Store full path for convenience
-                                        app.move_completion_candidates.push(name);
-                                    }
+                                    // Store full path for convenience
+                                    app.move_completion_candidates
+                                        .push(entry.path().to_string_lossy().to_string());
                                 }
                             }
                             app.move_completion_candidates.sort();
@@ -1046,9 +1059,13 @@ pub(super) fn handle_dialogs(
                 // Set the target and trigger the standard confirmation flow
                 app.state.move_target = Some(target_path);
                 app.show_move_input = false;
+                app.move_completion_candidates.clear();
+                app.move_completion_index = 0;
                 app.state.handle_input(InputIntent::MoveMarked);
             } else {
                 app.state.error_popup = Some("Target is not a valid directory.".to_string());
+                app.move_completion_candidates.clear();
+                app.move_completion_index = 0;
             }
         }
         if cancel {
@@ -1620,7 +1637,9 @@ fn perform_ignore_group(app: &mut GuiApp) {
 
             // Remove the group from display
             app.state.groups.remove(g_idx);
-            app.state.group_infos.remove(g_idx);
+            if g_idx < app.state.group_infos.len() {
+                app.state.group_infos.remove(g_idx);
+            }
             if app.state.groups.is_empty() {
                 app.state.current_group_idx = 0;
                 app.state.current_file_idx = 0;
