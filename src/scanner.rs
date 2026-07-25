@@ -2329,7 +2329,7 @@ pub fn scan_for_view(
                     // Note: For RAW files, the actual orientation used depends on whether thumbnails
                     // or full decode is used. The image loader will return the correct value.
                     let orientation = get_orientation(path, None);
-                    eprintln!(
+                    img_debug!(
                         "[DEBUG-SCAN] scan_for_view get_orientation={} for {:?}",
                         orientation,
                         path.file_name().unwrap_or_default()
