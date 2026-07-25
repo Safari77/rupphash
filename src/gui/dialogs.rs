@@ -1910,6 +1910,12 @@ fn check_exif_criteria_fallback(
     use crate::exif_types::*;
     use crate::search_index::SearchOp;
 
+    // Sentinel appended to a cached tag list to record that derived tags were
+    // requested when it was built. The cache is keyed by path alone, so without
+    // it an entry populated by a plain Make:/ISO: query gets reused by a later
+    // Country:/SunAzimuth: query and reports "no match" for every file.
+    const DERIVED_MARK: &str = "__derived_fetched";
+
     // Build tag names to fetch
     let mut tag_names: Vec<String> = vec![
         "Make",
@@ -1931,18 +1937,31 @@ fn check_exif_criteria_fallback(
     .collect();
 
     // Add derived tags if needed
-    if criteria.iter().any(|c| c.tag_id >= 0xF000) {
+    let needs_derived = criteria.iter().any(|c| c.tag_id >= 0xF000);
+    if needs_derived {
         tag_names.push("DerivedSunPosition".to_string());
         tag_names.push("DerivedCountry".to_string());
     }
 
-    // Get or fetch EXIF data
-    let exif_tags = if let Some(cached) = exif_cache.get(&file.path) {
-        cached.clone()
-    } else {
-        let tags = crate::scanner::get_exif_tags(&file.path, &tag_names, false, false);
-        exif_cache.insert(file.path.clone(), tags.clone());
-        tags
+    // A cache entry is usable only if it was built with at least the tag set
+    // this call needs.
+    let cached_ok = exif_cache
+        .get(&file.path)
+        .map(|tags| !needs_derived || tags.iter().any(|(n, _)| n == DERIVED_MARK))
+        .unwrap_or(false);
+
+    if !cached_ok {
+        let mut tags = crate::scanner::get_exif_tags(&file.path, &tag_names, false, false);
+        if needs_derived {
+            tags.push((DERIVED_MARK.to_string(), String::new()));
+        }
+        exif_cache.insert(file.path.clone(), tags);
+    }
+
+    // Borrow rather than clone: the entry lives longer than this function's use
+    // of it and the cache is not touched again below.
+    let Some(exif_tags) = exif_cache.get(&file.path) else {
+        return false;
     };
 
     // Check each criterion
