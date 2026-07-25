@@ -1,9 +1,11 @@
 // GPS Map widget using walkers crate for displaying image locations on a map
 use eframe::egui;
 use geo::Point;
+#[cfg(target_arch = "x86_64")]
 use once_cell::sync::Lazy;
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use walkers::sources::{Attribution, TileSource};
 use walkers::{HttpTiles, Map, MapMemory, Plugin, Position, Projector};
 
@@ -131,26 +133,40 @@ fn optimize_2opt(markers: &mut [GpsMarker]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 type FnTy = fn(u32) -> u64;
 
+#[cfg(target_arch = "x86_64")]
 static PART1BY1: Lazy<FnTy> = Lazy::new(|| {
     if std::is_x86_feature_detected!("bmi2") { part1by1_bmi2_safe } else { part1by1_scalar }
 });
 
 #[inline]
 pub fn part1by1(n: u32) -> u64 {
-    (PART1BY1)(n)
+    #[cfg(target_arch = "x86_64")]
+    {
+        (PART1BY1)(n)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        part1by1_scalar(n)
+    }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn part1by1_bmi2_safe(n: u32) -> u64 {
     unsafe { part1by1_bmi2(n) }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(never)]
 #[target_feature(enable = "bmi2")]
 unsafe fn part1by1_bmi2(n: u32) -> u64 {
-    core::arch::x86_64::_pdep_u64(n as u64, 0x5555_5555_5555_5555)
+    // Mask to 16 bits to match part1by1_scalar: _pdep_u64 would otherwise
+    // spread all 32 input bits across the full 64-bit result, so the two
+    // implementations would disagree for n > 0xffff.
+    core::arch::x86_64::_pdep_u64((n & 0xffff) as u64, 0x5555_5555_5555_5555)
 }
 
 fn part1by1_scalar(mut n: u32) -> u64 {
