@@ -90,7 +90,11 @@ pub fn sort_nearest_neighbor(markers: &mut [GpsMarker]) {
 
 /// Improves a path by uncrossing lines (2-Opt Algorithm).
 /// This fixes the "stranding" issue where the greedy sort leaves a long jump at the end.
-fn optimize_2opt(markers: &mut [GpsMarker]) {
+///
+/// Bounded by `deadline`: the `reverse()` below is O(N) inside a double loop,
+/// so this is O(N^3) worst case and runs on the UI thread. Partial improvement
+/// is fine — the path is still valid after any number of completed swaps.
+fn optimize_2opt(markers: &mut [GpsMarker], deadline: std::time::Instant) {
     let len = markers.len();
     if len < 4 {
         return;
@@ -105,6 +109,9 @@ fn optimize_2opt(markers: &mut [GpsMarker]) {
         passes += 1;
 
         for i in 0..(len - 2) {
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
             for j in (i + 2)..(len - 1) {
                 // -1 because we are looking at segments
                 let p1 = (markers[i].lat, markers[i].lon);
@@ -488,7 +495,10 @@ impl GpsMapState {
 
             // 2. Refinement: 2-Opt (Uncrossing)
             // Fixes the ugly cross-country jumps the greedy sort left behind.
-            optimize_2opt(&mut self.markers);
+            // Capped so a large set can't stall the frame; whatever passes fit
+            // in the budget still improve the path.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+            optimize_2opt(&mut self.markers, deadline);
         } else {
             // For massive datasets, stick to the instant spatial sort
             sort_by_zorder_curve(&mut self.markers);
