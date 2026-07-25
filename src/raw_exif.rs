@@ -131,12 +131,6 @@ fn dms_to_decimal(dms: &[f32; 3]) -> f64 {
     let minutes = dms[1].abs() as f64;
     let seconds = dms[2].abs() as f64;
 
-    // Check if coordinates are already in decimal format (minutes and seconds are 0)
-    // Some cameras/formats store decimal degrees directly
-    if minutes < 0.0001 && seconds < 0.0001 {
-        return sign * degrees;
-    }
-
     sign * (degrees + minutes / 60.0 + seconds / 3600.0)
 }
 
