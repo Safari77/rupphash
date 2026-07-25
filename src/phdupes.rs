@@ -54,6 +54,7 @@ pub struct FileMetadata {
     pub size: u64,
     pub modified: DateTime<Utc>,
     pub pdqhash: Option<[u8; 32]>,
+    pub pdq_quality: Option<u16>, // PDQ quality 0-100, None if never hashed
     pub resolution: Option<(u32, u32)>,
     pub content_hash: [u8; 32],
     pub pixel_hash: Option<[u8; 32]>,
@@ -61,6 +62,16 @@ pub struct FileMetadata {
     pub gps_pos: Option<Point<f64>>,
     pub unique_file_id: u128,        // Always has dev+inode
     pub exif_timestamp: Option<i64>, // EXIF DateTimeOriginal or DateTimeDigitized (Unix epoch seconds)
+}
+
+/// Render a stored PDQ quality for CLI output, flagging values that are below
+/// the fuzzy-matching cutoff.
+fn format_pdq_quality(quality: Option<u16>) -> String {
+    match quality {
+        Some(q) if q < crate::scanner::PDQ_MIN_QUALITY => format!("{} (low)", q),
+        Some(q) => q.to_string(),
+        None => "n/a".to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -629,10 +640,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 chrono::DateTime::<Utc>::from_timestamp(entry.timestamp as i64, 0)
                                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                                     .unwrap_or_else(|| format!("{}", entry.timestamp));
+                            let q_str = format_pdq_quality(ctx.get_pdq_quality(ch));
                             println!(
-                                "  blake3: {}  pdqhash: {}  added: {}",
+                                "  blake3: {}  pdqhash: {}  quality: {}  added: {}",
                                 hex::encode(ch),
                                 pdq_str,
+                                q_str,
                                 ts_str
                             );
                         }
@@ -646,10 +659,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             chrono::DateTime::<Utc>::from_timestamp(entry.timestamp as i64, 0)
                                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                                 .unwrap_or_else(|| format!("{}", entry.timestamp));
+                        let q_str = format_pdq_quality(ctx.get_pdq_quality(ch));
                         println!(
-                            "blake3: {}  pdqhash: {}  added: {}  (no group)",
+                            "blake3: {}  pdqhash: {}  quality: {}  added: {}  (no group)",
                             hex::encode(ch),
                             pdq_str,
+                            q_str,
                             ts_str
                         );
                     }

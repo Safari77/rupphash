@@ -60,7 +60,7 @@ impl ExifValue {
 
 /// Derived: Country name from GPS coordinates
 pub const TAG_DERIVED_COUNTRY: u16 = 0xF001;
-/// Derived: Subdivision/state from GPS coordinates  
+/// Derived: Subdivision/state from GPS coordinates
 pub const TAG_DERIVED_SUBDIVISION: u16 = 0xF002;
 /// Derived: Sun azimuth angle (degrees from north)
 pub const TAG_DERIVED_SUN_AZIMUTH: u16 = 0xF003;
@@ -70,6 +70,8 @@ pub const TAG_DERIVED_SUN_ALTITUDE: u16 = 0xF004;
 pub const TAG_DERIVED_TIMEZONE: u16 = 0xF005;
 /// Derived: EXIF timestamp as Unix epoch seconds
 pub const TAG_DERIVED_TIMESTAMP: u16 = 0xF006;
+/// PDQ Quality
+pub const TAG_DERIVED_PDQ_QUALITY: u16 = 0xF007;
 
 // =============================================================================
 // Common EXIF Tag IDs (for reference and name mapping)

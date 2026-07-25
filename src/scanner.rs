@@ -25,7 +25,8 @@ use crate::db::{
 };
 use crate::exif_extract::extract_gps_lat_lon;
 use crate::exif_types::{
-    ExifValue, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE, TAG_ORIENTATION,
+    ExifValue, TAG_DERIVED_PDQ_QUALITY, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE,
+    TAG_GPS_LONGITUDE, TAG_ORIENTATION,
 };
 use crate::fileops;
 use crate::fileops::get_file_key;
@@ -1118,6 +1119,7 @@ struct ScannedFile {
     pub unique_file_id: u128,
     pub pdqhash: Option<[u8; 32]>,
     pub pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>>,
+    pub pdq_quality: Option<u16>,
     pub pixel_hash: Option<[u8; 32]>,
     pub exif_timestamp: Option<i64>,
 }
@@ -1129,6 +1131,7 @@ impl ScannedFile {
             size: self.size,
             modified: self.modified,
             pdqhash: self.pdqhash,
+            pdq_quality: self.pdq_quality,
             resolution: self.resolution,
             content_hash: self.content_hash,
             orientation: self.orientation,
@@ -1227,6 +1230,7 @@ pub fn scan_and_group(
                 }
                 let mut pdqhash: Option<[u8; 32]> = None;
                 let mut pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>> = None;
+                let mut pdq_quality: Option<u16> = None;
                 // IMPORTANT: new_meta tracks updates to the file_metadata DB.
                 // Even if we hit the cache, we MUST set this to refresh the timestamp.
                 let mut new_meta = None;
@@ -1255,6 +1259,7 @@ pub fn scan_and_group(
                             resolution = Some((feats.width, feats.height));
                             orientation = feats.orientation();
                             gps_pos = feats.gps_pos();
+                            pdq_quality = feats.pdq_quality();
 
                             // Get coefficients from separate db
                             if let Ok(Some(coeff_vec)) = ctx_ref.get_coefficients(&ch)
@@ -1401,15 +1406,23 @@ pub fn scan_and_group(
                             }
 
                             // Use 'img' directly - do NOT call load_from_memory again
-                            if let Some((features, _)) = crate::pdqhash::generate_pdq_features(img)
+                            if let Some((features, quality)) =
+                                crate::pdqhash::generate_pdq_features(img)
                             {
                                 let hash = features.to_hash();
                                 pdqhash = Some(hash);
 
-                                let mut coeffs = [0.0; 256];
-                                coeffs.copy_from_slice(&features.coefficients);
-                                let feats = crate::pdqhash::PdqFeatures { coefficients: coeffs };
-                                pdq_features = Some(Arc::new(feats.clone()));
+                                // 0-100, the scale reference PDQ tools report.
+                                let quality_100 =
+                                    (quality * 100.0).round().clamp(0.0, 100.0) as u16;
+                                pdq_quality = Some(quality_100);
+
+                                // Serialize for the DB first, then move the features
+                                // into the Arc: no intermediate array, no clone.
+                                let cached_coeffs = CachedCoefficients {
+                                    coefficients: features.coefficients.to_vec(),
+                                };
+                                pdq_features = Some(Arc::new(features));
 
                                 // Build ImageFeatures from the data we have
                                 let (w, h) = resolution.unwrap_or((0, 0));
@@ -1449,9 +1462,15 @@ pub fn scan_and_group(
                                         .insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(ts));
                                 }
 
-                                let cached_coeffs = CachedCoefficients {
-                                    coefficients: features.coefficients.to_vec(),
-                                };
+                                // Persist the PDQ quality so later scans can gate on
+                                // it without decoding the image again. It cannot be
+                                // recovered from the cached coefficients: it is
+                                // measured on the 64x64 image-domain buffer, not on
+                                // the DCT output.
+                                img_features.insert_tag(
+                                    TAG_DERIVED_PDQ_QUALITY,
+                                    ExifValue::Short(quality_100),
+                                );
 
                                 if new_hash.is_none() {
                                     new_hash = Some((ck, HashValue::PdqHash(hash)));
@@ -1492,6 +1511,7 @@ pub fn scan_and_group(
                     gps_pos,
                     unique_file_id,
                     pdqhash,
+                    pdq_quality,
                     pdq_features,
                     pixel_hash,
                     exif_timestamp,
@@ -1556,12 +1576,26 @@ pub fn scan_and_group(
     combined.into_iter().unzip()
 }
 
+/// Hashes at or below this quality are not trusted for fuzzy matching.
+/// Upstream PDQ recommends discarding hashes with quality <= 49.
+///
+/// The metric is close to binary in practice: the gradient sum is capped at 90
+/// but a single image with any contrast at all reaches that cap, so anything
+/// scoring below this is genuinely featureless. A flat image thresholds
+/// numerical noise against the median, and every solid-colour image collapses
+/// onto the same handful of bits, which is what makes unrelated blank scans
+/// group together.
+pub const PDQ_MIN_QUALITY: u16 = 50;
+
 // --- 1. Define Strategy Trait
 trait GroupingStrategy<H>: Sync + Send {
     fn extract_hash(&self, file: &ScannedFile) -> Option<H>;
     // Write variants into a fixed-size buffer to avoid Vec allocation.
     // Returns the number of variants written.
     fn generate_variants(&self, file: &ScannedFile, hash: H, out: &mut [H; 8]) -> usize;
+    /// True when the hash is too featureless to be matched fuzzily. Such files
+    /// are still indexed, but only pair up on an exact (distance 0) match.
+    fn is_low_confidence(&self, file: &ScannedFile) -> bool;
 }
 
 struct PdqStrategy;
@@ -1579,16 +1613,20 @@ impl GroupingStrategy<[u8; 32]> for PdqStrategy {
         out: &mut [[u8; 32]; 8],
     ) -> usize {
         if let Some(features) = &file.pdq_features {
-            let vars = features.generate_dihedral_hashes();
-            let count = vars.len().min(8);
-            for (i, v) in vars.iter().enumerate().take(count) {
-                out[i] = *v;
-            }
-            count
+            *out = features.generate_dihedral_hashes();
+            out.len()
         } else {
             out[0] = hash;
             1
         }
+    }
+
+    #[inline(always)]
+    fn is_low_confidence(&self, file: &ScannedFile) -> bool {
+        // Unknown quality counts as good: records written before quality was
+        // stored, and view-mode feature records, must not silently stop
+        // matching after an upgrade.
+        file.pdq_quality.is_some_and(|q| q < PDQ_MIN_QUALITY)
     }
 }
 
@@ -1623,6 +1661,8 @@ where
 
     let hashes: Vec<H> = valid_entries.iter().map(|(_, h)| *h).collect();
     let dense_to_sparse: Vec<usize> = valid_entries.iter().map(|(i, _)| *i).collect();
+    // Indexed by sparse file index, same as valid_files.
+    let low_conf: Vec<bool> = valid_files.iter().map(|f| strategy.is_low_confidence(f)).collect();
 
     let mih = MIHIndex::new(hashes);
     let n = valid_files.len();
@@ -1646,6 +1686,12 @@ where
                     let count = strategy.generate_variants(file, hash, variants_buf);
                     let variants = &variants_buf[..count];
 
+                    // A low-quality hash may only match exactly. That still keeps
+                    // byte-identical duplicates (two copies of the same blank scan)
+                    // together, while stopping unrelated featureless images from
+                    // being pulled into the same group.
+                    let base_limit = if low_conf[i] { 0 } else { config.similarity };
+
                     for &variant in variants {
                         visited.clear();
 
@@ -1666,8 +1712,9 @@ where
                                         }
 
                                         let cand_hash = mih.hash(*dense);
-                                        if variant.hamming_distance(cand_hash) <= config.similarity
-                                        {
+                                        let limit =
+                                            if low_conf[cand_idx] { 0 } else { base_limit };
+                                        if variant.hamming_distance(cand_hash) <= limit {
                                             edges.push((i as u32, cand_idx as u32));
                                         }
                                     }
@@ -2160,22 +2207,26 @@ fn analyze_group_with_features(
 
     sort_by_stem_then_ext(files);
 
-    let pivot_features = files.first().and_then(|pivot| features_map.get(&pivot.path)).copied(); // Dereference &&PdqFeatures to &PdqFeatures
+    // Pivot on the first file that actually has features / a hash. Using
+    // files.first() unconditionally collapsed max_dist to 0 for the whole
+    // group whenever the first file after sorting had neither (decode
+    // failure, or an entry that was never PDQ hashed).
+    let pivot_features: Option<&crate::pdqhash::PdqFeatures> =
+        files.iter().find_map(|f| features_map.get(&f.path).copied());
 
     let max_d = if let Some(pivot_feats) = pivot_features {
         let pivot_variants = pivot_feats.generate_dihedral_hashes();
         files
             .iter()
-            .map(|f| {
-                if let Some(h) = f.pdqhash {
-                    pivot_variants.iter().map(|v| v.hamming_distance(&h)).min().unwrap_or(255)
-                } else {
-                    0
-                }
+            .filter_map(|f| f.pdqhash)
+            .map(|h| {
+                pivot_variants
+                    .iter()
+                    .fold(u32::MAX, |best, v| best.min(v.hamming_distance(&h)))
             })
             .max()
             .unwrap_or(0)
-    } else if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
+    } else if let Some(pivot) = files.iter().find_map(|f| f.pdqhash) {
         files
             .iter()
             .filter_map(|f| f.pdqhash)
@@ -2342,6 +2393,7 @@ pub fn scan_for_view(
                         size,
                         modified,
                         pdqhash: None,
+                        pdq_quality: None,
                         resolution: None,
                         content_hash: [0u8; 32],
                         pixel_hash: None,
@@ -2471,6 +2523,7 @@ pub fn spawn_background_flatten_scan(
                     size: e.size,
                     modified: e.modified,
                     pdqhash: None,
+                    pdq_quality: None,
                     resolution,
                     content_hash: [0u8; 32],
                     pixel_hash: None,
@@ -2763,6 +2816,7 @@ pub fn spawn_background_dir_scan(
                     size: e.size,
                     modified: e.modified,
                     pdqhash: None,
+                    pdq_quality: None,
                     resolution,
                     content_hash: [0u8; 32],
                     pixel_hash: None,

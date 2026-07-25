@@ -2,7 +2,8 @@
 // Uses BTreeMap for flexible EXIF tag storage with postcard serialization.
 
 use crate::exif_types::{
-    ExifValue, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE, TAG_ORIENTATION,
+    ExifValue, TAG_DERIVED_PDQ_QUALITY, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE,
+    TAG_ORIENTATION,
 };
 use geo::Point;
 use serde::{Deserialize, Serialize};
@@ -102,6 +103,13 @@ impl ImageFeatures {
         if self.width > 0 && self.height > 0 { Some((self.width, self.height)) } else { None }
     }
 
+    /// Get PDQ Quality
+    pub fn pdq_quality(&self) -> Option<u16> {
+        match self.get_tag(TAG_DERIVED_PDQ_QUALITY) {
+            Some(ExifValue::Short(q)) => Some(*q),
+            _ => None,
+        }
+    }
     /// Check if features contain a specific tag
     pub fn has_tag(&self, tag_id: u16) -> bool {
         self.tags.contains_key(&tag_id)

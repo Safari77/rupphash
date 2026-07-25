@@ -1026,6 +1026,7 @@ impl GuiApp {
                                         size,
                                         modified,
                                         pdqhash: None,
+                                        pdq_quality: None,
                                         resolution,
                                         content_hash: [0u8; 32],
                                         pixel_hash: None,

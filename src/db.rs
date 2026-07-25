@@ -29,6 +29,23 @@ const DB_FILE_NAME_COEFFICIENTS: &str = "phdupes_coefficients";
 const DB_FILE_NAME_IGNORED: &str = "phdupes_ignored";
 const DB_FILE_NAME_IGNORED_PDQMAP: &str = "phdupes_ignored_pdqmap";
 
+/// Version of the PDQ pipeline whose output is stored in hash_db and coeff_db.
+///
+/// Bump this whenever something that changes hash bits changes: DCT_FREQ_OFFSET,
+/// JAROSZ_WINDOW_DIVISOR, RESIZE_ALG, the luma weights, or the pre-downsample
+/// size. The version is written as a leading byte on the stored value and a
+/// mismatch is reported as a cache miss, so stale entries are recomputed and
+/// overwritten on the next scan instead of being silently mixed with current
+/// ones.
+///
+/// ignored_db and ignored_pdqmap_db are deliberately NOT versioned. They are
+/// keyed by blake3 content_hash, so the ignore list survives an algorithm
+/// change; only the pdqmap loses its old-hash entries, which costs a group its
+/// previous UUID and is cleaned up by --prune.
+///
+/// 1 = original non-reference pipeline, 2 = reference-compatible PDQ.
+pub const PDQ_ALGO_VERSION: u8 = 2;
+
 // Encryption overhead: 24-byte nonce + 16-byte Poly1305 tag
 const ENCRYPTION_OVERHEAD: usize = 24 + 16;
 
@@ -663,8 +680,17 @@ impl AppContext {
         match txn.get(self.hash_db, content_hash) {
             Ok(encrypted_bytes) => {
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    let arr: [u8; 32] = decrypted.try_into().map_err(|_| lmdb::Error::Corrupted)?;
-                    Ok(Some(arr))
+                    // Stored as [PDQ_ALGO_VERSION || 32-byte hash]. A different
+                    // version means the entry came from another PDQ pipeline, so
+                    // report a miss and let the scanner recompute it.
+                    match decrypted.split_first() {
+                        Some((&PDQ_ALGO_VERSION, rest)) if rest.len() == 32 => {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(rest);
+                            Ok(Some(arr))
+                        }
+                        _ => Ok(None),
+                    }
                 } else {
                     eprintln!("[ERROR-DB] get_pdqhash Corruped content_hash={:x?}", content_hash);
                     Err(lmdb::Error::Corrupted)
@@ -697,6 +723,13 @@ impl AppContext {
         }
     }
 
+    /// Get the stored PDQ quality (0-100) for a content hash, if any.
+    /// None means the record predates quality storage, or was written by view
+    /// mode, which never computes a PDQ hash.
+    pub fn get_pdq_quality(&self, content_hash: &[u8; 32]) -> Option<u16> {
+        self.get_features(content_hash).ok().flatten().and_then(|f| f.pdq_quality())
+    }
+
     /// Get coefficients from the separate coeff_db
     pub fn get_coefficients(
         &self,
@@ -706,10 +739,17 @@ impl AppContext {
         match txn.get(self.coeff_db, content_hash) {
             Ok(encrypted_bytes) => {
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    if let Ok(cached) = CachedCoefficients::from_bytes(&decrypted) {
-                        Ok(Some(cached.coefficients))
-                    } else {
-                        Err(lmdb::Error::Corrupted)
+                    // Stored as [PDQ_ALGO_VERSION || postcard(CachedCoefficients)].
+                    match decrypted.split_first() {
+                        Some((&PDQ_ALGO_VERSION, rest)) => {
+                            if let Ok(cached) = CachedCoefficients::from_bytes(rest) {
+                                Ok(Some(cached.coefficients))
+                            } else {
+                                Err(lmdb::Error::Corrupted)
+                            }
+                        }
+                        // Older algorithm version: treat as absent, not corrupt.
+                        _ => Ok(None),
                     }
                 } else {
                     Err(lmdb::Error::Corrupted)
@@ -1160,11 +1200,15 @@ impl AppContext {
             txn.put(meta_db, key, &encrypted, WriteFlags::empty())?;
         }
 
-        // 2. Hash Updates
+        // 2. Hash Updates: prefix the algorithm version (1 byte) to the hash
         for (key, val) in hash_updates {
             match val {
                 HashValue::PdqHash(pdqhash) => {
-                    let encrypted = Self::encrypt_value(cipher, key, pdqhash);
+                    let mut data = Vec::with_capacity(1 + 32);
+                    data.push(PDQ_ALGO_VERSION);
+                    data.extend_from_slice(pdqhash);
+
+                    let encrypted = Self::encrypt_value(cipher, key, &data);
                     txn.put(hash_db, key, &encrypted, WriteFlags::empty())?;
                 }
             }
@@ -1178,9 +1222,14 @@ impl AppContext {
         }
 
         // 4. Coefficient Updates (PDQ coefficients - duplicate finder mode only)
+        //    Prefixed with the algorithm version, same as the hashes.
         for (key, coeffs) in coeff_updates {
             let bytes = coeffs.to_bytes().expect("CachedCoefficients serialization failed");
-            let encrypted = Self::encrypt_value(cipher, key, &bytes);
+            let mut data = Vec::with_capacity(1 + bytes.len());
+            data.push(PDQ_ALGO_VERSION);
+            data.extend_from_slice(&bytes);
+
+            let encrypted = Self::encrypt_value(cipher, key, &data);
             txn.put(coeff_db, key, &encrypted, WriteFlags::empty())?;
         }
 
