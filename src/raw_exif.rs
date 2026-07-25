@@ -89,15 +89,15 @@ pub fn build_features_from_raw_image(raw: &RawImage) -> ImageFeatures {
     // GPS info
     let lat = dms_to_decimal(&info.gps.latitude);
     let lon = dms_to_decimal(&info.gps.longitude);
-    let has_valid_gps = lat.abs() > 0.0001 || lon.abs() > 0.0001;
+    let has_valid_gps = gps_is_valid(lat, lon);
 
     if has_valid_gps {
         features.insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(lat));
         features.insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(lon));
     }
 
-    // Altitude
-    if info.gps.altitude.abs() > 0.0001 {
+    // Altitude — only alongside a usable position, and only if finite.
+    if has_valid_gps && info.gps.altitude.is_finite() && info.gps.altitude.abs() > 0.0001 {
         features.insert_tag(TAG_GPS_ALTITUDE, ExifValue::Float(info.gps.altitude.into()));
     }
 
@@ -108,6 +108,23 @@ pub fn build_features_from_raw_image(raw: &RawImage) -> ImageFeatures {
     }
 
     features
+}
+
+/// Decide whether a decoded lat/lon pair should be published as a position.
+///
+/// Two separate rejections:
+/// - rsraw returns all-zero arrays for files without GPS, so a coordinate
+///   within ~11 m of (0, 0) is read as "absent" rather than Null Island.
+/// - Out-of-range or non-finite values come from corrupt or vendor-specific
+///   headers. They must not reach GpsMapState: walkers projects them into
+///   nonsense screen coordinates and they poison the sort bounds.
+#[inline]
+fn gps_is_valid(lat: f64, lon: f64) -> bool {
+    lat.is_finite()
+        && lon.is_finite()
+        && (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lon)
+        && (lat.abs() > 0.0001 || lon.abs() > 0.0001)
 }
 
 /// Convert GPS coordinates from rsraw's [degrees, minutes, seconds] format to decimal degrees.
@@ -138,8 +155,7 @@ pub fn get_gps_point_from_raw(raw: &RawImage) -> Option<Point<f64>> {
     let lat = dms_to_decimal(&info.gps.latitude);
     let lon = dms_to_decimal(&info.gps.longitude);
 
-    // Check if we have valid GPS coordinates
-    if lat.abs() > 0.0001 || lon.abs() > 0.0001 {
+    if gps_is_valid(lat, lon) {
         Some(Point::new(lon, lat)) // geo uses (x, y) = (lon, lat)
     } else {
         None
@@ -256,7 +272,7 @@ pub fn merge_raw_info_into_features(features: &mut ImageFeatures, raw: &RawImage
     // GPS info
     let lat = dms_to_decimal(&info.gps.latitude);
     let lon = dms_to_decimal(&info.gps.longitude);
-    let has_valid_gps = lat.abs() > 0.0001 || lon.abs() > 0.0001;
+    let has_valid_gps = gps_is_valid(lat, lon);
 
     if has_valid_gps {
         if !features.has_tag(TAG_GPS_LATITUDE) {
@@ -267,7 +283,11 @@ pub fn merge_raw_info_into_features(features: &mut ImageFeatures, raw: &RawImage
         }
     }
 
-    if !features.has_tag(TAG_GPS_ALTITUDE) && info.gps.altitude.abs() > 0.0001 {
+    if has_valid_gps
+        && !features.has_tag(TAG_GPS_ALTITUDE)
+        && info.gps.altitude.is_finite()
+        && info.gps.altitude.abs() > 0.0001
+    {
         features.insert_tag(TAG_GPS_ALTITUDE, ExifValue::Float(info.gps.altitude.into()));
     }
 
@@ -282,6 +302,17 @@ pub fn merge_raw_info_into_features(features: &mut ImageFeatures, raw: &RawImage
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gps_is_valid() {
+        assert!(gps_is_valid(60.1699, 24.9384)); // Helsinki
+        assert!(gps_is_valid(51.4779, 0.0)); // Greenwich: lon 0 is fine
+        assert!(!gps_is_valid(0.0, 0.0)); // rsraw "no GPS" sentinel
+        assert!(!gps_is_valid(91.0, 10.0)); // latitude out of range
+        assert!(!gps_is_valid(45.0, 200.0)); // longitude out of range
+        assert!(!gps_is_valid(f64::NAN, 10.0));
+        assert!(!gps_is_valid(45.0, f64::INFINITY));
+    }
 
     #[test]
     fn test_dms_to_decimal() {
