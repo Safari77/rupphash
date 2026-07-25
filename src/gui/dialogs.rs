@@ -480,9 +480,6 @@ pub(super) fn handle_input(
                     // No current image, center on first marker
                     app.gps_map.set_initial_center(first_marker.lat, first_marker.lon);
                 }
-                let marker_count = app.gps_map.markers.len();
-                app.set_status(format!("GPS Map enabled. {} markers loaded.", marker_count), false);
-
                 let count = app.gps_map.markers.len();
                 app.set_status(format!("GPS Map enabled. {} markers.", count), false);
             } else if !app.gps_map.show_path_lines {
@@ -835,7 +832,7 @@ pub(super) fn handle_dialogs(
         });
     }
 
-    // Ignore Group Confirmation Dialog (Ctrl+Q in duplicate mode)
+    // Ignore Group Confirmation Dialog (Shift+Q in duplicate mode)
     if app.state.show_ignore_group_confirmation {
         let group_len =
             app.state.groups.get(app.state.current_group_idx).map(|g| g.len()).unwrap_or(0);
