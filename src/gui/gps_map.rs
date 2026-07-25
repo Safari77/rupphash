@@ -403,6 +403,9 @@ impl GpsMapState {
 
     /// Remove a marker by path and mark the list for sorting
     pub fn remove_marker(&mut self, path: &Path) {
+        // Capture the selection as a path before the vector is reshuffled.
+        let selected_path = self.selected_path();
+
         if let Some(idx) = self.path_to_marker.remove(path) {
             // 1. Remove from the vector using swap_remove (O(1))
             // This moves the last element into the 'idx' spot to fill the gap.
@@ -418,15 +421,11 @@ impl GpsMapState {
                 }
             }
 
-            // 3. Clear selection if the removed marker was selected
-            if self.selected_marker == Some(idx) {
-                self.selected_marker = None;
-            }
-            // Note: If the selected marker was the one that *moved* (was at the end),
-            // its index effectively changed to 'idx'.
-            // However, since we set 'markers_needs_sort', the indices will likely
-            // change again on the next frame, so simply deselecting or leaving it
-            // is acceptable until the sort logic handles selection mapping.
+            // 3. Re-resolve the selection against the new layout. This clears
+            // it when the removed marker was the selected one, and follows the
+            // marker that swap_remove moved from the end into 'idx' — which the
+            // old index comparison left pointing out of bounds.
+            self.restore_selection(selected_path);
 
             // 4. Mark dirty to trigger re-sort/re-line-draw
             self.markers_needs_sort = true;
@@ -470,6 +469,9 @@ impl GpsMapState {
             return 0.0;
         }
 
+        // Every branch below reorders `markers`, invalidating the index.
+        let selected_path = self.selected_path();
+
         if self.sort_by_exif_timestamp {
             // Sort by EXIF timestamp (oldest first), files without timestamp go to the end
             self.markers.sort_by(|a, b| {
@@ -486,6 +488,7 @@ impl GpsMapState {
             for (i, m) in self.markers.iter().enumerate() {
                 self.path_to_marker.insert(m.path.clone(), i);
             }
+            self.restore_selection(selected_path);
 
             // Calculate total distance
             let mut total_dist = 0.0;
@@ -529,6 +532,7 @@ impl GpsMapState {
         for (i, m) in self.markers.iter().enumerate() {
             self.path_to_marker.insert(m.path.clone(), i);
         }
+        self.restore_selection(selected_path);
 
         // Calculate and log Total Distance using exact geodesic formula
         let mut total_dist = 0.0;
@@ -555,7 +559,18 @@ impl GpsMapState {
 
     /// Helper to check if we already have a marker for this path
     pub fn get_marker_by_path(&self, path: &Path) -> Option<&GpsMarker> {
-        self.path_to_marker.get(path).map(|&idx| &self.markers[idx])
+        self.path_to_marker.get(path).and_then(|&idx| self.markers.get(idx))
+    }
+
+    /// Path of the currently selected marker, if the stored index is still valid.
+    fn selected_path(&self) -> Option<PathBuf> {
+        self.selected_marker.and_then(|i| self.markers.get(i)).map(|m| m.path.clone())
+    }
+
+    /// Re-point `selected_marker` after `markers` has been reordered or had an
+    /// element removed. Call once `path_to_marker` has been rebuilt.
+    fn restore_selection(&mut self, path: Option<PathBuf>) {
+        self.selected_marker = path.and_then(|p| self.path_to_marker.get(&p).copied());
     }
 
     /// Find the closest marker to a given position
