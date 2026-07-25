@@ -123,7 +123,7 @@ pub fn build_features_from_raw_image(raw: &RawImage) -> ImageFeatures {
 /// rsraw folds the N/S/E/W sign into ALL THREE components, so each of
 /// degrees/minutes/seconds is negative for southern/western coordinates.
 #[inline]
-fn dms_to_decimal(dms: &[f32; 3]) -> f64 {
+pub fn dms_to_decimal(dms: &[f32; 3]) -> f64 {
     // Recover the hemisphere sign from any component (rsraw signs all three),
     // then sum the magnitudes so minutes/seconds add instead of subtracting.
     let sign = if dms[0] < 0.0 || dms[1] < 0.0 || dms[2] < 0.0 { -1.0 } else { 1.0 };
@@ -132,12 +132,6 @@ fn dms_to_decimal(dms: &[f32; 3]) -> f64 {
     let seconds = dms[2].abs() as f64;
 
     sign * (degrees + minutes / 60.0 + seconds / 3600.0)
-}
-
-/// Public version of dms_to_decimal for use by scanner.rs get_exif_tags_from_rsraw()
-#[inline]
-pub fn dms_to_decimal_pub(dms: &[f32; 3]) -> f64 {
-    dms_to_decimal(dms)
 }
 
 /// Get GPS position as geo::Point from an rsraw RawImage.

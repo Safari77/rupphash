@@ -34,6 +34,7 @@ use crate::helper_exif::{get_altitude, get_date_str, get_exif_timestamp, parse_g
 use crate::image_features::ImageFeatures;
 use crate::position;
 use crate::raw_exif;
+use crate::raw_exif::dms_to_decimal;
 use crate::{FileMetadata, GroupInfo, GroupStatus};
 use std::sync::OnceLock;
 use sysinfo::System;
@@ -330,7 +331,7 @@ fn get_exif_tags_from_rsraw(
                 info.datetime.as_ref().map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             }
             "gpslatitude" => {
-                let lat = raw_exif::dms_to_decimal_pub(&info.gps.latitude);
+                let lat = dms_to_decimal(&info.gps.latitude);
                 if lat.abs() > 0.0001 {
                     if decimal_coords {
                         Some(format!("{:.6}°", lat))
@@ -342,7 +343,7 @@ fn get_exif_tags_from_rsraw(
                 }
             }
             "gpslongitude" => {
-                let lon = raw_exif::dms_to_decimal_pub(&info.gps.longitude);
+                let lon = dms_to_decimal(&info.gps.longitude);
                 if lon.abs() > 0.0001 {
                     if decimal_coords {
                         Some(format!("{:.6}°", lon))
@@ -361,8 +362,8 @@ fn get_exif_tags_from_rsraw(
                 }
             }
             "derivedcountry" | "country" => {
-                let lat = raw_exif::dms_to_decimal_pub(&info.gps.latitude);
-                let lon = raw_exif::dms_to_decimal_pub(&info.gps.longitude);
+                let lat = dms_to_decimal(&info.gps.latitude);
+                let lon = dms_to_decimal(&info.gps.longitude);
                 if lat.abs() > 0.0001 || lon.abs() > 0.0001 {
                     derive_country(lat, lon)
                 } else {
