@@ -2396,6 +2396,8 @@ pub fn scan_for_view(
                         size,
                         modified,
                         pdqhash: None,
+                        // scan_for_view has no AppContext, so there is no cached
+                        // ImageFeatures record to read a quality out of.
                         pdq_quality: None,
                         resolution: None,
                         content_hash: [0u8; 32],
@@ -2508,17 +2510,20 @@ pub fn spawn_background_flatten_scan(
         let mut files: Vec<FileMetadata> = entries
             .into_iter()
             .map(|e| {
-                // Extract fields from ImageFeatures if cached
-                let (resolution, orientation, gps_pos, exif_timestamp) =
+                // Extract fields from ImageFeatures if cached.
+                // pdq_quality is part of the same record, so it costs nothing
+                // extra here even though view mode never hashes anything.
+                let (resolution, orientation, gps_pos, exif_timestamp, pdq_quality) =
                     if let Some(feats) = cached.get(&e.unique_file_id) {
                         (
                             feats.resolution(),
                             feats.orientation(),
                             feats.gps_pos(),
                             feats.exif_timestamp(),
+                            feats.pdq_quality(),
                         )
                     } else {
-                        (None, 1, None, None)
+                        (None, 1, None, None, None)
                     };
 
                 FileMetadata {
@@ -2526,7 +2531,7 @@ pub fn spawn_background_flatten_scan(
                     size: e.size,
                     modified: e.modified,
                     pdqhash: None,
-                    pdq_quality: None,
+                    pdq_quality,
                     resolution,
                     content_hash: [0u8; 32],
                     pixel_hash: None,
@@ -2801,17 +2806,20 @@ pub fn spawn_background_dir_scan(
         let mut files: Vec<FileMetadata> = entries
             .into_iter()
             .map(|e| {
-                // Extract fields from ImageFeatures if cached
-                let (resolution, orientation, gps_pos, exif_timestamp) =
+                // Extract fields from ImageFeatures if cached.
+                // pdq_quality is part of the same record, so it costs nothing
+                // extra here even though view mode never hashes anything.
+                let (resolution, orientation, gps_pos, exif_timestamp, pdq_quality) =
                     if let Some(feats) = cached.get(&e.unique_file_id) {
                         (
                             feats.resolution(),
                             feats.orientation(),
                             feats.gps_pos(),
                             feats.exif_timestamp(),
+                            feats.pdq_quality(),
                         )
                     } else {
-                        (None, 1, None, None)
+                        (None, 1, None, None, None)
                     };
 
                 FileMetadata {
@@ -2819,7 +2827,7 @@ pub fn spawn_background_dir_scan(
                     size: e.size,
                     modified: e.modified,
                     pdqhash: None,
-                    pdq_quality: None,
+                    pdq_quality,
                     resolution,
                     content_hash: [0u8; 32],
                     pixel_hash: None,

@@ -1008,25 +1008,32 @@ impl GuiApp {
                                     let cached =
                                         self.ctx.lookup_cached_features(&meta, unique_file_id);
 
-                                    // Extract fields from ImageFeatures if found
-                                    let (resolution, orientation, gps_pos, exif_timestamp) =
-                                        if let Some(feats) = cached {
-                                            (
-                                                feats.resolution(),
-                                                feats.orientation(),
-                                                feats.gps_pos(),
-                                                feats.exif_timestamp(),
-                                            )
-                                        } else {
-                                            (None, 1, None, None)
-                                        };
+                                    // Extract fields from ImageFeatures if found.
+                                    // pdq_quality rides along in the same record.
+                                    let (
+                                        resolution,
+                                        orientation,
+                                        gps_pos,
+                                        exif_timestamp,
+                                        pdq_quality,
+                                    ) = if let Some(feats) = cached {
+                                        (
+                                            feats.resolution(),
+                                            feats.orientation(),
+                                            feats.gps_pos(),
+                                            feats.exif_timestamp(),
+                                            feats.pdq_quality(),
+                                        )
+                                    } else {
+                                        (None, 1, None, None, None)
+                                    };
 
                                     new_files.push(FileMetadata {
                                         path: canonical,
                                         size,
                                         modified,
                                         pdqhash: None,
-                                        pdq_quality: None,
+                                        pdq_quality,
                                         resolution,
                                         content_hash: [0u8; 32],
                                         pixel_hash: None,
@@ -2995,9 +3002,11 @@ impl eframe::App for GuiApp {
                                     // its members were only allowed to pair up on an
                                     // exact match. Say so, so the distance is not read
                                     // as evidence of a fuzzy match.
-                                    if group.iter().any(|f| {
-                                        crate::scanner::is_low_pdq_quality(f.pdq_quality)
-                                    }) {
+                                    if !self.state.view_mode
+                                        && group.iter().any(|f| {
+                                            crate::scanner::is_low_pdq_quality(f.pdq_quality)
+                                        })
+                                    {
                                         txt.push_str("  [low quality: exact match only]");
                                     }
 
@@ -3048,8 +3057,11 @@ impl eframe::App for GuiApp {
                                         *counts.get(&file.content_hash).unwrap_or(&0) > 1;
                                     let is_hardlinked =
                                         hardlink_groups.contains_key(&file.unique_file_id);
-                                    let is_low_quality =
-                                        crate::scanner::is_low_pdq_quality(file.pdq_quality);
+                                    // Cached quality is now populated in view mode too, but
+                                    // "low quality" only means "excluded from fuzzy matching",
+                                    // and view mode does no matching at all.
+                                    let is_low_quality = !self.state.view_mode
+                                        && crate::scanner::is_low_pdq_quality(file.pdq_quality);
 
                                     // Content Group ID
                                     let content_id =
