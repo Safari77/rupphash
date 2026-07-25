@@ -1416,8 +1416,12 @@ pub(super) fn handle_dialogs(
                             {
                                 Some(dt) => {
                                     if show_relative {
-                                        let ts = Timestamp::from_second(dt.timestamp()).unwrap();
-                                        format_relative_time(ts)
+                                        if let Ok(ts) = Timestamp::from_second(dt.timestamp()) {
+                                            format_relative_time(ts)
+                                        } else {
+                                            // Fallback to absolute time if mtime is out of jiff's range
+                                            dt.format("%Y-%m-%d %H:%M").to_string()
+                                        }
                                     } else {
                                         dt.format("%Y-%m-%d %H:%M").to_string()
                                     }
