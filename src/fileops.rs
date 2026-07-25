@@ -1,5 +1,6 @@
 use file_id::FileId;
 use filetime::FileTime;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -109,18 +110,11 @@ fn move_one(dest: &DestinationDir, src: &Path) -> MoveResult {
             )),
         };
     };
-    let Some(dst_name) = dst_name_os.to_str() else {
-        return MoveResult {
-            source: src.to_path_buf(),
-            destination: dest.path.join(dst_name_os),
-            outcome: Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "source filename is not valid UTF-8",
-            )),
-        };
-    };
 
-    let (final_name, outcome) = try_move_with_retry(dest, src, dst_name);
+    // Names stay as OsStr end to end: rustix's openat/renameat_with take any
+    // Arg, so there is no reason to reject the non-UTF-8 names that turn up on
+    // media copied from other systems.
+    let (final_name, outcome) = try_move_with_retry(dest, src, dst_name_os);
     MoveResult { source: src.to_path_buf(), destination: dest.path.join(&final_name), outcome }
 }
 
@@ -128,27 +122,27 @@ fn move_one(dest: &DestinationDir, src: &Path) -> MoveResult {
 fn try_move_with_retry(
     dest: &DestinationDir,
     src: &Path,
-    dst_name: &str,
-) -> (String, std::io::Result<()>) {
+    dst_name: &OsStr,
+) -> (OsString, std::io::Result<()>) {
     let outcome = try_move(dest, src, dst_name);
 
     if let Err(ref e) = outcome
         && is_name_too_long(e)
+        && let Some(name_str) = dst_name.to_str()
     {
-        let truncated = truncate_filename_to_limit(dst_name);
-        if truncated != dst_name {
+        let truncated = truncate_filename_to_limit(name_str);
+        if truncated != name_str {
             eprintln!("Filename too long, retrying with: {}", truncated);
-            let retry = try_move(dest, src, &truncated);
-            return (truncated, retry);
+            let retry = try_move(dest, src, OsStr::new(&truncated));
+            return (OsString::from(truncated), retry);
         }
     }
-
-    (dst_name.to_string(), outcome)
+    (dst_name.to_os_string(), outcome)
 }
 
 /// Single move attempt: rename within the same fs, copy+delete across fs
 /// boundaries. Always uses NOREPLACE / O_EXCL so we never overwrite.
-fn try_move(dest: &DestinationDir, src: &Path, dst_name: &str) -> std::io::Result<()> {
+fn try_move(dest: &DestinationDir, src: &Path, dst_name: &OsStr) -> std::io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // 1. Try atomic renameat2 with RENAME_NOREPLACE on the kept-open dirfd.
@@ -205,7 +199,7 @@ fn try_move(dest: &DestinationDir, src: &Path, dst_name: &str) -> std::io::Resul
 fn try_renameat_noreplace(
     dest: &DestinationDir,
     src: &Path,
-    dst_name: &str,
+    dst_name: &OsStr,
 ) -> std::io::Result<()> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     use std::os::fd::AsFd;
@@ -219,18 +213,19 @@ fn try_renameat_noreplace(
 /// Copy + delete via the kept-open dirfd. Uses O_EXCL so we never overwrite,
 /// and restores permissions / timestamps / xattrs on a best-effort basis.
 #[cfg(unix)]
-fn copy_move_into(dest: &DestinationDir, src: &Path, dst_name: &str) -> std::io::Result<()> {
-    use rustix::fs::{Mode, OFlags, openat};
+fn copy_move_into(dest: &DestinationDir, src: &Path, dst_name: &OsStr) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
     use std::os::fd::AsFd;
-    use xattr::FileExt;
 
     // Open source for reading.
-    let mut reader = std::fs::File::open(src)?;
-    let metadata = reader.metadata()?;
+    let reader = std::fs::File::open(src)?;
 
     // Create destination via openat on the kept-open dirfd. O_EXCL ensures
     // we never overwrite an existing file. Mode 0o600 is restrictive at
     // creation; the real perms are restored below from the source metadata.
+    // Everything that can fail *after* this point must unlink what we just
+    // created: a half-written file (ENOSPC, EIO) would otherwise stay behind
+    // and make every retry fail with EEXIST.
     let owned_fd = openat(
         dest.dir_fd.as_fd(),
         dst_name,
@@ -239,7 +234,37 @@ fn copy_move_into(dest: &DestinationDir, src: &Path, dst_name: &str) -> std::io:
     )?;
     // Convert rustix OwnedFd to std::fs::File so we can use std::io::copy
     // and other std-friendly APIs (set_permissions, sync_all).
-    let mut writer = std::fs::File::from(owned_fd);
+    let writer = std::fs::File::from(owned_fd);
+
+    if let Err(e) = copy_contents_and_metadata(dest, dst_name, reader, writer) {
+        if let Err(unlink_err) = unlinkat(dest.dir_fd.as_fd(), dst_name, AtFlags::empty()) {
+            eprintln!(
+                "[WARN] Failed to remove partial file {:?}: {}",
+                dest.path.join(dst_name),
+                unlink_err
+            );
+        }
+        return Err(e);
+    }
+
+    // NOTE: if this fails the copy is already durable, so we keep it and report
+    // rather than unwinding — the caller sees the error and both copies exist.
+    std::fs::remove_file(src)?;
+    Ok(())
+}
+
+/// Everything between "destination created" and "source removed". Split out so
+/// `copy_move_into` can unlink the destination on any failure in here.
+#[cfg(unix)]
+fn copy_contents_and_metadata(
+    dest: &DestinationDir,
+    dst_name: &OsStr,
+    mut reader: std::fs::File,
+    mut writer: std::fs::File,
+) -> std::io::Result<()> {
+    use xattr::FileExt;
+
+    let metadata = reader.metadata()?;
 
     // Copy data.
     std::io::copy(&mut reader, &mut writer)?;
@@ -266,9 +291,11 @@ fn copy_move_into(dest: &DestinationDir, src: &Path, dst_name: &str) -> std::io:
 
     // Restore extended attributes (ACLs, SELinux labels, user xattrs) on the
     // freshly created fd via xattr::FileExt, ignoring per-attr errors.
-    if let Ok(iter) = xattr::list(src) {
-        for name in iter {
-            if let Ok(Some(value)) = xattr::get(src, &name) {
+    //
+    // Read through the open source handle rather than by path.
+    if let Ok(names) = reader.list_xattr() {
+        for name in names {
+            if let Ok(Some(value)) = reader.get_xattr(&name) {
                 let _ = writer.set_xattr(&name, &value);
             }
         }
@@ -277,11 +304,6 @@ fn copy_move_into(dest: &DestinationDir, src: &Path, dst_name: &str) -> std::io:
     // Fsync before unlinking the source so the new file is durable.
     writer.sync_all()?;
 
-    // Drop handles before removing source (purely tidy; not required).
-    drop(writer);
-    drop(reader);
-
-    std::fs::remove_file(src)?;
     Ok(())
 }
 
