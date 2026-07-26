@@ -128,7 +128,14 @@ impl PdqFeatures {
 
 #[inline(always)]
 fn apply_sign(v: f32, r: usize, c: usize, neg_rows: bool, neg_cols: bool) -> f32 {
-    if (neg_rows && (r & 1 == 1)) ^ (neg_cols && (c & 1 == 1)) { -v } else { v }
+    // Row r of the kept block is DCT frequency r + DCT_FREQ_OFFSET, and a
+    // mirror negates the odd *frequencies*, not the odd array indices. With
+    // DCT_FREQ_OFFSET = 1 the DC term is dropped, so the parity is inverted
+    // relative to the index; getting this wrong complements the hash of every
+    // variant built from an odd number of mirrors.
+    let flip_r = neg_rows && (r + DCT_FREQ_OFFSET) % 2 == 1;
+    let flip_c = neg_cols && (c + DCT_FREQ_OFFSET) % 2 == 1;
+    if flip_r ^ flip_c { -v } else { v }
 }
 
 /// Bit (r, c) of the transposed matrix is bit (c, r) of the original.
@@ -494,7 +501,7 @@ mod tests {
         let mut new_coeffs = f.coefficients;
         for r in 0..DCT_OUTPUT_W_H {
             for c in 0..DCT_OUTPUT_W_H {
-                if c % 2 != 0 {
+                if (c + DCT_FREQ_OFFSET) % 2 != 0 {
                     let idx = r * DCT_OUTPUT_W_H + c;
                     new_coeffs[idx] = -new_coeffs[idx];
                 }
@@ -506,7 +513,7 @@ mod tests {
     fn naive_flip_y(f: &PdqFeatures) -> PdqFeatures {
         let mut new_coeffs = f.coefficients;
         for r in 0..DCT_OUTPUT_W_H {
-            if r % 2 != 0 {
+            if (r + DCT_FREQ_OFFSET) % 2 != 0 {
                 for c in 0..DCT_OUTPUT_W_H {
                     let idx = r * DCT_OUTPUT_W_H + c;
                     new_coeffs[idx] = -new_coeffs[idx];
@@ -560,6 +567,64 @@ mod tests {
         for i in 0..8 {
             for j in (i + 1)..8 {
                 assert_ne!(hashes[i], hashes[j], "variants {i} and {j} collided");
+            }
+        }
+    }
+
+    /// The bug this guards against: `generate_dihedral_hashes` derives each
+    /// variant from sign flips on the DCT coefficients, which is only valid if
+    /// the parity used matches the DCT *frequency* (index + DCT_FREQ_OFFSET).
+    /// Using the raw index instead complements the hash of the four variants
+    /// built from an odd number of mirrors, which the naive cross-check above
+    /// cannot see because it shares the same assumption.
+    ///
+    /// Here the ground truth is independent: physically transform the 64x64
+    /// buffer and re-run the real DCT over it. No resampling is involved, so
+    /// the hashes must match exactly, slot for slot.
+    #[test]
+    fn dihedral_hashes_match_physically_transformed_buffer() {
+        const N: usize = BUFFER_W_H;
+        type Buf = [[f32; N]; N];
+
+        fn transform(input: &Buf, variant: usize) -> Buf {
+            let mut out = [[0.0f32; N]; N];
+            for (x, row) in out.iter_mut().enumerate() {
+                for (y, px) in row.iter_mut().enumerate() {
+                    *px = match variant {
+                        0 => input[x][y],                 // identity
+                        1 => input[N - 1 - y][x],         // rotate 90 cw
+                        2 => input[N - 1 - x][N - 1 - y], // rotate 180
+                        3 => input[y][N - 1 - x],         // rotate 270 cw
+                        4 => input[x][N - 1 - y],         // mirror columns
+                        5 => input[N - 1 - x][y],         // mirror rows
+                        6 => input[y][x],                 // transpose
+                        _ => input[N - 1 - y][N - 1 - x], // anti-transpose
+                    };
+                }
+            }
+            out
+        }
+
+        for seed in [1u32, 42, 0xDEAD_BEEF] {
+            let mut state = seed;
+            let mut buf = [[0.0f32; N]; N];
+            for row in buf.iter_mut() {
+                for px in row.iter_mut() {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *px = ((state >> 16) & 0xFF) as f32;
+                }
+            }
+
+            let predicted = PdqFeatures::new(&buf).generate_dihedral_hashes();
+
+            for (variant, expected) in predicted.iter().enumerate() {
+                let actual = PdqFeatures::new(&transform(&buf, variant)).to_hash();
+                let dist: u32 =
+                    actual.iter().zip(expected).map(|(a, b)| (a ^ b).count_ones()).sum();
+                assert_eq!(
+                    dist, 0,
+                    "variant {variant} (seed {seed}) is {dist} bits from the real transform"
+                );
             }
         }
     }
