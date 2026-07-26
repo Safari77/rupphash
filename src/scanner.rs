@@ -2069,9 +2069,9 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
             files.reverse();
         }
         "date" => files.sort_by_key(|a| a.modified),
-        "date-desc" => files.sort_by(|a, b| b.modified.cmp(&a.modified)),
+        "date-desc" => files.sort_by_key(|b| std::cmp::Reverse(b.modified)),
         "size" => files.sort_by_key(|a| a.size),
-        "size-desc" => files.sort_by(|a, b| b.size.cmp(&a.size)),
+        "size-desc" => files.sort_by_key(|b| std::cmp::Reverse(b.size)),
         "exif-date" => {
             // Sort by EXIF timestamp (oldest first).
             // Files with EXIF timestamps come first, then files without (sorted by mtime).

@@ -904,33 +904,30 @@ impl AppContext {
         // 1. Scan MetaDB
         if txn.stat(self.meta_db)?.entries() > 0 {
             let mut cursor = txn.open_rw_cursor(self.meta_db)?;
-            for iter in cursor.iter_start() {
-                if let Ok((key, val_bytes)) = iter {
-                    let should_delete = if let Some(decrypted) = self.decrypt_value(key, val_bytes)
-                    {
-                        if decrypted.len() == 40 {
-                            let ts_bytes: [u8; 8] = decrypted[32..40].try_into().unwrap();
-                            let last_seen = u64::from_le_bytes(ts_bytes);
+            for (key, val_bytes) in cursor.iter_start().flatten() {
+                let should_delete = if let Some(decrypted) = self.decrypt_value(key, val_bytes) {
+                    if decrypted.len() == 40 {
+                        let ts_bytes: [u8; 8] = decrypted[32..40].try_into().unwrap();
+                        let last_seen = u64::from_le_bytes(ts_bytes);
 
-                            if last_seen < cutoff {
-                                true // Expired
-                            } else {
-                                let mut ch = [0u8; 32];
-                                ch.copy_from_slice(&decrypted[0..32]);
-                                valid_content_hashes.insert(ch);
-                                false // Keep
-                            }
+                        if last_seen < cutoff {
+                            true // Expired
                         } else {
-                            true // Corrupted/Old format -> Delete
+                            let mut ch = [0u8; 32];
+                            ch.copy_from_slice(&decrypted[0..32]);
+                            valid_content_hashes.insert(ch);
+                            false // Keep
                         }
                     } else {
-                        true // Decrypt fail -> Delete
-                    };
-
-                    if should_delete {
-                        cursor.del(WriteFlags::empty())?;
-                        meta_remove_count += 1;
+                        true // Corrupted/Old format -> Delete
                     }
+                } else {
+                    true // Decrypt fail -> Delete
+                };
+
+                if should_delete {
+                    cursor.del(WriteFlags::empty())?;
+                    meta_remove_count += 1;
                 }
             }
         }

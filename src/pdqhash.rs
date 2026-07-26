@@ -426,11 +426,12 @@ fn decimate_float<const R: usize, const C: usize>(
     in_c: usize,
 ) -> [[f32; C]; R] {
     let mut out = [[0.0; C]; R];
-    for i in 0..R {
+    for (i, out_row) in out.iter_mut().enumerate() {
         let ini = ((i * 2 + 1) * in_r) / (R * 2);
-        for j in 0..C {
-            let inj = ((j * 2 + 1) * in_c) / (C * 2);
-            out[i][j] = input[ini * in_c + inj];
+        // Slice the source row once so the inner loop indexes within it.
+        let in_row = &input[ini * in_c..][..in_c];
+        for (j, out_px) in out_row.iter_mut().enumerate() {
+            *out_px = in_row[((j * 2 + 1) * in_c) / (C * 2)];
         }
     }
     out
@@ -439,17 +440,16 @@ fn decimate_float<const R: usize, const C: usize>(
 fn pdq_image_domain_quality_metric<const R: usize, const C: usize>(buf: &[[f32; C]; R]) -> f32 {
     // Reference PDQ scales each gradient by 100/255 and truncates it to an
     // integer before summing.
-    let mut sum = 0.0;
-    for i in 0..(R - 1) {
-        for j in 0..C {
-            sum += (((buf[i][j] - buf[i + 1][j]) * 100.0) / 255.0).abs().trunc();
-        }
-    }
-    for i in 0..R {
-        for j in 0..(C - 1) {
-            sum += (((buf[i][j] - buf[i][j + 1]) * 100.0) / 255.0).abs().trunc();
-        }
-    }
+    //
+    // Vertical gradients (each row against the next) come first, then the
+    // horizontal ones; f32 addition is not associative, so the order of the
+    // chain has to stay as it is to keep the sum bit-identical to reference.
+    let vertical = buf.windows(2).flat_map(|pair| pair[0].iter().zip(&pair[1]));
+    let horizontal = buf.iter().flat_map(|row| row.iter().zip(&row[1..]));
+
+    let sum: f32 =
+        vertical.chain(horizontal).map(|(a, b)| (((a - b) * 100.0) / 255.0).abs().trunc()).sum();
+
     let q = sum / 90.0;
     if q > 1.0 { 1.0 } else { q }
 }

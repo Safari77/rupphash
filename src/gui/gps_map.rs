@@ -74,7 +74,7 @@ pub fn sort_nearest_neighbor(markers: &mut [GpsMarker]) {
         let mut best_idx = i + 1;
 
         // Scan all subsequent markers
-        for j in (i + 1)..len {
+        for (j, marker) in markers.iter().enumerate().skip(i + 1) {
             let candidate_pos = (markers[j].lat, markers[j].lon);
             let d2 = dist_sq_approx(current_pos, candidate_pos);
 

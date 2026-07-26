@@ -1192,7 +1192,7 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
     for frame in raw_frames {
         let delay = frame.delay();
         let (numer, denom) = delay.numer_denom_ms();
-        let ms = if denom == 0 { 100 } else { numer / denom };
+        let ms = numer.checked_div(denom).unwrap_or(100);
         // Clamp very short durations (some encoders use 0 or 10ms meaning ~100ms)
         let ms = if ms < 20 { 100 } else { ms };
         durations.push(Duration::from_millis(ms as u64));
@@ -2595,8 +2595,7 @@ fn kmeans_palette(
     let mut result: Vec<(egui::Color32, f32)> = Vec::with_capacity(final_k);
     let mut sort_keys: Vec<(i32, u32)> = Vec::with_capacity(final_k);
 
-    for i in 0..final_k {
-        let (weight, ref centroid) = unique_centroids[i];
+    for &(weight, ref centroid) in unique_centroids.iter().take(final_k) {
         let l_key = (centroid.l * 1000.0) as u32;
 
         if use_lightness_only {

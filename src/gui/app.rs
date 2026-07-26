@@ -1656,8 +1656,8 @@ impl GuiApp {
             let start =
                 if end - start < preload_limit { end.saturating_sub(preload_limit) } else { start };
 
-            for i in start..end {
-                paths_to_preload.push((group[i].path.clone(), i == current_f, 0, i));
+            for (i, file) in group.iter().enumerate().take(end).skip(start) {
+                paths_to_preload.push((file.path.clone(), i == current_f, 0, i));
             }
         } else {
             // Multiple groups: preload current group + files from nearby groups
@@ -1749,8 +1749,9 @@ impl GuiApp {
             let half_ret = retention_limit / 2;
             let start = current_f.saturating_sub(half_ret);
             let end = (start + retention_limit).min(group.len());
-            for i in start..end {
-                retention_paths.insert(group[i].path.clone());
+
+            for file in group.iter().take(end).skip(start) {
+                retention_paths.insert(file.path.clone());
             }
         } else {
             // Multiple groups (Duplicate Mode): Retain current group + 2 groups adjacent
