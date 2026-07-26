@@ -1,9 +1,7 @@
 // ---------------------------------------------------------------------------
 // COMPATIBILITY WITH REFERENCE PDQ (facebook/ThreatExchange)
 //
-//   4. Luma: the `image` crate uses Rec.709 weights, reference PDQ uses
-//      Rec.601 (0.299/0.587/0.114). Also, reference does not pre-downsample
-//      to 512px.
+// Reference does not pre-downsample to 512px.
 //
 // ---------------------------------------------------------------------------
 
