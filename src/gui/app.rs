@@ -207,6 +207,16 @@ pub struct GuiApp {
     pub(super) dir_scan_rx: Option<Receiver<Vec<FileMetadata>>>,
     // Total file count from directory (for progress display)
     pub(super) dir_total_count: Option<usize>,
+
+    // --- Fullscreen ---
+    // Last `state.is_fullscreen` value we pushed to the windowing system.
+    // None until the first frame, where we adopt whatever the window already is
+    // instead of forcing our default onto it.
+    pub(super) fullscreen_applied: Option<bool>,
+    // Set while our own Fullscreen command is still in flight. The backend keeps
+    // reporting the old value for a frame or two after the request; feeding that
+    // stale value back into state.is_fullscreen would undo the toggle instantly.
+    pub(super) fullscreen_sent_at: Option<Instant>,
 }
 
 impl GuiApp {
@@ -435,6 +445,8 @@ impl GuiApp {
             db_tx: None,
             dir_scan_rx: None,
             dir_total_count: None,
+            fullscreen_applied: None,
+            fullscreen_sent_at: None,
         }
     }
 
@@ -655,12 +667,80 @@ impl GuiApp {
             db_tx,
             dir_scan_rx,
             dir_total_count,
+            fullscreen_applied: None,
+            fullscreen_sent_at: None,
         }
     }
 
     pub fn with_move_target(mut self, target: Option<std::path::PathBuf>) -> Self {
         self.state.move_target = target;
         self
+    }
+
+    /// Keep the OS window in sync with `state.is_fullscreen`.
+    ///
+    /// The key handler only flips the flag; this is the single place that turns
+    /// it into a real `ViewportCommand::Fullscreen`. It also notices when the
+    /// window manager changed the state without going through us (a WM
+    /// fullscreen shortcut, or a compositor that refused our request) and
+    /// follows it instead of fighting it.
+    pub(super) fn sync_fullscreen(&mut self, ctx: &egui::Context) {
+        // What the backend currently reports. None on platforms that don't
+        // report it, and during the first frames before the event lands.
+        let reported = ctx.input(|i| i.viewport().fullscreen);
+        let wanted = self.state.is_fullscreen;
+
+        // First frame: adopt the window's actual state rather than pushing our
+        // default onto it, so launching fullscreen from NativeOptions still works.
+        let Some(applied) = self.fullscreen_applied else {
+            let actual = reported.unwrap_or(wanted);
+            self.state.is_fullscreen = actual;
+            self.fullscreen_applied = Some(actual);
+            return;
+        };
+
+        // 1. Our flag changed -> push it to the window.
+        if applied != wanted {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(wanted));
+
+            // Only Windows keeps native decorations; everywhere else we already
+            // run undecorated and draw the title bar ourselves (see the
+            // custom_title_bar panel below). Drop them for the fullscreen span so
+            // no window frame is left around the image.
+            if cfg!(target_os = "windows") {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!wanted));
+            }
+
+            self.fullscreen_applied = Some(wanted);
+            self.fullscreen_sent_at = Some(Instant::now());
+            // A resize + relayout is coming; make sure we get frames for it.
+            ctx.request_repaint();
+            return;
+        }
+
+        // 2. While our own request is in flight the backend still reports the old
+        //    value. Ignore it until it agrees, or until we give up waiting.
+        if let Some(sent_at) = self.fullscreen_sent_at {
+            if reported == Some(wanted) {
+                self.fullscreen_sent_at = None; // confirmed
+            } else if sent_at.elapsed() < Duration::from_millis(500) {
+                ctx.request_repaint_after(Duration::from_millis(16));
+                return;
+            } else {
+                // Never confirmed: the backend either doesn't report the flag or
+                // refused the request. Stop waiting and let step 3 decide.
+                self.fullscreen_sent_at = None;
+            }
+        }
+
+        // 3. Steady state: follow the window manager if it changed things behind
+        //    our back, so our panels match what the window actually looks like.
+        if let Some(actual) = reported
+            && actual != wanted
+        {
+            self.state.is_fullscreen = actual;
+            self.fullscreen_applied = Some(actual);
+        }
     }
 
     /// Set status message with automatic 5-second timeout
@@ -1899,6 +1979,10 @@ impl eframe::App for GuiApp {
         let ctx = &ctx_owned;
 
         self.check_fs_events(ctx);
+
+        // Push state.is_fullscreen to the actual window before anything lays out,
+        // so the panels below and the window geometry agree within this frame.
+        self.sync_fullscreen(ctx);
 
         // Initial setup for view mode: create watcher (but don't refresh while scanning)
         if self.state.view_mode && self.current_dir.is_some() && self.watcher.is_none() {
@@ -3743,7 +3827,17 @@ impl eframe::App for GuiApp {
             }
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        // In fullscreen the image owns the whole screen: pure black fill and no
+        // frame margin, so nothing of the theme's panel colour shows around the
+        // picture and available_rect below spans the entire display. Outside
+        // fullscreen we leave the frame untouched so it keeps tracking whatever
+        // the current theme's default central-panel frame is.
+        let mut central_panel = egui::CentralPanel::default();
+        if self.state.is_fullscreen {
+            central_panel = central_panel.frame(egui::Frame::NONE.fill(egui::Color32::BLACK));
+        }
+
+        central_panel.show(ui, |ui| {
             let available_rect = ui.available_rect_before_wrap();
 
             if let Some(path) = current_image_path {
@@ -3908,6 +4002,18 @@ impl eframe::App for GuiApp {
         // physical pixels == logical points in that case.
         if size.0 > 100 && size.1 > 100 && ppp > 0.0 && ppp.is_finite() && !is_maximized {
             self.last_window_size = Some(size);
+        }
+    }
+
+    /// Colour the framebuffer is cleared to before any panel paints.
+    ///
+    /// Black in fullscreen, so the resize transition (and any frame where the
+    /// central panel hasn't painted yet) never flashes the theme's panel colour.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.state.is_fullscreen {
+            egui::Color32::BLACK.to_normalized_gamma_f32()
+        } else {
+            visuals.panel_fill.to_normalized_gamma_f32()
         }
     }
 }
