@@ -62,29 +62,20 @@ fn dist_sq_approx(p1: (f64, f64), p2: (f64, f64)) -> f64 {
 /// Best for visual paths (circles, routes) on datasets < 2000 items.
 pub fn sort_nearest_neighbor(markers: &mut [GpsMarker]) {
     let len = markers.len();
-    if len < 2 {
-        return;
-    }
 
-    // Start from index 0. Find the closest remaining point and swap it to index 1.
-    // Then find closest to 1 and swap to 2, etc.
-    for i in 0..(len - 1) {
-        let current_pos = (markers[i].lat, markers[i].lon);
-        let mut best_dist = f64::MAX;
+    for i in 0..len.saturating_sub(1) {
+        let current = (markers[i].lat, markers[i].lon);
+        let mut best_dist = f64::INFINITY;
         let mut best_idx = i + 1;
 
-        // Scan all subsequent markers
-        for (j, marker) in markers.iter().enumerate().skip(i + 1) {
-            let candidate_pos = (markers[j].lat, markers[j].lon);
-            let d2 = dist_sq_approx(current_pos, candidate_pos);
-
+        for j in i + 1..len {
+            let d2 = dist_sq_approx(current, (markers[j].lat, markers[j].lon));
             if d2 < best_dist {
                 best_dist = d2;
                 best_idx = j;
             }
         }
 
-        // Move the closest found neighbor to the next position in the chain
         markers.swap(i + 1, best_idx);
     }
 }
