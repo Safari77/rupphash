@@ -158,6 +158,17 @@ pub struct GuiApp {
         ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>),
     >,
     pub(super) histogram_channel: usize, // 0 = L, 1 = A, 2 = B
+    // Histogram/palette misses are computed off-thread: render_histogram must
+    // never decode inside the paint pass (a RAW fallback there meant a full
+    // unpack + process before the frame could finish).
+    pub(super) histogram_request_tx: Sender<std::path::PathBuf>,
+    pub(super) histogram_result_rx:
+        Receiver<(std::path::PathBuf, Option<super::image::HistPalette>)>,
+    // Paths already queued on the pool, so a miss does not re-send every frame.
+    // Entries are dropped only when a result lands or when cached_histogram is
+    // pruned, which is what lets a failed compute be retried after navigating
+    // away and back rather than spinning on it.
+    pub(super) histogram_pending: std::collections::HashSet<std::path::PathBuf>,
     pub(super) cached_exif: Option<(std::path::PathBuf, Vec<(String, String)>)>,
     pub(super) search_input: String,
     pub(super) search_focus_requested: bool,
@@ -348,6 +359,8 @@ impl GuiApp {
             Arc::clone(&histogram_enabled),
             Arc::clone(&deep_caps),
         );
+        let (histogram_request_tx, histogram_result_rx) =
+            super::image::spawn_histogram_pool(palette_config);
 
         // panel_width is saved in logical points (after font_scale applied)
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
@@ -413,6 +426,9 @@ impl GuiApp {
             histogram_enabled,
             show_exif: false,
             cached_histogram: HashMap::new(),
+            histogram_request_tx,
+            histogram_result_rx,
+            histogram_pending: std::collections::HashSet::new(),
             cached_exif: None,
             search_input: String::new(),
             search_focus_requested: false,
@@ -522,6 +538,8 @@ impl GuiApp {
             Arc::clone(&histogram_enabled),
             Arc::clone(&deep_caps),
         );
+        let (histogram_request_tx, histogram_result_rx) =
+            super::image::spawn_histogram_pool(palette_config);
 
         let panel_width = ctx.gui_config.panel_width.unwrap_or(450.0);
         let initial_window_size =
@@ -635,6 +653,9 @@ impl GuiApp {
             histogram_enabled,
             show_exif: false,
             cached_histogram: HashMap::new(),
+            histogram_request_tx,
+            histogram_result_rx,
+            histogram_pending: std::collections::HashSet::new(),
             cached_exif: None,
             search_input: String::new(),
             search_focus_requested: false,
@@ -979,6 +1000,7 @@ impl GuiApp {
             self.gpu_cache.clear();
             self.animation_cache.clear();
             self.cached_histogram.clear();
+            self.histogram_pending.clear();
             self.raw_loading.clear();
             self.exif_search_cache.clear();
             self.gps_map.clear_markers();
@@ -1227,6 +1249,7 @@ impl GuiApp {
                     self.gpu_cache.remove(dest);
                     self.animation_cache.remove(dest);
                     self.cached_histogram.remove(dest);
+                    self.histogram_pending.remove(dest);
                 }
                 continue;
             }
@@ -1242,6 +1265,7 @@ impl GuiApp {
                         self.gpu_cache.remove(path);
                         self.animation_cache.remove(path);
                         self.cached_histogram.remove(path);
+                        self.histogram_pending.remove(path);
 
                         if let Some(name) = path.file_name() {
                             let name_str = name.to_string_lossy().to_string();
@@ -1271,6 +1295,7 @@ impl GuiApp {
                             self.gpu_cache.remove(path);
                             self.animation_cache.remove(path);
                             self.cached_histogram.remove(path);
+                            self.histogram_pending.remove(path);
                             self.failed_images.remove(path);
                             self.retry_after.remove(path);
                             self.raw_loading.remove(path);
@@ -1297,6 +1322,7 @@ impl GuiApp {
                             self.gpu_cache.remove(path);
                             self.animation_cache.remove(path);
                             self.cached_histogram.remove(path);
+                            self.histogram_pending.remove(path);
                             self.failed_images.remove(path);
                             self.retry_after.remove(path);
                             if let Some(name) = path.file_name() {
@@ -1770,6 +1796,10 @@ impl GuiApp {
         self.gpu_cache.retain(|k, _| retention_paths.contains(k));
         self.animation_cache.retain(|k, _| retention_paths.contains(k));
         self.cached_histogram.retain(|k, _| retention_paths.contains(k));
+        // Dropping the pending marker with the cache entry is what allows a
+        // compute that failed (unreadable file, unsupported codec) to be tried
+        // again the next time the user navigates back to it.
+        self.histogram_pending.retain(|k| retention_paths.contains(k));
 
         // Active worker tasks should still be cancelled strictly based on the active window
         self.raw_loading.retain(|k| active_window_paths.contains(k));
@@ -2057,6 +2087,19 @@ impl eframe::App for GuiApp {
         {
             self.state.status_message = None;
             self.state.status_set_time = None;
+        }
+
+        // Receive finished histogram/palette work. These are the overlay's
+        // cache misses, computed on the histogram pool instead of inline in
+        // render_histogram, which used to mean a full RAW decode in the paint
+        // pass. A None result leaves the path in histogram_pending so it is
+        // not re-queued every frame.
+        while let Ok((path, data)) = self.histogram_result_rx.try_recv() {
+            if let Some(hp) = data {
+                self.cached_histogram.insert(path.clone(), hp);
+                self.histogram_pending.remove(&path);
+                ctx.request_repaint();
+            }
         }
 
         // Receive finished raw images from worker thread pool

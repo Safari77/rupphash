@@ -738,13 +738,18 @@ pub(super) fn spawn_image_loader_pool(
                 let is_webp = ext_lower == "webp";
                 let is_gif = ext_lower == "gif";
 
-                if (is_webp || is_gif)
-                    && let Ok(bytes) = std::fs::read(&path)
-                {
-                    let animated_result = if is_webp && is_animated_webp(&bytes) {
-                        Some(decode_animated_webp_frames(&path, &bytes))
-                    } else if is_gif && is_animated_gif(&bytes) {
-                        Some(decode_animated_gif_frames(&path, &bytes))
+                // Read once: the animation probe below and the still-image
+                // path underneath it both need the bytes, and a still GIF or
+                // WebP used to be read from disk twice — once here to look for
+                // an ANIM/second frame, then again to hash and decode it.
+                let prefetched: Option<Vec<u8>> =
+                    if is_webp || is_gif { std::fs::read(&path).ok() } else { None };
+
+                if let Some(bytes) = prefetched.as_deref() {
+                    let animated_result = if is_webp && is_animated_webp(bytes) {
+                        Some(decode_animated_webp_frames(&path, bytes))
+                    } else if is_gif && is_animated_gif(bytes) {
+                        Some(decode_animated_gif_frames(&path, bytes))
                     } else {
                         None
                     };
@@ -755,11 +760,11 @@ pub(super) fn spawn_image_loader_pool(
                                 // Compute content_hash
                                 let content_hash = {
                                     let mut hasher = blake3::Hasher::new_keyed(&content_key);
-                                    hasher.update(&bytes);
+                                    hasher.update(bytes);
                                     *hasher.finalize().as_bytes()
                                 };
                                 let exif_timestamp =
-                                    crate::exif_extract::read_exif_data(&path, Some(&bytes))
+                                    crate::exif_extract::read_exif_data(&path, Some(bytes))
                                         .and_then(|exif| {
                                             crate::exif_extract::get_exif_timestamp(&exif)
                                         });
@@ -786,11 +791,12 @@ pub(super) fn spawn_image_loader_pool(
                     &content_key,
                     hcfg,
                     &caps,
+                    prefetched,
                 ) {
                     Ok((decoded, dims, orientation, content_hash, exif_timestamp)) => {
                         // Only compute histogram + palette when the overlay is enabled;
-                        // the disk-based fallback in render_histogram handles cache misses
-                        // when the user toggles it on later.
+                        // if the user toggles it on later, render_histogram queues the
+                        // miss on the histogram pool rather than decoding inline.
                         let hist_palette = if hist_flag.load(Ordering::Relaxed) {
                             // The analysis code works on 8-bit ColorImages; a 10-bit
                             // decode is unpacked to one here, which costs nothing in
@@ -885,9 +891,15 @@ fn load_and_process_image_with_hash(
     content_key: &[u8; 32],
     hdr_config: crate::db::HdrConfig,
     caps: &DeepColorCaps,
+    prefetched: Option<Vec<u8>>,
 ) -> Result<(DecodedImage, (u32, u32), u8, [u8; 32], Option<i64>), String> {
-    // Read file once for both hashing and image processing
-    let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
+    // Read file once for both hashing and image processing — or reuse what the
+    // caller already read, which the GIF/WebP animation probe in the worker
+    // loop has in hand by the time it gets here.
+    let bytes = match prefetched {
+        Some(b) => b,
+        None => fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?,
+    };
 
     // Compute content_hash using BLAKE3
     let content_hash = {
@@ -1082,12 +1094,8 @@ fn maybe_resize_image(
         let resized = {
             // View the Color32 pixels as raw bytes in place — Color32 is a
             // #[repr(C)] [u8; 4] with alignment 1, so the reinterpretation is
-            // sound and no copy or ownership juggling is needed. On any
-            // failure below the original pixels are simply left untouched.
-            let pixels = &mut color_image.pixels;
-            let raw_pixels: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u8, pixels.len() * 4)
-            };
+            // sound and no copy or ownership juggling is needed.
+            let raw_pixels: &mut [u8] = bytemuck::cast_slice_mut(&mut color_image.pixels);
             FastImage::from_slice_u8(w as u32, h as u32, raw_pixels, pixel_type).ok().and_then(
                 |src_image| {
                     let mut dst_image = FastImage::new(new_w as u32, new_h as u32, pixel_type);
@@ -1103,10 +1111,7 @@ fn maybe_resize_image(
 
         if let Some(dst_image) = resized {
             eprintln!("[DEBUG] Fast-Resized {:?} from {}x{} to {}x{}", path, w, h, new_w, new_h);
-            // The resized bytes are already premultiplied Color32 values, so
-            // rebuild them verbatim: going through from_rgba_unmultiplied
-            // here would premultiply a second time and darken semi-
-            // transparent pixels.
+            // The resized bytes are already premultiplied Color32 values, so rebuild them verbatim.
             color_image = egui::ColorImage {
                 size: [new_w, new_h],
                 pixels: dst_image
@@ -1229,13 +1234,25 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
     let mut frames = Vec::with_capacity(raw_frames.len());
     let mut durations = Vec::with_capacity(raw_frames.len());
 
+    // Fastest frame rate we honour.
+    const MAX_FPS: u64 = 240;
+    const MIN_FRAME_US: u64 = 1_000_000 / MAX_FPS;
+    // A zero delay means "unspecified", which by long-standing GIF convention
+    // is treated as ~100 ms.
+    const UNSPECIFIED_US: u64 = 100_000;
+
     for frame in raw_frames {
         let delay = frame.delay();
         let (numer, denom) = delay.numer_denom_ms();
-        let ms = numer.checked_div(denom).unwrap_or(100);
-        // Clamp very short durations (some encoders use 0 or 10ms meaning ~100ms)
-        let ms = if ms < 20 { 100 } else { ms };
-        durations.push(Duration::from_millis(ms as u64));
+        // numer/denom is a rational number of milliseconds, so work in
+        // microseconds and round instead of truncating.
+        let us = if denom == 0 {
+            UNSPECIFIED_US
+        } else {
+            (numer as u64 * 1000 + (denom as u64 / 2)) / denom as u64
+        };
+        let us = if us == 0 { UNSPECIFIED_US } else { us.max(MIN_FRAME_US) };
+        durations.push(Duration::from_micros(us));
 
         let rgba = frame.buffer();
         let w = rgba.width() as usize;
@@ -1432,7 +1449,14 @@ fn load_and_process_image_from_bytes(
             }
         };
 
-        let dims = (raw.width(), raw.height());
+        // Sensor-crop dimensions, in the sensor's own orientation. These are
+        // only the right answer for the thumbnail paths, which report an EXIF
+        // orientation alongside and leave the rotation to render time. A full
+        // decode is different: LibRaw applies `sizes.flip` inside `process()`,
+        // so for a portrait shot the buffer that comes back is transposed
+        // relative to these. Each full-decode arm therefore reports the
+        // processed buffer's own dimensions instead of reusing this.
+        let raw_dims = (raw.width(), raw.height());
 
         // LibRaw computes the sensor orientation (sizes.flip) even for RAW
         // containers that kamadak-exif can't parse (e.g. CR3/CRX). The embedded
@@ -1447,7 +1471,7 @@ fn load_and_process_image_from_bytes(
         if use_thumbnails && let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
             let actual_orientation =
                 if thumb_orient != 1 { thumb_orient } else { raw_fallback_orientation };
-            return Ok(srgb8_result(thumb, dims, actual_orientation, path));
+            return Ok(srgb8_result(thumb, raw_dims, actual_orientation, path));
         }
 
         // 2. Full RAW decode mode
@@ -1462,7 +1486,7 @@ fn load_and_process_image_from_bytes(
         // Either way the pixels come out gamma-encoded with LibRaw's default
         // output curve, which we treat as sRGB — the same approximation the
         // 8-bit path has always made. Only the bit depth changes here.
-        let full_decode: Result<DecodedImage, String> = match raw.unpack() {
+        let full_decode: Result<(DecodedImage, (u32, u32)), String> = match raw.unpack() {
             Ok(_) => {
                 if caps.enabled() {
                     raw.process::<{ rsraw::BIT_DEPTH_16 }>()
@@ -1471,12 +1495,15 @@ fn load_and_process_image_from_bytes(
                             let w = processed.width() as usize;
                             let h = processed.height() as usize;
                             raw16_to_dynamic(w, h, &processed)
+                                .map(|img| (img, (w as u32, h as u32)))
                         })
                         // RAW carries no alpha, so this always lands on the
                         // 4-bytes-per-pixel Rgb10a2 path, never Rgba16.
                         // LibRaw hands back pixels in its own output curve, which we
                         // treat as sRGB, so there is no cICP to pass on here.
-                        .map(|dyn_img| finish_dynamic(dyn_img, dims, 1, caps, None, path).0)
+                        .map(|(dyn_img, dims)| {
+                            (finish_dynamic(dyn_img, dims, 1, caps, None, path).0, dims)
+                        })
                 } else {
                     raw.process::<{ rsraw::BIT_DEPTH_8 }>()
                         .map_err(|e| format!("Failed to process RAW: {}", e))
@@ -1485,36 +1512,41 @@ fn load_and_process_image_from_bytes(
                             let h = processed.height() as usize;
                             let total_pixels = w * h;
                             // Determine channels dynamically
-                            if processed.len() == total_pixels {
+                            let img = if processed.len() == total_pixels {
                                 // Monochrome: 1 byte per pixel
-                                Ok(egui::ColorImage::from_gray([w, h], &processed))
+                                egui::ColorImage::from_gray([w, h], &processed)
                             } else if processed.len() == total_pixels * 3 {
                                 // RGB: 3 bytes per pixel
-                                Ok(egui::ColorImage::from_rgb([w, h], &processed))
+                                egui::ColorImage::from_rgb([w, h], &processed)
                             } else {
-                                Err(format!(
+                                return Err(format!(
                                     "RAW size mismatch: expected {} (Mono) or {} (RGB) bytes, got {}",
                                     total_pixels,
                                     total_pixels * 3,
                                     processed.len()
-                                ))
-                            }
+                                ));
+                            };
+                            Ok((img, (w as u32, h as u32)))
                         })
-                        .map(|img| DecodedImage::Srgb8(maybe_resize_image(img, dims, 1, path).0))
+                        .map(|(img, dims)| {
+                            (DecodedImage::Srgb8(maybe_resize_image(img, dims, 1, path).0), dims)
+                        })
                 }
             }
             Err(e) => Err(format!("Failed to unpack RAW: {}", e)),
         };
-        // rsraw handles rotation, so orientation = 1 for a full decode.
+        // rsraw handles rotation, so orientation = 1 for a full decode — and
+        // the resolution we report is the rotated one that came back with the
+        // pixels, not the sensor crop.
         match full_decode {
-            Ok(decoded) => return Ok((decoded, dims, 1)),
+            Ok((decoded, dims)) => return Ok((decoded, dims, 1)),
             Err(e) => {
                 // Fallback to thumbnail on unpack or process error
                 // (unsupported full-decode formats)
                 if let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
                     let actual_orientation =
                         if thumb_orient != 1 { thumb_orient } else { raw_fallback_orientation };
-                    return Ok(srgb8_result(thumb, dims, actual_orientation, path));
+                    return Ok(srgb8_result(thumb, raw_dims, actual_orientation, path));
                 }
                 return Err(e);
             }
@@ -2040,6 +2072,33 @@ fn linear_to_srgb(c: f32) -> f32 {
     if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
 }
 
+/// Undo egui's alpha premultiplication, or `None` for a fully transparent
+/// pixel — one that carries no colour at all and would only drag the analysis
+/// towards black.
+///
+/// `ColorImage` stores premultiplied `Color32`, so a half-transparent red is
+/// held at half intensity. Reading those bytes as if they were straight sRGB
+/// reports it as a dark red, which skews both the histogram and the palette.
+#[inline]
+fn straight_rgb(px: egui::Color32) -> Option<(u8, u8, u8)> {
+    if px.a() == 0 {
+        return None;
+    }
+    let [r, g, b, _] = px.to_srgba_unmultiplied();
+    Some((r, g, b))
+}
+
+/// `straight_rgb` for a raw premultiplied RGBA quad, carried on into Oklab.
+#[inline]
+fn oklab_from_premultiplied(px: &[u8]) -> Option<Oklab> {
+    let (r, g, b) =
+        straight_rgb(egui::Color32::from_rgba_premultiplied(px[0], px[1], px[2], px[3]))?;
+    let lr = srgb_to_linear(r as f32 / 255.0);
+    let lg = srgb_to_linear(g as f32 / 255.0);
+    let lb = srgb_to_linear(b as f32 / 255.0);
+    Some(linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb }))
+}
+
 /// Compute a contrasting border color by inverting lightness and rotating hue 180° in Oklab.
 fn opposite_color(color: egui::Color32) -> egui::Color32 {
     let lr = srgb_to_linear(color.r() as f32 / 255.0);
@@ -2123,21 +2182,23 @@ fn compute_histogram_from_colorimage(
             std::collections::HashMap::new();
         let mut idx = 0;
         while idx < total_pixels && counts.len() <= k {
-            let px = img.pixels[idx];
-            *counts.entry((px.r(), px.g(), px.b())).or_insert(0) += 1;
+            if let Some(rgb) = straight_rgb(img.pixels[idx]) {
+                *counts.entry(rgb).or_insert(0) += 1;
+            }
             idx += step;
         }
-        if counts.len() <= k {
+        if counts.len() <= k && !counts.is_empty() {
             // Re-count with the full sample to get accurate pixel distribution
             // (the first pass may have stopped early once unique count exceeded k)
             counts.clear();
             idx = 0;
             while idx < total_pixels {
-                let px = img.pixels[idx];
-                *counts.entry((px.r(), px.g(), px.b())).or_insert(0) += 1;
+                if let Some(rgb) = straight_rgb(img.pixels[idx]) {
+                    *counts.entry(rgb).or_insert(0) += 1;
+                }
                 idx += step;
             }
-            let total_sampled: u32 = counts.values().sum();
+            let total_sampled: u32 = counts.values().sum::<u32>().max(1);
             let mut colors: Vec<(Oklab, egui::Color32, f32)> = counts
                 .iter()
                 .map(|(&(r, g, b), &count)| {
@@ -2175,12 +2236,14 @@ fn compute_histogram_from_colorimage(
         );
 
     if let Some(dst_image) = resized_successfully {
-        // 2. Convert smoothed pixels to Oklab
+        // 2. Convert smoothed pixels to Oklab. Resampling premultiplied data is
+        // correct — that is what keeps edge pixels from bleeding — but the
+        // result is still premultiplied and has to be undone before it means
+        // anything as a colour.
         for chunk in dst_image.buffer().chunks_exact(4) {
-            let lr = srgb_to_linear(chunk[0] as f32 / 255.0);
-            let lg = srgb_to_linear(chunk[1] as f32 / 255.0);
-            let lb = srgb_to_linear(chunk[2] as f32 / 255.0);
-            oklab_pixels.push(linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb }));
+            if let Some(ok) = oklab_from_premultiplied(chunk) {
+                oklab_pixels.push(ok);
+            }
         }
     } else {
         // Fallback: Original nearest-neighbor logic if the high-quality resize fails
@@ -2194,10 +2257,9 @@ fn compute_histogram_from_colorimage(
             for dx in 0..dst_w_usize {
                 let sx = (dx * src_w_usize) / dst_w_usize;
                 let px = img.pixels[sy * src_w_usize + sx];
-                let lr = srgb_to_linear(px.r() as f32 / 255.0);
-                let lg = srgb_to_linear(px.g() as f32 / 255.0);
-                let lb = srgb_to_linear(px.b() as f32 / 255.0);
-                oklab_pixels.push(linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb }));
+                if let Some(ok) = oklab_from_premultiplied(&px.to_array()) {
+                    oklab_pixels.push(ok);
+                }
             }
         }
     }
@@ -2913,8 +2975,12 @@ fn compute_histogram_from_raw(
     raw.set_use_camera_wb(true);
     match raw.process::<{ rsraw::BIT_DEPTH_8 }>() {
         Ok(processed) => {
-            let w = raw.width() as usize;
-            let h = raw.height() as usize;
+            // Not raw.width()/height(): LibRaw applies sizes.flip during
+            // process(), so for a portrait shot those are transposed relative
+            // to the buffer and the length checks below fall through to the
+            // "size mismatch" arm, leaving the image with no histogram at all.
+            let w = processed.width() as usize;
+            let h = processed.height() as usize;
 
             if processed.len() == w * h {
                 // Monochrome: construct grayscale DynamicImage
@@ -2958,15 +3024,79 @@ fn compute_histogram_from_raw(
     None
 }
 
-/// Render greyscale histogram and dominant palette, using cached data if available
+/// Worker pool for histogram/palette requests that missed the preload cache.
+///
+/// `palette_config` is captured once at spawn, exactly as `spawn_image_loader_pool`
+/// does, so a config change needs a restart to take effect either way.
+pub(super) fn spawn_histogram_pool(
+    palette_config: crate::db::PaletteConfig,
+) -> (Sender<PathBuf>, Receiver<(PathBuf, Option<HistPalette>)>) {
+    let (tx, rx) = unbounded::<PathBuf>();
+    let (result_tx, result_rx) = unbounded();
+
+    // Two threads is plenty. Only the image on screen needs an overlay, so a
+    // deeper pool would just decode files the user has already left behind.
+    for _ in 0..2 {
+        let rx_clone = rx.clone();
+        let tx_clone = result_tx.clone();
+        let pcfg = palette_config;
+        thread::spawn(move || {
+            while let Ok(path) = rx_clone.recv() {
+                let data = if is_raw_ext(&path) {
+                    compute_histogram_from_raw(&path, pcfg)
+                } else {
+                    compute_histogram_from_image(&path, pcfg)
+                };
+
+                if let Some(ref d) = data {
+                    let colors_str: Vec<String> =
+                        d.3.iter()
+                            .map(|(c, w)| {
+                                format!("({}, {}, {} {:.0}%)", c.r(), c.g(), c.b(), w * 100.0)
+                            })
+                            .collect();
+                    eprintln!(
+                        "[PALETTE-FALLBACK] {:?}: [{}]",
+                        path.file_name().unwrap_or_default(),
+                        colors_str.join(", ")
+                    );
+                }
+
+                if tx_clone.send((path, data)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    (tx, result_rx)
+}
+
+/// Render greyscale histogram and dominant palette from cached data.
+///
+/// A cache miss queues the work and draws nothing this frame; the result
+/// arrives via `histogram_result_rx` and the next frame picks it up.
 pub(super) fn render_histogram(
     app: &mut GuiApp,
     ui: &mut egui::Ui,
     available_rect: egui::Rect,
     path: &Path,
 ) {
-    let palette_config = crate::db::PaletteConfig::from_gui_config(&app.ctx.gui_config);
     let histogram_mode = app.histogram_mode;
+
+    // Cache first (HashMap keyed by path, populated during preload or by the
+    // histogram pool). `histogram_pending` keeps a miss from re-queuing the
+    // same path every frame; it is cleared alongside `cached_histogram` when
+    // the retention set changes, which is also what lets a failed compute be
+    // retried after navigating away and back.
+    let Some((hist_l, hist_a, hist_b, palette)) = app.cached_histogram.get(path).cloned() else {
+        if app.histogram_pending.insert(path.to_path_buf())
+            && app.histogram_request_tx.send(path.to_path_buf()).is_err()
+        {
+            app.histogram_pending.remove(path);
+        }
+        return;
+    };
 
     let window_width = ui.ctx().input(|i| {
         i.viewport()
@@ -2980,14 +3110,15 @@ pub(super) fn render_histogram(
     let hist_height = hist_width * 0.75;
     let swatch_height = 16.0;
 
-    // Dynamic height: standard grid uses multiple rows, proportional strip uses one row
+    // Dynamic height: standard grid uses multiple rows, proportional strip uses
+    // one row.
     let palette_total_height = if histogram_mode == 2 {
         // Proportional strip: single row
         swatch_height + 4.0
     } else {
         // Standard grid: rows of 5
-        let num_rows = palette_config.dominant_colors.div_ceil(5);
-        (num_rows as f32) * swatch_height + ((num_rows as f32) * 4.0)
+        let num_rows = palette.len().max(1).div_ceil(5);
+        (num_rows as f32) * (swatch_height + 4.0)
     };
     let total_height = hist_height + palette_total_height;
     let padding = 10.0;
@@ -3010,75 +3141,38 @@ pub(super) fn render_histogram(
         egui::Sense::click_and_drag(),
     );
 
-    // Check cache first (HashMap keyed by path, populated during preload)
-    let histogram_data = app.cached_histogram.get(path).cloned();
-
-    // Fallback: compute from disk if not preloaded (shouldn't happen often)
-    let histogram_data = histogram_data.or_else(|| {
-        let data = if is_raw_ext(path) {
-            compute_histogram_from_raw(path, palette_config)
-        } else {
-            compute_histogram_from_image(path, palette_config)
-        };
-        // Cache the result
-        if let Some(d) = data {
-            let colors_str: Vec<String> =
-                d.3.iter()
-                    .map(|(c, w)| format!("({}, {}, {} {:.0}%)", c.r(), c.g(), c.b(), w * 100.0))
-                    .collect();
-            eprintln!(
-                "[PALETTE-FALLBACK] {:?}: [{}]",
-                path.file_name().unwrap_or_default(),
-                colors_str.join(", ")
-            );
-            app.cached_histogram.insert(path.to_path_buf(), d.clone());
-            Some(d)
-        } else {
-            None
-        }
-    });
-
-    if let Some((hist_l, hist_a, hist_b, palette)) = histogram_data {
-        // Use a thread-local timer to debounce scroll wheel events so it doesn't flicker wildly
-        thread_local! {
-            static LAST_HIST_SWITCH: std::cell::RefCell<std::time::Instant> = std::cell::RefCell::new(std::time::Instant::now());
-        }
-
-        let response = ui.interact(hist_rect, ui.id().with("hist_scroll"), egui::Sense::hover());
-        if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-
-            if scroll.abs() > 0.1 {
-                LAST_HIST_SWITCH.with(|last| {
-                    let mut last_mut = last.borrow_mut();
-                    // 200ms debounce
-                    if last_mut.elapsed().as_secs_f32() > 0.2 {
-                        if scroll > 0.0 {
-                            app.histogram_channel = (app.histogram_channel + 1) % 3;
-                        } else {
-                            app.histogram_channel = (app.histogram_channel + 2) % 3;
-                        }
-                        *last_mut = std::time::Instant::now();
-                    }
-                });
-            }
-        }
-
-        let hist_to_draw = match app.histogram_channel {
-            1 => &hist_a,
-            2 => &hist_b,
-            _ => &hist_l,
-        };
-
-        draw_histogram(
-            ui,
-            hist_rect,
-            hist_to_draw,
-            &palette,
-            app.histogram_channel,
-            histogram_mode,
-        );
+    // Use a thread-local timer to debounce scroll wheel events so it doesn't flicker wildly
+    thread_local! {
+        static LAST_HIST_SWITCH: std::cell::RefCell<std::time::Instant> = std::cell::RefCell::new(std::time::Instant::now());
     }
+
+    let response = ui.interact(hist_rect, ui.id().with("hist_scroll"), egui::Sense::hover());
+    if response.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+
+        if scroll.abs() > 0.1 {
+            LAST_HIST_SWITCH.with(|last| {
+                let mut last_mut = last.borrow_mut();
+                // 200ms debounce
+                if last_mut.elapsed().as_secs_f32() > 0.2 {
+                    if scroll > 0.0 {
+                        app.histogram_channel = (app.histogram_channel + 1) % 3;
+                    } else {
+                        app.histogram_channel = (app.histogram_channel + 2) % 3;
+                    }
+                    *last_mut = std::time::Instant::now();
+                }
+            });
+        }
+    }
+
+    let hist_to_draw = match app.histogram_channel {
+        1 => &hist_a,
+        2 => &hist_b,
+        _ => &hist_l,
+    };
+
+    draw_histogram(ui, hist_rect, hist_to_draw, &palette, app.histogram_channel, histogram_mode);
 }
 
 /// Draw histogram bars and dominant color palette
