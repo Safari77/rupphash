@@ -998,27 +998,67 @@ fn deep_format_for(img: &image::DynamicImage, caps: &DeepColorCaps) -> Option<bo
 }
 
 /// Pick the final pixel representation for a plain (non-HDR) decoded image.
+///
+/// `cicp` is the source's signalling, if any. Absent signalling means sRGB —
+/// that is what an untagged still has always meant — but a cICP that says
+/// anything else has to be converted before the pixels can go to an sRGB
+/// surface. Transfer 1 (BT.709) is the common case and the easy one to miss:
+/// it is a camera OETF whose display counterpart is BT.1886 (γ2.4), not sRGB,
+/// so passing those code values through unchanged lifts the shadows by up to
+/// ~12 8-bit codes.
 fn finish_dynamic(
     dyn_img: image::DynamicImage,
     real_dims: (u32, u32),
     orientation: u8,
     caps: &DeepColorCaps,
+    cicp: Option<crate::hdr::Cicp>,
     path: &Path,
 ) -> (DecodedImage, (u32, u32), u8) {
+    let convert = cicp.filter(|c| !c.is_display_ready_srgb());
+    if let Some(c) = convert {
+        eprintln!(
+            "[DEBUG-HDR] {:?}: SDR transfer conversion (primaries={} transfer={} full_range={})",
+            path, c.color_primaries, c.transfer_characteristics, c.full_range,
+        );
+    }
+
     if caps.enabled()
         && is_deep_color(&dyn_img)
         && let Some(wide) = deep_format_for(&dyn_img, caps)
     {
         let dyn_img = maybe_downscale_dynamic(dyn_img, path);
-        let (w, h, pixels) = if wide {
-            let (w, h, data) = crate::hdr::requantize_srgb16_to_rgba16(&dyn_img);
-            (w, h, DeepPixels::Rgba16(data))
-        } else {
-            let (w, h, data) = crate::hdr::requantize_srgb16_to_rgb10a2(&dyn_img);
-            (w, h, DeepPixels::Rgb10a2(data))
+        let (w, h, pixels) = match (wide, convert) {
+            (true, Some(c)) => {
+                let (w, h, data) = crate::hdr::convert_sdr_to_srgb_rgba16(&dyn_img, c);
+                (w, h, DeepPixels::Rgba16(data))
+            }
+            (true, None) => {
+                let (w, h, data) = crate::hdr::requantize_srgb16_to_rgba16(&dyn_img);
+                (w, h, DeepPixels::Rgba16(data))
+            }
+            (false, Some(c)) => {
+                let (w, h, data) = crate::hdr::convert_sdr_to_srgb_rgb10a2(&dyn_img, c);
+                (w, h, DeepPixels::Rgb10a2(data))
+            }
+            (false, None) => {
+                let (w, h, data) = crate::hdr::requantize_srgb16_to_rgb10a2(&dyn_img);
+                (w, h, DeepPixels::Rgb10a2(data))
+            }
         };
         return (DecodedImage::Deep { width: w, height: h, pixels }, real_dims, orientation);
     }
+
+    // 8-bit fallback. The conversion is just as necessary here — an 8-bit
+    // BT.709-tagged PNG is exactly as light as the 16-bit one was.
+    if let Some(c) = convert {
+        let rgba = crate::hdr::convert_sdr_to_srgb8(&dyn_img, c);
+        let img = egui::ColorImage::from_rgba_unmultiplied(
+            [rgba.width() as usize, rgba.height() as usize],
+            rgba.as_flat_samples().as_slice(),
+        );
+        return srgb8_result(img, real_dims, orientation, path);
+    }
+
     srgb8_result(dynamic_image_to_egui(dyn_img), real_dims, orientation, path)
 }
 
@@ -1434,7 +1474,9 @@ fn load_and_process_image_from_bytes(
                         })
                         // RAW carries no alpha, so this always lands on the
                         // 4-bytes-per-pixel Rgb10a2 path, never Rgba16.
-                        .map(|dyn_img| finish_dynamic(dyn_img, dims, 1, caps, path).0)
+                        // LibRaw hands back pixels in its own output curve, which we
+                        // treat as sRGB, so there is no cICP to pass on here.
+                        .map(|dyn_img| finish_dynamic(dyn_img, dims, 1, caps, None, path).0)
                 } else {
                     raw.process::<{ rsraw::BIT_DEPTH_8 }>()
                         .map_err(|e| format!("Failed to process RAW: {}", e))
@@ -1499,6 +1541,13 @@ fn load_and_process_image_from_bytes(
         crate::exif_extract::get_orientation(path, Some(bytes))
     };
 
+    // Detect cICP before decoding — every path below needs it, not just the
+    // HDR one. PNG is the main current carrier of cICP in still images;
+    // AVIF/HEIC signal their color space through ISOBMFF container metadata,
+    // JPEG/TIFF through a v4.4 `cicp` tag inside their ICC profile.
+    let cicp = crate::hdr::detect_cicp(bytes);
+    eprintln!("[DEBUG-IMAGE] {:?}: final detected cICP: {:?}", path, cicp);
+
     // ---------------------------------------------------------------------
     // JXL / PDF / JPEG / TIFF FAST PATH
     // ---------------------------------------------------------------------
@@ -1512,7 +1561,7 @@ fn load_and_process_image_from_bytes(
                 eprintln!("[DEBUG-GUI] scanner decode SUCCESS for {:?}", path);
                 // 16-bit TIFF and JXL reach this branch, so let finish_dynamic
                 // decide whether they are worth keeping at 10 bits.
-                return Ok(finish_dynamic(dyn_img, (w, h), orientation, caps, path));
+                return Ok(finish_dynamic(dyn_img, (w, h), orientation, caps, cicp, path));
             }
             Err(err_msg) => {
                 eprintln!("[DEBUG-GUI] scanner decode FAILED for {:?}: {}", path, err_msg);
@@ -1536,12 +1585,6 @@ fn load_and_process_image_from_bytes(
 
     let format_name =
         reader.format().map(|f| format!("{:?}", f)).unwrap_or_else(|| "unknown".to_string());
-
-    // Detect HDR cICP before decoding. PNG is the main current carrier of
-    // cICP in still images; AVIF/HEIC signal their color space through
-    // ISOBMFF container metadata.
-    let cicp = crate::hdr::detect_cicp(bytes);
-    eprintln!("[DEBUG-IMAGE] Final detected cICP: {:?}", cicp);
 
     let dyn_img =
         reader.decode().map_err(|e| format!("Failed to decode {}: {}", format_name, e))?;
@@ -1598,7 +1641,7 @@ fn load_and_process_image_from_bytes(
         return Ok(srgb8_result(img, dims, orientation, path));
     }
 
-    Ok(finish_dynamic(dyn_img, dims, orientation, caps, path))
+    Ok(finish_dynamic(dyn_img, dims, orientation, caps, cicp, path))
 }
 
 pub(super) fn update_file_metadata(

@@ -48,6 +48,23 @@ impl Cicp {
     pub fn is_hdr(&self) -> bool {
         matches!(self.transfer_characteristics, 16 | 18)
     }
+
+    /// The transfer function the pixels are encoded with, as far as we
+    /// recognise it. `None` for reserved/unspecified code points and for
+    /// curves we do not implement; callers should assume sRGB there.
+    pub fn trc(&self) -> Option<Trc> {
+        Trc::from_cicp(self.transfer_characteristics)
+    }
+
+    /// True when the pixels can be handed to an sRGB display verbatim:
+    /// sRGB transfer, BT.709 primaries, and no limited-range expansion
+    /// pending. Everything else needs at least a transfer conversion first
+    /// — in particular transfer 1/6/14/15, which are *not* sRGB (see `Trc`).
+    pub fn is_display_ready_srgb(&self) -> bool {
+        self.transfer_characteristics == 13
+            && self.color_primaries == 1
+            && (self.full_range || self.matrix_coefficients != 0)
+    }
 }
 
 /// Extract `cICP` from ISOBMFF (AVIF/HEIC) files.
@@ -339,6 +356,71 @@ fn srgb_oetf(v: f32) -> f32 {
     if v <= 0.0031308 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
 }
 
+/// H.273 Table 3 transfer characteristics, reduced to the curves we can
+/// actually evaluate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Trc {
+    /// 1 (BT.709), 6 (BT.601), 14/15 (BT.2020 10/12-bit). These code points
+    /// name a camera *OETF*, not a display EOTF, and the reference display
+    /// response for them is ITU-R BT.1886 — a pure 2.4 power law,
+    /// mpv's equivalent of "target-contrast=inf".
+    ///
+    /// Real HDR passthrough — signalling PQ + BT.2020 on your surface and letting the panel do the
+    /// work instead of tone-mapping to SDR — needs wp_color_manager_v1 on the wgpu surface. wgpu
+    /// has no colour-space API, and winit doesn't expose the raw wl_surface colour-management bits either.
+    Bt1886,
+    /// 4 (BT.470M, gamma 2.2) and 5 (BT.470BG, gamma 2.8).
+    Gamma(f32),
+    /// 8 — linear light.
+    Linear,
+    /// 13 — sRGB / IEC 61966-2-1. The only curve that is a no-op on an
+    /// sRGB display.
+    Srgb,
+    /// 16 — SMPTE ST 2084 (PQ).
+    Pq,
+    /// 18 — ARIB STD-B67 (HLG).
+    Hlg,
+}
+
+impl Trc {
+    /// Map an H.273 TransferCharacteristics code point. `None` for 0/2/3
+    /// (reserved / unspecified) and for curves we do not implement.
+    pub fn from_cicp(tc: u8) -> Option<Self> {
+        Some(match tc {
+            1 | 6 | 14 | 15 => Trc::Bt1886,
+            4 => Trc::Gamma(2.2),
+            5 => Trc::Gamma(2.8),
+            8 => Trc::Linear,
+            13 => Trc::Srgb,
+            16 => Trc::Pq,
+            18 => Trc::Hlg,
+            _ => return None,
+        })
+    }
+
+    /// PQ and HLG are absolute / scene-referred and go through the
+    /// tone-mapping path instead of `sdr_eotf`.
+    pub fn is_hdr(self) -> bool {
+        matches!(self, Trc::Pq | Trc::Hlg)
+    }
+}
+
+/// SDR EOTF: display-encoded code value in [0,1] → display-linear light,
+/// normalised so 1.0 is display white.
+#[inline]
+fn sdr_eotf(v: f32, trc: Trc) -> f32 {
+    let v = v.clamp(0.0, 1.0);
+    match trc {
+        Trc::Srgb => srgb_to_linear_simple(v),
+        Trc::Linear => v,
+        Trc::Gamma(g) => v.powf(g),
+        // BT.1886 with a black level of 0 collapses to a pure 2.4 power
+        // law. PQ/HLG never reach here, but 2.4 is the safer default than
+        // sRGB for anything else that does.
+        _ => v.powf(2.4),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Primaries conversion: BT.2020 / Display-P3 linear → BT.709 linear
 // ---------------------------------------------------------------------------
@@ -443,6 +525,19 @@ enum SourceGamut {
     DisplayP3,
 }
 
+impl SourceGamut {
+    /// Map an H.273 ColourPrimaries code point. Anything we cannot convert
+    /// is left alone, which is the right call for 1 (BT.709) and the least
+    /// wrong one for the rest.
+    fn from_cicp(primaries: u8) -> Self {
+        match primaries {
+            9 => SourceGamut::Bt2020,
+            12 => SourceGamut::DisplayP3,
+            _ => SourceGamut::Bt709,
+        }
+    }
+}
+
 /// Per-image constants shared by every pixel, derived once from the cICP
 /// signalling and the target display peak.
 #[derive(Debug, Clone, Copy)]
@@ -457,6 +552,10 @@ struct TonemapParams {
     /// already applied the range during its YCbCr → RGB conversion, so
     /// expanding again here would double-stretch.
     limited_range_rgb: bool,
+    /// Transfer function used when the source is neither PQ nor HLG, so an
+    /// SDR image routed through this path is still linearised with its own
+    /// curve rather than being assumed to be sRGB.
+    sdr_trc: Trc,
     sdr_peak_nits: f32,
     /// Source peak in nits: 10000 for PQ (absolute), 1000 for HLG (the
     /// nominal BT.2100 display, matching the OOTF applied in `tonemap_px`).
@@ -475,16 +574,13 @@ impl TonemapParams {
         // nominal 1000 nit BT.2100 display, which must match the OOTF peak
         // in `tonemap_px` or the EETF over-compresses HLG highlights.
         let src_peak_nits: f32 = if use_hlg { 1000.0 } else { 10000.0 };
-        let gamut = match cicp.color_primaries {
-            9 => SourceGamut::Bt2020,
-            12 => SourceGamut::DisplayP3,
-            _ => SourceGamut::Bt709,
-        };
+        let gamut = SourceGamut::from_cicp(cicp.color_primaries);
         Self {
             use_pq,
             use_hlg,
             gamut,
             limited_range_rgb: !cicp.full_range && cicp.matrix_coefficients == 0,
+            sdr_trc: cicp.trc().filter(|t| !t.is_hdr()).unwrap_or(Trc::Srgb),
             sdr_peak_nits,
             src_peak_nits,
             src_peak_pq: pq_inverse_eotf_nits(src_peak_nits),
@@ -557,10 +653,11 @@ fn tonemap_px(src: &[u16], p: TonemapParams) -> (f32, f32, f32, f32) {
         g = hlg_eotf(g, p.src_peak_nits);
         b = hlg_eotf(b, p.src_peak_nits);
     } else {
-        // sRGB / BT.709 — no HDR processing; just treat as normal.
-        r = srgb_to_linear_simple(r) * p.sdr_peak_nits;
-        g = srgb_to_linear_simple(g) * p.sdr_peak_nits;
-        b = srgb_to_linear_simple(b) * p.sdr_peak_nits;
+        // SDR source: linearise with its own curve (sRGB, BT.1886, plain
+        // gamma, …) and scale to the SDR display peak.
+        r = sdr_eotf(r, p.sdr_trc) * p.sdr_peak_nits;
+        g = sdr_eotf(g, p.sdr_trc) * p.sdr_peak_nits;
+        b = sdr_eotf(b, p.sdr_trc) * p.sdr_peak_nits;
     }
 
     // 2. Primaries: BT.2020 or Display P3 → BT.709 in linear light.
@@ -713,8 +810,162 @@ pub fn process_hdr_to_rgb10a2(
     (width, height, out)
 }
 
+// ---------------------------------------------------------------------------
+// SDR sources that are not sRGB-encoded
+// ---------------------------------------------------------------------------
+
+/// Per-image constants for the SDR → sRGB conversion path.
+#[derive(Debug, Clone, Copy)]
+struct SdrParams {
+    trc: Trc,
+    gamut: SourceGamut,
+    /// Same rule as `TonemapParams::limited_range_rgb`.
+    limited_range_rgb: bool,
+}
+
+impl SdrParams {
+    fn new(cicp: Cicp) -> Self {
+        Self {
+            // Unrecognised curve: assume sRGB, which is what an untagged
+            // still means in practice.
+            trc: cicp.trc().filter(|t| !t.is_hdr()).unwrap_or(Trc::Srgb),
+            gamut: SourceGamut::from_cicp(cicp.color_primaries),
+            limited_range_rgb: !cicp.full_range && cicp.matrix_coefficients == 0,
+        }
+    }
+
+    /// True when the conversion would be the identity, so the caller can
+    /// take the cheaper `requantize_*` path instead.
+    fn is_noop(&self) -> bool {
+        self.trc == Trc::Srgb && self.gamut == SourceGamut::Bt709 && !self.limited_range_rgb
+    }
+}
+
+/// Re-encode one SDR pixel to sRGB display encoding: EOTF → optional gamut
+/// matrix in linear light → sRGB OETF. No tone mapping and no peak scaling,
+/// because the source is already display-referred: SDR white in, SDR white
+/// out. Only the shape of the curve between black and white changes.
+#[inline]
+fn sdr_px(src: &[u16], p: SdrParams) -> (f32, f32, f32, f32) {
+    let mut r = src[0] as f32 / 65535.0;
+    let mut g = src[1] as f32 / 65535.0;
+    let mut b = src[2] as f32 / 65535.0;
+    let a = src[3] as f32 / 65535.0;
+
+    if p.limited_range_rgb {
+        const BLACK: f32 = 4096.0 / 65535.0;
+        const SCALE: f32 = 65535.0 / (60160.0 - 4096.0);
+        r = ((r - BLACK) * SCALE).clamp(0.0, 1.0);
+        g = ((g - BLACK) * SCALE).clamp(0.0, 1.0);
+        b = ((b - BLACK) * SCALE).clamp(0.0, 1.0);
+    }
+
+    r = sdr_eotf(r, p.trc);
+    g = sdr_eotf(g, p.trc);
+    b = sdr_eotf(b, p.trc);
+
+    match p.gamut {
+        SourceGamut::Bt2020 => {
+            let (nr, ng, nb) = bt2020_to_bt709_linear(r, g, b);
+            r = nr;
+            g = ng;
+            b = nb;
+        }
+        SourceGamut::DisplayP3 => {
+            let (nr, ng, nb) = p3_to_bt709_linear(r, g, b);
+            r = nr;
+            g = ng;
+            b = nb;
+        }
+        SourceGamut::Bt709 => {}
+    }
+
+    // Out-of-gamut components after the matrix are simply clipped; SDR has
+    // no headroom to map them into.
+    (
+        srgb_oetf(r.clamp(0.0, 1.0)),
+        srgb_oetf(g.clamp(0.0, 1.0)),
+        srgb_oetf(b.clamp(0.0, 1.0)),
+        a.clamp(0.0, 1.0),
+    )
+}
+
+/// Convert an SDR image whose cICP says it is *not* sRGB (typically
+/// transfer 1 / BT.709, which is BT.1886 on a display) into sRGB-encoded
+/// packed Rgb10a2Unorm.
+///
+/// This is the SDR counterpart of `process_hdr_to_rgb10a2`.
+pub fn convert_sdr_to_srgb_rgb10a2(img: &DynamicImage, cicp: Cicp) -> (u32, u32, Vec<u32>) {
+    let params = SdrParams::new(cicp);
+    if params.is_noop() {
+        return requantize_srgb16_to_rgb10a2(img);
+    }
+    let (width, height, raw) = to_rgba16_flat(img);
+
+    let mut out: Vec<u32> = vec![0u32; (width as usize) * (height as usize)];
+    let w = width as usize;
+    raw.par_chunks_exact(4).zip(out.par_iter_mut()).enumerate().for_each(|(i, (src, dst))| {
+        let (r, g, b, a) = sdr_px(src, params);
+        let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
+        let q = |v: f32| (v * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
+        *dst = (((a * 3.0).round() as u32) << 30) | (q(b) << 20) | (q(g) << 10) | q(r);
+    });
+
+    (width, height, out)
+}
+
+/// As `convert_sdr_to_srgb_rgb10a2`, but writing 16-bit RGBA — for sources
+/// with a real alpha channel, which Rgb10a2Unorm's 2-bit alpha cannot hold.
+pub fn convert_sdr_to_srgb_rgba16(img: &DynamicImage, cicp: Cicp) -> (u32, u32, Vec<u16>) {
+    let params = SdrParams::new(cicp);
+    if params.is_noop() {
+        return requantize_srgb16_to_rgba16(img);
+    }
+    let (width, height, raw) = to_rgba16_flat(img);
+
+    let mut out: Vec<u16> = vec![0u16; (width as usize) * (height as usize) * 4];
+    raw.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).for_each(|(src, dst)| {
+        let (r, g, b, a) = sdr_px(src, params);
+        // 65536 codes is far below the visible threshold, so no dither here.
+        let q = |v: f32| (v * 65535.0).round().clamp(0.0, 65535.0) as u16;
+        dst[0] = q(r);
+        dst[1] = q(g);
+        dst[2] = q(b);
+        dst[3] = q(a);
+    });
+
+    (width, height, out)
+}
+
+/// As `convert_sdr_to_srgb_rgb10a2`, but for the dithered 8-bit path used
+/// when the swapchain cannot carry 10 bits.
+pub fn convert_sdr_to_srgb8(img: &DynamicImage, cicp: Cicp) -> RgbaImage {
+    let params = SdrParams::new(cicp);
+    let (width, height, raw) = to_rgba16_flat(img);
+
+    let pixel_count = (width as usize) * (height as usize);
+    let mut out: Vec<u8> = vec![0u8; pixel_count * 4];
+    let w = width as usize;
+    raw.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).enumerate().for_each(
+        |(i, (src, dst))| {
+            let (r, g, b, a) = sdr_px(src, params);
+            let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
+            let q = |v: f32| (v * 255.0 + d).round().clamp(0.0, 255.0) as u8;
+            dst[0] = q(r);
+            dst[1] = q(g);
+            dst[2] = q(b);
+            dst[3] = (a * 255.0).round() as u8;
+        },
+    );
+
+    ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, out)
+        .unwrap_or_else(|| ImageBuffer::new(width, height))
+}
+
 /// Requantize a 16-bit sRGB image to packed Rgb10a2Unorm with blue-noise dither.
 /// No transfer or gamut conversion: source and target are both sRGB-encoded.
+/// Only valid when `Cicp::is_display_ready_srgb` holds (or there is no cICP
+/// at all); otherwise use `convert_sdr_to_srgb_rgb10a2`.
 pub fn requantize_srgb16_to_rgb10a2(img: &DynamicImage) -> (u32, u32, Vec<u32>) {
     let (width, height, raw) = to_rgba16_flat(img);
     let w = width as usize;
@@ -733,6 +984,8 @@ pub fn requantize_srgb16_to_rgb10a2(img: &DynamicImage) -> (u32, u32, Vec<u32>) 
 /// No dither and no math: source and target are both 16-bit sRGB-encoded, so
 /// this is a straight copy. Kept as its own function anyway so the call site
 /// reads the same as the other three and `to_rgba16_flat` stays private.
+/// Same precondition as `requantize_srgb16_to_rgb10a2`: only for sources
+/// that are genuinely sRGB-encoded.
 pub fn requantize_srgb16_to_rgba16(img: &DynamicImage) -> (u32, u32, Vec<u16>) {
     to_rgba16_flat(img)
 }
@@ -789,6 +1042,54 @@ mod tests {
             let back = pq_eotf(pq);
             assert!((back - n).abs() / n < 1e-3, "round-trip {} -> {}", n, back);
         }
+    }
+
+    #[test]
+    fn bt709_transfer_is_not_srgb() {
+        // cICP 1/1/0/full: BT.709 primaries *and* transfer, i.e. what a
+        // "plain" 16-bit PNG tagged by ffmpeg carries. Transfer 1 is not
+        // sRGB, so this must not take the passthrough path.
+        let cicp = Cicp {
+            color_primaries: 1,
+            transfer_characteristics: 1,
+            matrix_coefficients: 0,
+            full_range: true,
+        };
+        assert!(!cicp.is_hdr());
+        assert!(!cicp.is_display_ready_srgb());
+
+        let p = SdrParams::new(cicp);
+        assert!(!p.is_noop());
+        assert_eq!(p.trc, Trc::Bt1886);
+
+        // Mid-grey: decoded with 2.4, re-encoded with ~2.2, so it has to
+        // come out darker than it went in.
+        let (r, g, b, a) = sdr_px(&[32768, 32768, 32768, 65535], p);
+        assert!((r - g).abs() < 1e-6 && (g - b).abs() < 1e-6);
+        assert!((r - 0.4725).abs() < 0.01, "unexpected mid-grey {}", r);
+        assert!((a - 1.0).abs() < 1e-6);
+
+        // Black and white are fixed points; only the curve between them moves.
+        let (w, ..) = sdr_px(&[65535, 65535, 65535, 65535], p);
+        assert!((w - 1.0).abs() < 1e-5);
+        let (k, ..) = sdr_px(&[0, 0, 0, 65535], p);
+        assert!(k.abs() < 1e-6);
+    }
+
+    #[test]
+    fn srgb_tagged_sdr_is_passthrough() {
+        let cicp = Cicp {
+            color_primaries: 1,
+            transfer_characteristics: 13,
+            matrix_coefficients: 0,
+            full_range: true,
+        };
+        assert!(cicp.is_display_ready_srgb());
+
+        let p = SdrParams::new(cicp);
+        assert!(p.is_noop());
+        let (r, ..) = sdr_px(&[20000, 20000, 20000, 65535], p);
+        assert!((r - 20000.0 / 65535.0).abs() < 1e-4, "round-trip drifted: {}", r);
     }
 
     #[test]
