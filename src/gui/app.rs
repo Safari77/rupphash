@@ -152,11 +152,17 @@ pub struct GuiApp {
     pub(super) histogram_enabled: Arc<AtomicBool>,
     // EXIF info display
     pub(super) show_exif: bool,
-    // Cache for histogram and palette data, keyed by path (lifecycle matches raw_cache)
-    pub(super) cached_histogram: HashMap<
-        std::path::PathBuf,
-        ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>),
-    >,
+    // Cache for histogram, palette and frosted backdrop, keyed by path
+    // (lifecycle matches raw_cache)
+    pub(super) cached_histogram: HashMap<std::path::PathBuf, super::image::HistPalette>,
+    // Uploaded backdrops. Separate from cached_histogram because turning a
+    // ColorImage into a texture needs a Context, which the worker has no access
+    // to. Pruned wherever cached_histogram is.
+    pub(super) blur_textures: HashMap<std::path::PathBuf, egui::TextureHandle>,
+    // Where render_image_texture put the image this frame, for overlays that
+    // are drawn after it. Cleared at the top of every frame so a stale
+    // placement cannot outlive the image it described.
+    pub(super) last_image_placement: Option<super::image::ImagePlacement>,
     pub(super) histogram_channel: usize, // 0 = L, 1 = A, 2 = B
     // Histogram/palette misses are computed off-thread: render_histogram must
     // never decode inside the paint pass (a RAW fallback there meant a full
@@ -426,6 +432,8 @@ impl GuiApp {
             histogram_enabled,
             show_exif: false,
             cached_histogram: HashMap::new(),
+            blur_textures: HashMap::new(),
+            last_image_placement: None,
             histogram_request_tx,
             histogram_result_rx,
             histogram_pending: std::collections::HashSet::new(),
@@ -653,6 +661,8 @@ impl GuiApp {
             histogram_enabled,
             show_exif: false,
             cached_histogram: HashMap::new(),
+            blur_textures: HashMap::new(),
+            last_image_placement: None,
             histogram_request_tx,
             histogram_result_rx,
             histogram_pending: std::collections::HashSet::new(),
@@ -1000,6 +1010,7 @@ impl GuiApp {
             self.gpu_cache.clear();
             self.animation_cache.clear();
             self.cached_histogram.clear();
+            self.blur_textures.clear();
             self.histogram_pending.clear();
             self.raw_loading.clear();
             self.exif_search_cache.clear();
@@ -1249,6 +1260,7 @@ impl GuiApp {
                     self.gpu_cache.remove(dest);
                     self.animation_cache.remove(dest);
                     self.cached_histogram.remove(dest);
+                    self.blur_textures.clear();
                     self.histogram_pending.remove(dest);
                 }
                 continue;
@@ -1265,6 +1277,7 @@ impl GuiApp {
                         self.gpu_cache.remove(path);
                         self.animation_cache.remove(path);
                         self.cached_histogram.remove(path);
+                        self.blur_textures.clear();
                         self.histogram_pending.remove(path);
 
                         if let Some(name) = path.file_name() {
@@ -1295,6 +1308,7 @@ impl GuiApp {
                             self.gpu_cache.remove(path);
                             self.animation_cache.remove(path);
                             self.cached_histogram.remove(path);
+                            self.blur_textures.clear();
                             self.histogram_pending.remove(path);
                             self.failed_images.remove(path);
                             self.retry_after.remove(path);
@@ -1322,6 +1336,7 @@ impl GuiApp {
                             self.gpu_cache.remove(path);
                             self.animation_cache.remove(path);
                             self.cached_histogram.remove(path);
+                            self.blur_textures.clear();
                             self.histogram_pending.remove(path);
                             self.failed_images.remove(path);
                             self.retry_after.remove(path);
@@ -1796,6 +1811,7 @@ impl GuiApp {
         self.gpu_cache.retain(|k, _| retention_paths.contains(k));
         self.animation_cache.retain(|k, _| retention_paths.contains(k));
         self.cached_histogram.retain(|k, _| retention_paths.contains(k));
+        self.blur_textures.retain(|k, _| retention_paths.contains(k));
         // Dropping the pending marker with the cache entry is what allows a
         // compute that failed (unreadable file, unsupported codec) to be tried
         // again the next time the user navigates back to it.
@@ -2008,7 +2024,9 @@ impl eframe::App for GuiApp {
         // just a reference into it.
         let ctx_owned = ui.ctx().clone();
         let ctx = &ctx_owned;
-
+        // Invalidated every frame; render_image_texture re-stashes it whenever
+        // an image is actually drawn.
+        self.last_image_placement = None;
         self.check_fs_events(ctx);
 
         // Push state.is_fullscreen to the actual window before anything lays out,

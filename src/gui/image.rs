@@ -41,8 +41,17 @@ pub(super) struct GroupViewState {
     pub(super) pan_center: egui::Pos2,
 }
 
-/// Histogram + dominant-colour palette, as produced by the worker pool.
-pub type HistPalette = ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>);
+/// Histogram, dominant-colour palette and frosted backdrop, as produced by the
+/// worker pool.
+#[derive(Clone)]
+pub struct HistPalette {
+    pub hist_l: [u32; 256],
+    pub hist_a: [u32; 256],
+    pub hist_b: [u32; 256],
+    pub palette: Vec<(egui::Color32, f32)>,
+    /// Pre-blurred copy of the analysis thumbnail, stretched under the overlay.
+    pub blur: egui::ColorImage,
+}
 
 /// Pixels for a texture with more than 8 bits per channel.
 ///
@@ -86,6 +95,125 @@ impl DeepColorCaps {
     #[inline]
     pub fn rgba16(&self) -> bool {
         self.rgba16.load(Ordering::Relaxed)
+    }
+}
+
+/// Gaussian sigma in thumbnail pixels.
+const BLUR_SIGMA: f32 = 1.666;
+
+/// Separable Gaussian blur, run in linear light on alpha-weighted colour.
+///
+/// Blurring gamma-encoded values darkens the result, and blurring straight
+/// colour bleeds transparent pixels' RGB into their neighbours, so this
+/// premultiplies into linear space, blurs, then divides the alpha back out.
+fn blur_backdrop(px: &[egui::Color32], w: usize, h: usize) -> egui::ColorImage {
+    let n = w * h;
+    if n == 0 || px.len() < n {
+        return egui::ColorImage {
+            size: [1, 1],
+            pixels: vec![egui::Color32::TRANSPARENT],
+            source_size: egui::vec2(1.0, 1.0),
+        };
+    }
+
+    let mut buf: Vec<[f32; 4]> = Vec::with_capacity(n);
+    for &c in &px[..n] {
+        let [r, g, b, a] = c.to_srgba_unmultiplied();
+        let a = a as f32 / 255.0;
+        buf.push([
+            srgb_to_linear(r as f32 / 255.0) * a,
+            srgb_to_linear(g as f32 / 255.0) * a,
+            srgb_to_linear(b as f32 / 255.0) * a,
+            a,
+        ]);
+    }
+
+    // Three sigma each side is where a Gaussian is worth truncating.
+    let radius = (BLUR_SIGMA * 3.0).ceil() as isize;
+    let mut kernel: Vec<f32> = (-radius..=radius)
+        .map(|i| {
+            let x = i as f32 / BLUR_SIGMA;
+            (-0.5 * x * x).exp()
+        })
+        .collect();
+    let sum: f32 = kernel.iter().sum();
+    for k in &mut kernel {
+        *k /= sum;
+    }
+
+    // Horizontal, then vertical. Edges clamp, which stops the border fading
+    // out against nothing where the kernel runs off the thumbnail.
+    let mut tmp = vec![[0.0f32; 4]; n];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = [0.0f32; 4];
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let sx = (x as isize + ki as isize - radius).clamp(0, w as isize - 1) as usize;
+                let s = buf[y * w + sx];
+                for c in 0..4 {
+                    acc[c] += s[c] * kv;
+                }
+            }
+            tmp[y * w + x] = acc;
+        }
+    }
+    for x in 0..w {
+        for y in 0..h {
+            let mut acc = [0.0f32; 4];
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let sy = (y as isize + ki as isize - radius).clamp(0, h as isize - 1) as usize;
+                let s = tmp[sy * w + x];
+                for c in 0..4 {
+                    acc[c] += s[c] * kv;
+                }
+            }
+            buf[y * w + x] = acc;
+        }
+    }
+
+    let pixels = buf
+        .iter()
+        .map(|p| {
+            let a = p[3].clamp(0.0, 1.0);
+            if a <= 1.0 / 255.0 {
+                return egui::Color32::TRANSPARENT;
+            }
+            let enc = |v: f32| (linear_to_srgb((v / a).clamp(0.0, 1.0)) * 255.0).round() as u8;
+            egui::Color32::from_rgba_unmultiplied(
+                enc(p[0]),
+                enc(p[1]),
+                enc(p[2]),
+                (a * 255.0).round() as u8,
+            )
+        })
+        .collect();
+
+    egui::ColorImage { size: [w, h], pixels, source_size: egui::vec2(w as f32, h as f32) }
+}
+
+/// Where the current image landed on screen this frame, and how quad space maps
+/// to texture UV.
+///
+/// Stashed by `render_image_texture` so overlays drawn later in the frame — the
+/// histogram's frosted backdrop — can work out which part of the picture is
+/// behind them without redoing the layout.
+#[derive(Clone, Copy)]
+pub(super) struct ImagePlacement {
+    pub(super) rect: egui::Rect,
+    pub(super) uv_mat: [f32; 4],
+    pub(super) uv_off: [f32; 2],
+}
+
+impl ImagePlacement {
+    /// Screen point -> texture UV: the same mapping the blit's vertex shader
+    /// applies, evaluated on the CPU for a handful of corners.
+    fn uv_at(&self, p: egui::Pos2) -> egui::Pos2 {
+        let qx = (p.x - self.rect.min.x) / self.rect.width().max(f32::EPSILON);
+        let qy = (p.y - self.rect.min.y) / self.rect.height().max(f32::EPSILON);
+        egui::pos2(
+            self.uv_mat[0] * qx + self.uv_mat[1] * qy + self.uv_off[0],
+            self.uv_mat[2] * qx + self.uv_mat[3] * qy + self.uv_off[1],
+        )
     }
 }
 
@@ -817,7 +945,7 @@ pub(super) fn spawn_image_loader_pool(
 
                             // Log dominant colors as gamma-encoded sRGB values
                             let colors_str: Vec<String> = hp
-                                .3
+                                .palette
                                 .iter()
                                 .map(|(c, w)| {
                                     format!("({}, {}, {} {:.0}%)", c.r(), c.g(), c.b(), w * 100.0)
@@ -1982,6 +2110,12 @@ pub(super) fn render_image_texture(
     // on every side — a uniform border on the deep path and not the 8-bit one.
     // Both paths must use the same painter to line up.
 
+    // Rotation and flips ride in the UV transform, not the mesh. Computed for
+    // both paths, not just the deep one: the histogram's frosted backdrop needs
+    // the same mapping to find out what is behind it.
+    let (uv_mat, uv_off) = image_uv_transform(total_steps as u32, flip_h, flip_v);
+    app.last_image_placement = Some(ImagePlacement { rect: target_rect, uv_mat, uv_off });
+
     match source {
         ImageSource::Egui { id, size } => {
             // Calculate UV coordinates for flipping (EXIF mirror + manual)
@@ -2032,8 +2166,6 @@ pub(super) fn render_image_texture(
                     );
                 }
 
-                // Rotation and flips ride in the UV transform, not the mesh.
-                let (uv_mat, uv_off) = image_uv_transform(total_steps as u32, flip_h, flip_v);
                 painter.add(egui_wgpu::Callback::new_paint_callback(
                     draw_rect,
                     ImageCallback {
@@ -2149,7 +2281,7 @@ fn compute_histogram_from_colorimage(
     img: &egui::ColorImage,
     palette_config: crate::db::PaletteConfig,
     pre_resized: bool,
-) -> ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>) {
+) -> HistPalette {
     let crate::db::PaletteConfig {
         dominant_colors,
         saturation_bias: sat_bias,
@@ -2163,7 +2295,13 @@ fn compute_histogram_from_colorimage(
     // pixel buffer, both of which would panic on an empty image.
     if src_w == 0 || src_h == 0 {
         let k = dominant_colors.clamp(1, 25);
-        return ([0; 256], [0; 256], [0; 256], vec![(egui::Color32::BLACK, 1.0 / k as f32); k]);
+        return HistPalette {
+            hist_l: [0; 256],
+            hist_a: [0; 256],
+            hist_b: [0; 256],
+            palette: vec![(egui::Color32::BLACK, 1.0 / k as f32); k],
+            blur: blur_backdrop(&[egui::Color32::TRANSPARENT], 1, 1),
+        };
     }
     // Detect low-color images (1-bit, indexed, etc.) by sampling the pixels
     // for unique RGB values. If there are fewer unique colors than requested,
@@ -2219,6 +2357,7 @@ fn compute_histogram_from_colorimage(
     };
 
     let mut oklab_pixels = Vec::with_capacity((dst_w * dst_h) as usize);
+    let mut thumb: Vec<egui::Color32> = Vec::with_capacity((dst_w * dst_h) as usize);
     let pixel_type = PixelType::U8x4;
 
     // 1. High-quality downsample using fast_image_resize
@@ -2241,6 +2380,9 @@ fn compute_histogram_from_colorimage(
         // result is still premultiplied and has to be undone before it means
         // anything as a colour.
         for chunk in dst_image.buffer().chunks_exact(4) {
+            thumb.push(egui::Color32::from_rgba_premultiplied(
+                chunk[0], chunk[1], chunk[2], chunk[3],
+            ));
             if let Some(ok) = oklab_from_premultiplied(chunk) {
                 oklab_pixels.push(ok);
             }
@@ -2270,7 +2412,13 @@ fn compute_histogram_from_colorimage(
     let palette = low_color_palette
         .unwrap_or_else(|| kmeans_palette(&oklab_pixels, dominant_colors, sat_bias, pal_sort));
 
-    (hist_l, hist_a, hist_b, palette)
+    HistPalette {
+        hist_l,
+        hist_a,
+        hist_b,
+        palette,
+        blur: blur_backdrop(&thumb, dst_w as usize, dst_h as usize),
+    }
 }
 
 /// K-means++ clustering with Logarithmic Culling and Oklch Distance.
@@ -2745,7 +2893,7 @@ fn kmeans_palette(
 fn compute_histogram_from_dynamic_image(
     img: &image::DynamicImage,
     palette_config: crate::db::PaletteConfig,
-) -> ([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>) {
+) -> HistPalette {
     let crate::db::PaletteConfig {
         dominant_colors,
         saturation_bias: sat_bias,
@@ -2760,7 +2908,13 @@ fn compute_histogram_from_dynamic_image(
     // step below divides by the pixel count, which would panic on an empty image.
     if src_w == 0 || src_h == 0 {
         let k = dominant_colors.clamp(1, 25);
-        return ([0; 256], [0; 256], [0; 256], vec![(egui::Color32::BLACK, 1.0 / k as f32); k]);
+        return HistPalette {
+            hist_l: [0; 256],
+            hist_a: [0; 256],
+            hist_b: [0; 256],
+            palette: vec![(egui::Color32::BLACK, 1.0 / k as f32); k],
+            blur: blur_backdrop(&[egui::Color32::TRANSPARENT], 1, 1),
+        };
     }
 
     // Detect low-color images before Lanczos downsampling destroys the information.
@@ -2825,12 +2979,16 @@ fn compute_histogram_from_dynamic_image(
                 .map(|_| dst_image)
         });
 
+    let mut thumb: Vec<egui::Color32> = Vec::with_capacity((dst_w * dst_h) as usize);
+
     let oklab_pixels: Vec<Oklab> = if let Some(dst_image) = resized_successfully {
-        // Parse the smoothed buffer
         dst_image
             .buffer()
             .chunks_exact(4)
             .map(|chunk| {
+                thumb.push(egui::Color32::from_rgba_unmultiplied(
+                    chunk[0], chunk[1], chunk[2], chunk[3],
+                ));
                 let lr = srgb_to_linear(chunk[0] as f32 / 255.0);
                 let lg = srgb_to_linear(chunk[1] as f32 / 255.0);
                 let lb = srgb_to_linear(chunk[2] as f32 / 255.0);
@@ -2838,13 +2996,12 @@ fn compute_histogram_from_dynamic_image(
             })
             .collect()
     } else {
-        // Fallback: If fast_image_resize fails, use the image crate's high-quality Lanczos3 filter
-        // instead of the lower quality thumbnail_exact() method.
-        let thumb =
+        let thumb_img =
             img.resize_exact(dst_w, dst_h, image::imageops::FilterType::Lanczos3).to_rgba8();
-        thumb
+        thumb_img
             .pixels()
             .map(|p| {
+                thumb.push(egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]));
                 let lr = srgb_to_linear(p[0] as f32 / 255.0);
                 let lg = srgb_to_linear(p[1] as f32 / 255.0);
                 let lb = srgb_to_linear(p[2] as f32 / 255.0);
@@ -2858,14 +3015,20 @@ fn compute_histogram_from_dynamic_image(
     let palette = low_color_palette
         .unwrap_or_else(|| kmeans_palette(&oklab_pixels, dominant_colors, sat_bias, pal_sort));
 
-    (hist_l, hist_a, hist_b, palette)
+    HistPalette {
+        hist_l,
+        hist_a,
+        hist_b,
+        palette,
+        blur: blur_backdrop(&thumb, dst_w as usize, dst_h as usize),
+    }
 }
 
 /// Compute histogram and palette from a standard image file
 fn compute_histogram_from_image(
     path: &Path,
     palette_config: crate::db::PaletteConfig,
-) -> Option<([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>)> {
+) -> Option<HistPalette> {
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
@@ -2911,7 +3074,7 @@ fn compute_histogram_from_image(
 fn compute_histogram_from_raw(
     path: &Path,
     palette_config: crate::db::PaletteConfig,
-) -> Option<([u32; 256], [u32; 256], [u32; 256], Vec<(egui::Color32, f32)>)> {
+) -> Option<HistPalette> {
     let data = match fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -3049,12 +3212,13 @@ pub(super) fn spawn_histogram_pool(
                 };
 
                 if let Some(ref d) = data {
-                    let colors_str: Vec<String> =
-                        d.3.iter()
-                            .map(|(c, w)| {
-                                format!("({}, {}, {} {:.0}%)", c.r(), c.g(), c.b(), w * 100.0)
-                            })
-                            .collect();
+                    let colors_str: Vec<String> = d
+                        .palette
+                        .iter()
+                        .map(|(c, w)| {
+                            format!("({}, {}, {} {:.0}%)", c.r(), c.g(), c.b(), w * 100.0)
+                        })
+                        .collect();
                     eprintln!(
                         "[PALETTE-FALLBACK] {:?}: [{}]",
                         path.file_name().unwrap_or_default(),
@@ -3089,7 +3253,7 @@ pub(super) fn render_histogram(
     // same path every frame; it is cleared alongside `cached_histogram` when
     // the retention set changes, which is also what lets a failed compute be
     // retried after navigating away and back.
-    let Some((hist_l, hist_a, hist_b, palette)) = app.cached_histogram.get(path).cloned() else {
+    let Some(hp) = app.cached_histogram.get(path).cloned() else {
         if app.histogram_pending.insert(path.to_path_buf())
             && app.histogram_request_tx.send(path.to_path_buf()).is_err()
         {
@@ -3117,7 +3281,7 @@ pub(super) fn render_histogram(
         swatch_height + 4.0
     } else {
         // Standard grid: rows of 5
-        let num_rows = palette.len().max(1).div_ceil(5);
+        let num_rows = hp.palette.len().max(1).div_ceil(5);
         (num_rows as f32) * (swatch_height + 4.0)
     };
     let total_height = hist_height + palette_total_height;
@@ -3127,7 +3291,6 @@ pub(super) fn render_histogram(
         egui::pos2(available_rect.min.x + padding, available_rect.max.y - total_height - padding),
         egui::vec2(hist_width, hist_height),
     );
-
     // Shield: register a click_and_drag widget covering the entire histogram
     // overlay (hist + palette below) so image-pan drags don't bleed through.
     // Allocated BEFORE the inner hist_rect/swatch interactions so those land
@@ -3135,6 +3298,40 @@ pub(super) fn render_histogram(
     // hover for swatch tooltips). The shield catches everything else.
     let shield_rect =
         egui::Rect::from_min_size(hist_rect.min, egui::vec2(hist_rect.width(), total_height + 4.0));
+
+    // Frosted backdrop. The pre-blurred thumbnail is painted through the same
+    // quad -> UV mapping the image blit uses, so it stays registered with what
+    // is actually behind the overlay under pan, zoom, rotation and flips.
+    // Clipped to where the image really is: where it isn't, the scrim below is
+    // all the background there is to draw.
+    if let Some(placement) = app.last_image_placement {
+        let blur_rect = shield_rect.intersect(placement.rect).intersect(ui.painter().clip_rect());
+        if blur_rect.is_positive() {
+            let tex = app.blur_textures.entry(path.to_path_buf()).or_insert_with(|| {
+                ui.ctx().load_texture(
+                    format!("blur_{}", path.display()),
+                    hp.blur.clone(),
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+            let mut mesh = egui::Mesh::with_texture(tex.id());
+            for corner in [
+                blur_rect.left_top(),
+                blur_rect.right_top(),
+                blur_rect.right_bottom(),
+                blur_rect.left_bottom(),
+            ] {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: corner,
+                    uv: placement.uv_at(corner),
+                    color: egui::Color32::WHITE,
+                });
+            }
+            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            ui.painter().add(egui::Shape::mesh(mesh));
+        }
+    }
+
     let _ = ui.interact(
         shield_rect,
         egui::Id::new("histogram_overlay_shield"),
@@ -3167,12 +3364,12 @@ pub(super) fn render_histogram(
     }
 
     let hist_to_draw = match app.histogram_channel {
-        1 => &hist_a,
-        2 => &hist_b,
-        _ => &hist_l,
+        1 => &hp.hist_a,
+        2 => &hp.hist_b,
+        _ => &hp.hist_l,
     };
 
-    draw_histogram(ui, hist_rect, hist_to_draw, &palette, app.histogram_channel, histogram_mode);
+    draw_histogram(ui, hist_rect, hist_to_draw, &hp.palette, app.histogram_channel, histogram_mode);
 }
 
 /// Draw histogram bars and dominant color palette
@@ -3190,7 +3387,10 @@ fn draw_histogram(
     let hist_height = hist_rect.height();
 
     // 1. Draw Histogram Background
-    ui.painter().rect_filled(hist_rect, 0.0, egui::Color32::from_black_alpha(180));
+    // Lighter than it was: there is a blurred backdrop under this now, and at
+    // alpha 180 the frost was invisible. This is only what keeps the bars and
+    // the channel label legible over a bright image.
+    ui.painter().rect_filled(hist_rect, 0.0, egui::Color32::from_black_alpha(110));
 
     // 2. Draw Histogram Bars
     let bar_width = hist_width / 256.0;
