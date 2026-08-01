@@ -47,6 +47,8 @@ Backspace            : Reset manual state of rotations and flips
                      : States are remembered for each file individually
 F                    : Toggle Fullscreen mode
 S                    : Toggle Slideshow (Pause/Resume)
+3                    : Toggled 3D LUT on/off (--3dlut)
+4                    : Load next 3D LUT
 Mouse Drag           : Pan image (when zoomed in)
 
 INFO OVERLAYS & DISPLAY
