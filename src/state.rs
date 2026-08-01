@@ -53,6 +53,8 @@ pub enum InputIntent {
     IgnoreCurrent,      // Q key: ignore marked files or current file (duplicate mode)
     IgnoreGroup,        // Ctrl+Q: ignore all files in current group (duplicate mode)
     ConfirmIgnoreGroup, // Y on ignore group confirmation dialog
+    ToggleLut,          // Key '3' logic for 3D LUT
+    CycleLut,           // Key '4' to switch to next LUT
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +181,10 @@ pub struct AppState {
     // Per-file transform state (rotation and flips)
     pub file_transforms: HashMap<u128, FileTransform>,
     pub last_title: String,
+    pub has_lut: bool,
+    pub lut_enabled: bool,
+    pub lut_index: usize,
+    pub lut_names: Vec<String>,
 }
 
 impl AppState {
@@ -230,6 +236,10 @@ impl AppState {
             use_gps_utc: false,
             file_transforms: HashMap::new(),
             last_title: String::new(),
+            has_lut: false,
+            lut_enabled: false,
+            lut_index: 0,
+            lut_names: Vec::new(),
         }
     }
 
@@ -465,6 +475,35 @@ impl AppState {
 
                 // Also update legacy manual_rotation for compatibility
                 self.manual_rotation = (self.manual_rotation + 1) % 4;
+            }
+            InputIntent::ToggleLut => {
+                if self.has_lut {
+                    self.lut_enabled = !self.lut_enabled;
+                    let lut_name = self.lut_names.get(self.lut_index).cloned().unwrap_or_default();
+                    let status = if self.lut_enabled {
+                        format!("3D LUT: ON [{}]", lut_name)
+                    } else {
+                        "3D LUT: OFF".to_string()
+                    };
+                    self.set_status(status, false);
+                } else {
+                    self.set_status("No 3D LUT loaded (use --3dlut <file.cube>)".to_string(), true);
+                }
+            }
+            InputIntent::CycleLut => {
+                let count = self.lut_names.len();
+                if self.has_lut && count > 0 {
+                    self.lut_index = (self.lut_index + 1) % count;
+                    let lut_name = self.lut_names.get(self.lut_index).cloned().unwrap_or_default();
+                    let status = if self.lut_enabled {
+                        format!("3D LUT: [{}] ({}/{})", lut_name, self.lut_index + 1, count)
+                    } else {
+                        format!("3D LUT Selected: [{}] (OFF, press '3' to enable)", lut_name)
+                    };
+                    self.set_status(status, false);
+                } else {
+                    self.set_status("No 3D LUT loaded (use --3dlut <file.cube>)".to_string(), true);
+                }
             }
             InputIntent::FlipHorizontal => {
                 // Per-file horizontal flip (left-right)

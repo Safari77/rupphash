@@ -248,6 +248,10 @@ struct Cli {
     #[arg(long, value_name = "SECONDS")]
     slideshow: Option<f32>,
 
+    /// Path to 3D LUT file(s) (.cube format)
+    #[arg(long = "3dlut", value_name = "FILE", num_args(1..))]
+    luts3d: Vec<PathBuf>,
+
     /// Directory to move marked files to
     #[arg(long, value_name = "DIR")]
     move_marked: Option<PathBuf>,
@@ -776,6 +780,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Trash folders on this system: {bins:#?}");
     }
 
+    // Parse specified 3D lut files
+    let mut parsed_luts = Vec::new();
+    if !args.luts3d.is_empty() {
+        for lut_path in &args.luts3d {
+            match gui::image::CubeLut3d::parse_file(lut_path) {
+                Ok(lut) => {
+                    parsed_luts.push(lut);
+                }
+                Err(e) => {
+                    eprintln!("Error reading 3D LUT file {:?}: {}", lut_path, e);
+                }
+            }
+        }
+
+        if parsed_luts.is_empty() {
+            eprintln!("Error: No valid 3D LUT files could be loaded.");
+            std::process::exit(1);
+        }
+        if args.use_tui {
+            eprintln!("Error: TUI mode not compatible with 3D LUT.");
+            std::process::exit(1);
+        }
+    }
+
     // View mode uses GUI by default unless --use-tui specified
     let use_gui = args.use_gui || (is_view_mode && !args.use_tui);
 
@@ -791,6 +819,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.slideshow,
             args.raw_thumbnails,
             args.view_flatten,
+            parsed_luts,
         );
         if let Err(e) = app.run() {
             eprintln!("GUI Error: {}", e);
@@ -836,6 +865,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sort_order,
             ext_priorities,
             args.raw_thumbnails,
+            parsed_luts,
         )
         .with_move_target(args.move_marked.clone());
 

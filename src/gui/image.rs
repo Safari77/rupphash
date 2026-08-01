@@ -4,6 +4,7 @@ use eframe::egui;
 use egui_wgpu::wgpu;
 use fast_image_resize::images::Image as FastImage;
 use fast_image_resize::{PixelType, ResizeOptions, Resizer};
+use half::f16;
 use image::GenericImageView;
 use oklab::{LinearRgb, Oklab, linear_srgb_to_oklab, oklab_to_linear_srgb};
 use std::borrow::Cow;
@@ -39,6 +40,28 @@ pub(super) enum ViewMode {
 pub(super) struct GroupViewState {
     pub(super) mode: ViewMode,
     pub(super) pan_center: egui::Pos2,
+}
+
+#[derive(Clone)]
+pub struct CubeLut3d {
+    pub name: String,
+    pub size: u32,
+    pub domain_min: [f32; 3],
+    pub domain_max: [f32; 3],
+    pub domain_scale: [f32; 3],
+    pub data: Vec<[f32; 3]>,
+}
+
+impl std::fmt::Debug for CubeLut3d {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CubeLut3d")
+            .field("name", &self.name)
+            .field("size", &self.size)
+            .field("data_len", &self.data.len())
+            .field("domain_min", &self.domain_min)
+            .field("domain_max", &self.domain_max)
+            .finish()
+    }
 }
 
 /// Histogram, dominant-colour palette and frosted backdrop, as produced by the
@@ -97,6 +120,325 @@ impl DeepColorCaps {
         self.rgba16.load(Ordering::Relaxed)
     }
 }
+
+impl CubeLut3d {
+    pub fn parse_file(path: &Path) -> Result<Self, String> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read 3D LUT file {:?}: {}", path, e))?;
+        let mut lut = Self::parse_str(&content)?;
+        if let Some(filename) = path.file_name() {
+            lut.name = filename.to_string_lossy().to_string();
+        }
+        Ok(lut)
+    }
+
+    pub fn parse_str(content: &str) -> Result<Self, String> {
+        let name = String::new();
+        let mut lut_size: Option<u32> = None;
+        let mut domain_min = [0.0f32, 0.0, 0.0];
+        let mut domain_max = [1.0f32, 1.0, 1.0];
+        let mut data = Vec::new();
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            if trimmed.starts_with("LUT_1D_SIZE") {
+                return Err("1D LUT formats are not supported; only 3D .cube format is supported."
+                    .to_string());
+            }
+
+            if trimmed.starts_with("LUT_3D_SIZE") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let s = parts[1]
+                        .parse::<u32>()
+                        .map_err(|e| format!("Invalid LUT_3D_SIZE: {}", e))?;
+                    if !(2..=256).contains(&s) {
+                        return Err(format!(
+                            "Invalid LUT_3D_SIZE {}; must be between 2 and 256.",
+                            s
+                        ));
+                    }
+                    lut_size = Some(s);
+                }
+                continue;
+            }
+
+            if trimmed.starts_with("DOMAIN_MIN") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    for i in 0..3 {
+                        if let Ok(v) = parts[i + 1].parse::<f32>() {
+                            domain_min[i] = v;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if trimmed.starts_with("DOMAIN_MAX") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    for i in 0..3 {
+                        if let Ok(v) = parts[i + 1].parse::<f32>() {
+                            domain_max[i] = v;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if trimmed.chars().next().is_some_and(|c| c.is_alphabetic()) {
+                continue;
+            }
+
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() == 3 {
+                let r = parts[0].parse::<f32>().map_err(|e| format!("Invalid float: {}", e))?;
+                let g = parts[1].parse::<f32>().map_err(|e| format!("Invalid float: {}", e))?;
+                let b = parts[2].parse::<f32>().map_err(|e| format!("Invalid float: {}", e))?;
+                // Keep stored output data untouched
+                data.push([r, g, b]);
+            }
+        }
+
+        let size =
+            lut_size.ok_or_else(|| "Missing LUT_3D_SIZE header in .cube file".to_string())?;
+        let expected_count = (size * size * size) as usize;
+        if data.len() != expected_count {
+            return Err(format!(
+                "Malformed .cube file: expected {} points for LUT_3D_SIZE {}, found {}",
+                expected_count,
+                size,
+                data.len()
+            ));
+        }
+
+        let domain_scale = [
+            if (domain_max[0] - domain_min[0]).abs() > 1e-6 {
+                1.0 / (domain_max[0] - domain_min[0])
+            } else {
+                1.0
+            },
+            if (domain_max[1] - domain_min[1]).abs() > 1e-6 {
+                1.0 / (domain_max[1] - domain_min[1])
+            } else {
+                1.0
+            },
+            if (domain_max[2] - domain_min[2]).abs() > 1e-6 {
+                1.0 / (domain_max[2] - domain_min[2])
+            } else {
+                1.0
+            },
+        ];
+
+        Ok(Self { name, size, domain_min, domain_max, domain_scale, data })
+    }
+}
+
+pub struct LutGpuResource {
+    pub name: String,
+    pub bind_group: Arc<wgpu::BindGroup>,
+    pub lut_size: u32,
+    pub domain_min: [f32; 3],
+    pub domain_scale: [f32; 3],
+}
+
+/// Rgba16Float's ~11-bit precision is finer than a quarter of a 10-bit output code step —
+/// nothing the 10-bit pipeline can show is lost.
+pub(super) const LUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const BYTES_PER_TEXEL: u32 = (4 * std::mem::size_of::<u16>()) as u32; // 8: four f16 components
+
+/// Pack `lut.data` ([r, g, b] triples) into tightly packed RGBA16F texels.
+/// Components are stored as raw f16 bit patterns (`u16`) so the slice can be
+/// cast with plain `bytemuck` (no need for half's `bytemuck` feature).
+fn pack_lut_rgba16f(lut: &CubeLut3d) -> Vec<u16> {
+    let size = lut.size as usize;
+    debug_assert_eq!(lut.data.len(), size * size * size);
+    let one = f16::ONE.to_bits();
+    let mut buf = Vec::with_capacity(lut.data.len() * 4);
+    for &[r, g, b] in &lut.data {
+        buf.extend_from_slice(&[
+            f16::from_f32(r).to_bits(),
+            f16::from_f32(g).to_bits(),
+            f16::from_f32(b).to_bits(),
+            one,
+        ]);
+    }
+    buf
+}
+
+pub fn upload_lut_to_gpu(rs: &egui_wgpu::RenderState, lut: &CubeLut3d) -> Option<LutGpuResource> {
+    let renderer = rs.renderer.read();
+    let pipe = renderer.callback_resources.get::<GpuImagePipeline>()?;
+
+    let size = lut.size;
+    // Degenerate LUT; also avoids a zero-size texture validation error.
+    if size == 0 {
+        return None;
+    }
+
+    let extent = wgpu::Extent3d { width: size, height: size, depth_or_array_layers: size };
+    let texture = rs.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("phdupes_3d_lut_texture"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: LUT_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    let texels = pack_lut_rgba16f(lut);
+    rs.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&texels),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(size * BYTES_PER_TEXEL), // tight stride, see pack_lut_rgba16f
+            rows_per_image: Some(size),
+        },
+        extent,
+    );
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = rs.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("phdupes_3d_lut_bind_group"),
+        layout: &pipe.lut_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }],
+    });
+
+    Some(LutGpuResource {
+        name: lut.name.clone(),
+        bind_group: Arc::new(bind_group),
+        lut_size: size,
+        domain_min: lut.domain_min,
+        domain_scale: lut.domain_scale,
+    })
+}
+
+// Shader & Uniform Definition with correct WGSL std140 layout
+const IMAGE_SHADER_WGSL: &str = r#"
+struct Uniforms {
+    rect: vec4<f32>,
+    uv_mat: vec4<f32>,
+    uv_off: vec2<f32>,
+    debug_mode: f32,
+    lut_enabled: f32,
+    lut_size: f32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
+    domain_min: vec3<f32>,
+    _pad_dm: f32,
+    domain_scale: vec3<f32>,
+    _pad_ds: f32,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var samp: sampler;
+@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(2) @binding(0) var lut_texture: texture_3d<f32>;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    let q = vec2<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u));
+    var out: VsOut;
+    out.pos = vec4<f32>(
+        mix(u.rect.x, u.rect.z, q.x),
+        mix(u.rect.y, u.rect.w, q.y),
+        0.0,
+        1.0,
+    );
+    out.uv = vec2<f32>(
+        u.uv_mat.x * q.x + u.uv_mat.y * q.y + u.uv_off.x,
+        u.uv_mat.z * q.x + u.uv_mat.w * q.y + u.uv_off.y,
+    );
+    return out;
+}
+
+fn load_lut(coord: vec3<i32>, max_dim: i32) -> vec3<f32> {
+    let clamped = clamp(coord, vec3<i32>(0), vec3<i32>(max_dim - 1));
+    return textureLoad(lut_texture, clamped, 0).rgb;
+}
+
+fn sample_lut_tetrahedral(color: vec3<f32>, lut_size: u32) -> vec3<f32> {
+    let max_dim = i32(lut_size);
+    let size_f = f32(max_dim - 1);
+    let scaled = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)) * size_f;
+    let base_idx = vec3<i32>(floor(scaled));
+    let f = fract(scaled);
+    let dx = f.x;
+    let dy = f.y;
+    let dz = f.z;
+
+    let v000 = load_lut(base_idx, max_dim);
+    let v111 = load_lut(base_idx + vec3<i32>(1, 1, 1), max_dim);
+
+    if (dx >= dy) {
+        if (dy >= dz) {
+            let v100 = load_lut(base_idx + vec3<i32>(1, 0, 0), max_dim);
+            let v110 = load_lut(base_idx + vec3<i32>(1, 1, 0), max_dim);
+            return (1.0 - dx) * v000 + (dx - dy) * v100 + (dy - dz) * v110 + dz * v111;
+        } else if (dx >= dz) {
+            let v100 = load_lut(base_idx + vec3<i32>(1, 0, 0), max_dim);
+            let v101 = load_lut(base_idx + vec3<i32>(1, 0, 1), max_dim);
+            return (1.0 - dx) * v000 + (dx - dz) * v100 + (dz - dy) * v101 + dy * v111;
+        } else {
+            let v001 = load_lut(base_idx + vec3<i32>(0, 0, 1), max_dim);
+            let v101 = load_lut(base_idx + vec3<i32>(1, 0, 1), max_dim);
+            return (1.0 - dz) * v000 + (dz - dx) * v001 + (dx - dy) * v101 + dy * v111;
+        }
+    } else {
+        if (dx >= dz) {
+            let v010 = load_lut(base_idx + vec3<i32>(0, 1, 0), max_dim);
+            let v110 = load_lut(base_idx + vec3<i32>(1, 1, 0), max_dim);
+            return (1.0 - dy) * v000 + (dy - dx) * v010 + (dx - dz) * v110 + dz * v111;
+        } else if (dy >= dz) {
+            let v010 = load_lut(base_idx + vec3<i32>(0, 1, 0), max_dim);
+            let v011 = load_lut(base_idx + vec3<i32>(0, 1, 1), max_dim);
+            return (1.0 - dy) * v000 + (dy - dz) * v010 + (dz - dx) * v011 + dx * v111;
+        } else {
+            let v001 = load_lut(base_idx + vec3<i32>(0, 0, 1), max_dim);
+            let v011 = load_lut(base_idx + vec3<i32>(0, 1, 1), max_dim);
+            return (1.0 - dz) * v000 + (dz - dy) * v001 + (dy - dx) * v011 + dx * v111;
+        }
+    }
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if (u.debug_mode > 1.5) {
+        return vec4<f32>(in.uv.x, in.uv.y, 0.0, 1.0);
+    }
+    if (u.debug_mode > 0.5) {
+        return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    }
+    var col = textureSample(tex, samp, in.uv);
+    if (u.lut_enabled > 0.5 && u.lut_size >= 2.0) {
+        let c = clamp((col.rgb - u.domain_min) * u.domain_scale, vec3<f32>(0.0), vec3<f32>(1.0));
+        col = vec4<f32>(sample_lut_tetrahedral(c, u32(u.lut_size)), col.a);
+    }
+    return col;
+}
+"#;
 
 /// Gaussian sigma in thumbnail pixels.
 const BLUR_SIGMA: f32 = 1.666;
@@ -273,69 +615,6 @@ impl Default for GroupViewState {
 /// individual pixels stay crisp when pixel-peeping. Below it, linear.
 const NEAREST_ZOOM_THRESHOLD: f32 = 2.0;
 
-const IMAGE_SHADER_WGSL: &str = r#"
-struct Uniforms {
-    // The image rect in normalized device coordinates: (x0, y0, x1, y1), with
-    // y0 the top edge. Absolute, not viewport-relative — see the note on
-    // ImageCallback::paint for why.
-    rect: vec4<f32>,
-    // Row-major 2x2 mapping quad space [0,1]^2 to texture UV, packed as
-    // [m00, m01, m10, m11]. Pure rotation and flip; the quad IS the image, so
-    // there is no scale or pan term here.
-    uv_mat: vec4<f32>,
-    uv_off: vec2<f32>,
-    // 0 = normal, 1 = solid magenta, 2 = uv as red/green. See gpu_debug_mode().
-    debug_mode: f32,
-    _pad: f32,
-};
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var samp: sampler;
-@group(1) @binding(0) var tex: texture_2d<f32>;
-
-struct VsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
-    // Triangle strip over the image: (0,0) (1,0) (0,1) (1,1) in quad space.
-    let q = vec2<f32>(f32(vi & 1u), f32((vi >> 1u) & 1u));
-    var out: VsOut;
-    // Place the quad at absolute clip coordinates. Parts that fall outside the
-    // panel are removed by egui's scissor rect, exactly as for egui's own
-    // meshes — nothing here depends on the viewport matching a rect.
-    out.pos = vec4<f32>(
-        mix(u.rect.x, u.rect.z, q.x),
-        mix(u.rect.y, u.rect.w, q.y),
-        0.0,
-        1.0,
-    );
-    out.uv = vec2<f32>(
-        u.uv_mat.x * q.x + u.uv_mat.y * q.y + u.uv_off.x,
-        u.uv_mat.z * q.x + u.uv_mat.w * q.y + u.uv_off.y,
-    );
-    return out;
-}
-
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    if (u.debug_mode > 1.5) {
-        // Where in the texture each visible pixel came from. Black at uv 0,0
-        // (top-left of the image), yellow at 1,1.
-        return vec4<f32>(in.uv.x, in.uv.y, 0.0, 1.0);
-    }
-    if (u.debug_mode > 0.5) {
-        // The exact extent of the quad on screen, texture ignored.
-        return vec4<f32>(1.0, 0.0, 1.0, 1.0);
-    }
-    // uv is a rotation/flip of q, so it never leaves [0,1] and needs no bounds
-    // check. Pass-through: no transfer function on either side of this sample.
-    return textureSample(tex, samp, in.uv);
-}
-"#;
-
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ImageUniform {
@@ -343,7 +622,15 @@ struct ImageUniform {
     uv_mat: [f32; 4],
     uv_off: [f32; 2],
     debug_mode: f32,
-    _pad: f32,
+    lut_enabled: f32,
+    lut_size: f32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
+    domain_min: [f32; 3],
+    _pad_dm: f32,
+    domain_scale: [f32; 3],
+    _pad_ds: f32,
 }
 
 /// Diagnostic level for the deep-colour blit, from `PHDUPES_GPU_DEBUG`:
@@ -382,11 +669,14 @@ struct GpuImagePipeline {
     rgba16_supported: bool,
     /// Layout of group 1 (the per-image texture view).
     texture_layout: wgpu::BindGroupLayout,
+    /// 3D LUT
+    lut_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
     /// Group 0 with a linear sampler.
     bind_linear: wgpu::BindGroup,
     /// Group 0 with a nearest sampler.
     bind_nearest: wgpu::BindGroup,
+    dummy_lut_bind_group: Arc<wgpu::BindGroup>,
 }
 
 /// A decoded image living in VRAM as `Rgb10a2Unorm`.
@@ -418,11 +708,9 @@ impl ImageSource {
 ///
 /// Returns true when the device also supports `Rgba16Unorm`, which is what
 /// backs images with real transparency (10-bit packing only has 2 alpha bits).
+
 pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) -> bool {
     let device = &rs.device;
-
-    // Requested in run() via WgpuConfiguration; absent on adapters that don't
-    // offer it, in which case transparent images stay on the 8-bit path.
     let rgba16_supported = device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -435,9 +723,6 @@ pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) -> bool {
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                // The vertex stage reads rect/uv_mat/uv_off; the fragment stage
-                // reads debug_mode. Both stages must be listed or wgpu rejects
-                // the pipeline at creation.
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
@@ -469,11 +754,62 @@ pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) -> bool {
         }],
     });
 
+    let lut_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("phdupes_image_lut_layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                // Rgba16Float is filterable on all backends without any extra
+                // device feature; this permits hardware trilinear LUT sampling.
+                // textureLoad-based lookups keep working unchanged either way.
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D3,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    });
+
+    let dummy_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("phdupes_dummy_lut"),
+        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: LUT_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    let dummy_bytes = [0u8; 8]; // one Rgba16Float texel
+    // Queue::write_texture has no 256-byte row alignment requirement (that
+    // applies to buffer-to-texture copies), so a tight stride is fine.
+    rs.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &dummy_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &dummy_bytes,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: Some(1) },
+        wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+    );
+
+    let dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let dummy_lut_bind_group = Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("phdupes_dummy_lut_bind_group"),
+        layout: &lut_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&dummy_view),
+        }],
+    }));
+
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("phdupes_image_pipeline_layout"),
-        // wgpu 29 allows sparse layouts, hence the Option wrapper per entry.
-        bind_group_layouts: &[Some(&shared_layout), Some(&texture_layout)],
-        // Formerly push_constant_ranges. We use none.
+        bind_group_layouts: &[Some(&shared_layout), Some(&texture_layout), Some(&lut_layout)],
         immediate_size: 0,
     });
 
@@ -500,11 +836,6 @@ pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) -> bool {
             topology: wgpu::PrimitiveTopology::TriangleStrip,
             ..Default::default()
         },
-        // eframe's NativeOptions defaults to depth_buffer: 0 and multisampling: 0,
-        // so egui's render pass has no depth attachment and one sample (which is
-        // what MultisampleState::default() gives). If either is ever enabled in
-        // run(), these two fields must be changed to match or wgpu will reject
-        // the pipeline at draw time.
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
@@ -518,9 +849,6 @@ pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) -> bool {
         mapped_at_creation: false,
     });
 
-    // Both samplers declare a Linear mipmap filter purely so wgpu classifies
-    // them as "filtering" and they satisfy the SamplerBindingType::Filtering
-    // slot above. With a single mip level it has no effect on sampling.
     let make_sampler = |label: &str, filter: wgpu::FilterMode| {
         device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some(label),
@@ -556,9 +884,11 @@ pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) -> bool {
         pipeline,
         rgba16_supported,
         texture_layout,
+        lut_layout,
         uniform_buffer,
         bind_linear,
         bind_nearest,
+        dummy_lut_bind_group,
     });
 
     rgba16_supported
@@ -665,15 +995,17 @@ pub(super) fn upload_gpu_image(
     })
 }
 
-/// One image blit. egui keeps this alive for the frame it was queued in.
 struct ImageCallback {
     bind_group: Arc<wgpu::BindGroup>,
-    /// The image rect in egui points, in screen space. Converted to clip space
-    /// in `prepare`, once the screen size is known.
+    lut_bind_group: Arc<wgpu::BindGroup>,
     target_rect: egui::Rect,
     uv_mat: [f32; 4],
     uv_off: [f32; 2],
     nearest: bool,
+    lut_enabled: bool,
+    lut_size: u32,
+    domain_min: [f32; 3],
+    domain_scale: [f32; 3],
 }
 
 impl egui_wgpu::CallbackTrait for ImageCallback {
@@ -685,13 +1017,10 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
         _egui_encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        // Only ever one image on screen at a time, so a single shared uniform
-        // buffer rewritten each frame is safe.
         let Some(pipe) = resources.get::<GpuImagePipeline>() else {
             return Vec::new();
         };
 
-        // Points -> clip space, against the whole framebuffer.
         let [w_px, h_px] = screen_descriptor.size_in_pixels;
         let ppp = screen_descriptor.pixels_per_point;
         let (w_px, h_px) = (w_px.max(1) as f32, h_px.max(1) as f32);
@@ -708,32 +1037,16 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
             uv_mat: self.uv_mat,
             uv_off: self.uv_off,
             debug_mode: gpu_debug_mode() as f32,
-            _pad: 0.0,
+            lut_enabled: if self.lut_enabled { 1.0 } else { 0.0 },
+            lut_size: self.lut_size as f32,
+            _pad1: 0.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
+            domain_min: self.domain_min,
+            _pad_dm: 0.0,
+            domain_scale: self.domain_scale,
+            _pad_ds: 0.0,
         };
-
-        if gpu_debug_mode() > 0 {
-            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-            log_changed(
-                &LAST,
-                format!(
-                    "[GPU-DBG] prepare  screen={}x{}px ppp={:.4}  screen_pts={:.1}x{:.1}\n\
-                     [GPU-DBG]          target_pts={:?}\n\
-                     [GPU-DBG]          ndc=[{:.5}, {:.5}, {:.5}, {:.5}]  uv_mat={:?} uv_off={:?}",
-                    w_px as u32,
-                    h_px as u32,
-                    ppp,
-                    w_px / ppp,
-                    h_px / ppp,
-                    self.target_rect,
-                    uniform.rect[0],
-                    uniform.rect[1],
-                    uniform.rect[2],
-                    uniform.rect[3],
-                    uniform.uv_mat,
-                    uniform.uv_off,
-                ),
-            );
-        }
 
         queue.write_buffer(&pipe.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         Vec::new()
@@ -749,47 +1062,14 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
             return;
         };
 
-        // egui sets a "courtesy" viewport from the callback rect before calling
-        // us, which does not reliably match that rect. Since our vertices are in
-        // absolute clip space, override it with the full framebuffer; egui's
-        // scissor rect still crops us to the panel. egui restores both after the
-        // callback, so this does not leak into later primitives.
         let [w_px, h_px] = info.screen_size_px;
         render_pass.set_viewport(0.0, 0.0, w_px as f32, h_px as f32, 0.0, 1.0);
-
-        if gpu_debug_mode() > 0 {
-            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-            let vp = info.viewport_in_pixels();
-            let clip = info.clip_rect_in_pixels();
-
-            log_changed(
-                &LAST,
-                format!(
-                    "[GPU-DBG] paint    screen_size_px={:?} ppp={:.4}\n\
-                     [GPU-DBG]          info.viewport(pts)={:?}\n\
-                     [GPU-DBG]          info.clip_rect(pts)={:?}\n\
-                     [GPU-DBG]          viewport_in_pixels=[x: {}, y: {}, w: {}, h: {}]\n\
-                     [GPU-DBG]          clip_rect_in_pixels=[x: {}, y: {}, w: {}, h: {}]  (this becomes the scissor)",
-                    info.screen_size_px,
-                    info.pixels_per_point,
-                    info.viewport,
-                    info.clip_rect,
-                    vp.left_px,
-                    vp.top_px,
-                    vp.width_px,
-                    vp.height_px,
-                    clip.left_px,
-                    clip.top_px,
-                    clip.width_px,
-                    clip.height_px,
-                ),
-            );
-        }
 
         let shared = if self.nearest { &pipe.bind_nearest } else { &pipe.bind_linear };
         render_pass.set_pipeline(&pipe.pipeline);
         render_pass.set_bind_group(0, shared, &[]);
         render_pass.set_bind_group(1, self.bind_group.as_ref(), &[]);
+        render_pass.set_bind_group(2, self.lut_bind_group.as_ref(), &[]);
         render_pass.draw(0..4, 0..1);
     }
 }
@@ -1982,6 +2262,65 @@ fn image_uv_transform(steps: u32, flip_h: bool, flip_v: bool) -> ([f32; 4], [f32
     (r, roff)
 }
 
+/// Upload an 8-bit ColorImage to VRAM as Rgba8Unorm for 3D LUT processing.
+pub(super) fn upload_gpu_image_8bit(
+    rs: &egui_wgpu::RenderState,
+    color_image: &egui::ColorImage,
+) -> Option<GpuImage> {
+    let width = color_image.width() as u32;
+    let height = color_image.height() as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let renderer = rs.renderer.read();
+    let pipe = renderer.callback_resources.get::<GpuImagePipeline>()?;
+
+    let extent = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+    let texture = rs.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("phdupes_image_rgba8"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    rs.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        color_image.as_raw(),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        extent,
+    );
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = rs.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("phdupes_image_bind_rgba8"),
+        layout: &pipe.texture_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }],
+    });
+
+    Some(GpuImage {
+        _texture: texture,
+        bind_group: Arc::new(bind_group),
+        size: egui::vec2(width as f32, height as f32),
+    })
+}
+
 // Helper to render an image with pan/zoom logic, from either backing store.
 pub(super) fn render_image_texture(
     app: &mut GuiApp,
@@ -2165,15 +2504,39 @@ pub(super) fn render_image_texture(
                         ),
                     );
                 }
+                let (lut_bind_group, lut_size, domain_min, domain_scale) = if app.state.lut_enabled
+                    && !app.lut_gpu_resources.is_empty()
+                    && app.state.lut_index < app.lut_gpu_resources.len()
+                {
+                    let res = &app.lut_gpu_resources[app.state.lut_index];
+                    (res.bind_group.clone(), res.lut_size, res.domain_min, res.domain_scale)
+                } else {
+                    let fallback = app.render_state.as_ref().and_then(|rs| {
+                        let r = rs.renderer.read();
+                        r.callback_resources
+                            .get::<GpuImagePipeline>()
+                            .map(|p| (p.dummy_lut_bind_group.clone(), 0, [0.0; 3], [1.0; 3]))
+                    });
+                    if let Some(fb) = fallback {
+                        fb
+                    } else {
+                        return; // Skip draw safely if render pipeline is unavailable
+                    }
+                };
 
                 painter.add(egui_wgpu::Callback::new_paint_callback(
                     draw_rect,
                     ImageCallback {
                         bind_group,
+                        lut_bind_group,
                         target_rect,
                         uv_mat,
                         uv_off,
                         nearest: zoom_factor >= NEAREST_ZOOM_THRESHOLD,
+                        lut_enabled: app.state.lut_enabled,
+                        lut_size,
+                        domain_min,
+                        domain_scale,
                     },
                 ));
             }

@@ -365,6 +365,22 @@ pub(super) fn handle_input(
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
             *intent.borrow_mut() = Some(InputIntent::DeleteImmediate);
         }
+        if plain
+            && ctx.input(|i| i.key_pressed(egui::Key::Num3))
+            && !app.state.is_any_dialog_open()
+            && !app.show_move_input
+            && !app.show_dir_picker
+        {
+            *intent.borrow_mut() = Some(InputIntent::ToggleLut);
+        }
+        if plain
+            && ctx.input(|i| i.key_pressed(egui::Key::Num4))
+            && !app.state.is_any_dialog_open()
+            && !app.show_move_input
+            && !app.show_dir_picker
+        {
+            *intent.borrow_mut() = Some(InputIntent::CycleLut);
+        }
         // Q key: Ignore files (duplicate mode only)
         // Plain Q: ignore marked files (or current file if none marked)
         // Shift+Q: ignore all files in current group (with confirmation)

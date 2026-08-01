@@ -155,6 +155,8 @@ pub struct GuiApp {
     // Cache for histogram, palette and frosted backdrop, keyed by path
     // (lifecycle matches raw_cache)
     pub(super) cached_histogram: HashMap<std::path::PathBuf, super::image::HistPalette>,
+    pub(super) luts3d: Vec<super::image::CubeLut3d>,
+    pub(super) lut_gpu_resources: Vec<super::image::LutGpuResource>,
     // Uploaded backdrops. Separate from cached_histogram because turning a
     // ColorImage into a texture needs a Context, which the worker has no access
     // to. Pruned wherever cached_histogram is.
@@ -336,6 +338,7 @@ impl GuiApp {
         group_by: String,
         ext_priorities: HashMap<String, usize>,
         use_raw_thumbnails: bool,
+        luts3d: Vec<super::image::CubeLut3d>,
     ) -> Self {
         let mut state = AppState::new(
             Vec::new(),
@@ -355,6 +358,14 @@ impl GuiApp {
         let palette_config = crate::db::PaletteConfig::from_gui_config(&ctx.gui_config);
         let hdr_config = crate::db::HdrConfig::from_gui_config(&ctx.gui_config);
         let histogram_enabled = Arc::new(AtomicBool::new(false));
+        let has_lut = !luts3d.is_empty();
+        let lut_names: Vec<String> = luts3d.iter().map(|l| l.name.clone()).collect();
+
+        state.has_lut = has_lut;
+        state.lut_enabled = has_lut;
+        state.lut_names = lut_names;
+        state.lut_index = 0;
+
         // Populated in run() once the swapchain format and device features are known.
         let deep_caps = Arc::new(super::image::DeepColorCaps::default());
         let (tx, rx) = super::image::spawn_image_loader_pool(
@@ -471,6 +482,8 @@ impl GuiApp {
             dir_total_count: None,
             fullscreen_applied: None,
             fullscreen_sent_at: None,
+            luts3d,
+            lut_gpu_resources: Vec::new(),
         }
     }
 
@@ -484,6 +497,7 @@ impl GuiApp {
         slideshow_interval: Option<f32>,
         use_raw_thumbnails: bool,
         view_flatten: bool,
+        luts3d: Vec<super::image::CubeLut3d>,
     ) -> Self {
         let mut state = AppState::new(
             Vec::new(),
@@ -497,6 +511,10 @@ impl GuiApp {
         state.view_mode_flatten = view_flatten;
         state.move_target = move_target;
         state.slideshow_interval = slideshow_interval;
+        state.has_lut = !luts3d.is_empty();
+        state.lut_enabled = !luts3d.is_empty();
+        state.lut_names = luts3d.iter().map(|l| l.name.clone()).collect();
+        state.lut_index = 0;
 
         // Canonicalize all input paths to ensure absolute paths throughout
         let canonical_paths: Vec<String> = paths
@@ -700,6 +718,8 @@ impl GuiApp {
             dir_total_count,
             fullscreen_applied: None,
             fullscreen_sent_at: None,
+            luts3d,
+            lut_gpu_resources: Vec::new(),
         }
     }
 
@@ -1965,21 +1985,50 @@ impl GuiApp {
                 // no dither, which is worse than the dithered CPU path in hdr.rs.
                 if let Some(rs) = cc.wgpu_render_state.as_ref() {
                     eprintln!("[GPU] target_format={:?}", rs.target_format);
+                    let rgba16 = super::image::init_gpu_image_pipeline(rs);
+                    app.render_state = Some(rs.clone()); // MUST be set unconditionally
+
                     if rs.target_format == wgpu::TextureFormat::Rgb10a2Unorm {
-                        let rgba16 = super::image::init_gpu_image_pipeline(rs);
-                        app.render_state = Some(rs.clone());
                         app.deep_caps.enabled.store(true, Ordering::Relaxed);
                         app.deep_caps.rgba16.store(rgba16, Ordering::Relaxed);
                         eprintln!("[GPU] deep-colour image path enabled (Rgba16Unorm: {})", rgba16);
                         if !rgba16 {
                             eprintln!(
                                 "[GPU] no TEXTURE_FORMAT_16BIT_NORM; transparent 16-bit images \
-                                 will use the dithered 8-bit path"
+                 will use the dithered 8-bit path"
                             );
                         }
                     } else {
-                        eprintln!("[GPU] 8-bit surface; staying on the dithered ColorImage path");
+                        eprintln!("[GPU] Standard surface ({:?})", rs.target_format);
                     }
+
+                    // Upload all valid 3D LUTs into GPU memory
+                    app.lut_gpu_resources = app
+                        .luts3d
+                        .iter()
+                        .filter_map(|lut| {
+                            let res = super::image::upload_lut_to_gpu(rs, lut);
+                            if res.is_some() {
+                                eprintln!(
+                                    "[GPU] Uploaded 3D LUT [{}] (size: {}x{}x{}) to VRAM",
+                                    lut.name, lut.size, lut.size, lut.size
+                                );
+                            } else {
+                                eprintln!("[GPU] Failed to upload 3D LUT [{}] to VRAM", lut.name);
+                            }
+                            res
+                        })
+                        .collect();
+
+                    // Rebuild lut_names from successfully uploaded resources to stay 1:1 in sync
+                    app.state.lut_names =
+                        app.lut_gpu_resources.iter().map(|r| r.name.clone()).collect();
+                    app.state.has_lut = !app.state.lut_names.is_empty();
+                    app.state.lut_enabled = app.state.has_lut;
+                    app.state.lut_index = 0;
+
+                    // Free CPU memory after GPU upload
+                    app.luts3d.clear();
                 }
 
                 Ok(Box::new(app))
@@ -2151,6 +2200,14 @@ impl eframe::App for GuiApp {
                                 self.cached_histogram.insert(path.clone(), hp);
                             }
 
+                            // Gate 8-bit GPU uploads strictly on self.state.has_lut
+                            if self.state.has_lut
+                                && let Some(rs) = self.render_state.as_ref()
+                                    && let Some(gpu) =
+                                        super::image::upload_gpu_image_8bit(rs, &color_image)
+                                    {
+                                        self.gpu_cache.insert(path.clone(), gpu);
+                                    }
                             let name = format!("img_{}", path.display());
                             let texture = ctx.load_texture(name, color_image, Default::default());
                             self.raw_cache.insert(path.clone(), texture);
@@ -2497,6 +2554,17 @@ impl eframe::App for GuiApp {
                         .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
                         .unwrap_or_default();
 
+                    // Format filename with [current_3dlut] prefix if --3dlut is enabled
+                    let filename_display = if self.state.lut_enabled
+                        && self.state.has_lut
+                        && !self.state.lut_names.is_empty()
+                    {
+                        let current_lut_name = &self.state.lut_names[self.state.lut_index];
+                        format!("[{}] {}", current_lut_name, filename)
+                    } else {
+                        filename
+                    };
+
                     let slideshow_status = if self.state.slideshow_interval.is_some() {
                         if self.state.slideshow_paused {
                             " | [S]lideshow: PAUSED"
@@ -2543,9 +2611,19 @@ impl eframe::App for GuiApp {
                     // Get distance to selected location (right-justified)
                     let distance_str = self.get_distance_to_location();
 
+                    let lut_status = if self.state.has_lut {
+                        if self.state.lut_enabled {
+                            " | [3] LUT: ON  [4] Next"
+                        } else {
+                            " | [3] LUT: OFF"
+                        }
+                    } else {
+                        ""
+                    };
+
                     ui.horizontal(|ui| {
                         ui.label(format!(
-                            "W: {}{} | Z: Zoom{}{}{}{}{}{}{}{}{}",
+                            "W: {}{} | Z: Zoom{}{}{}{}{}{}{}{}{}{}",
                             mode_str,
                             extra,
                             rel_tag,
@@ -2556,14 +2634,15 @@ impl eframe::App for GuiApp {
                             rot_str,
                             hist_str,
                             exif_str,
-                            gps_map_str
+                            gps_map_str,
+                            lut_status
                         ));
                         ui.separator();
                         ui.label(pos_str);
-                        if !filename.is_empty() {
+                        if !filename_display.is_empty() {
                             ui.separator();
                             ui.label(
-                                egui::RichText::new(filename)
+                                egui::RichText::new(filename_display)
                                     .size(14.0)
                                     .family(egui::FontFamily::Monospace)
                                     .strong(),

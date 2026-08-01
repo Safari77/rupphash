@@ -2,7 +2,7 @@ mod app;
 mod dialogs;
 mod fonts;
 pub mod gps_map;
-mod image;
+pub mod image;
 
 pub use app::GuiApp;
 
