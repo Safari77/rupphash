@@ -72,16 +72,16 @@ rustix = { version = "1", features = ["fs"] }
 num-integer = "0.1"
 
 # GUI
-eframe = { version = "0.35", default-features = false, features = [
+eframe = { version = "0.36", default-features = false, features = [
   "default_fonts",
   "wgpu",
   "wayland",
   "x11",
 ] }
-egui = "0.35"
-egui_extras = { version = "0.35", features = ["all_loaders"] }
-egui-wgpu = "0.35"
-walkers = "0.56"
+egui = "0.36"
+egui_extras = { version = "0.36", features = ["all_loaders"] }
+egui-wgpu = "0.36"
+walkers = { git = "https://github.com/Safari77/walkers", branch = "main" }
 roaring = { version = "0.11", features = ["serde"] }
 skrifa = "0.45"
 
