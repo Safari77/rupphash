@@ -251,19 +251,14 @@ impl RenderState {
 
                 let (device, queue) = {
                     profiling::scope!("request_device");
-                    adapter
-                        .request_device(&(*device_descriptor)(&adapter))
-                        .await?
+                    adapter.request_device(&(*device_descriptor)(&adapter)).await?
                 };
 
                 (instance.clone(), adapter, device, queue)
             }
-            WgpuSetup::Existing(WgpuSetupExisting {
-                instance,
-                adapter,
-                device,
-                queue,
-            }) => (instance, adapter, device, queue),
+            WgpuSetup::Existing(WgpuSetupExisting { instance, adapter, device, queue }) => {
+                (instance, adapter, device, queue)
+            }
         };
 
         log_adapter_info(&adapter.get_info());
@@ -360,11 +355,7 @@ fn wgpu_config_impl_send_sync() {
 
 impl std::fmt::Debug for WgpuConfiguration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            surface,
-            wgpu_setup,
-            on_surface_status: _,
-        } = self;
+        let Self { surface, wgpu_setup, on_surface_status: _ } = self;
         f.debug_struct("WgpuConfiguration")
             .field("surface", &surface)
             .field("wgpu_setup", &wgpu_setup)
@@ -423,18 +414,16 @@ pub fn preferred_framebuffer_format(
     formats: &[wgpu::TextureFormat],
 ) -> Result<wgpu::TextureFormat, WgpuError> {
     for &format in formats {
-        if matches!(
-            format,
-            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
-        ) {
+        // Prefer 10-bit output when the surface offers it.
+        if formats.contains(&wgpu::TextureFormat::Rgb10a2Unorm) {
+            return Ok(wgpu::TextureFormat::Rgb10a2Unorm);
+        }
+        if matches!(format, wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm) {
             return Ok(format);
         }
     }
 
-    formats
-        .first()
-        .copied()
-        .ok_or(WgpuError::NoSurfaceFormatsAvailable)
+    formats.first().copied().ok_or(WgpuError::NoSurfaceFormatsAvailable)
 }
 
 /// Take's epi's depth/stencil bits and returns the corresponding wgpu format.
@@ -502,12 +491,7 @@ pub fn adapter_info_summary(info: &wgpu::AdapterInfo) -> String {
     if *vendor != 0 {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            write!(
-                summary,
-                ", vendor: {} (0x{vendor:04X})",
-                parse_vendor_id(*vendor)
-            )
-            .ok();
+            write!(summary, ", vendor: {} (0x{vendor:04X})", parse_vendor_id(*vendor)).ok();
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -521,17 +505,9 @@ pub fn adapter_info_summary(info: &wgpu::AdapterInfo) -> String {
         write!(summary, ", pci_bus_id: {device_pci_bus_id:?}").ok();
     }
     if *subgroup_min_size != 0 || *subgroup_max_size != 0 {
-        write!(
-            summary,
-            ", subgroup_size: {subgroup_min_size}..={subgroup_max_size}"
-        )
-        .ok();
+        write!(summary, ", subgroup_size: {subgroup_min_size}..={subgroup_max_size}").ok();
     }
-    write!(
-        summary,
-        ", transient_saves_memory: {transient_saves_memory:?}"
-    )
-    .ok();
+    write!(summary, ", transient_saves_memory: {transient_saves_memory:?}").ok();
     write!(summary, ", limit_bucket: {limit_bucket:?}").ok();
 
     summary
