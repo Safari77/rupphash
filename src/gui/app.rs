@@ -21,6 +21,7 @@ use crate::db::{AppContext, EnrichmentResult};
 use crate::format_relative_time;
 use crate::gui::APP_TITLE;
 use crate::gui::image::{ImageLoadResult, MAX_TEXTURE_SIDE};
+use crate::gui::slideshow::SlideshowEffectChoice;
 use crate::img_debug;
 use crate::position;
 use crate::scanner::{self, ScanConfig};
@@ -96,6 +97,7 @@ pub struct GuiApp {
     pub(super) move_completion_index: usize,
     pub(super) last_preload_pos: Option<(usize, usize)>,
     pub(super) slideshow_last_advance: Option<std::time::Instant>,
+    pub(super) slideshow_manager: Option<super::slideshow::SlideshowManager>,
     // View mode: if Some, use scan_for_view with this sort order instead of scan_and_group
     pub(super) view_mode_sort: Option<String>,
     // View mode: if true, recursive scanning is enabled (flatten mode)
@@ -272,6 +274,14 @@ impl GuiApp {
         self.state.selection_changed = true;
     }
 
+    pub fn with_slideshow_effect(mut self, effect: Option<SlideshowEffectChoice>) -> Self {
+        if let Some(choice) = effect
+            && let Some(ref mut manager) = self.slideshow_manager {
+                manager.set_effect_choice(choice);
+            }
+        self
+    }
+
     pub fn get_point(&self, name: &str) -> Option<Point<f64>> {
         self.ctx.locations.get(name).cloned()
     }
@@ -412,6 +422,7 @@ impl GuiApp {
             move_completion_index: 0,
             last_preload_pos: None,
             slideshow_last_advance: None,
+            slideshow_manager: None,
             view_mode_sort: None,
             view_mode_flatten: false,
             raw_cache: HashMap::new(),
@@ -495,6 +506,7 @@ impl GuiApp {
         use_trash: bool,
         move_target: Option<std::path::PathBuf>,
         slideshow_interval: Option<f32>,
+        slideshow_effect: Option<SlideshowEffectChoice>,
         use_raw_thumbnails: bool,
         view_flatten: bool,
         luts3d: Vec<super::image::CubeLut3d>,
@@ -511,6 +523,7 @@ impl GuiApp {
         state.view_mode_flatten = view_flatten;
         state.move_target = move_target;
         state.slideshow_interval = slideshow_interval;
+        state.slideshow_effect = slideshow_effect;
         state.has_lut = !luts3d.is_empty();
         state.lut_enabled = !luts3d.is_empty();
         state.lut_names = luts3d.iter().map(|l| l.name.clone()).collect();
@@ -648,6 +661,7 @@ impl GuiApp {
             move_completion_index: 0,
             last_preload_pos: None,
             slideshow_last_advance: None,
+            slideshow_manager: None,
             view_mode_sort: Some(sort_order),
             view_mode_flatten: view_flatten,
             raw_cache: HashMap::new(),
@@ -1836,7 +1850,10 @@ impl GuiApp {
         // compute that failed (unreadable file, unsupported codec) to be tried
         // again the next time the user navigates back to it.
         self.histogram_pending.retain(|k| retention_paths.contains(k));
-
+        // Keep slideshow texture cache synchronized with retention window
+        if let Some(sm) = self.slideshow_manager.as_mut() {
+            sm.prune_cache(&retention_paths);
+        }
         // Active worker tasks should still be cancelled strictly based on the active window
         self.raw_loading.retain(|k| active_window_paths.contains(k));
     }
@@ -2001,6 +2018,13 @@ impl GuiApp {
                     } else {
                         eprintln!("[GPU] Standard surface ({:?})", rs.target_format);
                     }
+
+                    let effect_choice = app.state.slideshow_effect.unwrap_or_default();
+                    app.slideshow_manager = Some(super::slideshow::SlideshowManager::new(
+                        &rs.device,
+                        rs.target_format,
+                        effect_choice,
+                    ));
 
                     // Upload all valid 3D LUTs into GPU memory
                     app.lut_gpu_resources = app
@@ -2203,11 +2227,19 @@ impl eframe::App for GuiApp {
                             // Gate 8-bit GPU uploads strictly on self.state.has_lut
                             if self.state.has_lut
                                 && let Some(rs) = self.render_state.as_ref()
-                                    && let Some(gpu) =
-                                        super::image::upload_gpu_image_8bit(rs, &color_image)
-                                    {
-                                        self.gpu_cache.insert(path.clone(), gpu);
-                                    }
+                                && let Some(gpu) =
+                                    super::image::upload_gpu_image_8bit(rs, &color_image)
+                            {
+                                self.gpu_cache.insert(path.clone(), gpu);
+                            }
+
+                            // Upload texture to slideshow GPU cache before color_image is consumed
+                            if let (Some(sm), Some(rs)) =
+                                (self.slideshow_manager.as_mut(), self.render_state.as_ref())
+                            {
+                                sm.register_color_image(&rs.device, &rs.queue, &path, &color_image);
+                            }
+
                             let name = format!("img_{}", path.display());
                             let texture = ctx.load_texture(name, color_image, Default::default());
                             self.raw_cache.insert(path.clone(), texture);
@@ -2238,11 +2270,21 @@ impl eframe::App for GuiApp {
                                 self.cached_histogram.insert(path.clone(), hp);
                             }
 
+                            // Upload 10-bit texture to slideshow GPU cache
+                            if let (Some(sm), Some(rs)) =
+                                (self.slideshow_manager.as_mut(), self.render_state.as_ref())
+                            {
+                                sm.register_deep_image(
+                                    &rs.device, &rs.queue, &path, &pixels, width, height,
+                                );
+                            }
+
                             // Hoisted out of the match so the borrow of
                             // self.render_state ends before gpu_cache is touched.
                             let uploaded = self.render_state.as_ref().and_then(|rs| {
                                 super::image::upload_gpu_image(rs, &pixels, width, height)
                             });
+
                             match uploaded {
                                 Some(gpu) => {
                                     self.gpu_cache.insert(path.clone(), gpu);
@@ -3982,113 +4024,129 @@ impl eframe::App for GuiApp {
             let available_rect = ui.available_rect_before_wrap();
 
             if let Some(path) = current_image_path {
-                // 0. Check Animation Cache (animated WebP etc.)
-                // Extract animation frame data first to avoid borrow conflicts
-                let anim_frame_info = if let Some(anim) = self.animation_cache.get_mut(&path) {
-                    // Advance frame based on elapsed time
-                    let now = Instant::now();
-                    let elapsed = now.duration_since(anim.last_frame_time);
-                    let current_duration = anim.frame_durations[anim.current_frame];
+                // 0a. Check Slideshow Shader Transitions (Ken Burns / Swirl Out)
+                let is_slideshow_transition = self.state.slideshow_interval.is_some()
+                    && !self.state.slideshow_paused
+                    && self.slideshow_manager.as_ref().is_some_and(|sm| sm.is_transition_active());
 
-                    if elapsed >= current_duration {
-                        anim.current_frame = (anim.current_frame + 1) % anim.frames.len();
-                        anim.last_frame_time = now;
-                    }
-
-                    let texture_id = anim.frames[anim.current_frame].id();
-                    let texture_size = anim.frames[anim.current_frame].size_vec2();
-                    let next_duration = anim.frame_durations[anim.current_frame];
-                    let last_frame_time = anim.last_frame_time;
-
-                    Some((texture_id, texture_size, next_duration, last_frame_time))
-                } else {
-                    None
-                };
-
-                if let Some((texture_id, texture_size, next_duration, last_frame_time)) =
-                    anim_frame_info
+                if is_slideshow_transition
+                    && let (Some(sm), Some(rs)) =
+                        (self.slideshow_manager.as_mut(), self.render_state.as_ref())
                 {
-                    // Animations are always 8-bit, so they stay on the egui path.
-                    super::image::render_image_texture(
-                        self,
-                        ui,
-                        super::image::ImageSource::Egui { id: texture_id, size: texture_size },
-                        available_rect,
-                        current_group_idx,
-                    );
-
-                    // Schedule repaint for next frame transition
-                    let since_last = Instant::now().duration_since(last_frame_time);
-                    let remaining = next_duration.saturating_sub(since_last);
-                    ctx.request_repaint_after(remaining);
-                } else if let Some(src) = self.gpu_cache.get(&path).map(|gpu| {
-                    // Cloned out of the map so the borrow of self ends here and
-                    // render_image_texture can take &mut self.
-                    super::image::ImageSource::Gpu {
-                        bind_group: gpu.bind_group.clone(),
-                        size: gpu.size,
-                    }
-                }) {
-                    // 1a. 10-bit texture, drawn via a wgpu paint callback
-                    super::image::render_image_texture(
-                        self,
-                        ui,
-                        src,
-                        available_rect,
-                        current_group_idx,
-                    );
-                } else if let Some(src) = self.raw_cache.get(&path).map(|texture| {
-                    super::image::ImageSource::Egui { id: texture.id(), size: texture.size_vec2() }
-                }) {
-                    // 1b. 8-bit egui texture
-                    super::image::render_image_texture(
-                        self,
-                        ui,
-                        src,
-                        available_rect,
-                        current_group_idx,
-                    );
-                } else if let Some(err_msg) = self.failed_images.get(&path) {
-                    // 2. Failed to load - display error message
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(20.0);
-                            ui.label(
-                                egui::RichText::new("⚠ Failed to load image")
-                                    .size(18.0)
-                                    .color(egui::Color32::from_rgb(255, 160, 0)),
-                            );
-                            ui.add_space(10.0);
-                            ui.label(
-                                egui::RichText::new(err_msg)
-                                    .size(14.0)
-                                    .color(egui::Color32::LIGHT_GRAY),
-                            );
-                            ui.add_space(10.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    path.file_name().unwrap_or_default().to_string_lossy(),
-                                )
-                                .size(12.0)
-                                .color(egui::Color32::DARK_GRAY),
-                            );
-                        });
-                    });
+                    sm.render(&rs.queue, &rs.device, ui, available_rect);
+                    ctx.request_repaint();
                 } else {
-                    // 3. Not in cache and not failed? It's loading.
-                    ui.centered_and_justified(|ui| {
-                        ui.spinner();
-                        ui.label("Loading...");
-                    });
+                    // 0b. Check Animation Cache (animated WebP etc.)
+                    // Extract animation frame data first to avoid borrow conflicts
+                    let anim_frame_info = if let Some(anim) = self.animation_cache.get_mut(&path) {
+                        // Advance frame based on elapsed time
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(anim.last_frame_time);
+                        let current_duration = anim.frame_durations[anim.current_frame];
 
-                    // Trigger load if missed (failsafe)
-                    if !self.raw_loading.contains(&path) {
-                        self.raw_loading.insert(path.clone());
-                        self.enqueue_image_load(
-                            &path,
+                        if elapsed >= current_duration {
+                            anim.current_frame = (anim.current_frame + 1) % anim.frames.len();
+                            anim.last_frame_time = now;
+                        }
+
+                        let texture_id = anim.frames[anim.current_frame].id();
+                        let texture_size = anim.frames[anim.current_frame].size_vec2();
+                        let next_duration = anim.frame_durations[anim.current_frame];
+                        let last_frame_time = anim.last_frame_time;
+
+                        Some((texture_id, texture_size, next_duration, last_frame_time))
+                    } else {
+                        None
+                    };
+
+                    if let Some((texture_id, texture_size, next_duration, last_frame_time)) =
+                        anim_frame_info
+                    {
+                        // Animations are always 8-bit, so they stay on the egui path.
+                        super::image::render_image_texture(
+                            self,
+                            ui,
+                            super::image::ImageSource::Egui { id: texture_id, size: texture_size },
+                            available_rect,
                             current_group_idx,
-                            self.state.current_file_idx,
                         );
+
+                        // Schedule repaint for next frame transition
+                        let since_last = Instant::now().duration_since(last_frame_time);
+                        let remaining = next_duration.saturating_sub(since_last);
+                        ctx.request_repaint_after(remaining);
+                    } else if let Some(src) = self.gpu_cache.get(&path).map(|gpu| {
+                        // Cloned out of the map so the borrow of self ends here and
+                        // render_image_texture can take &mut self.
+                        super::image::ImageSource::Gpu {
+                            bind_group: gpu.bind_group.clone(),
+                            size: gpu.size,
+                        }
+                    }) {
+                        // 1a. 10-bit texture, drawn via a wgpu paint callback
+                        super::image::render_image_texture(
+                            self,
+                            ui,
+                            src,
+                            available_rect,
+                            current_group_idx,
+                        );
+                    } else if let Some(src) =
+                        self.raw_cache.get(&path).map(|texture| super::image::ImageSource::Egui {
+                            id: texture.id(),
+                            size: texture.size_vec2(),
+                        })
+                    {
+                        // 1b. 8-bit egui texture
+                        super::image::render_image_texture(
+                            self,
+                            ui,
+                            src,
+                            available_rect,
+                            current_group_idx,
+                        );
+                    } else if let Some(err_msg) = self.failed_images.get(&path) {
+                        // 2. Failed to load - display error message
+                        ui.centered_and_justified(|ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(20.0);
+                                ui.label(
+                                    egui::RichText::new("⚠ Failed to load image")
+                                        .size(18.0)
+                                        .color(egui::Color32::from_rgb(255, 160, 0)),
+                                );
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new(err_msg)
+                                        .size(14.0)
+                                        .color(egui::Color32::LIGHT_GRAY),
+                                );
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        path.file_name().unwrap_or_default().to_string_lossy(),
+                                    )
+                                    .size(12.0)
+                                    .color(egui::Color32::DARK_GRAY),
+                                );
+                            });
+                        });
+                    } else {
+                        // 3. Not in cache and not failed? It's loading.
+                        ui.centered_and_justified(|ui| {
+                            ui.spinner();
+                            ui.label("Loading...");
+                        });
+
+                        // Trigger load if missed (failsafe)
+                        if !self.raw_loading.contains(&path) {
+                            self.raw_loading.insert(path.clone());
+                            self.enqueue_image_load(
+                                &path,
+                                current_group_idx,
+                                self.state.current_file_idx,
+                            );
+                        }
                     }
                 }
 

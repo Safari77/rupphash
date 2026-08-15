@@ -1562,13 +1562,7 @@ pub(super) fn handle_dialogs(
         }
     }
 
-    // Slideshow
     // Suspend the slideshow entirely while any dialog or input box is open.
-    // Otherwise this block runs every frame, calls `request_repaint_after(0.1s)`,
-    // and silently advances `next_item()` behind the user's confirmation —
-    // which both burns CPU (the scroll_to_rect smooth-scroll triggered by
-    // `selection_changed = true` repaints at full frame rate for a few hundred
-    // ms after each advance) and changes the file the user is about to confirm.
     let dialog_blocking_slideshow =
         app.state.is_any_dialog_open() || app.show_move_input || app.show_dir_picker;
 
@@ -1580,14 +1574,43 @@ pub(super) fn handle_dialogs(
     {
         let should_advance = match app.slideshow_last_advance {
             Some(last) => last.elapsed().as_secs_f32() >= interval,
-            None => true,
+            None => {
+                // Initialize timer on first frame so image 0 is shown for the full interval
+                app.slideshow_last_advance = Some(std::time::Instant::now());
+                false
+            }
         };
+
         if should_advance {
-            app.slideshow_last_advance = Some(std::time::Instant::now());
-            app.state.next_item();
-            app.state.selection_changed = true;
+            let total_files: usize = app.state.groups.iter().map(|g| g.len()).sum();
+            if total_files > 1 {
+                let prev_path = app.state.get_current_image_path().cloned();
+                app.slideshow_last_advance = Some(std::time::Instant::now());
+
+                // Check if we are at the end of the list
+                let is_at_end = app.state.current_group_idx + 1 >= app.state.groups.len()
+                    && app.state.current_file_idx + 1
+                        >= app.state.groups[app.state.current_group_idx].len();
+
+                if is_at_end {
+                    // Wrap around to the start of the slideshow list
+                    app.state.current_group_idx = 0;
+                    app.state.current_file_idx = 0;
+                } else {
+                    app.state.next_item();
+                }
+
+                let next_path = app.state.get_current_image_path().cloned();
+                if prev_path != next_path {
+                    if let Some(sm) = app.slideshow_manager.as_mut() {
+                        sm.on_slide_change(prev_path, next_path);
+                    }
+                    app.state.selection_changed = true;
+                    ctx.request_repaint();
+                }
+            }
         }
-        ctx.request_repaint_after(std::time::Duration::from_secs_f32(0.1));
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
     } else if dialog_blocking_slideshow && app.state.slideshow_interval.is_some() {
         // Reset the timer so the slideshow doesn't immediately fire and skip
         // a file the moment the user dismisses the dialog.

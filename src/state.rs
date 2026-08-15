@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::fileops;
+use crate::gui::slideshow::SlideshowEffectChoice;
 use crate::scanner::{analyze_group, sort_files};
 use crate::{FileMetadata, GroupInfo};
 
@@ -172,6 +173,7 @@ pub struct AppState {
     pub move_target: Option<PathBuf>,
     pub slideshow_interval: Option<f32>,
     pub slideshow_paused: bool,
+    pub slideshow_effect: Option<SlideshowEffectChoice>,
     pub is_fullscreen: bool,
     pub manual_rotation: u8,
     pub show_search: bool,
@@ -228,6 +230,7 @@ impl AppState {
             move_target: None,
             slideshow_interval: None,
             slideshow_paused: false,
+            slideshow_effect: Some(SlideshowEffectChoice::Random),
             is_fullscreen: false,
             manual_rotation: 0,
             show_search: false,

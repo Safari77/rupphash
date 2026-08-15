@@ -248,6 +248,10 @@ struct Cli {
     #[arg(long, value_name = "SECONDS")]
     slideshow: Option<f32>,
 
+    /// Slideshow transition effect
+    #[arg(long, value_name = "EFFECT")]
+    slideshow_effect: Option<gui::slideshow::SlideshowEffectChoice>,
+
     /// Path to 3D LUT file(s) (.cube format)
     #[arg(long = "3dlut", value_name = "FILE", num_args(1..))]
     luts3d: Vec<PathBuf>,
@@ -341,7 +345,11 @@ impl Cli {
 
     /// Check if we're in view mode (explicit or implied)
     fn is_view_mode(&self) -> bool {
-        self.view || self.view_flatten || self.shuffle || self.slideshow.is_some()
+        self.view
+            || self.view_flatten
+            || self.shuffle
+            || self.slideshow.is_some()
+            || self.slideshow_effect.is_some()
     }
 
     /// Get the hash algorithm based on CLI flags
@@ -817,6 +825,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.use_trash,
             args.move_marked.clone(),
             args.slideshow,
+            args.slideshow_effect,
             args.raw_thumbnails,
             args.view_flatten,
             parsed_luts,
@@ -867,7 +876,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.raw_thumbnails,
             parsed_luts,
         )
-        .with_move_target(args.move_marked.clone());
+        .with_move_target(args.move_marked.clone())
+        .with_slideshow_effect(args.slideshow_effect);
 
         if let Err(e) = app.run() {
             eprintln!("GUI Error: {}", e);
