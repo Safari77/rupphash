@@ -180,8 +180,18 @@ impl SlideshowEffect {
 
 /// Thread-safe pseudo-random number generator (SplitMix64)
 fn random_u64() -> u64 {
+    use std::sync::LazyLock;
     use std::sync::atomic::{AtomicU64, Ordering};
-    static SEED: AtomicU64 = AtomicU64::new(0x853c49e6748fea9b);
+
+    static SEED: LazyLock<AtomicU64> = LazyLock::new(|| {
+        let mut buf = [0u8; 8];
+        let initial_seed = match getrandom::fill(&mut buf) {
+            Ok(()) => u64::from_ne_bytes(buf),
+            Err(_) => 0x853c49e6748fea9b,
+        };
+        AtomicU64::new(initial_seed)
+    });
+
     let mut x = SEED.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed);
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58476d1ce4e5b9);
