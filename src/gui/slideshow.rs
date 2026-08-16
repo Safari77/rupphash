@@ -20,11 +20,21 @@ pub enum SlideshowEffectChoice {
     Shards,
     PixelBoom,
     Explode,
+    Slic,
 }
 
 impl SlideshowEffectChoice {
-    pub const VALID_CHOICES: [&'static str; 8] =
-        ["none", "kenburns", "swirlin", "swirlout", "shards", "pixelboom", "explode", "random"];
+    pub const VALID_CHOICES: [&'static str; 9] = [
+        "none",
+        "kenburns",
+        "swirlin",
+        "swirlout",
+        "shards",
+        "pixelboom",
+        "explode",
+        "slic",
+        "random",
+    ];
 
     pub fn try_from_str(s: &str) -> Result<Self, String> {
         let clean = s.trim().to_lowercase().replace(['-', '_', ' '], "");
@@ -36,29 +46,13 @@ impl SlideshowEffectChoice {
             "shards" | "shard" | "glass" | "shatter" => Ok(SlideshowEffectChoice::Shards),
             "pixelboom" | "pixelblast" | "boom" | "pixels" => Ok(SlideshowEffectChoice::PixelBoom),
             "explode" | "explosion" | "blast" => Ok(SlideshowEffectChoice::Explode),
+            "slic" | "superpixel" | "superpixels" => Ok(SlideshowEffectChoice::Slic),
             "random" | "all" | "any" => Ok(SlideshowEffectChoice::Random),
             _ => Err(format!(
                 "Invalid slideshow effect '{}'. Use one of: {}",
                 s,
                 Self::VALID_CHOICES.join(", ")
             )),
-        }
-    }
-
-    pub fn from_str_loose(s: &str) -> Self {
-        Self::try_from_str(s).unwrap_or(SlideshowEffectChoice::Random)
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SlideshowEffectChoice::None => "none",
-            SlideshowEffectChoice::KenBurns => "ken-burns",
-            SlideshowEffectChoice::SwirlOut => "swirl-out",
-            SlideshowEffectChoice::SwirlIn => "swirl-in",
-            SlideshowEffectChoice::Shards => "shards",
-            SlideshowEffectChoice::PixelBoom => "pixel-boom",
-            SlideshowEffectChoice::Explode => "explode",
-            SlideshowEffectChoice::Random => "random",
         }
     }
 
@@ -71,6 +65,7 @@ impl SlideshowEffectChoice {
             SlideshowEffectChoice::Shards => SlideshowEffect::Shards,
             SlideshowEffectChoice::PixelBoom => SlideshowEffect::PixelBoom,
             SlideshowEffectChoice::Explode => SlideshowEffect::Explode,
+            SlideshowEffectChoice::Slic => SlideshowEffect::Slic,
             SlideshowEffectChoice::Random => {
                 let available = SlideshowEffect::ALL;
                 let idx = (random_u64() as usize) % available.len();
@@ -104,29 +99,19 @@ pub enum SlideshowEffect {
     Shards,
     PixelBoom,
     Explode,
+    Slic,
 }
 
 impl SlideshowEffect {
-    pub const ALL: [SlideshowEffect; 6] = [
+    pub const ALL: [SlideshowEffect; 7] = [
         SlideshowEffect::KenBurns,
         SlideshowEffect::SwirlOut,
         SlideshowEffect::SwirlIn,
         SlideshowEffect::Shards,
         SlideshowEffect::PixelBoom,
         SlideshowEffect::Explode,
+        SlideshowEffect::Slic,
     ];
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            SlideshowEffect::None => "None",
-            SlideshowEffect::KenBurns => "Ken Burns",
-            SlideshowEffect::SwirlOut => "Swirl Out",
-            SlideshowEffect::SwirlIn => "Swirl In",
-            SlideshowEffect::Shards => "Shards",
-            SlideshowEffect::PixelBoom => "Pixel Boom",
-            SlideshowEffect::Explode => "Explode",
-        }
-    }
 
     pub fn effect_type_id(&self) -> u32 {
         match self {
@@ -137,6 +122,7 @@ impl SlideshowEffect {
             SlideshowEffect::Shards => 4,
             SlideshowEffect::PixelBoom => 5,
             SlideshowEffect::Explode => 6,
+            SlideshowEffect::Slic => 7,
         }
     }
 }
@@ -202,7 +188,7 @@ struct Uniforms {
     view_aspect: f32,   // viewport width / height
     curr_aspect: f32,   // current image width / height
     next_aspect: f32,   // next image width / height
-    effect_type: u32,   // 0 = None/Crossfade, 1 = Ken Burns, 2 = Swirl Out, 3 = Swirl In, 4 = Shards, 5 = Pixel Boom, 6 = Explode
+    effect_type: u32,   // 0 = None/Crossfade, 1 = Ken Burns, 2 = Swirl Out, 3 = Swirl In, 4 = Shards, 5 = Pixel Boom, 6 = Explode, 7 = SLIC
     direction: f32,     // 1.0 or -1.0
     param1: f32,        // KenBurns: zoom_start
     param2: f32,        // KenBurns: zoom_end
@@ -271,6 +257,67 @@ fn hash22(p: vec2<f32>) -> vec2<f32> {
     var p3 = fract(vec3<f32>(p.xyx) * vec3<f32>(443.897, 441.423, 437.195));
     p3 = p3 + dot(p3, p3.yzx + 19.19);
     return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+// Convert sRGB channel to linear RGB matching srgb_to_linear in slic.rs
+fn srgb_to_linear(val: f32) -> f32 {
+    if (val <= 0.04045) {
+        return val / 12.92;
+    } else {
+        return pow((val + 0.055) / 1.055, 2.4);
+    }
+}
+
+// 5-tap cross average; r is in UV units. r <= 0.0 falls back to a single tap.
+fn sample_avg_rgb(tex: texture_2d<f32>, smp: sampler, uv: vec2<f32>, r: f32) -> vec3<f32> {
+    let lo = vec2<f32>(0.0, 0.0);
+    let hi = vec2<f32>(1.0, 1.0);
+    if (r <= 0.0) {
+        return textureSampleLevel(tex, smp, clamp(uv, lo, hi), 0.0).rgb;
+    }
+    var acc = textureSampleLevel(tex, smp, clamp(uv, lo, hi), 0.0).rgb;
+    acc = acc + textureSampleLevel(tex, smp, clamp(uv + vec2<f32>(r, 0.0), lo, hi), 0.0).rgb;
+    acc = acc + textureSampleLevel(tex, smp, clamp(uv - vec2<f32>(r, 0.0), lo, hi), 0.0).rgb;
+    acc = acc + textureSampleLevel(tex, smp, clamp(uv + vec2<f32>(0.0, r), lo, hi), 0.0).rgb;
+    acc = acc + textureSampleLevel(tex, smp, clamp(uv - vec2<f32>(0.0, r), lo, hi), 0.0).rgb;
+    return acc * 0.2;
+}
+
+fn rgb_dist2(a: vec3<f32>, b: vec3<f32>) -> f32 {
+    let d = a - b;
+    return dot(d, d);
+}
+
+// Convert linear RGB to CIELAB (D65 illuminant) matching rgb_to_lab in slic.rs
+fn rgb_to_lab_vec(col: vec3<f32>) -> vec3<f32> {
+    let r = srgb_to_linear(col.r);
+    let g = srgb_to_linear(col.g);
+    let b = srgb_to_linear(col.b);
+
+    var x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b;
+    var y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
+    var z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b;
+
+    x = x / 0.95047;
+    y = y / 1.00000;
+    z = z / 1.08883;
+
+    let eps = 0.008856;
+    let fx = select(7.787 * x + 16.0 / 116.0, pow(x, 1.0 / 3.0), x > eps);
+    let fy = select(7.787 * y + 16.0 / 116.0, pow(y, 1.0 / 3.0), y > eps);
+    let fz = select(7.787 * z + 16.0 / 116.0, pow(z, 1.0 / 3.0), z > eps);
+
+    let l = 116.0 * fy - 16.0;
+    let a = 500.0 * (fx - fy);
+    let b_val = 200.0 * (fy - fz);
+    return vec3<f32>(l, a, b_val);
+}
+
+// Gaussian-smoothed CIELAB sampling replicating gaussian_smooth_rgb in slic.rs
+fn sample_gaussian_lab(tex: texture_2d<f32>, smp: sampler, uv: vec2<f32>, lod: f32) -> vec3<f32> {
+    let clamped_uv = clamp(uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
+    let col = textureSampleLevel(tex, smp, clamped_uv, lod);
+    return rgb_to_lab_vec(col.rgb);
 }
 
 @fragment
@@ -539,6 +586,146 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let fade_edge = smoothstep(0.0, 1.0, is_blown_open * (1.0 - blast_t * 0.9));
 
         return mix(col_next, col_exploded, fade_edge);
+    } else if (u.effect_type == 7u) {
+        // --- SLIC SUPERPIXEL SEGMENTATION & SINE DROP EFFECT ---
+        // Blocks are real rigid objects: a pixel shows the next image unless a
+        // dropped superpixel currently covers it, so the next image is revealed
+        // as segments tumble away.
+        let img_uv_curr = fit_uv(uv, u.curr_aspect, u.view_aspect);
+        let img_uv_next = fit_uv(uv, u.next_aspect, u.view_aspect);
+        let col_next = sample_image(t_next, s_sampler, img_uv_next);
+
+        let in_image = img_uv_curr.x >= 0.0 && img_uv_curr.x <= 1.0 && img_uv_curr.y >= 0.0 && img_uv_curr.y <= 1.0;
+        if (!in_image) {
+            return col_next;
+        }
+
+        let lo = vec2<f32>(0.0, 0.0);
+        let hi = vec2<f32>(1.0, 1.0);
+        let p = img_uv_curr;
+
+        // Roughly square superpixel cells relative to the image itself
+        let cols = 12.0;
+        let rows = max(3.0, round(cols / max(u.curr_aspect, 0.2)));
+        let grid = vec2<f32>(cols, rows);
+        let cell_size = 1.0 / grid;
+        let cols_i = i32(cols);
+        let rows_i = i32(rows);
+
+        // --- NOISE IMMUNITY KNOB ---
+        // Blur radius (UV units) applied ONLY to the colour taps used for SLIC
+        // classification. The displayed blocks stay sharp; this stops pixel
+        // noise from making cluster assignment flicker at boundaries.
+        //   0.0          = off (fastest, speckly on noisy photos)
+        //   0.002 - 0.01 = useful range (~4-20 px on a 2000 px-wide image)
+        //   too high     = boundaries stop following thin structures (hair, wires)
+        let colour_smooth = cell_size.x * 0.2;
+
+        // SLIC compactness m (in Lab units): lower = segments hug colours harder
+        let m = 10.0;
+        let inv_m2 = 1.0 / (m * m);
+
+        var hit = false;
+        var hit_q = vec2<f32>(0.0, 0.0);
+        var hit_alpha = 0.0;
+        var hit_edge = 0.0;
+        var best_z = -1.0;
+
+        for (var gy = 0; gy < rows_i; gy = gy + 1) {
+            for (var gx = 0; gx < cols_i; gx = gx + 1) {
+                let cc = vec2<f32>(f32(gx), f32(gy));
+                let rnd = hash22(cc + vec2<f32>(7.182, 3.491));
+                let center0 = (cc + vec2<f32>(0.5, 0.5)) * cell_size;
+
+                // --- Per-cluster animation ---
+                let stagger = (1.0 - center0.y) * 0.28 + rnd.x * 0.20;
+                let local_t = clamp((t - stagger) / max(1.0 - stagger, 0.001), 0.0, 1.0);
+                if (local_t >= 1.0) {
+                    continue; // already gone
+                }
+
+                let drop_dist = pow(local_t, 2.2) * (1.5 + rnd.y * 0.6);
+                let sine_freq = 3.4 + rnd.x * 4.0;
+                let sine_phase = rnd.y * 6.28318;
+                let sine_amp = (0.045 + rnd.x * 0.06) * smoothstep(0.0, 0.35, local_t);
+                let sway_x = sin(local_t * sine_freq + sine_phase) * sine_amp;
+                let moved = center0 + vec2<f32>(sway_x, drop_dist);
+
+                // Cheap prune: this block can only cover pixels near its centre
+                let dcell = abs((p - moved) / cell_size);
+                if (dcell.x > 1.75 || dcell.y > 1.75) {
+                    continue;
+                }
+
+                // Map the screen pixel back into the block's rest frame
+                let rot = sin(local_t * sine_freq * 0.75 + sine_phase) * (0.22 + rnd.y * 0.24) * u.direction;
+                let cos_r = cos(-rot);
+                let sin_r = sin(-rot);
+                let delta_asp = vec2<f32>((p.x - moved.x) * u.curr_aspect, p.y - moved.y);
+                let rot_asp = vec2<f32>(
+                    delta_asp.x * cos_r - delta_asp.y * sin_r,
+                    delta_asp.x * sin_r + delta_asp.y * cos_r
+                );
+                let q = center0 + vec2<f32>(rot_asp.x / u.curr_aspect, rot_asp.y);
+
+                if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) {
+                    continue;
+                }
+
+                // --- Coverage test: is q assigned to this cluster? ---
+                // Classic SLIC distance D = (dc/m)^2 + (ds/S)^2 vs the cluster's
+                // own seed and its 8 neighbours; covered only if this seed wins.
+                let q_lab = rgb_to_lab_vec(sample_avg_rgb(t_current, s_sampler, q, colour_smooth));
+
+                let c_rgb = sample_avg_rgb(t_current, s_sampler, center0, colour_smooth);
+                let dc0 = q_lab - rgb_to_lab_vec(c_rgb);
+                let ds0 = (q - center0) * grid;
+                let d0 = dot(dc0, dc0) * inv_m2 + dot(ds0, ds0);
+
+                var rival = 1e30;
+                for (var ny = -1; ny <= 1; ny = ny + 1) {
+                    for (var nx = -1; nx <= 1; nx = nx + 1) {
+                        if (nx == 0 && ny == 0) {
+                            continue;
+                        }
+                        let nc = cc + vec2<f32>(f32(nx), f32(ny));
+                        if (nc.x < 0.0 || nc.y < 0.0 || nc.x > cols - 1.0 || nc.y > rows - 1.0) {
+                            continue;
+                        }
+                        let n_seed = (nc + vec2<f32>(0.5, 0.5)) * cell_size;
+                        let n_rgb = sample_avg_rgb(t_current, s_sampler, n_seed, colour_smooth); 
+                        let dcn = q_lab - rgb_to_lab_vec(n_rgb);
+                        let dsn = (q - n_seed) * grid;
+                        rival = min(rival, dot(dcn, dcn) * inv_m2 + dot(dsn, dsn));
+                    }
+                }
+
+                if (d0 < rival) {
+                    // Occlusion: higher original rows and random ties win
+                    let z = center0.y * 0.6 + rnd.y * 0.4;
+                    if (z > best_z) {
+                        let margin = rival - d0;
+                        best_z = z;
+                        hit = true;
+                        hit_q = q;
+                        // Seam hugs the real SLIC boundary (margin -> 0) and
+                        // moves with the block; soft also anti-aliases the edge
+                        let soft = smoothstep(0.0, 0.07, margin);
+                        let fade = clamp(1.0 - smoothstep(0.72, 1.0, local_t), 0.0, 1.0);
+                        hit_alpha = fade * soft;
+                        hit_edge = smoothstep(0.2, 0.0, margin) * (1.0 - local_t * 0.55)
+                                 * smoothstep(0.03, 0.12, t) * 0.28;
+                    }
+                }
+            }
+        }
+
+        if (hit && hit_alpha > 0.0) {
+            var col_curr = sample_image(t_current, s_sampler, clamp(hit_q, lo, hi));
+            col_curr = col_curr + vec4<f32>(vec3<f32>(hit_edge), 0.0);
+            return mix(col_next, col_curr, hit_alpha);
+        }
+        return col_next;
     }
 
     // Default Crossfade
