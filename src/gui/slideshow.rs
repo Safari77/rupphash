@@ -12,14 +12,23 @@ use std::time::{Duration, Instant};
 #[clap(rename_all = "kebab-case")]
 pub enum SlideshowEffectChoice {
     #[default]
+    #[value(alias = "all", alias = "any")]
     Random,
+    #[value(alias = "off", alias = "cut")]
     None,
+    #[value(alias = "kenburns", alias = "kenburn", alias = "panzoom")]
     KenBurns,
+    #[value(alias = "swirlout", alias = "swirl", alias = "vortex", alias = "vortexout")]
     SwirlOut,
+    #[value(alias = "swirlin", alias = "vortexin")]
     SwirlIn,
+    #[value(alias = "shard", alias = "glass", alias = "shatter")]
     Shards,
+    #[value(alias = "pixelboom", alias = "pixelblast", alias = "boom", alias = "pixels")]
     PixelBoom,
+    #[value(alias = "explosion", alias = "blast")]
     Explode,
+    #[value(alias = "superpixel", alias = "superpixels")]
     Slic,
 }
 
@@ -76,6 +85,48 @@ impl SlideshowEffectChoice {
                     chosen
                 }
             }
+        }
+    }
+
+    pub fn pick_effective_from_slice(
+        choices: &[SlideshowEffectChoice],
+        last_effect: Option<SlideshowEffect>,
+    ) -> SlideshowEffect {
+        if choices.is_empty() {
+            return SlideshowEffectChoice::Random.pick_effective(last_effect);
+        }
+        if choices.len() == 1 {
+            return choices[0].pick_effective(last_effect);
+        }
+
+        let mut effects = Vec::new();
+        for choice in choices {
+            match choice {
+                SlideshowEffectChoice::Random => effects.extend_from_slice(&SlideshowEffect::ALL),
+                SlideshowEffectChoice::None => effects.push(SlideshowEffect::None),
+                SlideshowEffectChoice::KenBurns => effects.push(SlideshowEffect::KenBurns),
+                SlideshowEffectChoice::SwirlOut => effects.push(SlideshowEffect::SwirlOut),
+                SlideshowEffectChoice::SwirlIn => effects.push(SlideshowEffect::SwirlIn),
+                SlideshowEffectChoice::Shards => effects.push(SlideshowEffect::Shards),
+                SlideshowEffectChoice::PixelBoom => effects.push(SlideshowEffect::PixelBoom),
+                SlideshowEffectChoice::Explode => effects.push(SlideshowEffect::Explode),
+                SlideshowEffectChoice::Slic => effects.push(SlideshowEffect::Slic),
+            }
+        }
+        effects.dedup();
+        if effects.is_empty() {
+            return SlideshowEffect::None;
+        }
+        if effects.len() == 1 {
+            return effects[0];
+        }
+
+        let idx = (random_u64() as usize) % effects.len();
+        let chosen = effects[idx];
+        if Some(chosen) == last_effect && effects.len() > 1 {
+            effects[(idx + 1) % effects.len()]
+        } else {
+            chosen
         }
     }
 }
@@ -879,6 +930,7 @@ impl SlideshowPipeline {
 pub struct SlideshowManager {
     pub pipeline: SlideshowPipeline,
     pub effect_choice: SlideshowEffectChoice,
+    pub effect_choices: Vec<SlideshowEffectChoice>,
     pub current_effect: SlideshowEffect,
     pub transition_start: Option<Instant>,
     pub transition_duration: Duration,
@@ -893,13 +945,16 @@ impl SlideshowManager {
     pub fn new(
         device: &wgpu::Device,
         target_format: wgpu::TextureFormat,
-        choice: SlideshowEffectChoice,
+        choices: Vec<SlideshowEffectChoice>,
     ) -> Self {
         let pipeline = SlideshowPipeline::new(device, target_format);
+        let current_effect = SlideshowEffectChoice::pick_effective_from_slice(&choices, None);
+        let effect_choice = choices.first().copied().unwrap_or_default();
         Self {
             pipeline,
-            effect_choice: choice,
-            current_effect: choice.pick_effective(None),
+            effect_choice,
+            effect_choices: choices,
+            current_effect,
             transition_start: None,
             transition_duration: Duration::from_millis(1200),
             prev_path: None,
@@ -910,15 +965,26 @@ impl SlideshowManager {
         }
     }
 
+    pub fn set_effect_choices(&mut self, choices: Vec<SlideshowEffectChoice>) {
+        self.effect_choice = choices.first().copied().unwrap_or_default();
+        self.effect_choices = choices;
+        self.current_effect = SlideshowEffectChoice::pick_effective_from_slice(
+            &self.effect_choices,
+            Some(self.current_effect),
+        );
+    }
+
     pub fn set_effect_choice(&mut self, choice: SlideshowEffectChoice) {
-        self.effect_choice = choice;
-        self.current_effect = choice.pick_effective(Some(self.current_effect));
+        self.set_effect_choices(vec![choice]);
     }
 
     pub fn on_slide_change(&mut self, from_path: Option<PathBuf>, to_path: Option<PathBuf>) {
         self.prev_path = from_path;
         self.current_path = to_path;
-        self.current_effect = self.effect_choice.pick_effective(Some(self.current_effect));
+        self.current_effect = SlideshowEffectChoice::pick_effective_from_slice(
+            &self.effect_choices,
+            Some(self.current_effect),
+        );
         self.transition_start = Some(Instant::now());
 
         let zoom_in = random_u64().is_multiple_of(2);

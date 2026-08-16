@@ -274,11 +274,11 @@ impl GuiApp {
         self.state.selection_changed = true;
     }
 
-    pub fn with_slideshow_effect(mut self, effect: Option<SlideshowEffectChoice>) -> Self {
-        if let Some(choice) = effect
-            && let Some(ref mut manager) = self.slideshow_manager {
-                manager.set_effect_choice(choice);
-            }
+    pub fn with_slideshow_effect(mut self, effects: Vec<SlideshowEffectChoice>) -> Self {
+        self.state.slideshow_effect = effects.clone();
+        if let Some(ref mut manager) = self.slideshow_manager {
+            manager.set_effect_choices(effects);
+        }
         self
     }
 
@@ -506,7 +506,7 @@ impl GuiApp {
         use_trash: bool,
         move_target: Option<std::path::PathBuf>,
         slideshow_interval: Option<f32>,
-        slideshow_effect: Option<SlideshowEffectChoice>,
+        slideshow_effect: Vec<SlideshowEffectChoice>,
         use_raw_thumbnails: bool,
         view_flatten: bool,
         luts3d: Vec<super::image::CubeLut3d>,
@@ -2012,14 +2012,14 @@ impl GuiApp {
                         if !rgba16 {
                             eprintln!(
                                 "[GPU] no TEXTURE_FORMAT_16BIT_NORM; transparent 16-bit images \
-                 will use the dithered 8-bit path"
+                                 will use the dithered 8-bit path"
                             );
                         }
                     } else {
                         eprintln!("[GPU] Standard surface ({:?})", rs.target_format);
                     }
 
-                    let effect_choice = app.state.slideshow_effect.unwrap_or_default();
+                    let effect_choice = app.state.slideshow_effect.clone();
                     app.slideshow_manager = Some(super::slideshow::SlideshowManager::new(
                         &rs.device,
                         rs.target_format,

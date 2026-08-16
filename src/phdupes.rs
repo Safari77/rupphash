@@ -248,9 +248,9 @@ struct Cli {
     #[arg(long, value_name = "SECONDS")]
     slideshow: Option<f32>,
 
-    /// Slideshow transition effect
-    #[arg(long, value_name = "EFFECT")]
-    slideshow_effect: Option<gui::slideshow::SlideshowEffectChoice>,
+    /// Slideshow transition effect(s) (can specify multiple separated by comma)
+    #[arg(long, value_name = "EFFECT", value_delimiter = ',')]
+    slideshow_effect: Vec<gui::slideshow::SlideshowEffectChoice>,
 
     /// Path to 3D LUT file(s) (.cube format)
     #[arg(long = "3dlut", value_name = "FILE", num_args(1..))]
@@ -349,7 +349,7 @@ impl Cli {
             || self.view_flatten
             || self.shuffle
             || self.slideshow.is_some()
-            || self.slideshow_effect.is_some()
+            || !self.slideshow_effect.is_empty()
     }
 
     /// Get the hash algorithm based on CLI flags
