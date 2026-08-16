@@ -2,7 +2,7 @@ use clap::ValueEnum;
 use eframe::egui;
 use egui_wgpu::wgpu;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -793,7 +793,7 @@ pub struct SlideshowPipeline {
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub sampler: wgpu::Sampler,
     pub uniform_buffer: wgpu::Buffer,
-    pub fallback_texture: wgpu::Texture,
+    pub _fallback_texture: wgpu::Texture,
     pub fallback_view: wgpu::TextureView,
 }
 
@@ -921,7 +921,7 @@ impl SlideshowPipeline {
             bind_group_layout,
             sampler,
             uniform_buffer,
-            fallback_texture,
+            _fallback_texture: fallback_texture,
             fallback_view,
         }
     }
@@ -974,6 +974,7 @@ impl SlideshowManager {
         );
     }
 
+    #[allow(dead_code)]
     pub fn set_effect_choice(&mut self, choice: SlideshowEffectChoice) {
         self.set_effect_choices(vec![choice]);
     }
@@ -1012,7 +1013,7 @@ impl SlideshowManager {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        path: &PathBuf,
+        path: &Path,
         image: &egui::ColorImage,
     ) {
         let width = image.size[0] as u32;
@@ -1044,15 +1045,15 @@ impl SlideshowManager {
         );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.texture_cache.insert(path.clone(), (texture, view));
-        self.texture_dimensions.insert(path.clone(), (width, height));
+        self.texture_cache.insert(path.to_path_buf(), (texture, view));
+        self.texture_dimensions.insert(path.to_path_buf(), (width, height));
     }
 
     pub fn register_deep_image(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        path: &PathBuf,
+        path: &Path,
         pixels: &super::image::DeepPixels,
         width: u32,
         height: u32,
@@ -1096,8 +1097,8 @@ impl SlideshowManager {
         );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.texture_cache.insert(path.clone(), (texture, view));
-        self.texture_dimensions.insert(path.clone(), (width, height));
+        self.texture_cache.insert(path.to_path_buf(), (texture, view));
+        self.texture_dimensions.insert(path.to_path_buf(), (width, height));
     }
 
     pub fn prune_cache(&mut self, active_paths: &std::collections::HashSet<PathBuf>) {
