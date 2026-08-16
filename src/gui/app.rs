@@ -4034,7 +4034,7 @@ impl eframe::App for GuiApp {
                         (self.slideshow_manager.as_mut(), self.render_state.as_ref())
                 {
                     sm.render(&rs.queue, &rs.device, ui, available_rect);
-                    ctx.request_repaint();
+                    ctx.request_repaint_after(Duration::from_millis(16));
                 } else {
                     // 0b. Check Animation Cache (animated WebP etc.)
                     // Extract animation frame data first to avoid borrow conflicts

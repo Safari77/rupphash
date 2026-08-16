@@ -1572,6 +1572,9 @@ pub(super) fn handle_dialogs(
         && !app.state.groups.is_empty()
         && !dialog_blocking_slideshow
     {
+        let is_transition =
+            app.slideshow_manager.as_ref().is_some_and(|sm| sm.is_transition_active());
+
         let should_advance = match app.slideshow_last_advance {
             Some(last) => last.elapsed().as_secs_f32() >= interval,
             None => {
@@ -1609,8 +1612,17 @@ pub(super) fn handle_dialogs(
                     ctx.request_repaint();
                 }
             }
+        } else if is_transition {
+            // Animate transition at ~60 FPS
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        } else if let Some(last) = app.slideshow_last_advance {
+            // Sleep until next slide advance is due instead of busy-polling every 16ms
+            let elapsed = last.elapsed().as_secs_f32();
+            if elapsed < interval {
+                let remaining = std::time::Duration::from_secs_f32(interval - elapsed);
+                ctx.request_repaint_after(remaining);
+            }
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
     } else if dialog_blocking_slideshow && app.state.slideshow_interval.is_some() {
         // Reset the timer so the slideshow doesn't immediately fire and skip
         // a file the moment the user dismisses the dialog.
