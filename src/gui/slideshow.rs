@@ -30,10 +30,21 @@ pub enum SlideshowEffectChoice {
     Explode,
     #[value(alias = "superpixel", alias = "superpixels")]
     Slic,
+    #[value(
+        alias = "pageflip",
+        alias = "pageturn",
+        alias = "page",
+        alias = "curl",
+        alias = "flip",
+        alias = "book"
+    )]
+    PageFlip,
+    #[value(alias = "vacuum", alias = "suck", alias = "blackhole", alias = "vortexcursor")]
+    Vacuum,
 }
 
 impl SlideshowEffectChoice {
-    pub const VALID_CHOICES: [&'static str; 9] = [
+    pub const VALID_CHOICES: [&'static str; 11] = [
         "none",
         "kenburns",
         "swirlin",
@@ -42,6 +53,8 @@ impl SlideshowEffectChoice {
         "pixelboom",
         "explode",
         "slic",
+        "pageflip",
+        "vacuum",
         "random",
     ];
 
@@ -56,6 +69,10 @@ impl SlideshowEffectChoice {
             "pixelboom" | "pixelblast" | "boom" | "pixels" => Ok(SlideshowEffectChoice::PixelBoom),
             "explode" | "explosion" | "blast" => Ok(SlideshowEffectChoice::Explode),
             "slic" | "superpixel" | "superpixels" => Ok(SlideshowEffectChoice::Slic),
+            "pageflip" | "pageturn" | "page" | "curl" | "flip" | "book" => {
+                Ok(SlideshowEffectChoice::PageFlip)
+            }
+            "vacuum" | "suck" | "blackhole" | "vortexcursor" => Ok(SlideshowEffectChoice::Vacuum),
             "random" | "all" | "any" => Ok(SlideshowEffectChoice::Random),
             _ => Err(format!(
                 "Invalid slideshow effect '{}'. Use one of: {}",
@@ -75,6 +92,8 @@ impl SlideshowEffectChoice {
             SlideshowEffectChoice::PixelBoom => SlideshowEffect::PixelBoom,
             SlideshowEffectChoice::Explode => SlideshowEffect::Explode,
             SlideshowEffectChoice::Slic => SlideshowEffect::Slic,
+            SlideshowEffectChoice::PageFlip => SlideshowEffect::PageFlip,
+            SlideshowEffectChoice::Vacuum => SlideshowEffect::Vacuum,
             SlideshowEffectChoice::Random => {
                 let available = SlideshowEffect::ALL;
                 let idx = (random_u64() as usize) % available.len();
@@ -111,6 +130,8 @@ impl SlideshowEffectChoice {
                 SlideshowEffectChoice::PixelBoom => effects.push(SlideshowEffect::PixelBoom),
                 SlideshowEffectChoice::Explode => effects.push(SlideshowEffect::Explode),
                 SlideshowEffectChoice::Slic => effects.push(SlideshowEffect::Slic),
+                SlideshowEffectChoice::PageFlip => effects.push(SlideshowEffect::PageFlip),
+                SlideshowEffectChoice::Vacuum => effects.push(SlideshowEffect::Vacuum),
             }
         }
         effects.dedup();
@@ -151,10 +172,12 @@ pub enum SlideshowEffect {
     PixelBoom,
     Explode,
     Slic,
+    PageFlip,
+    Vacuum,
 }
 
 impl SlideshowEffect {
-    pub const ALL: [SlideshowEffect; 7] = [
+    pub const ALL: [SlideshowEffect; 9] = [
         SlideshowEffect::KenBurns,
         SlideshowEffect::SwirlOut,
         SlideshowEffect::SwirlIn,
@@ -162,6 +185,8 @@ impl SlideshowEffect {
         SlideshowEffect::PixelBoom,
         SlideshowEffect::Explode,
         SlideshowEffect::Slic,
+        SlideshowEffect::PageFlip,
+        SlideshowEffect::Vacuum,
     ];
 
     pub fn effect_type_id(&self) -> u32 {
@@ -174,6 +199,8 @@ impl SlideshowEffect {
             SlideshowEffect::PixelBoom => 5,
             SlideshowEffect::Explode => 6,
             SlideshowEffect::Slic => 7,
+            SlideshowEffect::PageFlip => 8,
+            SlideshowEffect::Vacuum => 9,
         }
     }
 }
@@ -216,12 +243,12 @@ pub struct SlideshowUniforms {
     pub next_aspect: f32,
     pub effect_type: u32,
     pub direction: f32,
-    pub param1: f32, // KenBurns: zoom_start
-    pub param2: f32, // KenBurns: zoom_end
-    pub param3: f32, // KenBurns: pan_start_x
-    pub param4: f32, // KenBurns: pan_start_y
-    pub param5: f32, // KenBurns: pan_end_x
-    pub param6: f32, // KenBurns: pan_end_y
+    pub param1: f32, // KenBurns: curr_zoom_end / Vacuum: mouse_x
+    pub param2: f32, // KenBurns: next_zoom_start / Vacuum: mouse_y
+    pub param3: f32, // KenBurns: curr_pan_end_x
+    pub param4: f32, // KenBurns: curr_pan_end_y
+    pub param5: f32, // KenBurns: next_pan_start_x
+    pub param6: f32, // KenBurns: next_pan_start_y
 }
 
 impl Default for SlideshowUniforms {
@@ -233,12 +260,12 @@ impl Default for SlideshowUniforms {
             next_aspect: 1.0,
             effect_type: 0,
             direction: 1.0,
-            param1: 1.0,
-            param2: 1.2,
-            param3: 0.0,
-            param4: 0.0,
-            param5: 0.05,
-            param6: 0.05,
+            param1: 1.15,
+            param2: 1.15,
+            param3: 0.03,
+            param4: -0.02,
+            param5: -0.02,
+            param6: 0.03,
         }
     }
 }
@@ -249,14 +276,14 @@ struct Uniforms {
     view_aspect: f32,   // viewport width / height
     curr_aspect: f32,   // current image width / height
     next_aspect: f32,   // next image width / height
-    effect_type: u32,   // 0 = None/Crossfade, 1 = Ken Burns, 2 = Swirl Out, 3 = Swirl In, 4 = Shards, 5 = Pixel Boom, 6 = Explode, 7 = SLIC
+    effect_type: u32,   // 0 = None/Crossfade, 1 = Ken Burns, 2 = Swirl Out, 3 = Swirl In, 4 = Shards, 5 = Pixel Boom, 6 = Explode, 7 = SLIC, 8 = Page Flip, 9 = Vacuum
     direction: f32,     // 1.0 or -1.0
-    param1: f32,        // KenBurns: zoom_start
-    param2: f32,        // KenBurns: zoom_end
-    param3: f32,        // KenBurns: pan_start_x
-    param4: f32,        // KenBurns: pan_start_y
-    param5: f32,        // KenBurns: pan_end_x
-    param6: f32,        // KenBurns: pan_end_y
+    param1: f32,        // KenBurns: curr_zoom_end / Vacuum: mouse_x
+    param2: f32,        // KenBurns: next_zoom_start / Vacuum: mouse_y
+    param3: f32,        // KenBurns: curr_pan_end_x
+    param4: f32,        // KenBurns: curr_pan_end_y
+    param5: f32,        // KenBurns: next_pan_start_x
+    param6: f32,        // KenBurns: next_pan_start_y
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -385,23 +412,31 @@ fn sample_gaussian_lab(tex: texture_2d<f32>, smp: sampler, uv: vec2<f32>, lod: f
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv;
     let t = clamp(u.progress, 0.0, 1.0);
+    const PI: f32 = 3.141592653589793;
 
     if (u.effect_type == 1u) {
-        // --- KEN BURNS EFFECT (Pan & Zoom transition) ---
-        let zoom = mix(u.param1, u.param2, t);
-        let pan_x = mix(u.param3, u.param5, t);
-        let pan_y = mix(u.param4, u.param6, t);
+        // --- KEN BURNS EFFECT (Continuous Pan & Zoom Transition) ---
+        // Outgoing image starts precisely unzoomed (1.0) and unpanned (0.0) at t=0 to
+        // ensure a seamless, zero-jump continuation from the resting image display.
+        let ease_t = smoothstep(0.0, 1.0, t);
+        let curr_zoom = mix(1.0, u.param1, ease_t);
+        let curr_pan_x = mix(0.0, u.param3, ease_t);
+        let curr_pan_y = mix(0.0, u.param4, ease_t);
 
-        let kb_viewport_uv = (uv - vec2<f32>(0.5, 0.5)) / max(zoom, 0.001) + vec2<f32>(0.5, 0.5) + vec2<f32>(pan_x, pan_y);
-        let curr_uv = fit_uv(kb_viewport_uv, u.curr_aspect, u.view_aspect);
+        let kb_curr_uv = (uv - vec2<f32>(0.5, 0.5)) / max(curr_zoom, 0.001) + vec2<f32>(0.5, 0.5) + vec2<f32>(curr_pan_x, curr_pan_y);
+        let curr_uv = fit_uv(kb_curr_uv, u.curr_aspect, u.view_aspect);
         let col_curr = sample_image(t_current, s_sampler, curr_uv);
 
-        let fade = smoothstep(0.15, 0.85, t);
-        let next_zoom = mix(u.param2 * 0.95, 1.0, t);
-        let next_viewport_uv = (uv - vec2<f32>(0.5, 0.5)) / max(next_zoom, 0.001) + vec2<f32>(0.5, 0.5);
-        let next_uv = fit_uv(next_viewport_uv, u.next_aspect, u.view_aspect);
+        // Incoming image zooms and pans smoothly into resting position (1.0 zoom, 0.0 pan) at t=1.
+        let next_zoom = mix(u.param2, 1.0, ease_t);
+        let next_pan_x = mix(u.param5, 0.0, ease_t);
+        let next_pan_y = mix(u.param6, 0.0, ease_t);
+
+        let kb_next_uv = (uv - vec2<f32>(0.5, 0.5)) / max(next_zoom, 0.001) + vec2<f32>(0.5, 0.5) + vec2<f32>(next_pan_x, next_pan_y);
+        let next_uv = fit_uv(kb_next_uv, u.next_aspect, u.view_aspect);
         let col_next = sample_image(t_next, s_sampler, next_uv);
 
+        let fade = smoothstep(0.2, 0.8, t);
         return mix(col_curr, col_next, fade);
     } else if (u.effect_type == 2u) {
         // --- SWIRL OUT EFFECT (Vortex Twist & Pinch) ---
@@ -558,7 +593,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let grid = vec2<f32>(42.0 * u.view_aspect, 42.0);
         let cell = floor(uv * grid);
         let cell_center = (cell + vec2<f32>(0.5, 0.5)) / grid;
-        let rnd = hash22(cell + vec2<f32>(3.1415, 7.8923));
+        let rnd = hash22(cell + vec2<f32>(PI, 7.8923));
 
         var from_center = cell_center - vec2<f32>(0.5, 0.5);
         let dist = length(vec2<f32>(from_center.x * u.view_aspect, from_center.y));
@@ -787,6 +822,126 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             return mix(col_next, col_curr, hit_alpha);
         }
         return col_next;
+    } else if (u.effect_type == 8u) {
+        // --- PAGE FLIP EFFECT (Realistic 3D Cylindrical Page Turn & Peel) ---
+        let angle = 0.22;
+        let n = select(
+            vec2<f32>(-cos(angle), sin(angle)),
+            vec2<f32>(cos(angle), sin(angle)),
+            u.direction >= 0.0
+        );
+
+        let d = dot(uv - vec2<f32>(0.5, 0.5), n);
+        let R = 0.18;
+        let c = mix(0.85, -0.95, t);
+        let s = d - c;
+
+        let uv_next = fit_uv(uv, u.next_aspect, u.view_aspect);
+        let col_next = sample_image(t_next, s_sampler, uv_next);
+
+        if (s <= 0.0) {
+            // Front flat page not yet reached by the turn
+            let uv_curr = fit_uv(uv, u.curr_aspect, u.view_aspect);
+            var col_curr = sample_image(t_current, s_sampler, uv_curr);
+            let shadow_edge = smoothstep(-0.15, 0.0, s) * 0.32;
+            return col_curr * (1.0 - shadow_edge);
+        } else if (s <= R) {
+            // Inside the curl region: test upper/back side first, then lower/front
+            let theta2 = PI - asin(clamp(s / R, 0.0, 1.0));
+            let p_orig2 = uv - n * (s + R * theta2);
+
+            if (p_orig2.x >= 0.0 && p_orig2.x <= 1.0 && p_orig2.y >= 0.0 && p_orig2.y <= 1.0) {
+                // Back face of turning page (turned over)
+                let uv_orig2 = fit_uv(p_orig2, u.curr_aspect, u.view_aspect);
+                let col_orig2 = sample_image(t_current, s_sampler, uv_orig2);
+                let normal_z = sin(theta2);
+                let diffuse = clamp(0.6 + 0.4 * normal_z, 0.0, 1.0);
+                let paper_tint = vec3<f32>(0.92, 0.91, 0.89);
+                let back_color = mix(paper_tint, col_orig2.rgb * 0.45 + vec3<f32>(0.35), 0.3);
+                let spec = pow(max(sin(theta2), 0.0), 6.0) * 0.22;
+                let shaded = back_color * diffuse + vec3<f32>(spec);
+                return vec4<f32>(shaded, 1.0);
+            }
+
+            let theta1 = asin(clamp(s / R, 0.0, 1.0));
+            let p_orig1 = uv - n * (s + R * theta1);
+
+            if (p_orig1.x >= 0.0 && p_orig1.x <= 1.0 && p_orig1.y >= 0.0 && p_orig1.y <= 1.0) {
+                // Front face curling upward
+                let uv_orig1 = fit_uv(p_orig1, u.curr_aspect, u.view_aspect);
+                let col_orig1 = sample_image(t_current, s_sampler, uv_orig1);
+                let normal_z = cos(theta1);
+                let diffuse = clamp(0.65 + 0.35 * normal_z, 0.0, 1.0);
+                let spec = pow(max(sin(theta1), 0.0), 6.0) * 0.25;
+                let shaded = col_orig1.rgb * diffuse + vec3<f32>(spec);
+                return vec4<f32>(shaded, col_orig1.a);
+            }
+
+            let drop_shadow = smoothstep(R + 0.2, 0.0, s) * 0.45 * smoothstep(0.0, 0.02, s);
+            return col_next * (1.0 - drop_shadow);
+        } else {
+            // Page has completely turned past this point: reveal next image with drop shadow
+            let drop_shadow = smoothstep(R + 0.25, R, s) * 0.45;
+            return col_next * (1.0 - drop_shadow);
+        }
+    } else if (u.effect_type == 9u) {
+        // --- VACUUM EFFECT (Gravitational Singularity Vortex under Cursor) ---
+        let mouse = vec2<f32>(u.param1, u.param2);
+        var offset = uv - mouse;
+        offset.x = offset.x * u.view_aspect;
+
+        let r = length(offset);
+        let theta = atan2(offset.y, offset.x);
+
+        // Suction progression and event horizon growth
+        let vacuum_t = pow(t, 1.4);
+        let horizon_r = vacuum_t * 1.8;
+
+        // Gravitational pull and rotational vortex spin
+        let pull = vacuum_t * (1.8 / (r + 0.15));
+        let spin = vacuum_t * (3.8 / (pow(r, 0.7) + 0.1)) * u.direction;
+
+        // Inverse mapping: fragments draw from pixels pulled inward toward singularity
+        let distorted_r = r * (1.0 + pull * 2.2);
+        let distorted_theta = theta + spin;
+
+        let src_offset = vec2<f32>(
+            cos(distorted_theta) * distorted_r / u.view_aspect,
+            sin(distorted_theta) * distorted_r
+        );
+
+        let uv_curr_sucked = fit_uv(mouse + src_offset, u.curr_aspect, u.view_aspect);
+        var col_curr = sample_image(t_current, s_sampler, uv_curr_sucked);
+
+        // Relativistic chromatic aberration along suction lines
+        let ca = 0.03 * pull;
+        let uv_ca_r = fit_uv(mouse + src_offset * (1.0 + ca), u.curr_aspect, u.view_aspect);
+        let uv_ca_b = fit_uv(mouse + src_offset * (1.0 - ca), u.curr_aspect, u.view_aspect);
+        col_curr.r = sample_image(t_current, s_sampler, uv_ca_r).r;
+        col_curr.b = sample_image(t_current, s_sampler, uv_ca_b).b;
+
+        // Accretion ring glow around the singularity horizon
+        let ring_dist = abs(r - horizon_r * 0.65);
+        let photon_ring = smoothstep(0.09, 0.0, ring_dist) * (1.0 - t * 0.7) * 0.85;
+        let ring_color = vec3<f32>(0.4, 0.8, 1.0) * photon_ring;
+
+        // Event horizon boundary consuming current image
+        let consumed = smoothstep(horizon_r - 0.12, horizon_r + 0.06, r);
+
+        // Next image emerging from the singularity cavity with subtle cosmic lens settle
+        let next_settle = (1.0 - t) * 0.25 / (r + 0.2);
+        let next_spin = (1.0 - t) * 1.2 * (1.0 - smoothstep(0.0, 0.7, r)) * -u.direction;
+        let next_r = r * max(1.0 - next_settle, 0.05);
+        let next_theta = theta + next_spin;
+        let next_offset = vec2<f32>(
+            cos(next_theta) * next_r / u.view_aspect,
+            sin(next_theta) * next_r
+        );
+        let uv_next = fit_uv(mouse + next_offset, u.next_aspect, u.view_aspect);
+        let col_next = sample_image(t_next, s_sampler, uv_next);
+
+        let col_sucked = col_curr + vec4<f32>(ring_color, 0.0);
+        return mix(col_next, col_sucked, consumed * (1.0 - pow(t, 2.5)));
     }
 
     // Default Crossfade
@@ -998,25 +1153,24 @@ impl SlideshowManager {
         );
         self.transition_start = Some(Instant::now());
 
-        let zoom_in = random_u64().is_multiple_of(2);
-        let (z_start, z_end) =
-            if zoom_in { (1.0, random_f32(1.15, 1.25)) } else { (random_f32(1.15, 1.25), 1.0) };
-
-        let px_start = random_f32(-0.04, 0.04);
-        let py_start = random_f32(-0.04, 0.04);
-        let px_end = random_f32(-0.04, 0.04);
-        let py_end = random_f32(-0.04, 0.04);
-
         let direction = if random_u64().is_multiple_of(2) { 1.0 } else { -1.0 };
+
+        // Ken Burns continuous pan-and-zoom motion targets
+        let curr_zoom_end = random_f32(1.10, 1.20);
+        let next_zoom_start = random_f32(1.10, 1.20);
+        let curr_pan_x = random_f32(-0.035, 0.035);
+        let curr_pan_y = random_f32(-0.035, 0.035);
+        let next_pan_x = random_f32(-0.035, 0.035);
+        let next_pan_y = random_f32(-0.035, 0.035);
 
         self.uniforms.effect_type = self.current_effect.effect_type_id();
         self.uniforms.direction = direction;
-        self.uniforms.param1 = z_start;
-        self.uniforms.param2 = z_end;
-        self.uniforms.param3 = px_start;
-        self.uniforms.param4 = py_start;
-        self.uniforms.param5 = px_end;
-        self.uniforms.param6 = py_end;
+        self.uniforms.param1 = curr_zoom_end;
+        self.uniforms.param2 = next_zoom_start;
+        self.uniforms.param3 = curr_pan_x;
+        self.uniforms.param4 = curr_pan_y;
+        self.uniforms.param5 = next_pan_x;
+        self.uniforms.param6 = next_pan_y;
     }
 
     pub fn register_color_image(
@@ -1156,6 +1310,24 @@ impl SlideshowManager {
 
         self.uniforms.curr_aspect = curr_aspect;
         self.uniforms.next_aspect = next_aspect;
+
+        let mouse_pos = ui.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()));
+        let (mouse_x, mouse_y) = if let Some(p) = mouse_pos {
+            if rect.width() > 0.0 && rect.height() > 0.0 {
+                let u = ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+                let v = ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+                (u, v)
+            } else {
+                (0.5, 0.5)
+            }
+        } else {
+            (0.5, 0.5)
+        };
+
+        if self.current_effect == SlideshowEffect::Vacuum {
+            self.uniforms.param1 = mouse_x;
+            self.uniforms.param2 = mouse_y;
+        }
 
         queue.write_buffer(&self.pipeline.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
 
