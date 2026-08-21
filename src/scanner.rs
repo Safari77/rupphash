@@ -673,7 +673,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                                     eprintln!(
                                         "[DEBUG-TIFF] Converting raw YCbCr bytes to RGB in-place..."
                                     );
-                                    for chunk in data.chunks_exact_mut(3) {
+                                    for chunk in data.as_chunks_mut::<3>().0 {
                                         let y = chunk[0] as f32;
                                         let cb = chunk[1] as f32 - 128.0;
                                         let cr = chunk[2] as f32 - 128.0;
