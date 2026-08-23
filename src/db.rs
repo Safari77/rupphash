@@ -430,6 +430,8 @@ impl AppContext {
             let missing_gui = raw_value.get("gui").is_none();
             let missing_db_size = raw_value.get("db_size_mb").is_none();
             let missing_locations = raw_value.get("locations").is_none();
+            let missing_map_providers = raw_value.get("map_providers").is_none();
+            let missing_selected_provider = raw_value.get("selected_provider").is_none();
 
             if cfg.map_providers.is_empty() {
                 cfg.map_providers.insert(
@@ -441,7 +443,6 @@ impl AppContext {
                     "http://localhost:3000/rpc/tiles/{z}/{x}/{y}".to_string(),
                 );
             }
-
             // Ensure a selection exists
             if cfg.selected_provider.is_none() {
                 cfg.selected_provider = Some("OpenStreetMap".to_string());
@@ -451,14 +452,18 @@ impl AppContext {
                 || missing_gui
                 || missing_db_size
                 || missing_locations
+                || missing_map_providers
+                || missing_selected_provider
                 || colors_clamped
             {
                 eprintln!(
-                    "[DEBUG-DB] Writing back defaults/fixes (grouping={}, gui={}, db_size={}, locations={}, colors_clamped={})",
+                    "[DEBUG-DB] Writing back defaults/fixes (grouping={}, gui={}, db_size={}, locations={}, map_providers={}, selected_provider={}, colors_clamped={})",
                     missing_grouping,
                     missing_gui,
                     missing_db_size,
                     missing_locations,
+                    missing_map_providers,
+                    missing_selected_provider,
                     colors_clamped
                 );
                 Self::write_config(&config_path, &cfg)?;
@@ -621,10 +626,8 @@ impl AppContext {
 
     /// Decode and validate master_key from hex string
     fn decode_master_key(hex_str: &str) -> Result<[u8; 32], String> {
-        let trimmed = hex_str.trim().trim_start_matches("0x");
-
+        let trimmed = hex_str.trim().trim_start_matches("0x").trim_start_matches("0X");
         let bytes = hex::decode(trimmed).map_err(|e| format!("hex decode failed: {}", e))?;
-
         let arr: [u8; 32] =
             bytes.try_into().map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))?;
 
@@ -692,7 +695,7 @@ impl AppContext {
                         _ => Ok(None),
                     }
                 } else {
-                    eprintln!("[ERROR-DB] get_pdqhash Corruped content_hash={:x?}", content_hash);
+                    eprintln!("[ERROR-DB] get_pdqhash Corrupted content_hash={:x?}", content_hash);
                     Err(lmdb::Error::Corrupted)
                 }
             }
@@ -903,100 +906,129 @@ impl AppContext {
 
         // 1. Scan MetaDB
         if txn.stat(self.meta_db)?.entries() > 0 {
-            let mut cursor = txn.open_rw_cursor(self.meta_db)?;
-            for (key, val_bytes) in cursor.iter_start().flatten() {
-                let should_delete = if let Some(decrypted) = self.decrypt_value(key, val_bytes) {
-                    if decrypted.len() == 40 {
-                        let ts_bytes: [u8; 8] = decrypted[32..40].try_into().unwrap();
-                        let last_seen = u64::from_le_bytes(ts_bytes);
+            let mut keys_to_delete = Vec::new();
+            {
+                let mut cursor = txn.open_ro_cursor(self.meta_db)?;
+                for (key, val_bytes) in cursor.iter_start().flatten() {
+                    if let Some(decrypted) = self.decrypt_value(key, val_bytes) {
+                        if decrypted.len() == 40 {
+                            let ts_bytes: [u8; 8] = decrypted[32..40].try_into().unwrap();
+                            let last_seen = u64::from_le_bytes(ts_bytes);
 
-                        if last_seen < cutoff {
-                            true // Expired
+                            if last_seen < cutoff {
+                                keys_to_delete.push(key.to_vec());
+                            } else {
+                                let mut ch = [0u8; 32];
+                                ch.copy_from_slice(&decrypted[0..32]);
+                                valid_content_hashes.insert(ch);
+                            }
                         } else {
-                            let mut ch = [0u8; 32];
-                            ch.copy_from_slice(&decrypted[0..32]);
-                            valid_content_hashes.insert(ch);
-                            false // Keep
+                            keys_to_delete.push(key.to_vec());
                         }
                     } else {
-                        true // Corrupted/Old format -> Delete
+                        keys_to_delete.push(key.to_vec());
                     }
-                } else {
-                    true // Decrypt fail -> Delete
-                };
-
-                if should_delete {
-                    cursor.del(WriteFlags::empty())?;
-                    meta_remove_count += 1;
                 }
+            }
+            for key in keys_to_delete {
+                txn.del(self.meta_db, &key, None)?;
+                meta_remove_count += 1;
             }
         }
 
         // 2. Sweep HashDB
         if txn.stat(self.hash_db)?.entries() > 0 {
-            let mut cursor = txn.open_rw_cursor(self.hash_db)?;
-            for iter in cursor.iter_start() {
-                if let Ok((key, _)) = iter
-                    && key.len() == 32
-                {
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(key);
+            let mut keys_to_delete = Vec::new();
+            {
+                let mut cursor = txn.open_ro_cursor(self.hash_db)?;
+                for iter in cursor.iter_start() {
+                    if let Ok((key, _)) = iter
+                        && key.len() == 32
+                    {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(key);
 
-                    if !valid_content_hashes.contains(&k) {
-                        cursor.del(WriteFlags::empty())?;
-                        hash_remove_count += 1;
+                        if !valid_content_hashes.contains(&k) {
+                            keys_to_delete.push(k);
+                        }
                     }
                 }
+            }
+            for k in keys_to_delete {
+                txn.del(self.hash_db, &k, None)?;
+                hash_remove_count += 1;
             }
         }
 
         // 3. Sweep FeatureDB
         if txn.stat(self.feature_db)?.entries() > 0 {
-            let mut cursor = txn.open_rw_cursor(self.feature_db)?;
-            for iter in cursor.iter_start() {
-                if let Ok((key, _)) = iter
-                    && key.len() == 32
-                {
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(key);
-                    if !valid_content_hashes.contains(&k) {
-                        cursor.del(WriteFlags::empty())?;
+            let mut keys_to_delete = Vec::new();
+            {
+                let mut cursor = txn.open_ro_cursor(self.feature_db)?;
+                for iter in cursor.iter_start() {
+                    if let Ok((key, _)) = iter
+                        && key.len() == 32
+                    {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(key);
+
+                        if !valid_content_hashes.contains(&k) {
+                            keys_to_delete.push(k);
+                        }
                     }
                 }
+            }
+            for k in keys_to_delete {
+                txn.del(self.feature_db, &k, None)?;
             }
         }
 
         // 4. Sweep CoeffDB (PDQ coefficients)
         if txn.stat(self.coeff_db)?.entries() > 0 {
-            let mut cursor = txn.open_rw_cursor(self.coeff_db)?;
-            for iter in cursor.iter_start() {
-                if let Ok((key, _)) = iter
-                    && key.len() == 32
-                {
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(key);
-                    if !valid_content_hashes.contains(&k) {
-                        cursor.del(WriteFlags::empty())?;
+            let mut keys_to_delete = Vec::new();
+            {
+                let mut cursor = txn.open_ro_cursor(self.coeff_db)?;
+                for iter in cursor.iter_start() {
+                    if let Ok((key, _)) = iter
+                        && key.len() == 32
+                    {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(key);
+
+                        if !valid_content_hashes.contains(&k) {
+                            keys_to_delete.push(k);
+                        }
                     }
                 }
+            }
+            for k in keys_to_delete {
+                txn.del(self.coeff_db, &k, None)?;
             }
         }
 
         // 5. Sweep PixelDB
         if txn.stat(self.pixel_db)?.entries() > 0 {
-            let mut cursor = txn.open_rw_cursor(self.pixel_db)?;
-            for iter in cursor.iter_start() {
-                if let Ok((key, _)) = iter
-                    && key.len() == 32
-                {
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(key);
-                    if !valid_content_hashes.contains(&k) {
-                        cursor.del(WriteFlags::empty())?;
+            let mut keys_to_delete = Vec::new();
+            {
+                let mut cursor = txn.open_ro_cursor(self.pixel_db)?;
+                for iter in cursor.iter_start() {
+                    if let Ok((key, _)) = iter
+                        && key.len() == 32
+                    {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(key);
+
+                        if !valid_content_hashes.contains(&k) {
+                            keys_to_delete.push(k);
+                        }
                     }
                 }
             }
+            for k in keys_to_delete {
+                txn.del(self.pixel_db, &k, None)?;
+            }
         }
+
         txn.commit()?;
         Ok((meta_remove_count, hash_remove_count))
     }
@@ -1441,7 +1473,9 @@ impl AppContext {
         match txn.get(self.ignored_db, content_hash) {
             Ok(encrypted_bytes) => {
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    Ok(IgnoredEntry::from_bytes(&decrypted).ok())
+                    IgnoredEntry::from_bytes(&decrypted)
+                        .map(Some)
+                        .map_err(|_| lmdb::Error::Corrupted)
                 } else {
                     Err(lmdb::Error::Corrupted)
                 }
