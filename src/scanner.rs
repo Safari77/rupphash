@@ -239,10 +239,11 @@ fn get_exif_tags_from_rsraw(
 ) -> Vec<(String, String)> {
     let info = raw.full_info();
     let mut results = Vec::new();
+    let has_gps = raw_exif::raw_has_gps(raw);
 
     eprintln!(
-        "[DEBUG-GET-EXIF-TAGS-RSRAW] make='{}', model='{}', iso={}, shutter={}, aperture={}, focal={}",
-        info.make, info.model, info.iso_speed, info.shutter, info.aperture, info.focal_len
+        "[DEBUG-GET-EXIF-TAGS-RSRAW] make='{}', model='{}', iso={}, shutter={}, aperture={}, focal={}, has_gps={}",
+        info.make, info.model, info.iso_speed, info.shutter, info.aperture, info.focal_len, has_gps
     );
 
     for tag_name in tag_names {
@@ -332,8 +333,8 @@ fn get_exif_tags_from_rsraw(
                 info.datetime.as_ref().map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             }
             "gpslatitude" => {
-                let lat = dms_to_decimal(&info.gps.latitude);
-                if lat.abs() > 0.0001 {
+                if has_gps {
+                    let lat = dms_to_decimal(&info.gps.latitude);
                     if decimal_coords {
                         Some(format!("{:.6}°", lat))
                     } else {
@@ -344,8 +345,8 @@ fn get_exif_tags_from_rsraw(
                 }
             }
             "gpslongitude" => {
-                let lon = dms_to_decimal(&info.gps.longitude);
-                if lon.abs() > 0.0001 {
+                if has_gps {
+                    let lon = dms_to_decimal(&info.gps.longitude);
                     if decimal_coords {
                         Some(format!("{:.6}°", lon))
                     } else {
@@ -356,7 +357,7 @@ fn get_exif_tags_from_rsraw(
                 }
             }
             "gpsaltitude" => {
-                if info.gps.altitude.abs() > 0.0001 {
+                if has_gps && info.gps.altitude.is_finite() && info.gps.altitude.abs() > 0.0001 {
                     Some(format!("{:.1}m", info.gps.altitude))
                 } else {
                     None

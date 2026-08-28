@@ -29,6 +29,12 @@ use crate::image_features::ImageFeatures;
 use geo::Point;
 use rsraw::RawImage;
 
+/// Check whether LibRaw parsed valid GPS EXIF metadata from the RAW container.
+#[inline]
+pub fn raw_has_gps(raw: &RawImage) -> bool {
+    raw.as_ref().other.parsed_gps.gpsparsed as u8 != 0
+}
+
 /// Extract ImageFeatures from an rsraw RawImage.
 /// This is used as a fallback when kamadak-exif fails to parse the RAW file.
 ///
@@ -87,9 +93,10 @@ pub fn build_features_from_raw_image(raw: &RawImage) -> ImageFeatures {
     }
 
     // GPS info
+    let has_gps = raw_has_gps(raw);
     let lat = dms_to_decimal(&info.gps.latitude);
     let lon = dms_to_decimal(&info.gps.longitude);
-    let has_valid_gps = gps_is_valid(lat, lon);
+    let has_valid_gps = has_gps && gps_is_valid(lat, lon);
 
     if has_valid_gps {
         features.insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(lat));
@@ -147,10 +154,13 @@ pub fn dms_to_decimal(dms: &[f32; 3]) -> f64 {
 }
 
 /// Get GPS position as geo::Point from an rsraw RawImage.
-/// Returns None if GPS coordinates are all zeros or invalid.
+/// Returns None if GPS data was not parsed by LibRaw or coordinates are invalid.
 ///
 /// Thread Safety: Only reads from RawImage.
 pub fn get_gps_point_from_raw(raw: &RawImage) -> Option<Point<f64>> {
+    if !raw_has_gps(raw) {
+        return None;
+    }
     let info = raw.full_info();
     let lat = dms_to_decimal(&info.gps.latitude);
     let lon = dms_to_decimal(&info.gps.longitude);
@@ -270,9 +280,10 @@ pub fn merge_raw_info_into_features(features: &mut ImageFeatures, raw: &RawImage
     }
 
     // GPS info
+    let has_gps = raw_has_gps(raw);
     let lat = dms_to_decimal(&info.gps.latitude);
     let lon = dms_to_decimal(&info.gps.longitude);
-    let has_valid_gps = gps_is_valid(lat, lon);
+    let has_valid_gps = has_gps && gps_is_valid(lat, lon);
 
     if has_valid_gps {
         if !features.has_tag(TAG_GPS_LATITUDE) {
@@ -307,7 +318,8 @@ mod tests {
     fn test_gps_is_valid() {
         assert!(gps_is_valid(60.1699, 24.9384)); // Helsinki
         assert!(gps_is_valid(51.4779, 0.0)); // Greenwich: lon 0 is fine
-        assert!(!gps_is_valid(0.0, 0.0)); // rsraw "no GPS" sentinel
+        assert!(!gps_is_valid(0.0, 0.0)); // rsraw can return 0.0,0.0 for some cameras without
+        // valid GPS data
         assert!(!gps_is_valid(91.0, 10.0)); // latitude out of range
         assert!(!gps_is_valid(45.0, 200.0)); // longitude out of range
         assert!(!gps_is_valid(f64::NAN, 10.0));
