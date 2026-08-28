@@ -32,7 +32,15 @@ use rsraw::RawImage;
 /// Check whether LibRaw parsed valid GPS EXIF metadata from the RAW container.
 #[inline]
 pub fn raw_has_gps(raw: &RawImage) -> bool {
-    raw.as_ref().other.parsed_gps.gpsparsed as u8 != 0
+    if raw.as_ref().other.parsed_gps.gpsparsed as u8 == 0 {
+        return false;
+    }
+
+    let info = raw.full_info();
+    let lat = dms_to_decimal(&info.gps.latitude);
+    let lon = dms_to_decimal(&info.gps.longitude);
+
+    lat.abs() >= 0.0001 && lon.abs() >= 0.0001
 }
 
 /// Extract ImageFeatures from an rsraw RawImage.
