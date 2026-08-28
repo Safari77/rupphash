@@ -59,6 +59,8 @@ macro_rules! img_debug {
 const BUDGET_PER_THREAD_BYTES: u64 = 1_500 * 1024 * 1024;
 // Create an empty lock to hold our calculated thread count and byte limit.
 static SMART_LIMITS: OnceLock<(usize, u64)> = OnceLock::new();
+// Cache parsed country boundaries once at module scope.
+static BOUNDARIES: OnceLock<Option<country_boundaries::CountryBoundaries>> = OnceLock::new();
 
 /// Calculates the safe number of threads and initializes the per-thread memory limit.
 /// Uses OnceLock so the heavy computation only runs on the first call.
@@ -338,7 +340,7 @@ fn get_exif_tags_from_rsraw(
                     if decimal_coords {
                         Some(format!("{:.6}°", lat))
                     } else {
-                        Some(format_dms_from_decimal(lat))
+                        Some(format_dms_from_decimal(lat, true))
                     }
                 } else {
                     None
@@ -350,7 +352,7 @@ fn get_exif_tags_from_rsraw(
                     if decimal_coords {
                         Some(format!("{:.6}°", lon))
                     } else {
-                        Some(format_dms_from_decimal(lon))
+                        Some(format_dms_from_decimal(lon, false))
                     }
                 } else {
                     None
@@ -391,16 +393,31 @@ fn get_exif_tags_from_rsraw(
     results
 }
 
-/// Format decimal degrees as DMS string (helper for rsraw GPS display)
-fn format_dms_from_decimal(decimal_deg: f64) -> String {
+/// Format decimal degrees as DMS string with hemisphere and carry-over handling (helper for rsraw GPS display)
+fn format_dms_from_decimal(decimal_deg: f64, is_latitude: bool) -> String {
     let abs_deg = decimal_deg.abs();
-    let d = abs_deg.floor() as i32;
+    let mut d = abs_deg.floor() as i32;
     let m_float = (abs_deg - d as f64) * 60.0;
-    let m = m_float.floor() as i32;
+    let mut m = m_float.floor() as i32;
     let s = (m_float - m as f64) * 60.0;
 
-    let sign = if decimal_deg < 0.0 { "-" } else { "" };
-    format!("{}{}° {}' {:.1}\"", sign, d, m, s)
+    let mut s_rounded = (s * 10.0).round() / 10.0;
+    if s_rounded >= 60.0 {
+        s_rounded = 0.0;
+        m += 1;
+        if m >= 60 {
+            m = 0;
+            d += 1;
+        }
+    }
+
+    let hemi = if is_latitude {
+        if decimal_deg >= 0.0 { "N" } else { "S" }
+    } else {
+        if decimal_deg >= 0.0 { "E" } else { "W" }
+    };
+
+    format!("{}° {}' {:.1}\" {}", d, m, s_rounded, hemi)
 }
 
 /// Get derived values based on tag name and available data
@@ -739,8 +756,10 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
 fn derive_country(lat: f64, lon: f64) -> Option<String> {
     use country_boundaries::{BOUNDARIES_ODBL_360X180, CountryBoundaries, LatLon};
 
-    // Create boundaries instance (this is fast after first load as data is static)
-    let boundaries = CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).ok()?;
+    // Lazily load boundaries instance once at module scope
+    let boundaries = BOUNDARIES
+        .get_or_init(|| CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).ok())
+        .as_ref()?;
 
     // Get the position
     let pos = LatLon::new(lat, lon).ok()?;
@@ -1361,6 +1380,11 @@ pub fn scan_and_group(
                         let mut img_for_hashing: Option<image::DynamicImage> = None;
 
                         if is_raw {
+                            // Extract full sensor dimensions directly from parsed RAW metadata
+                            if let Some(ref raw) = parsed_raw {
+                                resolution = Some((raw.width(), raw.height()));
+                            }
+
                             // RAW FILE: Extract Largest JPEG Thumbnail
                             // We need the image for PDQ even if pixel_hash is disabled.
                             if let Some(mut raw) = parsed_raw
@@ -1376,15 +1400,9 @@ pub fn scan_and_group(
                                     img_for_hashing =
                                         load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data)
                                             .ok();
-
-                                    if let Some(img) = &img_for_hashing
-                                        && resolution.is_none()
-                                    {
-                                        resolution = Some(img.dimensions());
-                                    }
                                 }
                             }
-                            // Fallback for resolution if thumbnail extraction failed or we didn't calculate hash
+                            // Fallback for resolution if RAW header parsing failed
                             if resolution.is_none() {
                                 resolution = get_resolution(path, Some(b));
                             }
@@ -1394,7 +1412,7 @@ pub fn scan_and_group(
                         }
 
                         if let Some(img) = &img_for_hashing {
-                            // Get resolution from the loaded image
+                            // Get resolution from the loaded image if not already set (e.g., standard images)
                             if resolution.is_none() {
                                 resolution = Some(img.dimensions());
                             }
@@ -1436,14 +1454,13 @@ pub fn scan_and_group(
 
                                 // Build ImageFeatures from the data we have
                                 let (w, h) = resolution.unwrap_or((0, 0));
-                                let mut img_features =
-                                    if let Some(exif) = read_exif_data(path, Some(b)) {
-                                        crate::exif_extract::build_image_features(
-                                            w, h, &exif, true, false,
-                                        )
-                                    } else {
-                                        ImageFeatures::new(w, h)
-                                    };
+                                let mut img_features = if let Some(ref exif) = exif_data {
+                                    crate::exif_extract::build_image_features(
+                                        w, h, exif, true, false,
+                                    )
+                                } else {
+                                    ImageFeatures::new(w, h)
+                                };
 
                                 // Persist orientation. build_image_features copies the raw
                                 // EXIF Orientation tag, so for formats whose decoder bakes
@@ -1689,8 +1706,15 @@ where
         .par_chunks(CHUNK_SIZE)
         .enumerate()
         .map_init(
-            || (SparseBitSet::new(n), Vec::<(u32, u32)>::new(), [H::default(); 8]),
-            |(visited, local_edges, variants_buf), (chunk_idx, chunk)| {
+            || {
+                (
+                    SparseBitSet::new(n),
+                    SparseBitSet::new(n),
+                    Vec::<(u32, u32)>::new(),
+                    [H::default(); 8],
+                )
+            },
+            |(visited, matched, local_edges, variants_buf), (chunk_idx, chunk)| {
                 local_edges.clear();
                 let chunk_base_idx = chunk_idx * CHUNK_SIZE;
 
@@ -1708,6 +1732,8 @@ where
                     // being pulled into the same group.
                     let base_limit = if low_conf[i] { 0 } else { config.similarity };
 
+                    matched.clear();
+
                     for &variant in variants {
                         visited.clear();
 
@@ -1716,8 +1742,11 @@ where
                             let bits = H::bit_width_per_chunk();
 
                             // Zero-allocation closure to handle bucket checks
-                            let check_bucket =
-                                |val: u16, v: &mut SparseBitSet, edges: &mut Vec<(u32, u32)>| {
+                            let mut check_bucket =
+                                |val: u16,
+                                 v: &mut SparseBitSet,
+                                 m: &mut SparseBitSet,
+                                 edges: &mut Vec<(u32, u32)>| {
                                     let bucket = mih.bucket(k, val);
                                     for dense in bucket {
                                         let dense_id = dense.index();
@@ -1730,18 +1759,26 @@ where
                                         let cand_hash = mih.hash(*dense);
                                         let limit = if low_conf[cand_idx] { 0 } else { base_limit };
                                         if variant.hamming_distance(cand_hash) <= limit {
-                                            edges.push((i as u32, cand_idx as u32));
+                                            // Deduplicate edges across multiple dihedral variants
+                                            if !m.set(cand_idx) {
+                                                edges.push((i as u32, cand_idx as u32));
+                                            }
                                         }
                                     }
                                 };
 
                             // R=0: Exact chunk match
-                            check_bucket(q_chunk, visited, local_edges);
+                            check_bucket(q_chunk, visited, matched, local_edges);
 
                             // R=1: 1-bit flips (exhaustive up to dist 31 for 16 chunks)
                             if config.similarity >= H::NUM_CHUNKS as u32 {
                                 for i_bit in 0..bits {
-                                    check_bucket(q_chunk ^ (1 << i_bit), visited, local_edges);
+                                    check_bucket(
+                                        q_chunk ^ (1 << i_bit),
+                                        visited,
+                                        matched,
+                                        local_edges,
+                                    );
                                 }
                             }
 
@@ -1752,6 +1789,7 @@ where
                                         check_bucket(
                                             q_chunk ^ (1 << i_bit) ^ (1 << j_bit),
                                             visited,
+                                            matched,
                                             local_edges,
                                         );
                                     }
@@ -1769,6 +1807,7 @@ where
                                                     ^ (1 << j_bit)
                                                     ^ (1 << m_bit),
                                                 visited,
+                                                matched,
                                                 local_edges,
                                             );
                                         }
@@ -1779,7 +1818,7 @@ where
                     }
                 }
 
-                local_edges.clone()
+                std::mem::take(local_edges)
             },
         )
         .flatten()
@@ -1888,7 +1927,7 @@ pub fn analyze_group(
     files.append(&mut duplicates);
     files.append(&mut unique);
 
-    let max_d = if let Some(pivot) = files.first().and_then(|f| f.pdqhash) {
+    let max_d = if let Some(pivot) = files.iter().find_map(|f| f.pdqhash) {
         files
             .iter()
             .filter_map(|f| f.pdqhash)
@@ -2220,8 +2259,6 @@ fn analyze_group_with_features(
     files.append(&mut duplicates);
     files.append(&mut unique);
 
-    sort_by_stem_then_ext(files);
-
     // Pivot on the first file that actually has features / a hash. Using
     // files.first() unconditionally collapsed max_dist to 0 for the whole
     // group whenever the first file after sorting had neither (decode
@@ -2261,14 +2298,6 @@ fn analyze_group_with_features(
     };
 
     GroupInfo { max_dist: max_d, status }
-}
-
-fn sort_by_stem_then_ext(files: &mut [FileMetadata]) {
-    files.sort_by_cached_key(|f| {
-        let stem = f.path.file_stem().unwrap_or_default().to_os_string();
-        let is_raw = is_raw_ext(&f.path);
-        (stem, is_raw)
-    });
 }
 
 pub fn is_raw_ext(path: &Path) -> bool {
@@ -2513,8 +2542,10 @@ pub fn spawn_background_flatten_scan(
 
     // Phase 2: Background processing with batch results
     let sort_order_clone = sort_order.clone();
+    let progress_tx_clone = progress_tx;
     std::thread::spawn(move || {
         const BATCH_SIZE: usize = 500;
+        let mut processed = 0;
 
         // Convert entries to FileMetadata using cached data
         let mut files: Vec<FileMetadata> = entries
@@ -2556,8 +2587,12 @@ pub fn spawn_background_flatten_scan(
         // Sort all files
         sort_files(&mut files, &sort_order_clone);
 
-        // Stream in batches
+        // Stream in batches and report progress
         for chunk in files.chunks(BATCH_SIZE) {
+            processed += chunk.len();
+            if let Some(ref tx) = progress_tx_clone {
+                let _ = tx.send((processed, file_count));
+            }
             let _ = batch_tx.send(chunk.to_vec());
         }
     });
@@ -2601,9 +2636,8 @@ pub fn spawn_background_enrichment(
                 // Determine if this is a RAW file for potential rsraw fallback
                 let is_raw = is_raw_ext(path);
 
-                // Try to get rsraw data for RAW files (we may need it as fallback)
-                // Only open rsraw if kamadak-exif failed - avoids double parsing
-                let raw_image = if is_raw && exif_data.is_none() {
+                // Open rsraw once if this is a RAW file (used for fallback or merging extra metadata)
+                let raw_image = if is_raw {
                     rsraw::RawImage::open(&data).ok()
                 } else {
                     None
@@ -2655,8 +2689,8 @@ pub fn spawn_background_enrichment(
                 // If we have kamadak-exif data and this is a RAW file, also merge rsraw data
                 // (rsraw might have data that kamadak-exif missed, like lens info)
                 if exif_data.is_some() && is_raw
-                    && let Ok(raw) = rsraw::RawImage::open(&data) {
-                        raw_exif::merge_raw_info_into_features(&mut features, &raw);
+                    && let Some(ref raw) = raw_image {
+                        raw_exif::merge_raw_info_into_features(&mut features, raw);
                     }
 
                 if false {
@@ -2697,12 +2731,12 @@ pub fn spawn_background_enrichment(
                     // Fallback: If build_image_features didn't derive country (or if we had no EXIF object), try manually
                     if !features.has_tag(crate::exif_types::TAG_DERIVED_COUNTRY)
                         && let Some(country) = crate::exif_extract::derive_country(pos.y(), pos.x())
-                        {
-                            features.insert_tag(
-                                crate::exif_types::TAG_DERIVED_COUNTRY,
-                                crate::exif_types::ExifValue::String(country),
-                            );
-                        }
+                    {
+                        features.insert_tag(
+                            crate::exif_types::TAG_DERIVED_COUNTRY,
+                            crate::exif_types::ExifValue::String(country),
+                        );
+                    }
                 }
 
                 // Ensure derived timestamp is indexed (critical for range search)
