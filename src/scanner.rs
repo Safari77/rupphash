@@ -1260,6 +1260,7 @@ pub fn scan_and_group(
                             orientation = feats.orientation();
                             gps_pos = feats.gps_pos();
                             pdq_quality = feats.pdq_quality();
+                            exif_timestamp = feats.exif_timestamp();
 
                             // Get coefficients from separate db
                             if let Ok(Some(coeff_vec)) = ctx_ref.get_coefficients(&ch)
