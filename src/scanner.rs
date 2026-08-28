@@ -998,26 +998,34 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
 
 /// Clean up EXIF string values that may contain garbage or repeated empty entries
 fn clean_exif_string(s: &str) -> String {
-    // Remove surrounding quotes if present
-    let s = s.trim().trim_matches('"');
+    // Remove surrounding quotes, brackets, and null bytes if present
+    let s = s.trim().trim_matches(|c: char| c == '"' || c == '[' || c == ']' || c == '\0');
 
     // If the string contains comma-separated values (common in some EXIF fields),
-    // take only the first non-empty meaningful value
-    if s.contains("\", \"") || s.contains(", ") {
-        // Split by common separators and find first non-empty value
-        let parts: Vec<&str> = s
-            .split([',', '"'])
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty() && *p != "'" && p.len() > 1)
+    // clean individual items, discard empty/garbage entries, and preserve valid values
+    if s.contains(',') || s.contains("\", \"") {
+        // Split by comma, strip surrounding quotes and nulls from each part, and filter out empties
+        let mut parts: Vec<String> = s
+            .split(',')
+            .map(|p| {
+                p.trim()
+                    .trim_matches(|c: char| c == '"' || c == '\'' || c == '\0')
+                    .trim()
+                    .to_string()
+            })
+            .filter(|p| !p.is_empty())
             .collect();
 
-        if let Some(first) = parts.first() {
-            return first.to_string();
+        // Deduplicate consecutive identical entries often produced by buggy EXIF encoders
+        parts.dedup();
+
+        if !parts.is_empty() {
+            return parts.join(", ");
         }
     }
 
     // Remove any trailing garbage (null bytes represented as empty quotes, etc.)
-    let cleaned = s.trim_end_matches(|c: char| {
+    let cleaned = s.trim_matches(|c: char| {
         c == '"' || c == '\'' || c == ',' || c.is_whitespace() || c == '\0'
     });
 
