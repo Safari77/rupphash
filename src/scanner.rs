@@ -412,7 +412,7 @@ fn get_derived_value(
     use_gps_utc: bool,
 ) -> Option<Vec<(String, String)>> {
     match tag_name.to_lowercase().as_str() {
-        "derivedcountry" => {
+        "country" | "derivedcountry" => {
             let (lat, lon) = gps_coords?;
             let val = derive_country(lat, lon)?;
             Some(vec![("Country".to_string(), val)])
