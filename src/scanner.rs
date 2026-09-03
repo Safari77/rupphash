@@ -1742,7 +1742,7 @@ where
                             let bits = H::bit_width_per_chunk();
 
                             // Zero-allocation closure to handle bucket checks
-                            let mut check_bucket =
+                            let check_bucket =
                                 |val: u16,
                                  v: &mut SparseBitSet,
                                  m: &mut SparseBitSet,
