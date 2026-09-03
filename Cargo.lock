@@ -6077,7 +6077,7 @@ dependencies = [
 
 [[package]]
 name = "rupphash"
-version = "0.7.18"
+version = "0.7.19"
 dependencies = [
  "anyhow",
  "blake3",
