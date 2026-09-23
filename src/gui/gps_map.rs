@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use walkers::sources::{Attribution, TileSource};
-use walkers::{HttpTiles, Map, MapMemory, Plugin, Position, Projector};
+use walkers::{HttpOptions, HttpTiles, Map, MapMemory, Plugin, Position, Projector, Style};
 
 /// Custom tile source that uses a URL pattern
 #[derive(Debug, Clone)]
@@ -626,6 +626,23 @@ impl GpsMapState {
     /// Initialize tiles with the current provider
     fn init_tiles(&mut self, ctx: &egui::Context) {
         let source = CustomTileSource::new(self.provider_name.clone(), self.provider_url.clone());
+
+        let is_vector = self.provider_url.contains(".pbf") || self.provider_url.contains("/tiles/");
+        if is_vector {
+            // Use the full bright style (covers water, landuse, roads, buildings):
+            let style = Style::openfreemap_bright();
+
+            let options = HttpOptions {
+                cache: None, // Temporarily disable cache while debugging
+                ..Default::default()
+            };
+
+            self.tiles =
+                Some(HttpTiles::with_options_and_style(source, options, style, ctx.clone()));
+            return;
+        }
+
+        // Fallback for raster tiles (PNG/JPG)
         self.tiles = Some(HttpTiles::new(source, ctx.clone()));
         self.tile_error = None;
     }

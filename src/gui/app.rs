@@ -2001,6 +2001,9 @@ impl GuiApp {
                 // On an 8-bit surface the GPU would truncate our 10-bit texture with
                 // no dither, which is worse than the dithered CPU path in hdr.rs.
                 if let Some(rs) = cc.wgpu_render_state.as_ref() {
+                    // Initialize walkers vector tile renderer with egui-wgpu
+                    walkers::install_renderer(Some(rs));
+
                     eprintln!("[GPU] target_format={:?}", rs.target_format);
                     let rgba16 = super::image::init_gpu_image_pipeline(rs);
                     app.render_state = Some(rs.clone()); // MUST be set unconditionally

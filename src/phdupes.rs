@@ -549,6 +549,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     windows_security::enable_heap_termination();
 
+    env_logger::init();
+
     hayro_jpeg2000::integration::register_decoding_hook();
     register_heif_decoding_hook();
     register_heic_decoding_hook();
