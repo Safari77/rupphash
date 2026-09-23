@@ -1092,7 +1092,9 @@ fn deep_to_colorimage(pixels: &DeepPixels, width: u32, height: u32) -> egui::Col
             })
             .collect(),
         DeepPixels::Rgba16(data) => data
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 egui::Color32::from_rgba_unmultiplied(
                     (c[0] >> 8) as u8,
@@ -1282,7 +1284,9 @@ fn dynamic_image_to_egui(img: image::DynamicImage) -> egui::ColorImage {
 
     let pixels = rgba
         .into_raw()
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
         .collect();
 
@@ -1524,7 +1528,9 @@ fn maybe_resize_image(
                 size: [new_w, new_h],
                 pixels: dst_image
                     .buffer()
-                    .as_chunks::<4>().0.iter()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|p| egui::Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3]))
                     .collect(),
                 source_size: egui::vec2(new_w as f32, new_h as f32),
@@ -1667,7 +1673,9 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
         let h = rgba.height() as usize;
         let pixels: Vec<egui::Color32> = rgba
             .as_raw()
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
             .collect();
 
@@ -1706,7 +1714,9 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
                         size: [new_w, new_h],
                         pixels: dst_image
                             .buffer()
-                            .as_chunks::<4>().0.iter()
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
                             .map(|p| egui::Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3]))
                             .collect(),
                         source_size: egui::vec2(new_w as f32, new_h as f32),
@@ -3347,7 +3357,9 @@ fn compute_histogram_from_dynamic_image(
     let oklab_pixels: Vec<Oklab> = if let Some(dst_image) = resized_successfully {
         dst_image
             .buffer()
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| {
                 thumb.push(egui::Color32::from_rgba_unmultiplied(
                     chunk[0], chunk[1], chunk[2], chunk[3],
