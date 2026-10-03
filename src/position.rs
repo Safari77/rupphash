@@ -1,7 +1,7 @@
 use chrono::Datelike;
 use geo::{Bearing, Distance, Geodesic, Point};
 use jiff::{Zoned, civil::DateTime as CivilDateTime};
-use solar_positioning::{RefractionCorrection, spa};
+use solar_positioning::{Location, RefractionCorrection, SolarPositions, delta_t};
 use std::sync::OnceLock;
 use tzf_rs::DefaultFinder;
 
@@ -97,23 +97,17 @@ pub fn sun_alt_and_azimuth(
             .ok_or("Invalid timestamp conversion")?
             .with_timezone(&chrono::Utc);
 
-    let delta_t = solar_positioning::time::DeltaT::estimate_from_date(
-        chrono_time.year(),
-        chrono_time.month(),
-    )
-    .map_err(|_| "solar_positioning DeltaT estimation failed")?;
+    let delta_t = delta_t::estimate_from_date(chrono_time.year(), chrono_time.month())
+        .map_err(|_| "solar_positioning DeltaT estimation failed")?;
 
     let elev_meters = altitude.unwrap_or(0.0);
 
-    let pos = spa::solar_position(
-        chrono_time,
-        lat,
-        lon,
-        elev_meters,
-        delta_t,
-        Some(RefractionCorrection::standard()),
-    )
-    .map_err(|_| "SPA calculation failed")?;
+    let location = Location { latitude: lat, longitude: lon };
+
+    let pos = SolarPositions::new()
+        .at(&chrono_time, location, elev_meters, delta_t, Some(RefractionCorrection::standard()))
+        .map_err(|_| "SPA calculation failed")?;
+
     //eprintln!("  TZ={}", tz_display);
     Ok((pos.elevation_angle(), pos.azimuth(), tz_display))
 }
