@@ -615,8 +615,8 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 let interpreter_settings = hayro::hayro_interpret::InterpreterSettings::default();
                 let cache = hayro::RenderCache::new();
 
-                // Configure render settings with a solid white background
-                let render_settings = hayro::RenderSettings {
+                let render_settings = hayro::RenderSettings::default();
+                let pixmap_settings = hayro::PixmapSettings {
                     x_scale: 2.0,
                     y_scale: 2.0,
                     bg_color: hayro::vello_cpu::color::palette::css::WHITE,
@@ -624,8 +624,13 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 };
 
                 // Render the page to a pixmap
-                let pixmap =
-                    hayro::render(first_page, &cache, &interpreter_settings, &render_settings);
+                let pixmap = hayro::render(
+                    first_page,
+                    &cache,
+                    &interpreter_settings,
+                    &render_settings,
+                    &pixmap_settings,
+                );
 
                 let width = pixmap.width() as u32;
                 let height = pixmap.height() as u32;
