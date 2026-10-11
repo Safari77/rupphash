@@ -81,7 +81,7 @@ eframe = { version = "0.36", default-features = false, features = [
 egui = "0.36"
 egui_extras = { version = "0.36", features = ["all_loaders"] }
 egui-wgpu = "0.36"
-walkers = { version = "0.60", features = ["mvt"] }
+walkers = { version = "0.61", features = ["mvt"] }
 #walkers = { git = "https://github.com/Safari77/walkers", branch = "main" }
 roaring = { version = "0.11", features = ["serde"] }
 skrifa = "0.48"
