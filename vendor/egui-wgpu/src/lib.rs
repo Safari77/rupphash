@@ -65,8 +65,6 @@ pub enum WgpuError {
 }
 
 /// Runtime-mutable subset of [`WgpuConfiguration`].
-///
-/// Edit any field to have the surface reconfigured on the next paint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SurfaceConfig {
     /// Present mode used for the primary surface.
@@ -129,11 +127,6 @@ pub struct RenderState {
 
     /// Egui renderer responsible for drawing the UI.
     pub renderer: Arc<RwLock<Renderer>>,
-
-    /// Runtime-mutable subset of the wgpu configuration.
-    ///
-    /// Update this to have the surface reconfigured on the next paint.
-    pub surface_config: SurfaceConfig,
 }
 
 async fn request_adapter(
@@ -251,14 +244,19 @@ impl RenderState {
 
                 let (device, queue) = {
                     profiling::scope!("request_device");
-                    adapter.request_device(&(*device_descriptor)(&adapter)).await?
+                    adapter
+                        .request_device(&(*device_descriptor)(&adapter))
+                        .await?
                 };
 
                 (instance.clone(), adapter, device, queue)
             }
-            WgpuSetup::Existing(WgpuSetupExisting { instance, adapter, device, queue }) => {
-                (instance, adapter, device, queue)
-            }
+            WgpuSetup::Existing(WgpuSetupExisting {
+                instance,
+                adapter,
+                device,
+                queue,
+            }) => (instance, adapter, device, queue),
         };
 
         log_adapter_info(&adapter.get_info());
@@ -286,7 +284,6 @@ impl RenderState {
             queue,
             target_format,
             renderer: Arc::new(RwLock::new(renderer)),
-            surface_config: config.surface,
         })
     }
 }
@@ -328,9 +325,6 @@ pub enum SurfaceErrorAction {
 #[derive(Clone)]
 pub struct WgpuConfiguration {
     /// Runtime-mutable configuration for the surface (present mode, frame latency).
-    ///
-    /// These are the fields exposed via [`RenderState::surface_config`] for live
-    /// reconfiguration at runtime.
     pub surface: SurfaceConfig,
 
     /// How to create the wgpu adapter & device
@@ -347,15 +341,29 @@ pub struct WgpuConfiguration {
         Arc<dyn Fn(&wgpu::CurrentSurfaceTexture) -> SurfaceErrorAction + Send + Sync>,
 }
 
-#[test]
-fn wgpu_config_impl_send_sync() {
-    fn assert_send_sync<T: Send + Sync>() {}
+// Compile-time check that `WgpuConfiguration` is `Send + Sync`.
+// Deliberately not a `#[test]`: tests never run on wasm, but `cargo check` does.
+// On wasm this only holds with `fragile-send-sync-non-atomic-wasm` and without threads;
+// look at the feature flag for an explanation.
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(
+        feature = "fragile-send-sync-non-atomic-wasm",
+        not(target_feature = "atomics")
+    ),
+))]
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<WgpuConfiguration>();
-}
+};
 
 impl core::fmt::Debug for WgpuConfiguration {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let Self { surface, wgpu_setup, on_surface_status: _ } = self;
+        let Self {
+            surface,
+            wgpu_setup,
+            on_surface_status: _,
+        } = self;
         f.debug_struct("WgpuConfiguration")
             .field("surface", &surface)
             .field("wgpu_setup", &wgpu_setup)
@@ -418,12 +426,18 @@ pub fn preferred_framebuffer_format(
         if formats.contains(&wgpu::TextureFormat::Rgb10a2Unorm) {
             return Ok(wgpu::TextureFormat::Rgb10a2Unorm);
         }
-        if matches!(format, wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm) {
+        if matches!(
+            format,
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
+        ) {
             return Ok(format);
         }
     }
 
-    formats.first().copied().ok_or(WgpuError::NoSurfaceFormatsAvailable)
+    formats
+        .first()
+        .copied()
+        .ok_or(WgpuError::NoSurfaceFormatsAvailable)
 }
 
 /// Take's epi's depth/stencil bits and returns the corresponding wgpu format.
@@ -491,7 +505,12 @@ pub fn adapter_info_summary(info: &wgpu::AdapterInfo) -> String {
     if *vendor != 0 {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            write!(summary, ", vendor: {} (0x{vendor:04X})", parse_vendor_id(*vendor)).ok();
+            write!(
+                summary,
+                ", vendor: {} (0x{vendor:04X})",
+                parse_vendor_id(*vendor)
+            )
+            .ok();
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -505,9 +524,17 @@ pub fn adapter_info_summary(info: &wgpu::AdapterInfo) -> String {
         write!(summary, ", pci_bus_id: {device_pci_bus_id:?}").ok();
     }
     if *subgroup_min_size != 0 || *subgroup_max_size != 0 {
-        write!(summary, ", subgroup_size: {subgroup_min_size}..={subgroup_max_size}").ok();
+        write!(
+            summary,
+            ", subgroup_size: {subgroup_min_size}..={subgroup_max_size}"
+        )
+        .ok();
     }
-    write!(summary, ", transient_saves_memory: {transient_saves_memory:?}").ok();
+    write!(
+        summary,
+        ", transient_saves_memory: {transient_saves_memory:?}"
+    )
+    .ok();
     write!(summary, ", limit_bucket: {limit_bucket:?}").ok();
 
     summary
