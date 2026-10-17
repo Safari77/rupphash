@@ -14,6 +14,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
     - uses: actions/checkout@v6
 
@@ -25,10 +27,14 @@ jobs:
 
         # Retry loop to handle 503 download errors
         $MaxRetries = 5
-        for ($i=1; $i -le $MaxRetries; $i++) {
+        for ($i = 1; $i -le $MaxRetries; $i++) {
             cmd /c "bootstrap-vcpkg.bat"
             if ($LASTEXITCODE -eq 0) { break }
             Start-Sleep -Seconds 10
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to bootstrap vcpkg after ${MaxRetries} attempts."
+            exit 1
         }
 
     - name: Check for Existing Windows Asset
@@ -39,40 +45,42 @@ jobs:
         # 1. Extract Version
         # perl -ne 'print "$1\n" if /^version\s*=\s*"([^"\r\n]+)"/' Cargo.toml
         $Content = Get-Content Cargo.toml
-        $Version = ($Content | Select-String -Pattern '^version\s*=\s*"([^"\r\n]+)"').Matches.Groups[1].Value.Trim()
+        $VersionMatch = Select-String -InputObject $Content -Pattern '^version\s*=\s*"([^"\r\n]+)"'
+        $Version = $VersionMatch.Matches[0].Groups[1].Value.Trim()
         if (-not $Version) {
             Write-Error "Failed to extract a valid version string"
             exit 1
         }
 
-        $TagName = "v$Version"
-        $TargetAsset = "phdupes-v$Version-windows-static.exe"
+        $TagName = "v${Version}"
+        $TargetAsset = "phdupes-v${Version}-windows-static.exe"
 
-        Write-Host "Checking for asset: $TargetAsset in release $TagName"
+        Write-Host "Checking for asset: ${TargetAsset} in release ${TagName}"
 
         # 2. Check if release exists
         $ErrorActionPreference = 'Continue'
-        $ExistingAssets = gh release view $TagName --json assets --jq '.assets[].name' 2>$null
+        $ExistingAssets = gh release view "${TagName}" --json assets --jq '.assets[].name' 2>$null
         $GhExitCode = $LASTEXITCODE
         $ErrorActionPreference = 'Stop'
 
         if ($GhExitCode -eq 0) {
             # Release exists, check for asset collision
-            if ($ExistingAssets -match [regex]::Escape($TargetAsset)) {
-                Write-Error "CRITICAL: Asset '$TargetAsset' already exists in release $TagName. Aborting to prevent overwrite."
+            $EscapedAsset = [regex]::Escape($TargetAsset)
+            if ($ExistingAssets -match $EscapedAsset) {
+                Write-Error "CRITICAL: Asset '${TargetAsset}' already exists in release ${TagName}. Aborting to prevent overwrite."
                 exit 1
             } else {
                 Write-Host "Release exists, but Windows asset is missing. Proceeding to build."
             }
         } else {
             # Release not found (Exit code 1)
-            Write-Host "Release $TagName does not exist yet. Proceeding to build."
+            Write-Host "Release ${TagName} does not exist yet. Proceeding to build."
             # Reset global exit code so the step finishes successfully
             $global:LASTEXITCODE = 0
         }
 
         # 3. Export version to ENV for later steps
-        "VERSION=$Version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        Add-Content -Path $env:GITHUB_ENV -Value "VERSION=${Version}" -Encoding utf8
 
     - name: Install Dependencies
       run: |
@@ -85,9 +93,10 @@ jobs:
       shell: powershell
       run: |
         # 1. Get raw output from vcpkg
-        # Output looks like: "dav1d:x64-windows-static       1.5.1       AV1 decoder..."
+        # Output looks like: "dav1d:x64-windows-static       1.5.1        AV1 decoder..."
         $Dav1dInfo = vcpkg list dav1d:x64-windows-static
-        $HeifInfo  = vcpkg list libheif:x64-windows-static
+        $HeifInfo = vcpkg list libheif:x64-windows-static
+        $AomInfo = vcpkg list aom:x64-windows-static
 
         # 2. Parse the version using Regex
         # We look for the first non-whitespace string after the package name
@@ -103,16 +112,26 @@ jobs:
             $HeifVer = "Unknown"
         }
 
-        $Dav1dVer = $Dav1dVer -replace "`r|`n",""
-        $HeifVer = $HeifVer -replace "`r|`n",""
+        if ($AomInfo -match "aom:x64-windows-static\s+([^\s]+)") {
+            $AomVer = $matches[1]
+        } else {
+            $AomVer = "Unknown"
+        }
 
-        Write-Host "Detected dav1d: $Dav1dVer"
-        Write-Host "Detected libheif: $HeifVer"
+        $Dav1dVer = $Dav1dVer.Trim()
+        $HeifVer = $HeifVer.Trim()
+        $AomVer = $AomVer.Trim()
 
-        "EXT_DAV1D_VER=$Dav1dVer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "EXT_HEIF_VER=$HeifVer" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "EXT_DAV1D_HASH=Managed by vcpkg (x64-windows-static)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "EXT_HEIF_HASH=Managed by vcpkg (x64-windows-static)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        Write-Host "Detected dav1d: ${Dav1dVer}"
+        Write-Host "Detected libheif: ${HeifVer}"
+        Write-Host "Detected aom: ${AomVer}"
+
+        Add-Content -Path $env:GITHUB_ENV -Value "EXT_DAV1D_VER=${Dav1dVer}" -Encoding utf8
+        Add-Content -Path $env:GITHUB_ENV -Value "EXT_HEIF_VER=${HeifVer}" -Encoding utf8
+        Add-Content -Path $env:GITHUB_ENV -Value "EXT_AOM_VER=${AomVer}" -Encoding utf8
+        Add-Content -Path $env:GITHUB_ENV -Value "EXT_DAV1D_HASH=Managed by vcpkg (x64-windows-static)" -Encoding utf8
+        Add-Content -Path $env:GITHUB_ENV -Value "EXT_HEIF_HASH=Managed by vcpkg (x64-windows-static)" -Encoding utf8
+        Add-Content -Path $env:GITHUB_ENV -Value "EXT_AOM_HASH=Managed by vcpkg (x64-windows-static)" -Encoding utf8
 
     - name: Install Rust 1.99.1
       uses: dtolnay/rust-toolchain@1.99.1
@@ -130,7 +149,7 @@ jobs:
         RUSTFLAGS: "-C target-feature=+crt-static"
         VCPKGRS_TRIPLET: x64-windows-static
       run: |
-        if (Test-Path "$env:PKG_CONFIG_PATH/dav1d.pc") {
+        if (Test-Path "${env:PKG_CONFIG_PATH}/dav1d.pc") {
             Write-Host "Found static dav1d.pc" -ForegroundColor Green
         } else {
             Write-Error "Could not find dav1d.pc in static path!"
@@ -144,10 +163,15 @@ jobs:
         # VERSION is already in env from previous step
         New-Item -ItemType Directory -Force -Path "staging"
         $Src = "target/x86_64-pc-windows-msvc/release/phdupes.exe"
-        $Dest = "staging/phdupes-v$env:VERSION-windows-static.exe"
-        Copy-Item $Src $Dest
-        Write-Host "Bundled Static Exe: $Dest"
+        $Dest = "staging/phdupes-v${env:VERSION}-windows-static.exe"
+        Copy-Item -Path $Src -Destination $Dest
+        Write-Host "Bundled Static Exe: ${Dest}"
         Get-ChildItem "staging/"
+
+    - name: Attest Build Provenance
+      uses: actions/attest-build-provenance@v2
+      with:
+        subject-path: "staging/phdupes-v${{ env.VERSION }}-windows-static.exe"
 
     - name: Publish Release
       uses: softprops/action-gh-release@v2
