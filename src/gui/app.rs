@@ -2759,7 +2759,7 @@ impl eframe::App for GuiApp {
             //    the panel, so this frame uses the new width. Only do this when the
             //    window is in a sensible state, otherwise pointer.x.clamp(min, max)
             //    can panic if max collapses to 0 mid-resize.
-            let panel_id = egui::Id::new("list_panel");
+            let panel_id = egui::Id::unique("list_panel");
             let resize_id = panel_id.with("__resize");
 
             if window_ready {
@@ -2906,7 +2906,7 @@ impl eframe::App for GuiApp {
 
                                 let resp = ui.interact(
                                     rect,
-                                    ui.id().with("dir_parent"),
+                                    ui.scope_id().with("dir_parent"),
                                     egui::Sense::click(),
                                 );
 
@@ -2968,7 +2968,7 @@ impl eframe::App for GuiApp {
 
                                 let resp = ui.interact(
                                     rect,
-                                    ui.id().with("dir").with(dir_idx),
+                                    ui.scope_id().with("dir").with(dir_idx),
                                     egui::Sense::click(),
                                 );
 
@@ -3532,12 +3532,12 @@ impl eframe::App for GuiApp {
                                     // 3. Create Interactions
                                     let header_resp = ui.interact(
                                         header_rect,
-                                        ui.id().with("hdr").with(g_idx).with(f_idx),
+                                        ui.scope_id().with("hdr").with(g_idx).with(f_idx),
                                         egui::Sense::click(),
                                     );
                                     let meta_resp = ui.interact(
                                         meta_rect,
-                                        ui.id().with("meta").with(g_idx).with(f_idx),
+                                        ui.scope_id().with("meta").with(g_idx).with(f_idx),
                                         egui::Sense::click(),
                                     );
 

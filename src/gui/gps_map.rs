@@ -800,7 +800,7 @@ impl Plugin for GpsMarkersPlugin {
             egui::Tooltip::always_open(
                 ui.ctx().clone(),
                 ui.layer_id(),
-                egui::Id::new("map_marker_tooltip"),
+                egui::Id::unique("map_marker_tooltip"),
                 egui::PopupAnchor::Pointer,
             )
             .show(|ui| {

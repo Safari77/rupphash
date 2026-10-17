@@ -583,8 +583,8 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 }
             };
 
-            let (w, h) = decoder.dimensions();
-            img_debug!("[jxl] dimensions: {}x{}", w, h);
+            let (_w, _h) = decoder.dimensions();
+            img_debug!("[jxl] dimensions: {}x{}", _w, _h);
 
             match DynamicImage::from_decoder(decoder) {
                 Ok(img) => {

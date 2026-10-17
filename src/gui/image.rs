@@ -708,7 +708,6 @@ impl ImageSource {
 ///
 /// Returns true when the device also supports `Rgba16Unorm`, which is what
 /// backs images with real transparency (10-bit packing only has 2 alpha bits).
-
 pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) -> bool {
     let device = &rs.device;
     let rgba16_supported = device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
@@ -3709,7 +3708,7 @@ pub(super) fn render_histogram(
 
     let _ = ui.interact(
         shield_rect,
-        egui::Id::new("histogram_overlay_shield"),
+        egui::Id::unique("histogram_overlay_shield"),
         egui::Sense::click_and_drag(),
     );
 
@@ -3718,7 +3717,7 @@ pub(super) fn render_histogram(
         static LAST_HIST_SWITCH: std::cell::RefCell<std::time::Instant> = std::cell::RefCell::new(std::time::Instant::now());
     }
 
-    let response = ui.interact(hist_rect, ui.id().with("hist_scroll"), egui::Sense::hover());
+    let response = ui.interact(hist_rect, ui.scope_id().with("hist_scroll"), egui::Sense::hover());
     if response.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
 
@@ -4065,6 +4064,9 @@ pub(super) fn render_exif(
     // Shield: register a click_and_drag widget over the entire overlay so that
     // image-pan drags (allocated earlier in this frame) don't bleed through.
     // Allocated last on this Ui, so it wins egui's hit-test against the pan rect.
-    let _ =
-        ui.interact(exif_rect, egui::Id::new("exif_overlay_shield"), egui::Sense::click_and_drag());
+    let _ = ui.interact(
+        exif_rect,
+        egui::Id::unique("exif_overlay_shield"),
+        egui::Sense::click_and_drag(),
+    );
 }
