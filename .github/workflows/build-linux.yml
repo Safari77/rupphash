@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
     - uses: actions/checkout@v6
 
@@ -18,8 +20,12 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        # 1. Extract Version from Cargo.toml
-        VERSION=$(awk -F '[""]' '/^version/ { print $2; exit }' Cargo.toml)
+        # 1. Extract Version from Cargo.toml [package] section
+        VERSION=$(awk -F'"' '/^\[package\]/{p=1} p&&/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+        if [ -z "$VERSION" ]; then
+            echo "::error::Failed to extract version from Cargo.toml"
+            exit 1
+        fi
         TAG_NAME="v$VERSION"
         TARGET_ASSET="phdupes-v${VERSION}-linux"
 
@@ -178,8 +184,8 @@ jobs:
         echo "Checking pkg-config for libheif..."
         pkg-config --static --libs --cflags libheif 'libheif == 1.21.2'
 
-    - name: Install Rust 1.94.1
-      uses: dtolnay/rust-toolchain@1.94.1
+    - name: Install Rust 1.99.1
+      uses: dtolnay/rust-toolchain@1.99.1
       with:
         targets: "x86_64-unknown-linux-gnu"
 
@@ -199,10 +205,15 @@ jobs:
         mkdir -p staging
         cp -v "target/release/phdupes" "staging/phdupes-v${VERSION}-linux"
 
+    - name: Attest Build Provenance
+      uses: actions/attest-build-provenance@v2
+      with:
+        subject-path: "staging/phdupes-v${{ env.VERSION }}-linux"
+
     - name: Publish Release
       uses: softprops/action-gh-release@v2
       with:
         tag_name: v${{ env.VERSION }}
         files: staging/*
-        draft: false
+        draft: true
         prerelease: false
