@@ -19,6 +19,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
+use tempfile::NamedTempFile;
 use zeroize::Zeroize;
 
 const CONFIG_FILE_NAME: &str = "phdupes.conf";
@@ -102,6 +103,7 @@ impl HdrConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct GroupingConfig {
     pub ignore_same_stem: bool,
     pub extensions: Vec<String>,
@@ -118,7 +120,11 @@ impl Default for GroupingConfig {
 }
 
 // --- GUI Config ---
+// `#[serde(default)]` at the struct level ensures that when a `[gui]` section
+// exists in `phdupes.conf` with only a subset of keys specified, any omitted
+// fields are populated from `GuiConfig::default()` rather than `Option::None`.
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct GuiConfig {
     pub font_monospace: Option<String>,
     pub dominant_colors: Option<usize>,
@@ -349,32 +355,19 @@ pub fn create_feature_update(
 }
 
 impl AppContext {
-    /// Atomically write the config file: serialize `config` to TOML, write it
-    /// to a `<file>.tmp` sibling first, then rename it over the original so a
-    /// crash mid-write can never leave a truncated/corrupt config behind.
+    /// Atomically write the config file using `tempfile::NamedTempFile` in the
+    /// same directory as `config_path`. Each writer gets a unique temporary file
+    /// that is automatically cleaned up on drop if an error occurs before `persist`.
     fn write_config(config_path: &Path, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         let toml_str = toml::to_string_pretty(config)?;
+        let parent_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
 
-        // Build "<config_path>.tmp", keeping the original file name intact
-        let mut tmp_os = config_path.as_os_str().to_owned();
-        tmp_os.push(".tmp");
-        let tmp_path = PathBuf::from(tmp_os);
-
-        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-            let mut file = fs::File::create(&tmp_path)?;
-            file.write_all(toml_str.as_bytes())?;
-            // Flush to disk before the rename makes the new file visible
-            file.sync_all()?;
-            // Atomic on POSIX; on Windows fs::rename also replaces the target
-            fs::rename(&tmp_path, config_path)?;
-            Ok(())
-        })();
-
-        if result.is_err() {
-            // Best-effort cleanup; the original config is untouched on failure
-            let _ = fs::remove_file(&tmp_path);
-        }
-        result
+        let mut tmp_file = NamedTempFile::new_in(parent_dir)?;
+        tmp_file.write_all(toml_str.as_bytes())?;
+        // Flush to disk before persist() renames the file over the target
+        tmp_file.as_file().sync_all()?;
+        tmp_file.persist(config_path)?;
+        Ok(())
     }
 
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -476,6 +469,8 @@ impl AppContext {
             );
             let mut random_bytes = [0u8; 32];
             getrandom::fill(&mut random_bytes)?;
+            let master_key_hex = hex::encode(random_bytes);
+            random_bytes.zeroize();
 
             let mut providers = HashMap::new();
             providers.insert(
@@ -488,7 +483,7 @@ impl AppContext {
             );
 
             let cfg = Config {
-                master_key: hex::encode(random_bytes),
+                master_key: master_key_hex,
                 db_size_mb: DEFAULT_DB_SIZE_MB,
                 grouping: GroupingConfig::default(),
                 gui: GuiConfig::default(),
@@ -510,10 +505,15 @@ impl AppContext {
 
                 let mut new_key = [0u8; 32];
                 getrandom::fill(&mut new_key)?;
+                config.master_key.zeroize();
                 config.master_key = hex::encode(new_key);
 
                 // Save updated config with new key
-                Self::write_config(&config_path, &config)?;
+                if let Err(write_err) = Self::write_config(&config_path, &config) {
+                    new_key.zeroize();
+                    config.master_key.zeroize();
+                    return Err(write_err);
+                }
                 eprintln!(
                     "[DEBUG-DB] Saved new master_key to config file. Cache will be invalidated."
                 );
@@ -521,6 +521,8 @@ impl AppContext {
                 new_key
             }
         };
+        // Scrub hex-encoded master key from heap memory now that we have the raw bytes
+        config.master_key.zeroize();
 
         // 1. Content Key: For blinding file content (keyed hash)
         let content_key = blake3::derive_key("phdupes:content_key", &master_key_bytes);
@@ -529,11 +531,12 @@ impl AppContext {
         let meta_key = blake3::derive_key("phdupes:meta_key", &master_key_bytes);
 
         // 3. Encryption Key: For ChaCha20Poly1305 database encryption
-        let encryption_key = blake3::derive_key("phdupes:encryption_key", &master_key_bytes);
+        let mut encryption_key = blake3::derive_key("phdupes:encryption_key", &master_key_bytes);
         master_key_bytes.zeroize();
 
-        // Initialize the cipher
-        let cipher = XChaCha20Poly1305::new(&encryption_key.into());
+        // Initialize the cipher and scrub the stack copy of encryption_key
+        let cipher = XChaCha20Poly1305::new((&encryption_key).into());
+        encryption_key.zeroize();
 
         fs::create_dir_all(&db_path)?;
 
@@ -627,9 +630,15 @@ impl AppContext {
     /// Decode and validate master_key from hex string
     fn decode_master_key(hex_str: &str) -> Result<[u8; 32], String> {
         let trimmed = hex_str.trim().trim_start_matches("0x").trim_start_matches("0X");
-        let bytes = hex::decode(trimmed).map_err(|e| format!("hex decode failed: {}", e))?;
-        let arr: [u8; 32] =
-            bytes.try_into().map_err(|v: Vec<u8>| format!("expected 32 bytes, got {}", v.len()))?;
+        let mut bytes = hex::decode(trimmed).map_err(|e| format!("hex decode failed: {}", e))?;
+        if bytes.len() != 32 {
+            let len = bytes.len();
+            bytes.zeroize();
+            return Err(format!("expected 32 bytes, got {}", len));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        bytes.zeroize();
 
         Ok(arr)
     }
@@ -1331,14 +1340,16 @@ impl AppContext {
         Some(entry.group_uuid)
     }
 
-    /// Look up an existing UUID from the pdqmap by checking pdqhashes.
-    /// Generic over any `lmdb::Transaction` (works for both `RoTransaction` and `RwTransaction`).
+    /// Look up an existing UUID for a group within `txn`.
+    /// First checks `ignored_pdqmap_db` by `pdqhash`, then falls back to checking
+    /// `ignored_db` by `content_hash` so groups without a PDQ hash (e.g., exact
+    /// content/pixel matches where `pdqhash` is `None`) also preserve their UUID.
     fn find_uuid_in_txn<T: Transaction>(
         &self,
         txn: &T,
-        pdqhashes: &[Option<[u8; 32]>],
+        group: &[([u8; 32], Option<[u8; 32]>)],
     ) -> Option<[u8; 16]> {
-        for pdqhash_opt in pdqhashes {
+        for (_, pdqhash_opt) in group {
             if let Some(pdqhash) = pdqhash_opt
                 && let Ok(encrypted) = txn.get(self.ignored_pdqmap_db, pdqhash)
                 && let Some(decrypted) = self.decrypt_value(pdqhash, encrypted)
@@ -1349,6 +1360,17 @@ impl AppContext {
                 return Some(uuid);
             }
         }
+
+        // Fallback: check if any file in the group already has an entry in ignored_db
+        for (content_hash, _) in group {
+            if let Ok(encrypted) = txn.get(self.ignored_db, content_hash)
+                && let Some(decrypted) = self.decrypt_value(content_hash, encrypted)
+                && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+            {
+                return Some(entry.group_uuid);
+            }
+        }
+
         None
     }
 
@@ -1387,7 +1409,7 @@ impl AppContext {
 
             // Use the write transaction as a reader; it sees the same snapshot.
             let all_pdqhashes: Vec<Option<[u8; 32]>> = group.iter().map(|(_, pdq)| *pdq).collect();
-            let uuid = self.find_uuid_in_txn(&txn, &all_pdqhashes).unwrap_or_else(|| {
+            let uuid = self.find_uuid_in_txn(&txn, group).unwrap_or_else(|| {
                 let mut uuid = [0u8; 16];
                 getrandom::fill(&mut uuid).expect("RNG failed");
                 uuid
@@ -1512,11 +1534,49 @@ impl AppContext {
         Ok(results)
     }
 
-    /// Remove a single entry by content_hash.
+    /// Remove a single entry by content_hash, and clean up its pdqhash in
+    /// `ignored_pdqmap_db` if no other entry in `ignored_db` still shares that pdqhash.
     pub fn remove_ignored(&self, content_hash: &[u8; 32]) -> Result<bool, lmdb::Error> {
         let mut txn = self.env.begin_rw_txn()?;
+
+        let assoc_pdq = match txn.get(self.ignored_db, content_hash) {
+            Ok(encrypted) => self
+                .decrypt_value(content_hash, encrypted)
+                .and_then(|dec| IgnoredEntry::from_bytes(&dec).ok())
+                .and_then(|entry| entry.pdqhash),
+            Err(lmdb::Error::NotFound) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
         match txn.del(self.ignored_db, content_hash, None) {
             Ok(()) => {
+                if let Some(pdq) = assoc_pdq {
+                    let mut still_referenced = false;
+                    if txn.stat(self.ignored_db)?.entries() > 0 {
+                        let mut cursor = txn.open_ro_cursor(self.ignored_db)?;
+                        for result in cursor.iter_start() {
+                            if let Ok((key, encrypted)) = result
+                                && key.len() == 32
+                            {
+                                let mut ch = [0u8; 32];
+                                ch.copy_from_slice(key);
+                                if let Some(dec) = self.decrypt_value(&ch, encrypted)
+                                    && let Ok(entry) = IgnoredEntry::from_bytes(&dec)
+                                    && entry.pdqhash == Some(pdq)
+                                {
+                                    still_referenced = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !still_referenced {
+                        match txn.del(self.ignored_pdqmap_db, &pdq, None) {
+                            Ok(()) | Err(lmdb::Error::NotFound) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
                 txn.commit()?;
                 Ok(true)
             }
@@ -1525,14 +1585,15 @@ impl AppContext {
         }
     }
 
-    /// Remove all entries matching a group UUID (both ignored_db and pdqmap_db).
+    /// Remove all entries matching a group UUID (both ignored_db and pdqmap_db)
+    /// within a single atomic read-write transaction.
     pub fn remove_ignored_by_uuid(&self, uuid: &[u8; 16]) -> Result<usize, lmdb::Error> {
-        let txn = self.env.begin_ro_txn()?;
+        let mut wtxn = self.env.begin_rw_txn()?;
         let mut to_remove = Vec::new();
         let mut pdqhashes_to_remove = Vec::new();
 
-        if txn.stat(self.ignored_db)?.entries() > 0 {
-            let mut cursor = txn.open_ro_cursor(self.ignored_db)?;
+        if wtxn.stat(self.ignored_db)?.entries() > 0 {
+            let mut cursor = wtxn.open_ro_cursor(self.ignored_db)?;
             for result in cursor.iter_start() {
                 if let Ok((key, encrypted)) = result
                     && key.len() == 32
@@ -1549,16 +1610,19 @@ impl AppContext {
                             entry.ignored,
                         );
                         to_remove.push(content_hash);
-                        if let Some(pdq) = entry.pdqhash {
+                        if let Some(pdq) = entry.pdqhash
+                            && !pdqhashes_to_remove.contains(&pdq)
+                        {
                             pdqhashes_to_remove.push(pdq);
                         }
                     }
                 }
             }
         }
+
         // Also collect pdqmap entries pointing to this UUID
-        if txn.stat(self.ignored_pdqmap_db)?.entries() > 0 {
-            let mut cursor = txn.open_ro_cursor(self.ignored_pdqmap_db)?;
+        if wtxn.stat(self.ignored_pdqmap_db)?.entries() > 0 {
+            let mut cursor = wtxn.open_ro_cursor(self.ignored_pdqmap_db)?;
             for result in cursor.iter_start() {
                 if let Ok((key, encrypted)) = result
                     && key.len() == 32
@@ -1577,26 +1641,32 @@ impl AppContext {
                 }
             }
         }
-        drop(txn);
 
-        let mut wtxn = self.env.begin_rw_txn()?;
-        let count = to_remove.len();
+        let mut count = 0;
         for ch in &to_remove {
-            let _ = wtxn.del(self.ignored_db, ch, None);
+            match wtxn.del(self.ignored_db, ch, None) {
+                Ok(()) => count += 1,
+                Err(lmdb::Error::NotFound) => {}
+                Err(e) => return Err(e),
+            }
         }
         for pdq in &pdqhashes_to_remove {
-            let _ = wtxn.del(self.ignored_pdqmap_db, pdq, None);
+            match wtxn.del(self.ignored_pdqmap_db, pdq, None) {
+                Ok(()) | Err(lmdb::Error::NotFound) => {}
+                Err(e) => return Err(e),
+            }
         }
         wtxn.commit()?;
         Ok(count)
     }
 
-    /// Remove all entries matching a PDQ hash.
+    /// Remove all entries matching a PDQ hash within a single atomic read-write transaction.
     pub fn remove_ignored_by_pdqhash(&self, pdqhash: &[u8; 32]) -> Result<usize, lmdb::Error> {
-        let txn = self.env.begin_ro_txn()?;
+        let mut wtxn = self.env.begin_rw_txn()?;
         let mut to_remove = Vec::new();
-        if txn.stat(self.ignored_db)?.entries() > 0 {
-            let mut cursor = txn.open_ro_cursor(self.ignored_db)?;
+
+        if wtxn.stat(self.ignored_db)?.entries() > 0 {
+            let mut cursor = wtxn.open_ro_cursor(self.ignored_db)?;
             for result in cursor.iter_start() {
                 if let Ok((key, encrypted)) = result
                     && key.len() == 32
@@ -1612,14 +1682,19 @@ impl AppContext {
                 }
             }
         }
-        drop(txn);
 
-        let mut wtxn = self.env.begin_rw_txn()?;
-        let count = to_remove.len();
+        let mut count = 0;
         for ch in &to_remove {
-            let _ = wtxn.del(self.ignored_db, ch, None);
+            match wtxn.del(self.ignored_db, ch, None) {
+                Ok(()) => count += 1,
+                Err(lmdb::Error::NotFound) => {}
+                Err(e) => return Err(e),
+            }
         }
-        let _ = wtxn.del(self.ignored_pdqmap_db, pdqhash, None);
+        match wtxn.del(self.ignored_pdqmap_db, pdqhash, None) {
+            Ok(()) | Err(lmdb::Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
         wtxn.commit()?;
         Ok(count)
     }
@@ -1669,10 +1744,15 @@ impl AppContext {
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
             let mut cfg: Config = toml::from_str(&content)?;
+            cfg.master_key.zeroize(); // Zeroize when dropped at end of scope via explicit cleanup below
 
+            // Re-parse without leaving an unzeroized copy if we fail mid-flight
+            cfg = toml::from_str(&content)?;
             cfg.selected_provider = Some(provider_name.to_string());
 
-            Self::write_config(&config_path, &cfg)?;
+            let res = Self::write_config(&config_path, &cfg);
+            cfg.master_key.zeroize();
+            res?;
         }
         Ok(())
     }
@@ -1689,7 +1769,9 @@ impl AppContext {
             let mut cfg: Config = toml::from_str(&content)?;
             cfg.gui = gui_config.clone();
 
-            Self::write_config(&config_path, &cfg)?;
+            let res = Self::write_config(&config_path, &cfg);
+            cfg.master_key.zeroize();
+            res?;
         } else {
             eprintln!("[DEBUG-DB] Config file does not exist at {:?}", config_path);
         }

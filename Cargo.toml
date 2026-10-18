@@ -70,6 +70,7 @@ oklab = "1"
 mp4parse = "0.17"
 rustix = { version = "1", features = ["fs"] }
 num-integer = "0.1"
+tempfile = "3"
 
 # GUI
 eframe = { version = "0.37", default-features = false, features = [
