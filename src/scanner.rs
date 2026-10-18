@@ -957,15 +957,15 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
             clean_exif_string(&value.display_as(tag).to_string())
         }
         exif::Tag::ExposureBiasValue => {
-            // ExposureBias is stored as SRational; reduce with gcd and print
-            // in the conventional "+1/3 EV" style instead of a long decimal
+            // ExposureBias is stored as SRational; widen to i64 first so that
+            // negating i32::MIN (-2147483648) never overflows or panics in gcd().
             if let exif::Value::SRational(rats) = value
                 && !rats.is_empty()
                 && rats[0].denom != 0
             {
-                let (mut n, mut d) = (rats[0].num, rats[0].denom);
+                let (mut n, mut d) = (rats[0].num as i64, rats[0].denom as i64);
                 if d < 0 {
-                    // Normalize sign into the numerator
+                    // Normalize sign into the numerator safely in i64
                     n = -n;
                     d = -d;
                 }
@@ -1135,7 +1135,6 @@ pub struct ScanConfig {
     pub similarity: u32,
     pub group_by: String,
     pub extensions: Vec<String>,
-    #[allow(unused)]
     pub ignore_same_stem: bool,
     pub calc_pixel_hash: bool,
 }
@@ -1276,6 +1275,7 @@ pub fn scan_and_group(
                 let mut orientation = 1;
                 let mut gps_pos = None;
                 let mut exif_timestamp: Option<i64> = None;
+                let mut pdq_cached = false;
                 let mut cache_hit_full = false;
                 let mut pixel_hash: Option<[u8; 32]> = None; // Init
                 let mut new_pixel = None; // For DB update
@@ -1304,6 +1304,7 @@ pub fn scan_and_group(
                                 pdq_features = Some(Arc::new(crate::pdqhash::PdqFeatures {
                                     coefficients: coeffs,
                                 }));
+                                pdq_cached = true;
                                 cache_hit_full = true;
                             }
                         }
@@ -1321,7 +1322,7 @@ pub fn scan_and_group(
                         eprintln!("[CACHE-FULL] {:?}", path.display());
                     } else {
                         eprintln!(
-                            "[CACHE-PARTIAL] Metadata found, but features missing for {:?}",
+                            "[CACHE-PARTIAL] Metadata found, but features/pixel_hash missing for {:?}",
                             path.display()
                         );
                     }
@@ -1334,44 +1335,50 @@ pub fn scan_and_group(
                     let bytes = fs::read(path).ok();
 
                     if let Some(ref b) = bytes {
-                        // 1. PRE-PARSE rsraw if it's a RAW file to avoid doing it multiple times
                         let is_raw = is_raw_ext(path);
-                        let parsed_raw = if is_raw { rsraw::RawImage::open(b).ok() } else { None };
+                        let mut parsed_raw = None;
+                        let mut exif_data = None;
 
-                        // Read Orientation, GPS location, and EXIF timestamp
-                        // For RAW files, we may need to fall back to rsraw if kamadak-exif fails
-                        let exif_data = read_exif_data(path, Some(b));
+                        // 1. Only parse EXIF / RAW metadata if PDQ features were NOT already cached
+                        if !pdq_cached {
+                            parsed_raw =
+                                if is_raw { rsraw::RawImage::open(b).ok() } else { None };
+                            exif_data = read_exif_data(path, Some(b));
 
-                        if let Some(ref exif) = exif_data {
-                            // kamadak-exif succeeded - extract data the normal way
-                            if let Some((lat, lon)) = extract_gps_lat_lon(exif) {
-                                gps_pos = Some(Point::new(lon, lat)); // Geo uses (x, y) = (lon, lat)
-                            }
-                            if let Some(field) =
-                                exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-                                && let Some(v @ 1..=8) = field.value.get_uint(0)
-                            {
-                                orientation = v as u8;
-                            }
-                            // HEIC/HEIF: libheif bakes orientation into the decoded pixels,
-                            // so the embedded EXIF Orientation tag must not be applied again.
-                            if orientation_baked_into_pixels(path) {
-                                orientation = 1;
-                            }
-                            exif_timestamp = get_exif_timestamp(exif);
-                        } else if is_raw {
-                            // kamadak-exif failed on RAW file - try rsraw as fallback
-                            if let Some(ref raw) = parsed_raw {
-                                // Get GPS from rsraw
-                                if let Some(point) = raw_exif::get_gps_point_from_raw(raw) {
-                                    gps_pos = Some(point);
+                            if let Some(ref exif) = exif_data {
+                                // kamadak-exif succeeded - extract data the normal way
+                                if let Some((lat, lon)) = extract_gps_lat_lon(exif) {
+                                    gps_pos = Some(Point::new(lon, lat)); // Geo uses (x, y) = (lon, lat)
                                 }
-                                // Get timestamp from rsraw
-                                exif_timestamp = raw_exif::get_timestamp_from_raw(raw);
-                                // Orientation: kamadak couldn't parse this RAW container
-                                // (e.g. CR3/CRX), so take LibRaw's value via rsraw.
-                                orientation = raw_exif::get_orientation_from_raw(raw);
+                                if let Some(field) =
+                                    exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                                    && let Some(v @ 1..=8) = field.value.get_uint(0)
+                                {
+                                    orientation = v as u8;
+                                }
+                                // HEIC/HEIF: libheif bakes orientation into the decoded pixels,
+                                // so the embedded EXIF Orientation tag must not be applied again.
+                                if orientation_baked_into_pixels(path) {
+                                    orientation = 1;
+                                }
+                                exif_timestamp = get_exif_timestamp(exif);
+                            } else if is_raw {
+                                // kamadak-exif failed on RAW file - try rsraw as fallback
+                                if let Some(ref raw) = parsed_raw {
+                                    // Get GPS from rsraw
+                                    if let Some(point) = raw_exif::get_gps_point_from_raw(raw) {
+                                        gps_pos = Some(point);
+                                    }
+                                    // Get timestamp from rsraw
+                                    exif_timestamp = raw_exif::get_timestamp_from_raw(raw);
+                                    // Orientation: kamadak couldn't parse this RAW container
+                                    // (e.g. CR3/CRX), so take LibRaw's value via rsraw.
+                                    orientation = raw_exif::get_orientation_from_raw(raw);
+                                }
                             }
+                        } else if is_raw {
+                            // PDQ is cached, we only need parsed_raw to extract the thumbnail for pixel_hash
+                            parsed_raw = rsraw::RawImage::open(b).ok();
                         }
 
                         // 2. Calculate file hash if needed
@@ -1386,12 +1393,13 @@ pub fn scan_and_group(
 
                         if is_raw {
                             // Extract full sensor dimensions directly from parsed RAW metadata
-                            if let Some(ref raw) = parsed_raw {
+                            if resolution.is_none()
+                                && let Some(ref raw) = parsed_raw
+                            {
                                 resolution = Some((raw.width(), raw.height()));
                             }
 
                             // RAW FILE: Extract Largest JPEG Thumbnail
-                            // We need the image for PDQ even if pixel_hash is disabled.
                             if let Some(mut raw) = parsed_raw
                                 && let Ok(thumbs) = raw.extract_thumbs()
                             {
@@ -1438,9 +1446,10 @@ pub fn scan_and_group(
                                 new_pixel = Some((ck, ph));
                             }
 
-                            // Use 'img' directly - do NOT call load_from_memory again
-                            if let Some((features, quality)) =
-                                crate::pdqhash::generate_pdq_features(img)
+                            // 5. Only compute PDQ features and ImageFeatures if not already cached!
+                            if !pdq_cached
+                                && let Some((features, quality)) =
+                                    crate::pdqhash::generate_pdq_features(img)
                             {
                                 let hash = features.to_hash();
                                 pdqhash = Some(hash);
@@ -1831,7 +1840,7 @@ where
 
     let comparison_count = edges.len();
 
-    // --- Union-Find (unchanged) ---
+    // --- Union-Find ---
     let mut parent: Vec<usize> = (0..n).collect();
 
     fn find(parent: &mut [usize], i: usize) -> usize {
@@ -1860,17 +1869,22 @@ where
         union(&mut parent, u as usize, v as usize);
     }
 
+    // Collect all elements by their component root unconditionally so that
+    // a root visited before its children is never dropped. Singletons are
+    // filtered out immediately afterwards by `.filter(|g| g.len() > 1)`.
     let mut groups_map = HashMap::<usize, Vec<u32>>::new();
     for i in 0..n {
         let root = find(&mut parent, i);
-        if root != i || groups_map.contains_key(&root) {
-            groups_map.entry(root).or_default().push(i as u32);
-        }
+        groups_map.entry(root).or_default().push(i as u32);
     }
 
     let raw_groups: Vec<Vec<u32>> = groups_map.into_values().filter(|g| g.len() > 1).collect();
 
-    let groups = merge_groups_by_stem(raw_groups, valid_files);
+    let groups = if config.ignore_same_stem {
+        raw_groups
+    } else {
+        merge_groups_by_stem(raw_groups, valid_files)
+    };
     let (groups, info) = process_raw_groups(groups, valid_files, config);
 
     (groups, info, comparison_count)
@@ -1885,14 +1899,27 @@ fn group_with_pdqhash(
     group_files_generic(valid_files, config, PdqStrategy)
 }
 
+#[inline]
+fn get_ext_priority(path: &Path, ext_priorities: &HashMap<String, usize>) -> usize {
+    if ext_priorities.is_empty() {
+        return 0;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .and_then(|e| ext_priorities.get(&e.to_lowercase()).copied())
+        .unwrap_or(usize::MAX)
+}
+
 pub fn analyze_group(
     files: &mut Vec<FileMetadata>,
     sort_order: &str,
-    #[allow(unused)] ext_priorities: &HashMap<String, usize>,
+    ext_priorities: &HashMap<String, usize>,
 ) -> GroupInfo {
     if files.is_empty() {
         return GroupInfo { max_dist: 0, status: GroupStatus::None };
     }
+
+    let total_files = files.len();
 
     // 1. Count Bit-Identical (Content Hash)
     let mut bit_counts = HashMap::new();
@@ -1921,12 +1948,16 @@ pub fn analyze_group(
         (
             f.pixel_hash,
             f.content_hash,
+            get_ext_priority(&f.path, ext_priorities),
             f.path.file_name().unwrap_or_default().to_string_lossy().to_string(),
         )
     });
 
-    // 5. Sort Unique: Standard user sort
+    // 5. Sort Unique: Standard user sort, then stable sort by extension priority if configured
     sort_files(&mut unique, sort_order);
+    if !ext_priorities.is_empty() {
+        unique.sort_by_cached_key(|f| get_ext_priority(&f.path, ext_priorities));
+    }
 
     // 6. Combine
     files.append(&mut duplicates);
@@ -1943,8 +1974,15 @@ pub fn analyze_group(
         0
     };
 
-    let has_duplicates = !bit_counts.values().all(|&c| c == 1);
-    let all_identical = bit_counts.len() == 1;
+    let has_bit_dupes = bit_counts.values().any(|&c| c > 1);
+    let has_pixel_dupes = pixel_counts.values().any(|&c| c > 1);
+    let has_duplicates = has_bit_dupes || has_pixel_dupes;
+
+    let all_bit_identical = bit_counts.len() == 1;
+    let all_pixel_identical =
+        pixel_counts.len() == 1 && pixel_counts.values().next() == Some(&total_files);
+    let all_identical = all_bit_identical || all_pixel_identical;
+
     let status = if all_identical {
         GroupStatus::AllIdentical
     } else if has_duplicates {
@@ -1961,33 +1999,23 @@ fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> V
         return groups;
     }
 
-    use rustc_hash::FxHasher;
-    use std::hash::{Hash, Hasher};
+    use std::ffi::OsStr;
 
-    // Helper to hash a path component to u64 quickly
-    fn hash_component<T: Hash>(t: T) -> u64 {
-        let mut s = FxHasher::default();
-        t.hash(&mut s);
-        s.finish()
-    }
-
-    // Flatten groups into a sortable list of (ParentHash, StemHash, GroupIndex)
-    let mut entries: Vec<(u64, u64, usize)> = Vec::with_capacity(valid_files.len());
+    // Flatten groups into a sortable list of (ParentPath, FileStem, GroupIndex)
+    let mut entries: Vec<(&Path, &OsStr, usize)> = Vec::with_capacity(valid_files.len());
 
     for (g_idx, group) in groups.iter().enumerate() {
         for &f_idx in group {
             // Safety: Indices are guaranteed valid by upstream logic
             let f = &valid_files[f_idx as usize];
             if let (Some(parent), Some(stem)) = (f.path.parent(), f.path.file_stem()) {
-                let p_hash = hash_component(parent);
-                let s_hash = hash_component(stem);
-                entries.push((p_hash, s_hash, g_idx));
+                entries.push((parent, stem, g_idx));
             }
         }
     }
 
-    // Sort by Parent -> Stem (Grouping identical stems together)
-    entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    // Sort by Parent -> Stem (Grouping identical stems in the same directory together)
+    entries.par_sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
 
     // Union-Find Merge Logic
     let mut parent: Vec<usize> = (0..groups.len()).collect();
@@ -2042,8 +2070,12 @@ fn process_raw_groups(
     valid_files: &[ScannedFile],
     config: &ScanConfig,
 ) -> (Vec<Vec<FileMetadata>>, Vec<GroupInfo>) {
-    let ext_priorities: HashMap<String, usize> =
-        config.extensions.iter().enumerate().map(|(i, e)| (e.to_lowercase(), i)).collect();
+    let ext_priorities: HashMap<String, usize> = config
+        .extensions
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.trim_start_matches('.').to_lowercase(), i))
+        .collect();
 
     // Build read-only lookup map
     let mut features_map = HashMap::new();
@@ -2238,29 +2270,52 @@ fn analyze_group_with_features(
     files: &mut Vec<FileMetadata>,
     features_map: &HashMap<&std::path::PathBuf, &crate::pdqhash::PdqFeatures>,
     sort_order: &str,
-    #[allow(unused)] ext_priorities: &HashMap<String, usize>,
+    ext_priorities: &HashMap<String, usize>,
 ) -> GroupInfo {
     if files.is_empty() {
         return GroupInfo { max_dist: 0, status: GroupStatus::None };
     }
 
-    let mut counts = HashMap::new();
+    let total_files = files.len();
+
+    // 1. Count Bit-Identical (Content Hash)
+    let mut bit_counts = HashMap::new();
     for f in files.iter() {
-        *counts.entry(f.content_hash).or_insert(0) += 1;
+        *bit_counts.entry(f.content_hash).or_insert(0) += 1;
     }
 
+    // 2. Count Pixel-Identical (Pixel Hash)
+    let mut pixel_counts = HashMap::new();
+    for f in files.iter() {
+        if let Some(ph) = f.pixel_hash {
+            *pixel_counts.entry(ph).or_insert(0) += 1;
+        }
+    }
+
+    // 3. Partition: Anything that is a duplicate (Bit OR Pixel) goes to the top
     let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) =
-        files.drain(..).partition(|f| *counts.get(&f.content_hash).unwrap_or(&0) > 1);
+        files.drain(..).partition(|f| {
+            let is_bit_dupe = *bit_counts.get(&f.content_hash).unwrap_or(&0) > 1;
+            let is_pixel_dupe =
+                f.pixel_hash.map(|ph| *pixel_counts.get(&ph).unwrap_or(&0) > 1).unwrap_or(false);
+            is_bit_dupe || is_pixel_dupe
+        });
 
     duplicates.sort_by_cached_key(|f| {
         (
             f.pixel_hash,
             f.content_hash,
+            get_ext_priority(&f.path, ext_priorities),
             f.path.file_name().unwrap_or_default().to_string_lossy().to_string(),
         )
     });
 
+    // 4. Sort Unique: Standard user sort, then stable sort by extension priority if configured
     sort_files(&mut unique, sort_order);
+    if !ext_priorities.is_empty() {
+        unique.sort_by_cached_key(|f| get_ext_priority(&f.path, ext_priorities));
+    }
+
     files.append(&mut duplicates);
     files.append(&mut unique);
 
@@ -2292,8 +2347,15 @@ fn analyze_group_with_features(
         0
     };
 
-    let has_duplicates = !counts.values().all(|&c| c == 1);
-    let all_identical = counts.len() == 1;
+    let has_bit_dupes = bit_counts.values().any(|&c| c > 1);
+    let has_pixel_dupes = pixel_counts.values().any(|&c| c > 1);
+    let has_duplicates = has_bit_dupes || has_pixel_dupes;
+
+    let all_bit_identical = bit_counts.len() == 1;
+    let all_pixel_identical =
+        pixel_counts.len() == 1 && pixel_counts.values().next() == Some(&total_files);
+    let all_identical = all_bit_identical || all_pixel_identical;
+
     let status = if all_identical {
         GroupStatus::AllIdentical
     } else if has_duplicates {
@@ -2803,24 +2865,38 @@ pub fn spawn_background_dir_scan(
 ) -> (Vec<std::path::PathBuf>, usize) {
     let mut subdirs = Vec::new();
     let mut entries: Vec<DirEntry> = Vec::new();
+    let follow_symlinks = false; // Reserved for future feature
 
     // Phase 1: Fast directory enumeration (synchronous, no I/O beyond readdir)
     if let Ok(dir_entries) = fs::read_dir(&dir) {
         for entry in dir_entries.flatten() {
+            if !follow_symlinks {
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_symlink() {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+
             let entry_path = entry.path();
             if let Ok(canonical) = entry_path.canonicalize() {
                 if canonical.is_dir() {
                     subdirs.push(canonical);
-                } else if is_image_ext(&canonical)
-                    && let Ok(meta) = entry.metadata()
-                    && let Some(unique_file_id) = get_file_key(&canonical)
-                {
-                    entries.push(DirEntry {
-                        path: canonical,
-                        size: meta.len(),
-                        modified: meta.modified().unwrap_or(UNIX_EPOCH).into(),
-                        unique_file_id,
-                    });
+                } else if is_image_ext(&canonical) {
+                    let meta_res =
+                        if follow_symlinks { fs::metadata(&canonical) } else { entry.metadata() };
+                    if let Ok(meta) = meta_res
+                        && let Some(unique_file_id) = get_file_key(&canonical)
+                    {
+                        entries.push(DirEntry {
+                            path: canonical,
+                            size: meta.len(),
+                            modified: meta.modified().unwrap_or(UNIX_EPOCH).into(),
+                            unique_file_id,
+                        });
+                    }
                 }
             }
         }
