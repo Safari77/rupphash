@@ -74,12 +74,13 @@ tempfile = "3"
 
 # GUI
 eframe = { version = "0.37", default-features = false, features = [
-  "system_fonts",
   "wgpu",
   "wayland",
   "x11",
 ] }
-egui = "0.37"
+egui = { version = "0.37", default-features = false, features = [
+  "monochrome_emoji_fonts",
+] }
 egui_extras = { version = "0.37", features = ["all_loaders"] }
 egui-wgpu = "0.37"
 walkers = { version = "0.63", features = ["mvt"] }

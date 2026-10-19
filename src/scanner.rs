@@ -121,9 +121,9 @@ pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exi
     match exif_reader.read_from_container(&mut reader) {
         Ok(exif) => Some(exif),
         Err(exif::Error::PartialResult(partial)) => {
-            let (exif, errors) = partial.into_inner();
+            let (exif, _errors) = partial.into_inner();
             #[cfg(debug_assertions)]
-            for err in errors {
+            for err in _errors {
                 eprintln!("[DEBUG-EXIF-WARNING] Non-fatal parse warning: {err}");
             }
             Some(exif)
