@@ -74,7 +74,7 @@ tempfile = "3"
 
 # GUI
 eframe = { version = "0.37", default-features = false, features = [
-  "default_fonts",
+  "system_fonts",
   "wgpu",
   "wayland",
   "x11",
