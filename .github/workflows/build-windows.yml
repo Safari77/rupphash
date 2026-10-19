@@ -2,12 +2,20 @@ name: Build and Release Windows (static binary)
 
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (test build only: bypass asset collision check and skip publishing)"
+        type: boolean
+        default: false
 
 permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
   VCPKG_ROOT: "C:/vcpkg"
+  VCPKG_DEFAULT_BINARY_CACHE: "C:/vcpkg-cache"
+  VCPKG_DEFAULT_TRIPLET: "x64-windows-static"
+  VCPKG_DEFAULT_HOST_TRIPLET: "x64-windows"
 
 jobs:
   build-windows:
@@ -17,13 +25,46 @@ jobs:
       id-token: write
       attestations: write
     steps:
-    - uses: actions/checkout@v6
+    - name: Log Runner Image and System Details
+      shell: powershell
+      run: |
+        $osInfo = Get-CimInstance Win32_OperatingSystem
+        $releaseTag = if ($env:ImageOS -and $env:ImageVersion) {
+            "$($env:ImageOS)/" + ($env:ImageVersion -replace '\.0$', '')
+        } else {
+            $null
+        }
+
+        Write-Host "================ RUNNER IMAGE DETAILS ================" -ForegroundColor Cyan
+        Write-Host "Runner Image Version : $env:ImageVersion"
+        Write-Host "Runner Image OS      : $env:ImageOS"
+        Write-Host "Runner Name          : $env:RUNNER_NAME"
+        Write-Host "Runner Architecture  : $env:RUNNER_ARCH"
+        Write-Host "Windows Caption      : $($osInfo.Caption)"
+        Write-Host "Windows Version      : $($osInfo.Version) (Build $($osInfo.BuildNumber))"
+        if ($releaseTag) {
+            Write-Host "Runner Release Notes : https://github.com/actions/runner-images/releases/tag/$releaseTag"
+        }
+        Write-Host "======================================================" -ForegroundColor Cyan
+
+        # Export ImageVersion to GITHUB_ENV for runner-specific cache keying
+        Add-Content -Path $env:GITHUB_ENV -Value "RUNNER_IMG_VER=$($env:ImageVersion)" -Encoding utf8
+
+    # v7.0.1
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Update vcpkg Portfiles with retry because github is unreliable
+      id: vcpkg-step
       shell: powershell
       run: |
         cd $env:VCPKG_ROOT
-        git pull origin master
+        git checkout master
+        git pull --ff-only origin master
+
+        # Capture current vcpkg commit so local git history contains the builtin-baseline SHA from vcpkg.json
+        $VcpkgCommit = (git rev-parse HEAD).Trim()
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "commit=${VcpkgCommit}" -Encoding utf8
+        Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_COMMIT=${VcpkgCommit}" -Encoding utf8
 
         # Retry loop to handle 503 download errors
         $MaxRetries = 5
@@ -34,6 +75,109 @@ jobs:
         }
         if ($LASTEXITCODE -ne 0) {
             Write-Error "Failed to bootstrap vcpkg after ${MaxRetries} attempts."
+            exit 1
+        }
+
+    - name: Ensure vcpkg binary cache dir exists
+      shell: powershell
+      run: New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+
+    - name: Cache vcpkg Binary Artifacts
+      # v6.1.0
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: C:/vcpkg-cache
+        key: vcpkg-bin-${{ runner.os }}-${{ env.RUNNER_IMG_VER }}-${{ hashFiles('vcpkg.json') }}
+        restore-keys: |
+          vcpkg-bin-${{ runner.os }}-${{ env.RUNNER_IMG_VER }}-
+
+    - name: Print Cached vcpkg Packages
+      shell: powershell
+      run: |
+        $CacheDir = $env:VCPKG_DEFAULT_BINARY_CACHE
+
+        $ZipFiles = Get-ChildItem -Path $CacheDir -Filter *.zip -Recurse
+        if ($ZipFiles.Count -eq 0) {
+            Write-Host "No cached binary packages found in $CacheDir." -ForegroundColor Yellow
+            exit 0
+        }
+
+        Write-Host "Found $($ZipFiles.Count) cached vcpkg package archive(s):" -ForegroundColor Cyan
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+        $Entries = foreach ($zip in $ZipFiles) {
+            $pkgName = "Unknown"
+            $pkgVer = "Unknown"
+            try {
+                $archive = [System.IO.Compression.ZipFile]::OpenRead($zip.FullName)
+                # Read SPDX metadata embedded by modern vcpkg
+                $spdx = $archive.Entries | Where-Object { $_.Name -eq 'vcpkg.spdx.json' } | Select-Object -First 1
+                if ($spdx) {
+                    $stream = $spdx.Open()
+                    $reader = [System.IO.StreamReader]::new($stream)
+                    $json = $reader.ReadToEnd() | ConvertFrom-Json
+                    $reader.Close()
+                    $stream.Close()
+                    $pkgName = $json.name
+                    $pkgVer = $json.versionInfo
+                } else {
+                    $shareEntry = $archive.Entries | Where-Object { $_.FullName -match '^share/([^/]+)/' } | Select-Object -First 1
+                    if ($shareEntry) { $pkgName = ($shareEntry.FullName -split '/')[1] }
+                }
+                $archive.Dispose()
+            } catch {}
+
+            [PSCustomObject]@{
+                Package  = $pkgName
+                Version  = $pkgVer
+                Size_MB  = [math]::Round($zip.Length / 1MB, 2)
+                Archive  = $zip.Name
+            }
+        }
+
+        $Entries | Format-Table -AutoSize
+
+    - name: Setup pkg-config and NASM
+      shell: powershell
+      run: |
+        # 1. Ensure NASM is on PATH (pre-installed on Windows runners at C:\Program Files\NASM)
+        if (Test-Path "C:\Program Files\NASM") {
+            Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM" -Encoding utf8
+        } else {
+            choco install nasm --yes --no-progress
+        }
+
+        # 2. Locate or install pkg-config, then pin PKG_CONFIG env and directory to GITHUB_PATH
+        $PkgConfigPath = ""
+        $CandidatePaths = @(
+            "C:\msys64\mingw64\bin\pkg-config.exe",
+            "C:\msys64\ucrt64\bin\pkg-config.exe",
+            "C:\msys64\usr\bin\pkg-config.exe",
+            "C:\ProgramData\chocolatey\bin\pkg-config.exe"
+        )
+
+        foreach ($Path in $CandidatePaths) {
+            if (Test-Path $Path) {
+                $PkgConfigPath = $Path
+                break
+            }
+        }
+
+        if (-not $PkgConfigPath) {
+            Write-Host "pkg-config not found in standard paths. Installing via Chocolatey..."
+            choco install pkgconfiglite --yes --no-progress
+            if (Test-Path "C:\ProgramData\chocolatey\bin\pkg-config.exe") {
+                $PkgConfigPath = "C:\ProgramData\chocolatey\bin\pkg-config.exe"
+            }
+        }
+
+        if ($PkgConfigPath) {
+            $PkgConfigDir = Split-Path -Parent $PkgConfigPath
+            Write-Host "Using pkg-config from: $PkgConfigPath"
+            Add-Content -Path $env:GITHUB_PATH -Value $PkgConfigDir -Encoding utf8
+            Add-Content -Path $env:GITHUB_ENV -Value "PKG_CONFIG=$PkgConfigPath" -Encoding utf8
+        } else {
+            Write-Error "Failed to locate or install pkg-config"
             exit 1
         }
 
@@ -64,8 +208,12 @@ jobs:
             # Release exists, check for asset collision
             $EscapedAsset = [regex]::Escape($TargetAsset)
             if ($ExistingAssets -match $EscapedAsset) {
-                Write-Error "CRITICAL: Asset '${TargetAsset}' already exists in release ${TagName}. Aborting to prevent overwrite."
-                exit 1
+                if ('${{ inputs.dry_run }}' -eq 'true') {
+                    Write-Host "Dry run enabled: Asset '${TargetAsset}' exists in release ${TagName}, but continuing build." -ForegroundColor Yellow
+                } else {
+                    Write-Error "CRITICAL: Asset '${TargetAsset}' already exists in release ${TagName}. Aborting to prevent overwrite."
+                    exit 1
+                }
             } else {
                 Write-Host "Release exists, but Windows asset is missing. Proceeding to build."
             }
@@ -81,19 +229,18 @@ jobs:
 
     - name: Install Dependencies
       run: |
+        New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
         vcpkg integrate install
-        vcpkg update
-        vcpkg install dav1d:x64-windows-static aom:x64-windows-static libde265:x64-windows-static x265:x64-windows-static libheif:x64-windows-static
-        choco install nasm pkgconfiglite
+        vcpkg install --triplet x64-windows-static --x-install-root="C:/vcpkg/installed"
 
     - name: Extract Versions for build.rs
       shell: powershell
       run: |
         # 1. Get raw output from vcpkg
         # Output looks like: "dav1d:x64-windows-static       1.5.1        AV1 decoder..."
-        $Dav1dInfo = vcpkg list dav1d:x64-windows-static
-        $HeifInfo = vcpkg list libheif:x64-windows-static
-        $AomInfo = vcpkg list aom:x64-windows-static
+        $Dav1dInfo = vcpkg list --x-install-root="C:/vcpkg/installed" dav1d:x64-windows-static
+        $HeifInfo = vcpkg list --x-install-root="C:/vcpkg/installed" libheif:x64-windows-static
+        $AomInfo = vcpkg list --x-install-root="C:/vcpkg/installed" aom:x64-windows-static
 
         # 2. Parse the version using Regex
         # We look for the first non-whitespace string after the package name
@@ -126,9 +273,9 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "EXT_DAV1D_VER=${Dav1dVer}" -Encoding utf8
         Add-Content -Path $env:GITHUB_ENV -Value "EXT_HEIF_VER=${HeifVer}" -Encoding utf8
         Add-Content -Path $env:GITHUB_ENV -Value "EXT_AOM_VER=${AomVer}" -Encoding utf8
-        Add-Content -Path $env:GITHUB_ENV -Value "EXT_DAV1D_HASH=Managed by vcpkg (x64-windows-static)" -Encoding utf8
-        Add-Content -Path $env:GITHUB_ENV -Value "EXT_HEIF_HASH=Managed by vcpkg (x64-windows-static)" -Encoding utf8
-        Add-Content -Path $env:GITHUB_ENV -Value "EXT_AOM_HASH=Managed by vcpkg (x64-windows-static)" -Encoding utf8
+        Add-Content -Path $env:GITHUB_ENV -Value "EXT_DAV1D_HASH=Managed by vcpkg.json (x64-windows-static)" -Encoding utf8
+        Add-Content -Path $env:GITHUB_ENV -Value "EXT_HEIF_HASH=Managed by vcpkg.json (x64-windows-static)" -Encoding utf8
+        Add-Content -Path $env:GITHUB_ENV -Value "EXT_AOM_HASH=Managed by vcpkg.json (x64-windows-static)" -Encoding utf8
 
     - name: Install Rust 1.99.1
       uses: dtolnay/rust-toolchain@1.99.1
@@ -146,6 +293,8 @@ jobs:
         RUSTFLAGS: "-C target-feature=+crt-static"
         VCPKGRS_TRIPLET: x64-windows-static
       run: |
+        # Verify pkg-config executes properly
+        & $env:PKG_CONFIG --version
         if (Test-Path "${env:PKG_CONFIG_PATH}/dav1d.pc") {
             Write-Host "Found static dav1d.pc" -ForegroundColor Green
         } else {
@@ -166,12 +315,16 @@ jobs:
         Get-ChildItem "staging/"
 
     - name: Attest Build Provenance
-      uses: actions/attest-build-provenance@v2
+      if: ${{ !inputs.dry_run }}
+      # v4.2.2
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
       with:
         subject-path: "staging/phdupes-v${{ env.VERSION }}-windows-static.exe"
 
     - name: Publish Release
-      uses: softprops/action-gh-release@v2
+      if: ${{ !inputs.dry_run }}
+      # v3.0.3
+      uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
       with:
         tag_name: v${{ env.VERSION }}
         files: staging/*

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "phdupes",
+  "version-string": "0.1.0",
+  "builtin-baseline": "664933b8d385dfc01f4e0cdff4c7c74e71f6a740",
+  "dependencies": [
+    "dav1d",
+    "aom",
+    "libde265",
+    "x265",
+    "libheif"
+  ]
+}
