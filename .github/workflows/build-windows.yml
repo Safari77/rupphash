@@ -140,11 +140,57 @@ jobs:
     - name: Setup pkg-config and NASM
       shell: powershell
       run: |
+        # Helper function to install Chocolatey packages with retries to handle transient 503 errors
+        function Install-ChocoPackageWithRetry {
+            param (
+                [string]$PackageName,
+                [string]$ExpectedPath = "",
+                [int]$MaxRetries = 5,
+                [int]$DelaySeconds = 10
+            )
+            for ($i = 1; $i -le $MaxRetries; $i++) {
+                Write-Host "Attempt $i of ${MaxRetries}: Installing $PackageName via Chocolatey..."
+                choco install $PackageName --yes --no-progress --fail-on-unfound
+
+                # Chocolatey can exit with 0 on feed errors (0/0 packages installed), so verify on disk
+                $targetExists = if ($ExpectedPath) {
+                    Test-Path $ExpectedPath
+                } else {
+                    Test-Path "C:\ProgramData\chocolatey\lib\$PackageName"
+                }
+
+                if ($LASTEXITCODE -eq 0 -and $targetExists) {
+                    Write-Host "Successfully installed $PackageName." -ForegroundColor Green
+                    return $true
+                }
+
+                if ($i -lt $MaxRetries) {
+                    Write-Warning "Installation of $PackageName failed (exit code: $LASTEXITCODE, found on disk: $targetExists). Retrying in $DelaySeconds seconds..."
+                    Start-Sleep -Seconds $DelaySeconds
+                }
+            }
+            return $false
+        }
+
         # 1. Ensure NASM is on PATH (pre-installed on Windows runners at C:\Program Files\NASM)
-        if (Test-Path "C:\Program Files\NASM") {
+        if (Test-Path "C:\Program Files\NASM\nasm.exe") {
             Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM" -Encoding utf8
+        } elseif (Test-Path "C:\ProgramData\chocolatey\bin\nasm.exe") {
+            Add-Content -Path $env:GITHUB_PATH -Value "C:\ProgramData\chocolatey\bin" -Encoding utf8
         } else {
-            choco install nasm --yes --no-progress
+            $nasmInstalled = Install-ChocoPackageWithRetry -PackageName "nasm" -ExpectedPath "C:\ProgramData\chocolatey\bin\nasm.exe"
+            if ($nasmInstalled) {
+                Add-Content -Path $env:GITHUB_PATH -Value "C:\ProgramData\chocolatey\bin" -Encoding utf8
+            } else {
+                # Fallback: install nasm via MSYS2 pacman if Chocolatey feed remains unavailable
+                Write-Host "Attempting fallback for nasm via MSYS2 pacman..."
+                if (Test-Path "C:\msys64\usr\bin\pacman.exe") {
+                    & "C:\msys64\usr\bin\pacman.exe" -S --noconfirm --needed mingw-w64-x86_64-nasm
+                    if (Test-Path "C:\msys64\mingw64\bin\nasm.exe") {
+                        Add-Content -Path $env:GITHUB_PATH -Value "C:\msys64\mingw64\bin" -Encoding utf8
+                    }
+                }
+            }
         }
 
         # 2. Locate or install pkg-config, then pin PKG_CONFIG env and directory to GITHUB_PATH
@@ -165,9 +211,18 @@ jobs:
 
         if (-not $PkgConfigPath) {
             Write-Host "pkg-config not found in standard paths. Installing via Chocolatey..."
-            choco install pkgconfiglite --yes --no-progress
-            if (Test-Path "C:\ProgramData\chocolatey\bin\pkg-config.exe") {
+            $pkgConfigInstalled = Install-ChocoPackageWithRetry -PackageName "pkgconfiglite" -ExpectedPath "C:\ProgramData\chocolatey\bin\pkg-config.exe"
+            if ($pkgConfigInstalled) {
                 $PkgConfigPath = "C:\ProgramData\chocolatey\bin\pkg-config.exe"
+            } else {
+                # Fallback: install pkgconf via MSYS2 pacman if Chocolatey feed remains unavailable
+                Write-Host "Attempting fallback for pkg-config via MSYS2 pacman..."
+                if (Test-Path "C:\msys64\usr\bin\pacman.exe") {
+                    & "C:\msys64\usr\bin\pacman.exe" -S --noconfirm --needed mingw-w64-x86_64-pkgconf
+                    if (Test-Path "C:\msys64\mingw64\bin\pkg-config.exe") {
+                        $PkgConfigPath = "C:\msys64\mingw64\bin\pkg-config.exe"
+                    }
+                }
             }
         }
 
