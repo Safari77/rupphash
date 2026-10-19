@@ -763,7 +763,6 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                     x_scale: 2.0,
                     y_scale: 2.0,
                     bg_color: hayro::vello_cpu::color::palette::css::WHITE,
-                    ..Default::default()
                 };
 
                 // Render the page to a pixmap
