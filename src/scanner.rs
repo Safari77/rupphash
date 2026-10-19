@@ -4,9 +4,9 @@ use codes_iso_3166::part_1::CountryCode;
 use codes_iso_3166::part_2::SubdivisionCode;
 use crossbeam_channel::{Sender, unbounded};
 use geo::Point;
-use image::{DynamicImage, GenericImageView};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, Rgba};
 use jpeg_decoder::Decoder as Tier2Decoder;
-use libheif_rs::HeifContext;
+use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 use num_integer::gcd;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -115,7 +115,24 @@ pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exi
         }
     };
 
-    exif::Reader::new().read_from_container(&mut reader).ok()
+    let mut exif_reader = exif::Reader::new();
+    exif_reader.continue_on_error(true);
+
+    match exif_reader.read_from_container(&mut reader) {
+        Ok(exif) => Some(exif),
+        Err(exif::Error::PartialResult(partial)) => {
+            let (exif, errors) = partial.into_inner();
+            #[cfg(debug_assertions)]
+            for err in errors {
+                eprintln!("[DEBUG-EXIF-WARNING] Non-fatal parse warning: {err}");
+            }
+            Some(exif)
+        }
+        Err(err) => {
+            eprintln!("[DEBUG-EXIF-ERROR] Fatal parse error on {:?}: {err}", path);
+            None
+        }
+    }
 }
 
 /// True for container formats whose decoder (libheif) bakes the orientation
@@ -476,6 +493,132 @@ fn get_derived_value(
     }
 }
 
+pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
+    let lib_heif = LibHeif::new();
+    let ctx = HeifContext::read_from_bytes(bytes).map_err(|e| e.to_string())?;
+    let handle = ctx.primary_image_handle().map_err(|e| e.to_string())?;
+
+    let bit_depth = handle.luma_bits_per_pixel();
+    let has_alpha = handle.has_alpha_channel();
+    let channels = if has_alpha { 4 } else { 3 };
+
+    let chroma = match (bit_depth > 8, has_alpha) {
+        (true, true) => RgbChroma::HdrRgbaLe,
+        (true, false) => RgbChroma::HdrRgbLe,
+        (false, true) => RgbChroma::Rgba,
+        (false, false) => RgbChroma::Rgb,
+    };
+
+    let decoded =
+        lib_heif.decode(&handle, ColorSpace::Rgb(chroma), None).map_err(|e| e.to_string())?;
+
+    let planes = decoded.planes();
+    let plane = planes.interleaved.ok_or_else(|| "HEIC: Missing interleaved plane".to_string())?;
+
+    // Pull dimensions from the decoded plane to guarantee buffer safety
+    let width = plane.width as usize;
+    let height = plane.height as usize;
+    let stride = plane.stride;
+    let data = plane.data;
+
+    let samples_per_row = width * channels;
+
+    if bit_depth > 8 {
+        let row_bytes_len = samples_per_row * 2;
+        if stride < row_bytes_len || data.len() < height.saturating_sub(1) * stride + row_bytes_len
+        {
+            return Err("HEIC: Plane buffer smaller than expected dimensions".to_string());
+        }
+
+        let mut out = Vec::with_capacity(samples_per_row * height);
+
+        // Hoist the bit_depth check outside the pixel loops so LLVM vectorizes with SIMD
+        match bit_depth {
+            10 => {
+                for y in 0..height {
+                    let row_start = y * stride;
+                    let row_bytes = &data[row_start..row_start + row_bytes_len];
+                    // 10-bit: (v << 6) | (v >> 4) maps 1023 -> 65535 exactly
+                    out.extend(row_bytes.as_chunks::<2>().0.iter().map(|&c| {
+                        let v = u16::from_le_bytes(c);
+                        (v << 6) | (v >> 4)
+                    }));
+                }
+            }
+            12 => {
+                for y in 0..height {
+                    let row_start = y * stride;
+                    let row_bytes = &data[row_start..row_start + row_bytes_len];
+                    // 12-bit: (v << 4) | (v >> 8) maps 4095 -> 65535 exactly
+                    out.extend(row_bytes.as_chunks::<2>().0.iter().map(|&c| {
+                        let v = u16::from_le_bytes(c);
+                        (v << 4) | (v >> 8)
+                    }));
+                }
+            }
+            16 => {
+                for y in 0..height {
+                    let row_start = y * stride;
+                    let row_bytes = &data[row_start..row_start + row_bytes_len];
+                    out.extend(row_bytes.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)));
+                }
+            }
+            _ => {
+                // Bit-replication scaling: scales an arbitrary N-bit value (e.g. 10-bit 0..1023)
+                // to standard 16-bit unorm (0..65535).
+                let max_val = ((1u32 << bit_depth) - 1).max(1);
+                for y in 0..height {
+                    let row_start = y * stride;
+                    let row_bytes = &data[row_start..row_start + row_bytes_len];
+                    out.extend(row_bytes.as_chunks::<2>().0.iter().map(|&c| {
+                        let v = u16::from_le_bytes(c) as u32;
+                        ((v * 65535 + (max_val / 2)) / max_val) as u16
+                    }));
+                }
+            }
+        }
+
+        if has_alpha {
+            let buf = ImageBuffer::<Rgba<u16>, _>::from_raw(width as u32, height as u32, out)
+                .ok_or_else(|| "Failed to construct ImageRgba16 buffer".to_string())?;
+            Ok(DynamicImage::ImageRgba16(buf))
+        } else {
+            let buf = ImageBuffer::<Rgb<u16>, _>::from_raw(width as u32, height as u32, out)
+                .ok_or_else(|| "Failed to construct ImageRgb16 buffer".to_string())?;
+            Ok(DynamicImage::ImageRgb16(buf))
+        }
+    } else {
+        // Standard 8-bit decode path
+        if stride < samples_per_row
+            || data.len() < height.saturating_sub(1) * stride + samples_per_row
+        {
+            return Err("HEIC: Plane buffer smaller than expected dimensions".to_string());
+        }
+
+        let out = if stride == samples_per_row {
+            // Fast path: single allocation + memcpy when there is no row padding
+            data[..samples_per_row * height].to_vec()
+        } else {
+            let mut out = Vec::with_capacity(samples_per_row * height);
+            for y in 0..height {
+                let row_start = y * stride;
+                out.extend_from_slice(&data[row_start..row_start + samples_per_row]);
+            }
+            out
+        };
+
+        if has_alpha {
+            let buf = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, out)
+                .ok_or_else(|| "Failed to construct ImageRgba8 buffer".to_string())?;
+            Ok(DynamicImage::ImageRgba8(buf))
+        } else {
+            let buf = ImageBuffer::<Rgb<u8>, _>::from_raw(width as u32, height as u32, out)
+                .ok_or_else(|| "Failed to construct ImageRgb8 buffer".to_string())?;
+            Ok(DynamicImage::ImageRgb8(buf))
+        }
+    }
+}
+
 pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage, String> {
     let ext =
         path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
@@ -729,6 +872,8 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 }
             }
         }
+
+        "heic" | "heif" => return decode_heic(bytes),
 
         _ => {}
     }

@@ -5,7 +5,6 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use geo::Point;
 use jiff::Timestamp;
-use libheif_rs::integration::image::{register_heic_decoding_hook, register_heif_decoding_hook};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -552,8 +551,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     hayro_jpeg2000::integration::register_decoding_hook();
-    register_heif_decoding_hook();
-    register_heic_decoding_hook();
     image_extras::register();
     let args = Cli::parse();
 

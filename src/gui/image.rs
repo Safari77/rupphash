@@ -2000,7 +2000,7 @@ fn load_and_process_image_from_bytes(
     // ---------------------------------------------------------------------
     // JXL / PDF / JPEG / TIFF FAST PATH
     // ---------------------------------------------------------------------
-    if matches!(ext.as_str(), "jpg" | "jpeg" | "jxl" | "pdf" | "tif" | "tiff") {
+    if matches!(ext.as_str(), "jpg" | "jpeg" | "jxl" | "pdf" | "tif" | "tiff" | "heic" | "heif") {
         eprintln!("[DEBUG-GUI] attempting scanner decode for {:?}", path);
 
         match crate::scanner::load_image_fast(path, bytes) {
@@ -2008,9 +2008,19 @@ fn load_and_process_image_from_bytes(
                 let (w, h) = dyn_img.dimensions();
 
                 eprintln!("[DEBUG-GUI] scanner decode SUCCESS for {:?}", path);
+
+                // Adjust HEIC container signaling before handing off to finish_dynamic
+                let mut final_cicp = cicp;
+                if matches!(ext.as_str(), "heic" | "heif")
+                    && let Some(ref mut c) = final_cicp {
+                        // libheif expands limited-range YCbCr to full-range RGB during matrix conversion.
+                        // Mark full_range = true so HDR/SDR pipeline won't apply a second range expansion.
+                        c.full_range = true;
+                    }
+
                 // 16-bit TIFF and JXL reach this branch, so let finish_dynamic
                 // decide whether they are worth keeping at 10 bits.
-                return Ok(finish_dynamic(dyn_img, (w, h), orientation, caps, cicp, path));
+                return Ok(finish_dynamic(dyn_img, (w, h), orientation, caps, final_cicp, path));
             }
             Err(err_msg) => {
                 eprintln!("[DEBUG-GUI] scanner decode FAILED for {:?}: {}", path, err_msg);
