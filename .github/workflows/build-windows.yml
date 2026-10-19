@@ -42,12 +42,9 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        # 1. Extract Version
-        # perl -ne 'print "$1\n" if /^version\s*=\s*"([^"\r\n]+)"/' Cargo.toml
-        $Content = Get-Content Cargo.toml
-        $VersionMatch = Select-String -InputObject $Content -Pattern '^version\s*=\s*"([^"\r\n]+)"'
-        $Version = $VersionMatch.Matches[0].Groups[1].Value.Trim()
-        if (-not $Version) {
+        # 1. Extract Version via cargo metadata
+        $Version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version.Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $Version) {
             Write-Error "Failed to extract a valid version string"
             exit 1
         }
