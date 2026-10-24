@@ -86,7 +86,7 @@ egui-wgpu = "0.37"
 walkers = { version = "0.63", features = ["mvt"] }
 #walkers = { git = "https://github.com/Safari77/walkers", branch = "main" }
 roaring = { version = "0.11", features = ["serde"] }
-skrifa = "0.48"
+skrifa = "0.49"
 env_logger = "0.11"
 
 [profile.release]
