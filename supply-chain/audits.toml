@@ -1,0 +1,10 @@
+
+# cargo-vet audits file
+
+[audits]
+
+[[trusted.openssl-probe]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2025-12-29"
+end = "2027-10-26"
