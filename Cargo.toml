@@ -71,6 +71,7 @@ mp4parse = "0.17"
 rustix = { version = "1", features = ["fs"] }
 num-integer = "0.1"
 tempfile = "3"
+criterion = "0.8"
 
 # GUI
 eframe = { version = "0.37", default-features = false, features = [
@@ -100,6 +101,10 @@ opt-level = 3
 debug = true
 lto = false
 
+[[bench]]
+name = "benchmarks"
+harness = false
+
 [build-dependencies]
 cargo-lock = "11"
 serde = { version = "1.0", features = ["derive"] }
@@ -111,6 +116,10 @@ egui-wgpu = { path = "vendor/egui-wgpu" }
 [[bin]]
 name = "phdupes"
 path = "src/phdupes.rs"
+
+[lib]
+name = "rupphash"
+path = "src/lib.rs"
 
 [[bin]]
 name = "phash_test"

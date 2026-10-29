@@ -54,7 +54,20 @@ impl HammingHash for [u8; 32] {
 
     #[inline(always)]
     fn hamming_distance(&self, other: &Self) -> u32 {
-        self.iter().zip(other.iter()).map(|(a, b)| (a ^ b).count_ones()).sum()
+        let a0 = u64::from_ne_bytes(self[0..8].try_into().unwrap());
+        let a1 = u64::from_ne_bytes(self[8..16].try_into().unwrap());
+        let a2 = u64::from_ne_bytes(self[16..24].try_into().unwrap());
+        let a3 = u64::from_ne_bytes(self[24..32].try_into().unwrap());
+
+        let b0 = u64::from_ne_bytes(other[0..8].try_into().unwrap());
+        let b1 = u64::from_ne_bytes(other[8..16].try_into().unwrap());
+        let b2 = u64::from_ne_bytes(other[16..24].try_into().unwrap());
+        let b3 = u64::from_ne_bytes(other[24..32].try_into().unwrap());
+
+        (a0 ^ b0).count_ones()
+            + (a1 ^ b1).count_ones()
+            + (a2 ^ b2).count_ones()
+            + (a3 ^ b3).count_ones()
     }
 
     fn bit_width_per_chunk() -> usize {
