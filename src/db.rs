@@ -7,7 +7,10 @@ use chacha20poly1305::{
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use geo::Point;
-use lmdb::{Cursor, Database, DatabaseFlags, Environment, Transaction, WriteFlags};
+use redb::{
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    WriteTransaction,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -23,12 +26,22 @@ use tempfile::NamedTempFile;
 use zeroize::Zeroize;
 
 const CONFIG_FILE_NAME: &str = "phdupes.conf";
-const DB_FILE_NAME_PDQHASH: &str = "phdupes_pdqhash";
+const DB_FILE_NAME_PDQHASH: &str = "phdupes_redb";
 const DB_FILE_NAME_FEATURES: &str = "phdupes_features";
 const DB_FILE_NAME_PIXELHASH: &str = "phdupes_pixelhash";
 const DB_FILE_NAME_COEFFICIENTS: &str = "phdupes_coefficients";
 const DB_FILE_NAME_IGNORED: &str = "phdupes_ignored";
 const DB_FILE_NAME_IGNORED_PDQMAP: &str = "phdupes_ignored_pdqmap";
+
+pub type DbTable = TableDefinition<'static, &'static [u8; 32], &'static [u8]>;
+
+const TABLE_HASH: DbTable = TableDefinition::new("pdqhash");
+const TABLE_META: DbTable = TableDefinition::new("file_metadata");
+const TABLE_FEATURES: DbTable = TableDefinition::new(DB_FILE_NAME_FEATURES);
+const TABLE_COEFFICIENTS: DbTable = TableDefinition::new(DB_FILE_NAME_COEFFICIENTS);
+const TABLE_PIXELHASH: DbTable = TableDefinition::new(DB_FILE_NAME_PIXELHASH);
+const TABLE_IGNORED: DbTable = TableDefinition::new(DB_FILE_NAME_IGNORED);
+const TABLE_IGNORED_PDQMAP: DbTable = TableDefinition::new(DB_FILE_NAME_IGNORED_PDQMAP);
 
 /// Version of the PDQ pipeline whose output is stored in hash_db and coeff_db.
 ///
@@ -53,7 +66,7 @@ const ENCRYPTION_OVERHEAD: usize = 24 + 16;
 // Total overhead: encryption only
 const TOTAL_OVERHEAD: usize = ENCRYPTION_OVERHEAD;
 
-// Default LMDB map size in MiB (2048 MiB = 2 GB)
+// Default redb cache size in MiB (2048 MiB = 2 GB)
 const DEFAULT_DB_SIZE_MB: u32 = 2048;
 
 /// Hash algorithm selection
@@ -270,14 +283,14 @@ pub struct EnrichmentResult {
 }
 
 pub struct AppContext {
-    pub env: Arc<Environment>,
-    pub hash_db: Database,
-    pub meta_db: Database,
-    pub feature_db: Database,
-    pub coeff_db: Database, // Separate DB for PDQ coefficients
-    pub pixel_db: Database,
-    pub ignored_db: Database, // Registered/ignored files (duplicate finder)
-    pub ignored_pdqmap_db: Database, // Maps pdqhash → UUID for cross-session stability
+    pub env: Arc<Database>,
+    pub hash_db: DbTable,
+    pub meta_db: DbTable,
+    pub feature_db: DbTable,
+    pub coeff_db: DbTable, // Separate DB for PDQ coefficients
+    pub pixel_db: DbTable,
+    pub ignored_db: DbTable, // Registered/ignored files (duplicate finder)
+    pub ignored_pdqmap_db: DbTable, // Maps pdqhash → UUID for cross-session stability
     pub content_key: [u8; 32],
     pub meta_key: [u8; 32],
     pub grouping_config: GroupingConfig,
@@ -354,6 +367,11 @@ pub fn create_feature_update(
     Some((Some((meta_key, content_hash)), None, Some((content_hash, features)), None, None))
 }
 
+#[inline]
+fn corrupted_err(msg: &'static str) -> redb::Error {
+    redb::Error::Corrupted(msg.to_string())
+}
+
 impl AppContext {
     /// Atomically write the config file using `tempfile::NamedTempFile` in the
     /// same directory as `config_path`. Each writer gets a unique temporary file
@@ -412,7 +430,7 @@ impl AppContext {
                 cfg.gui.palette_sort,
                 cfg.gui.sdr_peak_nits
             );
-            eprintln!("[DEBUG-DB] LMDB map size: {} MiB", cfg.db_size_mb);
+            eprintln!("[DEBUG-DB] redb cache size: {} MiB", cfg.db_size_mb);
             eprintln!("[DEBUG-DB] Locations loaded: {}", cfg.locations.len());
 
             // Check for missing sections to write back defaults
@@ -538,68 +556,57 @@ impl AppContext {
         let cipher = XChaCha20Poly1305::new((&encryption_key).into());
         encryption_key.zeroize();
 
-        fs::create_dir_all(&db_path)?;
-
-        // Calculate map size from config (convert MiB to bytes)
-        let map_size = (config.db_size_mb as usize) * 1024 * 1024;
+        // Calculate cache size from config (convert MiB to bytes)
+        let cache_size = (config.db_size_mb as usize) * 1024 * 1024;
         eprintln!(
-            "[DEBUG-DB] Setting LMDB map size to {} bytes ({} MiB)",
-            map_size, config.db_size_mb
+            "[DEBUG-DB] Setting redb cache size to {} bytes ({} MiB) at {:?}",
+            cache_size, config.db_size_mb, db_path
         );
 
-        let env = Environment::new()
-            .set_map_size(map_size)
-            .set_max_dbs(10)
-            .set_max_readers(512)
-            .open(&db_path)?;
-
-        let actual_map_size = match env.info() {
-            Ok(info) => info.map_size(),
-            Err(e) => {
-                eprintln!("[WARN-DB] Could not get LMDB env info: {}, skipping map size check", e);
-                map_size
+        // Open database with retry loop to support parallel/concurrent process access
+        // Next redb supports Builder::set_concurrency_mode() ConcurrencyMode::MultiWriter
+        let env = match Database::builder().set_cache_size(cache_size).create(&db_path) {
+            Ok(db) => db,
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                eprintln!("[WARN-DB] Database is locked by another process. Waiting for lock...");
+                let start = Instant::now();
+                let timeout = Duration::from_secs(10);
+                loop {
+                    if start.elapsed() > timeout {
+                        return Err("Timeout waiting for database lock from another process".into());
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                    match Database::builder().set_cache_size(cache_size).create(&db_path) {
+                        Ok(db) => break db,
+                        Err(redb::DatabaseError::DatabaseAlreadyOpen) => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
             }
+            Err(e) => return Err(e.into()),
         };
 
-        let configured_map_size = map_size;
+        let hash_db = TABLE_HASH;
+        let meta_db = TABLE_META;
+        let feature_db = TABLE_FEATURES;
+        let coeff_db = TABLE_COEFFICIENTS;
+        let pixel_db = TABLE_PIXELHASH;
+        let ignored_db = TABLE_IGNORED;
+        let ignored_pdqmap_db = TABLE_IGNORED_PDQMAP;
 
-        if actual_map_size != configured_map_size {
-            let actual_mb = actual_map_size / (1024 * 1024);
-            let config_mb = config.db_size_mb as usize;
-
-            if configured_map_size > actual_map_size {
-                eprintln!(
-                    "[WARN-DB] Config db_size_mb ({} MiB) differs from current DB map size ({} MiB).",
-                    config_mb, actual_mb
-                );
-                eprintln!("[WARN-DB] The database is using its existing size. To increase:");
-                eprintln!("[WARN-DB]   - Delete the database directory ({:?}) and rescan", db_path);
-                eprintln!("[WARN-DB]   - Or use `mdb_copy -c` to compact/resize the database");
-            } else {
-                eprintln!(
-                    "[WARN-DB] Config db_size_mb ({} MiB) is smaller than current DB map size ({} MiB).",
-                    config_mb, actual_mb
-                );
-                eprintln!("[WARN-DB] LMDB cannot shrink an existing database. Options:");
-                eprintln!(
-                    "[WARN-DB]   - Update db_size_mb in config to {} to match actual size",
-                    actual_mb
-                );
-                eprintln!(
-                    "[WARN-DB]   - Delete the database directory ({:?}) to start fresh",
-                    db_path
-                );
-            }
+        // Ensure all tables exist in redb so read transactions never fail with TableDoesNotExist
+        {
+            let write_txn = env.begin_write()?;
+            let _ = write_txn.open_table(hash_db)?;
+            let _ = write_txn.open_table(meta_db)?;
+            let _ = write_txn.open_table(feature_db)?;
+            let _ = write_txn.open_table(coeff_db)?;
+            let _ = write_txn.open_table(pixel_db)?;
+            let _ = write_txn.open_table(ignored_db)?;
+            let _ = write_txn.open_table(ignored_pdqmap_db)?;
+            write_txn.commit()?;
         }
 
-        let hash_db = env.open_db(None)?;
-        let meta_db = env.create_db(Some("file_metadata"), DatabaseFlags::empty())?;
-        let feature_db = env.create_db(Some(DB_FILE_NAME_FEATURES), DatabaseFlags::empty())?;
-        let coeff_db = env.create_db(Some(DB_FILE_NAME_COEFFICIENTS), DatabaseFlags::empty())?;
-        let pixel_db = env.create_db(Some(DB_FILE_NAME_PIXELHASH), DatabaseFlags::empty())?;
-        let ignored_db = env.create_db(Some(DB_FILE_NAME_IGNORED), DatabaseFlags::empty())?;
-        let ignored_pdqmap_db =
-            env.create_db(Some(DB_FILE_NAME_IGNORED_PDQMAP), DatabaseFlags::empty())?;
         // Convert the locations into runtime usable Points
         let locations: HashMap<String, Point<f64>> =
             config.locations.into_iter().map(|(name, option)| (name, option.into())).collect();
@@ -687,10 +694,12 @@ impl AppContext {
     // --- DATABASE ACCESS ---
 
     /// Get PDQ hash (256-bit) from database
-    pub fn get_pdqhash(&self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, lmdb::Error> {
-        let txn = self.env.begin_ro_txn()?;
-        match txn.get(self.hash_db, content_hash) {
-            Ok(encrypted_bytes) => {
+    pub fn get_pdqhash(&self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, redb::Error> {
+        let txn = self.env.begin_read()?;
+        let table = txn.open_table(self.hash_db)?;
+        match table.get(content_hash)? {
+            Some(encrypted_guard) => {
+                let encrypted_bytes = encrypted_guard.value();
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
                     // Stored as [PDQ_ALGO_VERSION || 32-byte hash]. A different
                     // version means the entry came from another PDQ pipeline, so
@@ -705,11 +714,10 @@ impl AppContext {
                     }
                 } else {
                     eprintln!("[ERROR-DB] get_pdqhash Corrupted content_hash={:x?}", content_hash);
-                    Err(lmdb::Error::Corrupted)
+                    Err(corrupted_err("get_pdqhash decryption failed"))
                 }
             }
-            Err(lmdb::Error::NotFound) => Ok(None),
-            Err(e) => Err(e),
+            None => Ok(None),
         }
     }
 
@@ -717,21 +725,22 @@ impl AppContext {
     pub fn get_features(
         &self,
         content_hash: &[u8; 32],
-    ) -> Result<Option<ImageFeatures>, lmdb::Error> {
-        let txn = self.env.begin_ro_txn()?;
-        match txn.get(self.feature_db, content_hash) {
-            Ok(encrypted_bytes) => {
+    ) -> Result<Option<ImageFeatures>, redb::Error> {
+        let txn = self.env.begin_read()?;
+        let table = txn.open_table(self.feature_db)?;
+        match table.get(content_hash)? {
+            Some(encrypted_guard) => {
+                let encrypted_bytes = encrypted_guard.value();
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
                     ImageFeatures::from_bytes(&decrypted)
                         .map(Some)
-                        .map_err(|_| lmdb::Error::Corrupted)
+                        .map_err(|_| corrupted_err("get_features deserialization failed"))
                 } else {
                     eprintln!("[ERROR] get_features Corrupted ch={:x?}", content_hash);
-                    Err(lmdb::Error::Corrupted)
+                    Err(corrupted_err("get_features decryption failed"))
                 }
             }
-            Err(lmdb::Error::NotFound) => Ok(None),
-            Err(e) => Err(e),
+            None => Ok(None),
         }
     }
 
@@ -746,10 +755,12 @@ impl AppContext {
     pub fn get_coefficients(
         &self,
         content_hash: &[u8; 32],
-    ) -> Result<Option<Vec<f32>>, lmdb::Error> {
-        let txn = self.env.begin_ro_txn()?;
-        match txn.get(self.coeff_db, content_hash) {
-            Ok(encrypted_bytes) => {
+    ) -> Result<Option<Vec<f32>>, redb::Error> {
+        let txn = self.env.begin_read()?;
+        let table = txn.open_table(self.coeff_db)?;
+        match table.get(content_hash)? {
+            Some(encrypted_guard) => {
+                let encrypted_bytes = encrypted_guard.value();
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
                     // Stored as [PDQ_ALGO_VERSION || postcard(CachedCoefficients)].
                     match decrypted.split_first() {
@@ -757,28 +768,29 @@ impl AppContext {
                             if let Ok(cached) = CachedCoefficients::from_bytes(rest) {
                                 Ok(Some(cached.coefficients))
                             } else {
-                                Err(lmdb::Error::Corrupted)
+                                Err(corrupted_err("get_coefficients deserialization failed"))
                             }
                         }
                         // Older algorithm version: treat as absent, not corrupt.
                         _ => Ok(None),
                     }
                 } else {
-                    Err(lmdb::Error::Corrupted)
+                    Err(corrupted_err("get_coefficients decryption failed"))
                 }
             }
-            Err(lmdb::Error::NotFound) => Ok(None),
-            Err(e) => Err(e),
+            None => Ok(None),
         }
     }
 
     /// Retrieve content hash from metadata key.
     /// STRICTLY expects [ContentHash (32) || Timestamp (8)].
     /// Returns ONLY the ContentHash.
-    pub fn get_content_hash(&self, meta_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, lmdb::Error> {
-        let txn = self.env.begin_ro_txn()?;
-        match txn.get(self.meta_db, meta_hash) {
-            Ok(encrypted) => {
+    pub fn get_content_hash(&self, meta_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, redb::Error> {
+        let txn = self.env.begin_read()?;
+        let table = txn.open_table(self.meta_db)?;
+        match table.get(meta_hash)? {
+            Some(encrypted_guard) => {
+                let encrypted = encrypted_guard.value();
                 if let Some(decrypted) = self.decrypt_value(meta_hash, encrypted) {
                     if decrypted.len() == 40 {
                         let mut arr = [0u8; 32];
@@ -787,30 +799,32 @@ impl AppContext {
                     } else {
                         // Strict check: if size is wrong, it's corrupted or old format
                         eprintln!("[ERROR] get_content_hash Corrupted mh={:x?}", meta_hash);
-                        Err(lmdb::Error::Corrupted)
+                        Err(corrupted_err("get_content_hash invalid length"))
                     }
                 } else {
-                    Err(lmdb::Error::Corrupted)
+                    Err(corrupted_err("get_content_hash decryption failed"))
                 }
             }
-            Err(lmdb::Error::NotFound) => Ok(None),
-            Err(e) => Err(e),
+            None => Ok(None),
         }
     }
 
-    pub fn get_pixel_hash(&self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, lmdb::Error> {
-        let txn = self.env.begin_ro_txn()?;
-        match txn.get(self.pixel_db, content_hash) {
-            Ok(encrypted_bytes) => {
+    pub fn get_pixel_hash(&self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, redb::Error> {
+        let txn = self.env.begin_read()?;
+        let table = txn.open_table(self.pixel_db)?;
+        match table.get(content_hash)? {
+            Some(encrypted_guard) => {
+                let encrypted_bytes = encrypted_guard.value();
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    let arr: [u8; 32] = decrypted.try_into().map_err(|_| lmdb::Error::Corrupted)?;
+                    let arr: [u8; 32] = decrypted
+                        .try_into()
+                        .map_err(|_| corrupted_err("get_pixel_hash invalid length"))?;
                     Ok(Some(arr))
                 } else {
-                    Err(lmdb::Error::Corrupted)
+                    Err(corrupted_err("get_pixel_hash decryption failed"))
                 }
             }
-            Err(lmdb::Error::NotFound) => Ok(None),
-            Err(e) => Err(e),
+            None => Ok(None),
         }
     }
 
@@ -866,15 +880,21 @@ impl AppContext {
     ) -> HashMap<u128, ImageFeatures> {
         let mut results = HashMap::with_capacity(files.len());
 
-        let Ok(txn) = self.env.begin_ro_txn() else {
+        let Ok(txn) = self.env.begin_read() else {
+            return results;
+        };
+        let Ok(meta_table) = txn.open_table(self.meta_db) else {
+            return results;
+        };
+        let Ok(feature_table) = txn.open_table(self.feature_db) else {
             return results;
         };
 
         for &(unique_file_id, size, mtime_ns) in files {
             let meta_key = compute_meta_key(&self.meta_key, mtime_ns, size, unique_file_id);
 
-            if let Ok(encrypted) = txn.get(self.meta_db, &meta_key)
-                && let Some(decrypted) = self.decrypt_value(&meta_key, encrypted)
+            if let Ok(Some(encrypted_guard)) = meta_table.get(&meta_key)
+                && let Some(decrypted) = self.decrypt_value(&meta_key, encrypted_guard.value())
                 && decrypted.len() == 40
             {
                 let mut content_hash = [0u8; 32];
@@ -884,9 +904,9 @@ impl AppContext {
                     continue;
                 }
 
-                if let Ok(encrypted_features) = txn.get(self.feature_db, &content_hash)
+                if let Ok(Some(encrypted_features_guard)) = feature_table.get(&content_hash)
                     && let Some(decrypted_features) =
-                        self.decrypt_value(&content_hash, encrypted_features)
+                        self.decrypt_value(&content_hash, encrypted_features_guard.value())
                     && let Ok(features) = ImageFeatures::from_bytes(&decrypted_features)
                 {
                     results.insert(unique_file_id, features);
@@ -908,133 +928,117 @@ impl AppContext {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let cutoff = now.saturating_sub(max_age_seconds);
 
-        let mut txn = self.env.begin_rw_txn()?;
+        let txn = self.env.begin_write()?;
         let mut valid_content_hashes = HashSet::new();
         let mut meta_remove_count = 0;
         let mut hash_remove_count = 0;
 
         // 1. Scan MetaDB
-        if txn.stat(self.meta_db)?.entries() > 0 {
-            let mut keys_to_delete = Vec::new();
-            {
-                let mut cursor = txn.open_ro_cursor(self.meta_db)?;
-                for (key, val_bytes) in cursor.iter_start().flatten() {
+        {
+            let mut table = txn.open_table(self.meta_db)?;
+            if table.len()? > 0 {
+                let mut keys_to_delete = Vec::new();
+                for item in table.iter()? {
+                    let (key_guard, val_guard) = item?;
+                    let key = key_guard.value();
+                    let val_bytes = val_guard.value();
+
                     if let Some(decrypted) = self.decrypt_value(key, val_bytes) {
                         if decrypted.len() == 40 {
                             let ts_bytes: [u8; 8] = decrypted[32..40].try_into().unwrap();
                             let last_seen = u64::from_le_bytes(ts_bytes);
 
                             if last_seen < cutoff {
-                                keys_to_delete.push(key.to_vec());
+                                keys_to_delete.push(*key);
                             } else {
                                 let mut ch = [0u8; 32];
                                 ch.copy_from_slice(&decrypted[0..32]);
                                 valid_content_hashes.insert(ch);
                             }
                         } else {
-                            keys_to_delete.push(key.to_vec());
+                            keys_to_delete.push(*key);
                         }
                     } else {
-                        keys_to_delete.push(key.to_vec());
+                        keys_to_delete.push(*key);
                     }
                 }
-            }
-            for key in keys_to_delete {
-                txn.del(self.meta_db, &key, None)?;
-                meta_remove_count += 1;
+                for key in keys_to_delete {
+                    table.remove(&key)?;
+                    meta_remove_count += 1;
+                }
             }
         }
 
         // 2. Sweep HashDB
-        if txn.stat(self.hash_db)?.entries() > 0 {
-            let mut keys_to_delete = Vec::new();
-            {
-                let mut cursor = txn.open_ro_cursor(self.hash_db)?;
-                for iter in cursor.iter_start() {
-                    if let Ok((key, _)) = iter
-                        && key.len() == 32
-                    {
-                        let mut k = [0u8; 32];
-                        k.copy_from_slice(key);
-
-                        if !valid_content_hashes.contains(&k) {
-                            keys_to_delete.push(k);
-                        }
+        {
+            let mut table = txn.open_table(self.hash_db)?;
+            if table.len()? > 0 {
+                let mut keys_to_delete = Vec::new();
+                for item in table.iter()? {
+                    let (key_guard, _) = item?;
+                    let k = *key_guard.value();
+                    if !valid_content_hashes.contains(&k) {
+                        keys_to_delete.push(k);
                     }
                 }
-            }
-            for k in keys_to_delete {
-                txn.del(self.hash_db, &k, None)?;
-                hash_remove_count += 1;
+                for k in keys_to_delete {
+                    table.remove(&k)?;
+                    hash_remove_count += 1;
+                }
             }
         }
 
         // 3. Sweep FeatureDB
-        if txn.stat(self.feature_db)?.entries() > 0 {
-            let mut keys_to_delete = Vec::new();
-            {
-                let mut cursor = txn.open_ro_cursor(self.feature_db)?;
-                for iter in cursor.iter_start() {
-                    if let Ok((key, _)) = iter
-                        && key.len() == 32
-                    {
-                        let mut k = [0u8; 32];
-                        k.copy_from_slice(key);
-
-                        if !valid_content_hashes.contains(&k) {
-                            keys_to_delete.push(k);
-                        }
+        {
+            let mut table = txn.open_table(self.feature_db)?;
+            if table.len()? > 0 {
+                let mut keys_to_delete = Vec::new();
+                for item in table.iter()? {
+                    let (key_guard, _) = item?;
+                    let k = *key_guard.value();
+                    if !valid_content_hashes.contains(&k) {
+                        keys_to_delete.push(k);
                     }
                 }
-            }
-            for k in keys_to_delete {
-                txn.del(self.feature_db, &k, None)?;
+                for k in keys_to_delete {
+                    table.remove(&k)?;
+                }
             }
         }
 
         // 4. Sweep CoeffDB (PDQ coefficients)
-        if txn.stat(self.coeff_db)?.entries() > 0 {
-            let mut keys_to_delete = Vec::new();
-            {
-                let mut cursor = txn.open_ro_cursor(self.coeff_db)?;
-                for iter in cursor.iter_start() {
-                    if let Ok((key, _)) = iter
-                        && key.len() == 32
-                    {
-                        let mut k = [0u8; 32];
-                        k.copy_from_slice(key);
-
-                        if !valid_content_hashes.contains(&k) {
-                            keys_to_delete.push(k);
-                        }
+        {
+            let mut table = txn.open_table(self.coeff_db)?;
+            if table.len()? > 0 {
+                let mut keys_to_delete = Vec::new();
+                for item in table.iter()? {
+                    let (key_guard, _) = item?;
+                    let k = *key_guard.value();
+                    if !valid_content_hashes.contains(&k) {
+                        keys_to_delete.push(k);
                     }
                 }
-            }
-            for k in keys_to_delete {
-                txn.del(self.coeff_db, &k, None)?;
+                for k in keys_to_delete {
+                    table.remove(&k)?;
+                }
             }
         }
 
         // 5. Sweep PixelDB
-        if txn.stat(self.pixel_db)?.entries() > 0 {
-            let mut keys_to_delete = Vec::new();
-            {
-                let mut cursor = txn.open_ro_cursor(self.pixel_db)?;
-                for iter in cursor.iter_start() {
-                    if let Ok((key, _)) = iter
-                        && key.len() == 32
-                    {
-                        let mut k = [0u8; 32];
-                        k.copy_from_slice(key);
-
-                        if !valid_content_hashes.contains(&k) {
-                            keys_to_delete.push(k);
-                        }
+        {
+            let mut table = txn.open_table(self.pixel_db)?;
+            if table.len()? > 0 {
+                let mut keys_to_delete = Vec::new();
+                for item in table.iter()? {
+                    let (key_guard, _) = item?;
+                    let k = *key_guard.value();
+                    if !valid_content_hashes.contains(&k) {
+                        keys_to_delete.push(k);
                     }
                 }
-            }
-            for k in keys_to_delete {
-                txn.del(self.pixel_db, &k, None)?;
+                for k in keys_to_delete {
+                    table.remove(&k)?;
+                }
             }
         }
 
@@ -1062,7 +1066,7 @@ impl AppContext {
             let flush_interval = Duration::from_secs(1);
             let max_buffer = 1000;
             // Hard cap on total buffered updates. These updates are a recomputable
-            // cache, so if writes keep failing (e.g. the LMDB map is full) we drop
+            // cache, so if writes keep failing (e.g. disk full) we drop
             // the backlog past this point rather than growing memory without bound.
             let hard_cap = max_buffer * 16;
             // Tracks whether the previous write_batch failed, so retries are
@@ -1211,100 +1215,113 @@ impl AppContext {
 
     fn write_batch(
         cipher: &XChaCha20Poly1305,
-        env: &Environment,
-        meta_db: Database,
-        hash_db: Database,
-        feature_db: Database,
-        coeff_db: Database,
-        pixel_db: Database,
+        env: &Database,
+        meta_db: DbTable,
+        hash_db: DbTable,
+        feature_db: DbTable,
+        coeff_db: DbTable,
+        pixel_db: DbTable,
         meta_updates: &Vec<([u8; 32], [u8; 32])>,
         hash_updates: &Vec<([u8; 32], HashValue)>,
         feature_updates: &Vec<([u8; 32], ImageFeatures)>,
         coeff_updates: &Vec<([u8; 32], CachedCoefficients)>,
         pixel_updates: &Vec<([u8; 32], [u8; 32])>,
-    ) -> Result<(), lmdb::Error> {
-        let mut txn = env.begin_rw_txn()?;
+    ) -> Result<(), redb::Error> {
+        let txn = env.begin_write()?;
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let now_bytes = now.to_le_bytes();
 
         // 1. Meta Updates: Append Timestamp (8 bytes) to ContentHash (32 bytes)
-        for (key, val) in meta_updates {
-            let mut data = Vec::with_capacity(32 + 8);
-            data.extend_from_slice(val); // Content Hash
-            data.extend_from_slice(&now_bytes); // Timestamp
+        if !meta_updates.is_empty() {
+            let mut table = txn.open_table(meta_db)?;
+            for (key, val) in meta_updates {
+                let mut data = Vec::with_capacity(32 + 8);
+                data.extend_from_slice(val); // Content Hash
+                data.extend_from_slice(&now_bytes); // Timestamp
 
-            let encrypted = Self::encrypt_value(cipher, key, &data);
-            txn.put(meta_db, key, &encrypted, WriteFlags::empty())?;
+                let encrypted = Self::encrypt_value(cipher, key, &data);
+                table.insert(key, encrypted.as_slice())?;
+            }
         }
 
         // 2. Hash Updates: prefix the algorithm version (1 byte) to the hash
-        for (key, val) in hash_updates {
-            match val {
-                HashValue::PdqHash(pdqhash) => {
-                    let mut data = Vec::with_capacity(1 + 32);
-                    data.push(PDQ_ALGO_VERSION);
-                    data.extend_from_slice(pdqhash);
+        if !hash_updates.is_empty() {
+            let mut table = txn.open_table(hash_db)?;
+            for (key, val) in hash_updates {
+                match val {
+                    HashValue::PdqHash(pdqhash) => {
+                        let mut data = Vec::with_capacity(1 + 32);
+                        data.push(PDQ_ALGO_VERSION);
+                        data.extend_from_slice(pdqhash);
 
-                    let encrypted = Self::encrypt_value(cipher, key, &data);
-                    txn.put(hash_db, key, &encrypted, WriteFlags::empty())?;
+                        let encrypted = Self::encrypt_value(cipher, key, &data);
+                        table.insert(key, encrypted.as_slice())?;
+                    }
                 }
             }
         }
 
         // 3. Feature Updates
-        for (key, features) in feature_updates {
-            let bytes = features.to_bytes().expect("ImageFeatures serialization failed");
-            let encrypted = Self::encrypt_value(cipher, key, &bytes);
-            txn.put(feature_db, key, &encrypted, WriteFlags::empty())?;
+        if !feature_updates.is_empty() {
+            let mut table = txn.open_table(feature_db)?;
+            for (key, features) in feature_updates {
+                let bytes = features.to_bytes().expect("ImageFeatures serialization failed");
+                let encrypted = Self::encrypt_value(cipher, key, &bytes);
+                table.insert(key, encrypted.as_slice())?;
+            }
         }
 
         // 4. Coefficient Updates (PDQ coefficients - duplicate finder mode only)
         //    Prefixed with the algorithm version, same as the hashes.
-        for (key, coeffs) in coeff_updates {
-            let bytes = coeffs.to_bytes().expect("CachedCoefficients serialization failed");
-            let mut data = Vec::with_capacity(1 + bytes.len());
-            data.push(PDQ_ALGO_VERSION);
-            data.extend_from_slice(&bytes);
+        if !coeff_updates.is_empty() {
+            let mut table = txn.open_table(coeff_db)?;
+            for (key, coeffs) in coeff_updates {
+                let bytes = coeffs.to_bytes().expect("CachedCoefficients serialization failed");
+                let mut data = Vec::with_capacity(1 + bytes.len());
+                data.push(PDQ_ALGO_VERSION);
+                data.extend_from_slice(&bytes);
 
-            let encrypted = Self::encrypt_value(cipher, key, &data);
-            txn.put(coeff_db, key, &encrypted, WriteFlags::empty())?;
+                let encrypted = Self::encrypt_value(cipher, key, &data);
+                table.insert(key, encrypted.as_slice())?;
+            }
         }
 
         // 5. Pixel Updates
-        for (key, val) in pixel_updates {
-            let encrypted = Self::encrypt_value(cipher, key, val);
-            txn.put(pixel_db, key, &encrypted, WriteFlags::empty())?;
+        if !pixel_updates.is_empty() {
+            let mut table = txn.open_table(pixel_db)?;
+            for (key, val) in pixel_updates {
+                let encrypted = Self::encrypt_value(cipher, key, val);
+                table.insert(key, encrypted.as_slice())?;
+            }
         }
 
-        txn.commit()
+        txn.commit()?;
+        Ok(())
     }
 
     /// Iterate all features in the database for building search index.
     /// Calls the provided callback for each (content_hash, ImageFeatures) pair.
     #[allow(dead_code)]
-    pub fn iterate_all_features<F>(&self, mut callback: F) -> Result<usize, lmdb::Error>
+    pub fn iterate_all_features<F>(&self, mut callback: F) -> Result<usize, redb::Error>
     where
         F: FnMut(&[u8; 32], &ImageFeatures),
     {
-        let txn = self.env.begin_ro_txn()?;
+        let txn = self.env.begin_read()?;
+        let table = txn.open_table(self.feature_db)?;
         let mut count = 0;
 
-        if txn.stat(self.feature_db)?.entries() > 0 {
-            let mut cursor = txn.open_ro_cursor(self.feature_db)?;
-            for result in cursor.iter_start() {
-                if let Ok((key, encrypted)) = result
-                    && key.len() == 32
-                {
-                    let mut content_hash = [0u8; 32];
-                    content_hash.copy_from_slice(key);
+        if table.len()? > 0 {
+            for result in table.iter()? {
+                let (key_guard, encrypted_guard) = result?;
+                let content_hash = *key_guard.value();
+                let encrypted = encrypted_guard.value();
 
-                    if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
-                        && let Ok(features) = ImageFeatures::from_bytes(&decrypted)
-                    {
-                        callback(&content_hash, &features);
-                        count += 1;
-                    }
+                if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
+                    && let Ok(features) = ImageFeatures::from_bytes(&decrypted)
+                {
+                    callback(&content_hash, &features);
+                    count += 1;
                 }
             }
         }
@@ -1316,10 +1333,11 @@ impl AppContext {
 
     /// Check if a file has been explicitly ignored (ignored flag == true).
     pub fn is_ignored(&self, content_hash: &[u8; 32]) -> bool {
-        let Ok(txn) = self.env.begin_ro_txn() else { return false };
-        match txn.get(self.ignored_db, content_hash) {
-            Ok(encrypted) => {
-                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted)
+        let Ok(txn) = self.env.begin_read() else { return false };
+        let Ok(table) = txn.open_table(self.ignored_db) else { return false };
+        match table.get(content_hash) {
+            Ok(Some(encrypted_guard)) => {
+                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_guard.value())
                     && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
                 {
                     entry.ignored
@@ -1333,9 +1351,10 @@ impl AppContext {
 
     /// Get the group UUID for a file (works for both ignored and registered-only files).
     pub fn get_group_uuid(&self, content_hash: &[u8; 32]) -> Option<[u8; 16]> {
-        let txn = self.env.begin_ro_txn().ok()?;
-        let encrypted = txn.get(self.ignored_db, content_hash).ok()?;
-        let decrypted = self.decrypt_value(content_hash, encrypted)?;
+        let txn = self.env.begin_read().ok()?;
+        let table = txn.open_table(self.ignored_db).ok()?;
+        let encrypted_guard = table.get(content_hash).ok()??;
+        let decrypted = self.decrypt_value(content_hash, encrypted_guard.value())?;
         let entry = IgnoredEntry::from_bytes(&decrypted).ok()?;
         Some(entry.group_uuid)
     }
@@ -1344,30 +1363,35 @@ impl AppContext {
     /// First checks `ignored_pdqmap_db` by `pdqhash`, then falls back to checking
     /// `ignored_db` by `content_hash` so groups without a PDQ hash (e.g., exact
     /// content/pixel matches where `pdqhash` is `None`) also preserve their UUID.
-    fn find_uuid_in_txn<T: Transaction>(
+    fn find_uuid_in_txn(
         &self,
-        txn: &T,
+        txn: &WriteTransaction,
         group: &[([u8; 32], Option<[u8; 32]>)],
     ) -> Option<[u8; 16]> {
-        for (_, pdqhash_opt) in group {
-            if let Some(pdqhash) = pdqhash_opt
-                && let Ok(encrypted) = txn.get(self.ignored_pdqmap_db, pdqhash)
-                && let Some(decrypted) = self.decrypt_value(pdqhash, encrypted)
-                && decrypted.len() == 16
-            {
-                let mut uuid = [0u8; 16];
-                uuid.copy_from_slice(&decrypted);
-                return Some(uuid);
+        if let Ok(pdqmap_table) = txn.open_table(self.ignored_pdqmap_db) {
+            for (_, pdqhash_opt) in group {
+                if let Some(pdqhash) = pdqhash_opt
+                    && let Ok(Some(encrypted_guard)) = pdqmap_table.get(pdqhash)
+                    && let Some(decrypted) = self.decrypt_value(pdqhash, encrypted_guard.value())
+                    && decrypted.len() == 16
+                {
+                    let mut uuid = [0u8; 16];
+                    uuid.copy_from_slice(&decrypted);
+                    return Some(uuid);
+                }
             }
         }
 
         // Fallback: check if any file in the group already has an entry in ignored_db
-        for (content_hash, _) in group {
-            if let Ok(encrypted) = txn.get(self.ignored_db, content_hash)
-                && let Some(decrypted) = self.decrypt_value(content_hash, encrypted)
-                && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
-            {
-                return Some(entry.group_uuid);
+        if let Ok(ignored_table) = txn.open_table(self.ignored_db) {
+            for (content_hash, _) in group {
+                if let Ok(Some(encrypted_guard)) = ignored_table.get(content_hash)
+                    && let Some(decrypted) =
+                        self.decrypt_value(content_hash, encrypted_guard.value())
+                    && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                {
+                    return Some(entry.group_uuid);
+                }
             }
         }
 
@@ -1377,14 +1401,15 @@ impl AppContext {
     /// Store pdqhash → UUID mappings for all pdqhashes in a group.
     fn store_pdqmap_entries(
         cipher: &XChaCha20Poly1305,
-        txn: &mut lmdb::RwTransaction,
-        pdqmap_db: Database,
+        txn: &WriteTransaction,
+        pdqmap_db: DbTable,
         pdqhashes: &[Option<[u8; 32]>],
         uuid: &[u8; 16],
-    ) -> Result<(), lmdb::Error> {
+    ) -> Result<(), redb::Error> {
+        let mut table = txn.open_table(pdqmap_db)?;
         for pdqhash in pdqhashes.iter().flatten() {
             let encrypted = Self::encrypt_value(cipher, pdqhash, uuid);
-            txn.put(pdqmap_db, pdqhash, &encrypted, WriteFlags::empty())?;
+            table.insert(pdqhash, encrypted.as_slice())?;
         }
         Ok(())
     }
@@ -1396,11 +1421,11 @@ impl AppContext {
     pub fn register_duplicate_groups(
         &self,
         groups: &[Vec<([u8; 32], Option<[u8; 32]>)>], // Vec of groups, each (content_hash, pdqhash)
-    ) -> Result<usize, lmdb::Error> {
+    ) -> Result<usize, redb::Error> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut total_registered = 0;
 
-        let mut txn = self.env.begin_rw_txn()?;
+        let txn = self.env.begin_write()?;
 
         for group in groups {
             if group.is_empty() {
@@ -1415,32 +1440,45 @@ impl AppContext {
                 uuid
             });
 
-            for (content_hash, pdqhash) in group {
-                // Don't overwrite entries that are already ignored=true
-                if let Ok(existing) = txn.get(self.ignored_db, content_hash)
-                    && let Some(decrypted) = self.decrypt_value(content_hash, existing)
-                    && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
-                    && entry.ignored
-                {
-                    continue;
-                }
+            {
+                let mut ignored_table = txn.open_table(self.ignored_db)?;
+                for (content_hash, pdqhash) in group {
+                    // Don't overwrite entries that are already ignored=true
+                    let already_ignored =
+                        if let Ok(Some(existing_guard)) = ignored_table.get(content_hash) {
+                            if let Some(decrypted) =
+                                self.decrypt_value(content_hash, existing_guard.value())
+                                && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                            {
+                                entry.ignored
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
 
-                let entry = IgnoredEntry {
-                    pdqhash: *pdqhash,
-                    group_uuid: uuid,
-                    timestamp: now,
-                    ignored: false,
-                };
-                let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
-                let encrypted = Self::encrypt_value(&self.cipher, content_hash, &bytes);
-                txn.put(self.ignored_db, content_hash, &encrypted, WriteFlags::empty())?;
-                total_registered += 1;
+                    if already_ignored {
+                        continue;
+                    }
+
+                    let entry = IgnoredEntry {
+                        pdqhash: *pdqhash,
+                        group_uuid: uuid,
+                        timestamp: now,
+                        ignored: false,
+                    };
+                    let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
+                    let encrypted = Self::encrypt_value(&self.cipher, content_hash, &bytes);
+                    ignored_table.insert(content_hash, encrypted.as_slice())?;
+                    total_registered += 1;
+                }
             }
 
             // Store pdqmap entries for cross-session UUID stability
             Self::store_pdqmap_entries(
                 &self.cipher,
-                &mut txn,
+                &txn,
                 self.ignored_pdqmap_db,
                 &all_pdqhashes,
                 &uuid,
@@ -1456,29 +1494,73 @@ impl AppContext {
         Ok(total_registered)
     }
 
+    /// Import ignored entries (into both `ignored_db` and `ignored_pdqmap_db`)
+    /// parsed from `--show-ignored` output.
+    /// Returns `(imported_entries_count, imported_pdqmap_count)`.
+    pub fn import_ignored_entries(
+        &self,
+        entries: &[([u8; 32], IgnoredEntry)],
+    ) -> Result<(usize, usize), redb::Error> {
+        let txn = self.env.begin_write()?;
+        let mut entry_count = 0;
+        let mut pdqmap_count = 0;
+
+        {
+            let mut ignored_table = txn.open_table(self.ignored_db)?;
+            let mut pdqmap_table = txn.open_table(self.ignored_pdqmap_db)?;
+
+            for (content_hash, entry) in entries {
+                let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
+                let encrypted = Self::encrypt_value(&self.cipher, content_hash, &bytes);
+                ignored_table.insert(content_hash, encrypted.as_slice())?;
+                entry_count += 1;
+
+                if let Some(ref pdqhash) = entry.pdqhash
+                    && entry.group_uuid != [0u8; 16]
+                {
+                    let encrypted_uuid =
+                        Self::encrypt_value(&self.cipher, pdqhash, &entry.group_uuid);
+                    pdqmap_table.insert(pdqhash, encrypted_uuid.as_slice())?;
+                    pdqmap_count += 1;
+                }
+            }
+        }
+
+        txn.commit()?;
+        eprintln!(
+            "[DEBUG-IGNORE] Imported {} ignored entries and {} pdqmap mappings into redb",
+            entry_count, pdqmap_count
+        );
+        Ok((entry_count, pdqmap_count))
+    }
+
     /// Set the ignored flag to true for the given content hashes.
     /// Returns the number of entries flipped from false to true.
-    pub fn set_files_ignored(&self, content_hashes: &[[u8; 32]]) -> Result<usize, lmdb::Error> {
-        let mut txn = self.env.begin_rw_txn()?;
+    pub fn set_files_ignored(&self, content_hashes: &[[u8; 32]]) -> Result<usize, redb::Error> {
+        let txn = self.env.begin_write()?;
         let mut count = 0;
 
-        for ch in content_hashes {
-            if let Ok(encrypted) = txn.get(self.ignored_db, ch) {
-                if let Some(decrypted) = self.decrypt_value(ch, encrypted)
-                    && let Ok(mut entry) = IgnoredEntry::from_bytes(&decrypted)
-                    && !entry.ignored
-                {
-                    entry.ignored = true;
-                    let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
-                    let new_encrypted = Self::encrypt_value(&self.cipher, ch, &bytes);
-                    txn.put(self.ignored_db, ch, &new_encrypted, WriteFlags::empty())?;
-                    count += 1;
+        {
+            let mut table = txn.open_table(self.ignored_db)?;
+            for ch in content_hashes {
+                let existing_bytes = table.get(ch)?.map(|guard| guard.value().to_vec());
+                if let Some(encrypted) = existing_bytes {
+                    if let Some(decrypted) = self.decrypt_value(ch, &encrypted)
+                        && let Ok(mut entry) = IgnoredEntry::from_bytes(&decrypted)
+                        && !entry.ignored
+                    {
+                        entry.ignored = true;
+                        let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
+                        let new_encrypted = Self::encrypt_value(&self.cipher, ch, &bytes);
+                        table.insert(ch, new_encrypted.as_slice())?;
+                        count += 1;
+                    }
+                } else {
+                    eprintln!(
+                        "[WARN-IGNORE] set_files_ignored: no entry for blake3={}, skipping",
+                        hex::encode(ch)
+                    );
                 }
-            } else {
-                eprintln!(
-                    "[WARN-IGNORE] set_files_ignored: no entry for blake3={}, skipping",
-                    hex::encode(ch)
-                );
             }
         }
 
@@ -1490,43 +1572,41 @@ impl AppContext {
     pub fn get_ignored(
         &self,
         content_hash: &[u8; 32],
-    ) -> Result<Option<IgnoredEntry>, lmdb::Error> {
-        let txn = self.env.begin_ro_txn()?;
-        match txn.get(self.ignored_db, content_hash) {
-            Ok(encrypted_bytes) => {
+    ) -> Result<Option<IgnoredEntry>, redb::Error> {
+        let txn = self.env.begin_read()?;
+        let table = txn.open_table(self.ignored_db)?;
+        match table.get(content_hash)? {
+            Some(encrypted_guard) => {
+                let encrypted_bytes = encrypted_guard.value();
                 if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
                     IgnoredEntry::from_bytes(&decrypted)
                         .map(Some)
-                        .map_err(|_| lmdb::Error::Corrupted)
+                        .map_err(|_| corrupted_err("get_ignored deserialization failed"))
                 } else {
-                    Err(lmdb::Error::Corrupted)
+                    Err(corrupted_err("get_ignored decryption failed"))
                 }
             }
-            Err(lmdb::Error::NotFound) => Ok(None),
-            Err(e) => Err(e),
+            None => Ok(None),
         }
     }
 
     /// Iterate all explicitly ignored entries (ignored == true).
-    pub fn get_all_ignored(&self) -> Result<Vec<([u8; 32], IgnoredEntry)>, lmdb::Error> {
-        let txn = self.env.begin_ro_txn()?;
+    pub fn get_all_ignored(&self) -> Result<Vec<([u8; 32], IgnoredEntry)>, redb::Error> {
+        let txn = self.env.begin_read()?;
+        let table = txn.open_table(self.ignored_db)?;
         let mut results = Vec::new();
 
-        if txn.stat(self.ignored_db)?.entries() > 0 {
-            let mut cursor = txn.open_ro_cursor(self.ignored_db)?;
-            for result in cursor.iter_start() {
-                if let Ok((key, encrypted)) = result
-                    && key.len() == 32
-                {
-                    let mut content_hash = [0u8; 32];
-                    content_hash.copy_from_slice(key);
+        if table.len()? > 0 {
+            for result in table.iter()? {
+                let (key_guard, encrypted_guard) = result?;
+                let content_hash = *key_guard.value();
+                let encrypted = encrypted_guard.value();
 
-                    if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
-                        && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
-                        && entry.ignored
-                    {
-                        results.push((content_hash, entry));
-                    }
+                if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
+                    && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                    && entry.ignored
+                {
+                    results.push((content_hash, entry));
                 }
             }
         }
@@ -1536,71 +1616,65 @@ impl AppContext {
 
     /// Remove a single entry by content_hash, and clean up its pdqhash in
     /// `ignored_pdqmap_db` if no other entry in `ignored_db` still shares that pdqhash.
-    pub fn remove_ignored(&self, content_hash: &[u8; 32]) -> Result<bool, lmdb::Error> {
-        let mut txn = self.env.begin_rw_txn()?;
+    pub fn remove_ignored(&self, content_hash: &[u8; 32]) -> Result<bool, redb::Error> {
+        let txn = self.env.begin_write()?;
 
-        let assoc_pdq = match txn.get(self.ignored_db, content_hash) {
-            Ok(encrypted) => self
-                .decrypt_value(content_hash, encrypted)
-                .and_then(|dec| IgnoredEntry::from_bytes(&dec).ok())
-                .and_then(|entry| entry.pdqhash),
-            Err(lmdb::Error::NotFound) => return Ok(false),
-            Err(e) => return Err(e),
-        };
+        let (removed, assoc_pdq, still_referenced) = {
+            let mut table = txn.open_table(self.ignored_db)?;
+            let assoc_pdq = match table.remove(content_hash)? {
+                Some(encrypted_guard) => self
+                    .decrypt_value(content_hash, encrypted_guard.value())
+                    .and_then(|dec| IgnoredEntry::from_bytes(&dec).ok())
+                    .and_then(|entry| entry.pdqhash),
+                None => return Ok(false),
+            };
 
-        match txn.del(self.ignored_db, content_hash, None) {
-            Ok(()) => {
-                if let Some(pdq) = assoc_pdq {
-                    let mut still_referenced = false;
-                    if txn.stat(self.ignored_db)?.entries() > 0 {
-                        let mut cursor = txn.open_ro_cursor(self.ignored_db)?;
-                        for result in cursor.iter_start() {
-                            if let Ok((key, encrypted)) = result
-                                && key.len() == 32
-                            {
-                                let mut ch = [0u8; 32];
-                                ch.copy_from_slice(key);
-                                if let Some(dec) = self.decrypt_value(&ch, encrypted)
-                                    && let Ok(entry) = IgnoredEntry::from_bytes(&dec)
-                                    && entry.pdqhash == Some(pdq)
-                                {
-                                    still_referenced = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if !still_referenced {
-                        match txn.del(self.ignored_pdqmap_db, &pdq, None) {
-                            Ok(()) | Err(lmdb::Error::NotFound) => {}
-                            Err(e) => return Err(e),
-                        }
+            let mut still_referenced = false;
+            if let Some(pdq) = assoc_pdq
+                && table.len()? > 0
+            {
+                for result in table.iter()? {
+                    let (key_guard, encrypted_guard) = result?;
+                    let ch = *key_guard.value();
+                    if let Some(dec) = self.decrypt_value(&ch, encrypted_guard.value())
+                        && let Ok(entry) = IgnoredEntry::from_bytes(&dec)
+                        && entry.pdqhash == Some(pdq)
+                    {
+                        still_referenced = true;
+                        break;
                     }
                 }
-                txn.commit()?;
-                Ok(true)
             }
-            Err(lmdb::Error::NotFound) => Ok(false),
-            Err(e) => Err(e),
+            (true, assoc_pdq, still_referenced)
+        };
+
+        if let Some(pdq) = assoc_pdq
+            && !still_referenced
+        {
+            let mut pdqmap_table = txn.open_table(self.ignored_pdqmap_db)?;
+            pdqmap_table.remove(&pdq)?;
         }
+
+        txn.commit()?;
+        Ok(removed)
     }
 
     /// Remove all entries matching a group UUID (both ignored_db and pdqmap_db)
     /// within a single atomic read-write transaction.
-    pub fn remove_ignored_by_uuid(&self, uuid: &[u8; 16]) -> Result<usize, lmdb::Error> {
-        let mut wtxn = self.env.begin_rw_txn()?;
+    pub fn remove_ignored_by_uuid(&self, uuid: &[u8; 16]) -> Result<usize, redb::Error> {
+        let wtxn = self.env.begin_write()?;
         let mut to_remove = Vec::new();
         let mut pdqhashes_to_remove = Vec::new();
+        let mut count = 0;
 
-        if wtxn.stat(self.ignored_db)?.entries() > 0 {
-            let mut cursor = wtxn.open_ro_cursor(self.ignored_db)?;
-            for result in cursor.iter_start() {
-                if let Ok((key, encrypted)) = result
-                    && key.len() == 32
-                {
-                    let mut content_hash = [0u8; 32];
-                    content_hash.copy_from_slice(key);
-                    if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
+        {
+            let mut ignored_table = wtxn.open_table(self.ignored_db)?;
+            if ignored_table.len()? > 0 {
+                for result in ignored_table.iter()? {
+                    let (key_guard, encrypted_guard) = result?;
+                    let content_hash = *key_guard.value();
+                    if let Some(decrypted) =
+                        self.decrypt_value(&content_hash, encrypted_guard.value())
                         && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
                         && entry.group_uuid == *uuid
                     {
@@ -1618,18 +1692,22 @@ impl AppContext {
                     }
                 }
             }
+
+            for ch in &to_remove {
+                if ignored_table.remove(ch)?.is_some() {
+                    count += 1;
+                }
+            }
         }
 
-        // Also collect pdqmap entries pointing to this UUID
-        if wtxn.stat(self.ignored_pdqmap_db)?.entries() > 0 {
-            let mut cursor = wtxn.open_ro_cursor(self.ignored_pdqmap_db)?;
-            for result in cursor.iter_start() {
-                if let Ok((key, encrypted)) = result
-                    && key.len() == 32
-                {
-                    let mut pdqhash = [0u8; 32];
-                    pdqhash.copy_from_slice(key);
-                    if let Some(decrypted) = self.decrypt_value(&pdqhash, encrypted)
+        // Also collect and remove pdqmap entries pointing to this UUID
+        {
+            let mut pdqmap_table = wtxn.open_table(self.ignored_pdqmap_db)?;
+            if pdqmap_table.len()? > 0 {
+                for result in pdqmap_table.iter()? {
+                    let (key_guard, encrypted_guard) = result?;
+                    let pdqhash = *key_guard.value();
+                    if let Some(decrypted) = self.decrypt_value(&pdqhash, encrypted_guard.value())
                         && decrypted.len() == 16
                     {
                         let mut stored_uuid = [0u8; 16];
@@ -1640,40 +1718,30 @@ impl AppContext {
                     }
                 }
             }
+
+            for pdq in &pdqhashes_to_remove {
+                pdqmap_table.remove(pdq)?;
+            }
         }
 
-        let mut count = 0;
-        for ch in &to_remove {
-            match wtxn.del(self.ignored_db, ch, None) {
-                Ok(()) => count += 1,
-                Err(lmdb::Error::NotFound) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        for pdq in &pdqhashes_to_remove {
-            match wtxn.del(self.ignored_pdqmap_db, pdq, None) {
-                Ok(()) | Err(lmdb::Error::NotFound) => {}
-                Err(e) => return Err(e),
-            }
-        }
         wtxn.commit()?;
         Ok(count)
     }
 
     /// Remove all entries matching a PDQ hash within a single atomic read-write transaction.
-    pub fn remove_ignored_by_pdqhash(&self, pdqhash: &[u8; 32]) -> Result<usize, lmdb::Error> {
-        let mut wtxn = self.env.begin_rw_txn()?;
+    pub fn remove_ignored_by_pdqhash(&self, pdqhash: &[u8; 32]) -> Result<usize, redb::Error> {
+        let wtxn = self.env.begin_write()?;
         let mut to_remove = Vec::new();
+        let mut count = 0;
 
-        if wtxn.stat(self.ignored_db)?.entries() > 0 {
-            let mut cursor = wtxn.open_ro_cursor(self.ignored_db)?;
-            for result in cursor.iter_start() {
-                if let Ok((key, encrypted)) = result
-                    && key.len() == 32
-                {
-                    let mut content_hash = [0u8; 32];
-                    content_hash.copy_from_slice(key);
-                    if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
+        {
+            let mut ignored_table = wtxn.open_table(self.ignored_db)?;
+            if ignored_table.len()? > 0 {
+                for result in ignored_table.iter()? {
+                    let (key_guard, encrypted_guard) = result?;
+                    let content_hash = *key_guard.value();
+                    if let Some(decrypted) =
+                        self.decrypt_value(&content_hash, encrypted_guard.value())
                         && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
                         && entry.pdqhash.as_ref() == Some(pdqhash)
                     {
@@ -1681,20 +1749,19 @@ impl AppContext {
                     }
                 }
             }
-        }
 
-        let mut count = 0;
-        for ch in &to_remove {
-            match wtxn.del(self.ignored_db, ch, None) {
-                Ok(()) => count += 1,
-                Err(lmdb::Error::NotFound) => {}
-                Err(e) => return Err(e),
+            for ch in &to_remove {
+                if ignored_table.remove(ch)?.is_some() {
+                    count += 1;
+                }
             }
         }
-        match wtxn.del(self.ignored_pdqmap_db, pdqhash, None) {
-            Ok(()) | Err(lmdb::Error::NotFound) => {}
-            Err(e) => return Err(e),
+
+        {
+            let mut pdqmap_table = wtxn.open_table(self.ignored_pdqmap_db)?;
+            pdqmap_table.remove(pdqhash)?;
         }
+
         wtxn.commit()?;
         Ok(count)
     }

@@ -2012,11 +2012,12 @@ fn load_and_process_image_from_bytes(
                 // Adjust HEIC container signaling before handing off to finish_dynamic
                 let mut final_cicp = cicp;
                 if matches!(ext.as_str(), "heic" | "heif")
-                    && let Some(ref mut c) = final_cicp {
-                        // libheif expands limited-range YCbCr to full-range RGB during matrix conversion.
-                        // Mark full_range = true so HDR/SDR pipeline won't apply a second range expansion.
-                        c.full_range = true;
-                    }
+                    && let Some(ref mut c) = final_cicp
+                {
+                    // libheif expands limited-range YCbCr to full-range RGB during matrix conversion.
+                    // Mark full_range = true so HDR/SDR pipeline won't apply a second range expansion.
+                    c.full_range = true;
+                }
 
                 // 16-bit TIFF and JXL reach this branch, so let finish_dynamic
                 // decide whether they are worth keeping at 10 bits.

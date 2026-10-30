@@ -199,6 +199,7 @@ struct Cli {
     #[arg(required_unless_present = "show_exif_tags")]
     #[arg(required_unless_present = "prune")]
     #[arg(required_unless_present = "show_ignored")]
+    #[arg(required_unless_present = "import_ignored")]
     #[arg(required_unless_present = "unignore")]
     paths: Vec<String>,
 
@@ -279,6 +280,10 @@ struct Cli {
     /// Show all ignored files (blake3 hash, group UUID, timestamp)
     #[arg(long)]
     show_ignored: bool,
+
+    /// Import ignored files from --show-ignored output file (use "-" for stdin)
+    #[arg(long, value_name = "FILE")]
+    import_ignored: Option<PathBuf>,
 
     /// Remove file(s) from ignore list by filename(s), group UUID, or PDQ hash
     #[arg(long, value_name = "VALUE", num_args(1..))]
@@ -394,6 +399,86 @@ fn format_size(bytes: u64) -> String {
     }
     let gb = mb / 1024.0;
     format!("{:.2} GB", gb)
+}
+
+/// Parse the text output produced by `--show-ignored` into `(content_hash, IgnoredEntry)` tuples.
+fn parse_show_ignored_output(input: &str) -> Result<Vec<([u8; 32], db::IgnoredEntry)>, String> {
+    let mut entries = Vec::new();
+    let mut current_uuid = [0u8; 16];
+
+    for (line_num, raw_line) in input.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty()
+            || line.starts_with("Ignored files")
+            || line.starts_with("No ignored files")
+        {
+            continue;
+        }
+
+        if let Some(uuid_part) = line.strip_prefix("Group UUID:") {
+            let uuid_str = uuid_part.trim();
+            current_uuid = AppContext::parse_uuid(uuid_str).ok_or_else(|| {
+                format!("Line {}: invalid Group UUID '{}'", line_num + 1, uuid_str)
+            })?;
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("blake3:") {
+            let is_no_group = line.ends_with("(no group)");
+            let group_uuid = if is_no_group { [0u8; 16] } else { current_uuid };
+
+            let (blake3_str, after_blake3) = rest
+                .trim_start()
+                .split_once("pdqhash:")
+                .ok_or_else(|| format!("Line {}: missing 'pdqhash:'", line_num + 1))?;
+
+            let content_hash_vec = hex::decode(blake3_str.trim())
+                .map_err(|e| format!("Line {}: invalid blake3 hex: {}", line_num + 1, e))?;
+            let content_hash: [u8; 32] = content_hash_vec
+                .try_into()
+                .map_err(|_| format!("Line {}: blake3 hash must be 32 bytes", line_num + 1))?;
+
+            let (pdq_str, after_pdq) = after_blake3
+                .trim_start()
+                .split_once("quality:")
+                .ok_or_else(|| format!("Line {}: missing 'quality:'", line_num + 1))?;
+
+            let pdq_str = pdq_str.trim();
+            let pdqhash = if pdq_str.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                let pdq_vec = hex::decode(pdq_str)
+                    .map_err(|e| format!("Line {}: invalid pdqhash hex: {}", line_num + 1, e))?;
+                let arr: [u8; 32] = pdq_vec
+                    .try_into()
+                    .map_err(|_| format!("Line {}: pdqhash must be 32 bytes", line_num + 1))?;
+                Some(arr)
+            };
+
+            let (_, after_quality) = after_pdq
+                .split_once("added:")
+                .ok_or_else(|| format!("Line {}: missing 'added:'", line_num + 1))?;
+
+            let ts_str = after_quality.trim().trim_end_matches("(no group)").trim();
+
+            let timestamp = if let Ok(secs) = ts_str.parse::<u64>() {
+                secs
+            } else {
+                chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S UTC")
+                    .map(|ndt| ndt.and_utc().timestamp() as u64)
+                    .map_err(|e| {
+                        format!("Line {}: invalid timestamp '{}': {}", line_num + 1, ts_str, e)
+                    })?
+            };
+
+            entries.push((
+                content_hash,
+                db::IgnoredEntry { pdqhash, group_uuid, timestamp, ignored: true },
+            ));
+        }
+    }
+
+    Ok(entries)
 }
 
 fn run_interactive_cli_delete(
@@ -683,6 +768,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(e) => eprintln!("Failed to read ignored list: {}", e),
+        }
+        return Ok(());
+    }
+
+    // --- IMPORT IGNORED ---
+    if let Some(ref import_path) = args.import_ignored {
+        let content = if import_path.as_os_str() == "-" {
+            use std::io::Read;
+            let mut buf = String::new();
+            io::stdin().read_to_string(&mut buf)?;
+            buf
+        } else {
+            fs::read_to_string(import_path)?
+        };
+
+        let entries = match parse_show_ignored_output(&content) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!("Failed to parse ignored list: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        if entries.is_empty() {
+            println!("No ignored entries found in input.");
+            return Ok(());
+        }
+
+        let ctx = AppContext::with_algorithm(hash_algorithm)?;
+        match ctx.import_ignored_entries(&entries) {
+            Ok((entry_count, pdqmap_count)) => {
+                println!(
+                    "Imported {} ignored entries and {} PDQ map entries into redb.",
+                    entry_count, pdqmap_count
+                );
+            }
+            Err(e) => {
+                eprintln!("Failed to import ignored entries: {}", e);
+                std::process::exit(1);
+            }
         }
         return Ok(());
     }

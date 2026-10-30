@@ -41,7 +41,7 @@ jxl-oxide = { version = "0.12", features = ["moxcms", "image"] }
 exif = { git = "https://github.com/kamadak/exif-rs", rev = "7cb491cd22aa4a586f37c0c0c3ef5c9ae207d337" }
 libc = "0.2"
 libheif-rs = { version = "3.0", features = ["image"] }
-lmdb-rkv = { git = "https://github.com/Safari77/lmdb-rs-mozilla" }
+redb = "4.4"
 natord = "1.0"
 notify = "8.2"
 once_cell = "1.21"

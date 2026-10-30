@@ -5,7 +5,7 @@ phdupes
 hash) and pdqhash implementations, includes phdupes app: rust GUI (egui) and
 TUI (ratatui)  for viewing and interacting with found duplicates, multithreaded
 scanning and (also RAW) image processing, configurable preload of images,
-metadata caching (encrypted with XChaCha20Poly1305, LMDB database),
+metadata caching (encrypted with XChaCha20Poly1305, native Rust redb database),
 Search inside Exif tags (also supports derived values like Country (from GPS location),
 and Sun Azimuth, Sun Altitude (from GPS date, location, and the location’s timezone).
 
