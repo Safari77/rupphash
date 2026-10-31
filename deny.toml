@@ -1,4 +1,68 @@
+[output]
+feature-depth = 1
+
 [advisories]
 ignore = [
     "RUSTSEC-2023-0089", "RUSTSEC-2024-0436"
 ]
+
+git-fetch-with-cli = false
+version = 2
+
+[licenses]
+version = 2
+unused-allowed-license = "allow"
+
+allow = [
+    # --- Permissive & Public Domain ---
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",                          # Boost Software License (e.g. xxhash-rust)
+    "ISC",
+    "0BSD",
+    "CC0-1.0",
+    "CC-PDDC",                          # Creative Commons Public Domain (e.g. oklab)
+    "Zlib",
+    "NCSA",
+    "Unicode-3.0",
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+
+    # --- Font Licenses ---
+    "OFL-1.1",                          # SIL Open Font License (epaint_default_fonts)
+    "Ubuntu-font-1.0",                  # Ubuntu Font License (epaint_default_fonts)
+
+    # --- Data / Databases ---
+    "ODbL-1.0",
+
+    # --- Compatible Copyleft ---
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
+    "LGPL-2.1-or-later",
+    "MPL-2.0",
+]
+
+# Set confidence threshold for detecting licenses from text files
+confidence-threshold = 0.8
+
+[licenses.private]
+# Set to false to enforce checking inside your private workspace/root crate
+ignore = false
+
+[sources]
+# Lint level for what to happen when a crate from a crate registry that is not
+# in the allow list is encountered
+unknown-registry = "warn"
+# Lint level for what to happen when a crate from a git repository that is not
+# in the allow list is encountered
+unknown-git = "warn"
+# List of URLs for allowed crate registries. Defaults to the crates.io index
+# if not specified. If it is specified but empty, no registries are allowed.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# List of URLs for allowed Git repositories
+allow-git = []

@@ -3,7 +3,7 @@ name = "rupphash"
 version = "0.8.3"
 publish = false
 edition = "2024"
-license = "GPL-3.0"
+license = "GPL-3.0-only"
 authors = ["Sami Farin"]
 repository = "https://github.com/Safari77/rupphash"
 
