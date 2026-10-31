@@ -67,7 +67,7 @@ static BOUNDARIES: OnceLock<Option<country_boundaries::CountryBoundaries>> = Onc
 /// Must be called once during app startup, before any parallel image work.
 pub fn init_smart_limits() -> usize {
     let &(threads, _) = SMART_LIMITS.get_or_init(|| {
-        let mut sys = System::new();
+        let mut sys = System::new().expect("failed to initialize sysinfo System");
         sys.refresh_memory();
 
         let total_ram_bytes = sys.total_memory();
