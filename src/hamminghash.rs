@@ -156,6 +156,11 @@ impl<H: HammingHash> MIHIndex<H> {
     }
 
     #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.db_hashes.is_empty()
+    }
+
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.db_hashes.len()
     }
