@@ -1,20 +1,25 @@
-use crate::db::{AppContext, HashAlgorithm};
-use crate::scanner::ScanConfig;
-use crate::state::get_bit_identical_counts;
+use std::{
+    collections::HashMap,
+    ffi::CStr,
+    fs,
+    io::{self, Write},
+    os::raw::c_char,
+    path::PathBuf,
+};
+
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use geo::Point;
-use jiff::Timestamp;
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::ffi::CStr;
-use std::fs;
-use std::io::{self, Write};
-use std::os::raw::c_char;
-use std::path::PathBuf;
-
 #[cfg(not(target_os = "windows"))]
 use jemallocator::Jemalloc;
+use jiff::Timestamp;
+use serde::Deserialize;
+
+use crate::{
+    db::{AppContext, HashAlgorithm},
+    scanner::ScanConfig,
+    state::get_bit_identical_counts,
+};
 
 #[cfg(not(target_os = "windows"))]
 #[global_allocator]
@@ -35,8 +40,7 @@ mod exif_types;
 mod fileops;
 mod gui;
 mod hdr;
-#[allow(unused)]
-mod helper_exif;
+#[allow(unused)] mod helper_exif;
 mod image_features;
 mod position;
 mod raw_exif;
@@ -45,8 +49,7 @@ mod search_index;
 mod state;
 mod ui;
 
-use rupphash::hamminghash;
-use rupphash::pdqhash;
+use rupphash::{hamminghash, pdqhash};
 
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
@@ -61,7 +64,7 @@ pub struct FileMetadata {
     pub orientation: u8, // Added: EXIF orientation (1-8)
     pub gps_pos: Option<Point<f64>>,
     pub unique_file_id: u128,        // Always has dev+inode
-    pub exif_timestamp: Option<i64>, // EXIF DateTimeOriginal or DateTimeDigitized (Unix epoch seconds)
+    pub exif_timestamp: Option<i64>, /* EXIF DateTimeOriginal or DateTimeDigitized (Unix epoch seconds) */
 }
 
 /// Render a stored PDQ quality for CLI output, flagging values that are below
@@ -503,13 +506,13 @@ fn run_interactive_cli_delete(
         match info.status {
             GroupStatus::AllIdentical => {
                 println!("Group {} - {}Bit-identical{}", g_idx + 1, green, reset)
-            }
+            },
             GroupStatus::SomeIdentical => {
                 println!("Group {} - {}Some files Bit-identical{}", g_idx + 1, green, reset)
-            }
+            },
             GroupStatus::None => {
                 println!("Group {}/{} (Max Dist: {})", g_idx + 1, groups.len(), info.max_dist)
-            }
+            },
         }
         println!("========================================================");
 
@@ -695,7 +698,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Success.");
                 println!("  - Removed {} expired file entries.", meta_count);
                 println!("  - Removed {} orphaned hash entries.", hash_count);
-            }
+            },
             Err(e) => eprintln!("Pruning failed: {}", e),
         }
         // Exit immediately after pruning
@@ -766,7 +769,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
-            }
+            },
             Err(e) => eprintln!("Failed to read ignored list: {}", e),
         }
         return Ok(());
@@ -788,7 +791,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 eprintln!("Failed to parse ignored list: {}", e);
                 std::process::exit(1);
-            }
+            },
         };
 
         if entries.is_empty() {
@@ -803,11 +806,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Imported {} ignored entries and {} PDQ map entries into redb.",
                     entry_count, pdqmap_count
                 );
-            }
+            },
             Err(e) => {
                 eprintln!("Failed to import ignored entries: {}", e);
                 std::process::exit(1);
-            }
+            },
         }
         return Ok(());
     }
@@ -834,7 +837,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             count,
                             AppContext::format_uuid(&uuid)
                         );
-                    }
+                    },
                     Err(e) => eprintln!("Failed to unignore by UUID: {}", e),
                 }
                 continue;
@@ -854,7 +857,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "[DEBUG-UNIGNORE] Removed {} entries for pdqhash {}",
                             count, value
                         );
-                    }
+                    },
                     Err(e) => eprintln!("Failed to unignore by PDQ hash: {}", e),
                 }
                 continue;
@@ -882,17 +885,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "[DEBUG-UNIGNORE] Successfully removed keyed blake3={}",
                                     hex::encode(content_hash)
                                 );
-                            }
+                            },
                             Ok(false) => {
                                 println!(
                                     "File {} (keyed blake3: {}) was not in the ignore list",
                                     value,
                                     hex::encode(content_hash)
                                 );
-                            }
+                            },
                             Err(e) => eprintln!("Failed to unignore: {}", e),
                         }
-                    }
+                    },
                     Err(e) => eprintln!("Failed to read file {}: {}", value, e),
                 }
             } else {
@@ -920,10 +923,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match gui::image::CubeLut3d::parse_file(lut_path) {
                 Ok(lut) => {
                     parsed_luts.push(lut);
-                }
+                },
                 Err(e) => {
                     eprintln!("Error reading 3D LUT file {:?}: {}", lut_path, e);
-                }
+                },
             }
         }
 
@@ -1046,7 +1049,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match info.status {
                 GroupStatus::AllIdentical => {
                     println!("\n--- Group {} - {}Bit-identical{} ---", i + 1, green, reset)
-                }
+                },
                 GroupStatus::SomeIdentical => {
                     println!(
                         "\n--- Group {} - {}Some files Bit-identical{} ---",
@@ -1054,10 +1057,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         green,
                         reset
                     )
-                }
+                },
                 GroupStatus::None => {
                     println!("\n--- Group {} (Max Dist: {}) ---", i + 1, info.max_dist)
-                }
+                },
             }
 
             let counts = get_bit_identical_counts(group);

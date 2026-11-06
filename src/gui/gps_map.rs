@@ -1,13 +1,18 @@
 // GPS Map widget using walkers crate for displaying image locations on a map
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
+
 use eframe::egui;
 use geo::Point;
 #[cfg(target_arch = "x86_64")]
 use once_cell::sync::Lazy;
 use rustc_hash::FxHashMap;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use walkers::sources::{Attribution, TileSource};
-use walkers::{HttpOptions, HttpTiles, Map, MapMemory, Plugin, Position, Projector, Style};
+use walkers::{
+    HttpOptions, HttpTiles, Map, MapMemory, Plugin, Position, Projector, Style,
+    sources::{Attribution, TileSource},
+};
 
 /// Custom tile source that uses a URL pattern
 #[derive(Debug, Clone)]
@@ -165,13 +170,13 @@ unsafe fn part1by1_bmi2(n: u32) -> u64 {
     // Mask to 16 bits to match part1by1_scalar: _pdep_u64 would otherwise
     // spread all 32 input bits across the full 64-bit result, so the two
     // implementations would disagree for n > 0xffff.
-    core::arch::x86_64::_pdep_u64((n & 0xffff) as u64, 0x5555_5555_5555_5555)
+    core::arch::x86_64::_pdep_u64((n & 0xFFFF) as u64, 0x5555_5555_5555_5555)
 }
 
 fn part1by1_scalar(mut n: u32) -> u64 {
-    n &= 0x0000ffff;
-    n = (n ^ (n << 8)) & 0x00ff00ff;
-    n = (n ^ (n << 4)) & 0x0f0f0f0f;
+    n &= 0x0000FFFF;
+    n = (n ^ (n << 8)) & 0x00FF00FF;
+    n = (n ^ (n << 4)) & 0x0F0F0F0F;
     n = (n ^ (n << 2)) & 0x33333333;
     n = (n ^ (n << 1)) & 0x55555555;
     n as u64
@@ -672,7 +677,7 @@ impl GpsMapState {
 /// Plugin for drawing GPS markers on the map and detecting clicks
 pub struct GpsMarkersPlugin {
     pub markers: Vec<(Position, egui::Color32, f32, usize, String)>, // (pos, color, radius, index)
-    pub clicked_idx: std::sync::Arc<std::sync::atomic::AtomicI32>, // -1 = no click, >= 0 = clicked marker index
+    pub clicked_idx: std::sync::Arc<std::sync::atomic::AtomicI32>, /* -1 = no click, >= 0 = clicked marker index */
     /// Sun position for current marker: (marker_position, azimuth, elevation)
     pub current_sun: Option<(Position, f64, f64)>,
     /// Map rect for clipping sun indicator to edges

@@ -1,7 +1,18 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+    str::FromStr,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::UNIX_EPOCH,
+};
+
 use bytemuck::cast_slice;
 use chrono::{DateTime, Utc};
-use codes_iso_3166::part_1::CountryCode;
-use codes_iso_3166::part_2::SubdivisionCode;
+use codes_iso_3166::{part_1::CountryCode, part_2::SubdivisionCode};
 use crossbeam_channel::{Sender, unbounded};
 use geo::Point;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, Rgba};
@@ -9,36 +20,29 @@ use jpeg_decoder::Decoder as Tier2Decoder;
 use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 use num_integer::gcd;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::UNIX_EPOCH;
+use sysinfo::System;
 use walkdir::WalkDir;
 use zune_jpeg::JpegDecoder as ZuneDecoder;
 
-use crate::db::{
-    AppContext, CachedCoefficients, DbUpdate, EnrichmentResult, HashValue, compute_meta_key,
-    create_feature_update,
+use crate::{
+    FileMetadata, GroupInfo, GroupStatus,
+    db::{
+        AppContext, CachedCoefficients, DbUpdate, EnrichmentResult, HashValue, compute_meta_key,
+        create_feature_update,
+    },
+    exif_extract::extract_gps_lat_lon,
+    exif_types::{
+        ExifValue, TAG_DERIVED_PDQ_QUALITY, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE,
+        TAG_GPS_LONGITUDE, TAG_ORIENTATION,
+    },
+    fileops,
+    fileops::get_file_key,
+    hamminghash::{HammingHash, MIHIndex, SparseBitSet},
+    helper_exif::{get_altitude, get_date_str, get_exif_timestamp, parse_gps_coordinate},
+    image_features::ImageFeatures,
+    position, raw_exif,
+    raw_exif::dms_to_decimal,
 };
-use crate::exif_extract::extract_gps_lat_lon;
-use crate::exif_types::{
-    ExifValue, TAG_DERIVED_PDQ_QUALITY, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE,
-    TAG_ORIENTATION,
-};
-use crate::fileops;
-use crate::fileops::get_file_key;
-use crate::hamminghash::{HammingHash, MIHIndex, SparseBitSet};
-use crate::helper_exif::{get_altitude, get_date_str, get_exif_timestamp, parse_gps_coordinate};
-use crate::image_features::ImageFeatures;
-use crate::position;
-use crate::raw_exif;
-use crate::raw_exif::dms_to_decimal;
-use crate::{FileMetadata, GroupInfo, GroupStatus};
-use std::sync::OnceLock;
-use sysinfo::System;
 
 pub const RAW_EXTS: &[&str] = &[
     "nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf", "kdc", "dcr", "pef", "x3f", "srf",
@@ -112,7 +116,7 @@ pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exi
         None => {
             let file = fs::File::open(path).ok()?;
             Box::new(std::io::BufReader::new(file))
-        }
+        },
     };
 
     let mut exif_reader = exif::Reader::new();
@@ -127,11 +131,11 @@ pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exi
                 eprintln!("[DEBUG-EXIF-WARNING] Non-fatal parse warning: {err}");
             }
             Some(exif)
-        }
+        },
         Err(err) => {
             eprintln!("[DEBUG-EXIF-ERROR] Fatal parse error on {:?}: {err}", path);
             None
-        }
+        },
     }
 }
 
@@ -273,35 +277,35 @@ fn get_exif_tags_from_rsraw(
                 } else {
                     None
                 }
-            }
+            },
             "model" => {
                 if !info.model.is_empty() {
                     Some(info.model.clone())
                 } else {
                     None
                 }
-            }
+            },
             "software" => {
                 if !info.software.is_empty() {
                     Some(info.software.trim().to_string())
                 } else {
                     None
                 }
-            }
+            },
             "artist" => {
                 if !info.artist.is_empty() {
                     Some(info.artist.clone())
                 } else {
                     None
                 }
-            }
+            },
             "iso" | "isospeedratings" | "photographicsensitivity" => {
                 if info.iso_speed > 0 {
                     Some(format!("ISO {}", info.iso_speed))
                 } else {
                     None
                 }
-            }
+            },
             "exposuretime" | "exposure" => {
                 if info.shutter > 0.0 {
                     if info.shutter >= 1.0 {
@@ -312,45 +316,45 @@ fn get_exif_tags_from_rsraw(
                 } else {
                     None
                 }
-            }
+            },
             "fnumber" | "aperture" => {
                 if info.aperture > 0.0 {
                     Some(format!("f/{:.1}", info.aperture))
                 } else {
                     None
                 }
-            }
+            },
             "focallength" => {
                 if info.focal_len > 0.0 {
                     Some(format!("{:.0}mm", info.focal_len))
                 } else {
                     None
                 }
-            }
+            },
             "focallengthin35mmfilm" | "focallength35mm" => {
                 if info.lens_info.focal_length_in_35mm_format > 0 {
                     Some(format!("{}mm (35mm equiv)", info.lens_info.focal_length_in_35mm_format))
                 } else {
                     None
                 }
-            }
+            },
             "lensmodel" | "lens" => {
                 if !info.lens_info.lens_name.is_empty() {
                     Some(info.lens_info.lens_name.trim().to_string())
                 } else {
                     None
                 }
-            }
+            },
             "lensmake" => {
                 if !info.lens_info.lens_make.is_empty() {
                     Some(info.lens_info.lens_make.clone())
                 } else {
                     None
                 }
-            }
+            },
             "datetime" | "datetimeoriginal" => {
                 info.datetime.as_ref().map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            }
+            },
             "gpslatitude" => {
                 if has_gps {
                     let lat = dms_to_decimal(&info.gps.latitude);
@@ -362,7 +366,7 @@ fn get_exif_tags_from_rsraw(
                 } else {
                     None
                 }
-            }
+            },
             "gpslongitude" => {
                 if has_gps {
                     let lon = dms_to_decimal(&info.gps.longitude);
@@ -374,14 +378,14 @@ fn get_exif_tags_from_rsraw(
                 } else {
                     None
                 }
-            }
+            },
             "gpsaltitude" => {
                 if has_gps && info.gps.altitude.is_finite() && info.gps.altitude.abs() > 0.0001 {
                     Some(format!("{:.1}m", info.gps.altitude))
                 } else {
                     None
                 }
-            }
+            },
             "derivedcountry" | "country" => {
                 let lat = dms_to_decimal(&info.gps.latitude);
                 let lon = dms_to_decimal(&info.gps.longitude);
@@ -390,11 +394,11 @@ fn get_exif_tags_from_rsraw(
                 } else {
                     None
                 }
-            }
+            },
             "orientation" => {
                 let o = raw_exif::get_orientation_from_raw(raw);
                 if o != 1 { Some(o.to_string()) } else { None }
-            }
+            },
             // Skip derived sun position for rsraw (requires full timestamp parsing)
             "derivedsunposition" => None,
             // Skip other tags not available in rsraw
@@ -451,7 +455,7 @@ fn get_derived_value(
             let (lat, lon) = gps_coords?;
             let val = derive_country(lat, lon)?;
             Some(vec![("Country".to_string(), val)])
-        }
+        },
         "derivedsunposition" => {
             let (lat, lon) = gps_coords?;
             let alt_m = sun_inputs.as_ref()?.unwrap_or(0.0);
@@ -488,7 +492,7 @@ fn get_derived_value(
             } else {
                 None
             }
-        }
+        },
         _ => None,
     }
 }
@@ -544,7 +548,7 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
                         (v << 6) | (v >> 4)
                     }));
                 }
-            }
+            },
             12 => {
                 for y in 0..height {
                     let row_start = y * stride;
@@ -555,14 +559,14 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
                         (v << 4) | (v >> 8)
                     }));
                 }
-            }
+            },
             16 => {
                 for y in 0..height {
                     let row_start = y * stride;
                     let row_bytes = &data[row_start..row_start + row_bytes_len];
                     out.extend(row_bytes.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)));
                 }
-            }
+            },
             _ => {
                 // Bit-replication scaling: scales an arbitrary N-bit value (e.g. 10-bit 0..1023)
                 // to standard 16-bit unorm (0..65535).
@@ -575,7 +579,7 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
                         ((v * 65535 + (max_val / 2)) / max_val) as u16
                     }));
                 }
-            }
+            },
         }
 
         if has_alpha {
@@ -709,12 +713,13 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                     return Ok(image::DynamicImage::ImageRgb8(buf));
                 }
             }
-        }
+        },
 
         "jxl" => {
+            use std::io::Cursor;
+
             use image::ImageDecoder;
             use jxl_oxide::integration::JxlDecoder;
-            use std::io::Cursor;
 
             img_debug!("[jxl] attempting decode");
 
@@ -723,7 +728,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 Err(e) => {
                     img_debug!("[jxl] decoder init failed: {:?}", e);
                     return Err(format!("JXL decoder init failed: {:?}", e));
-                }
+                },
             };
 
             let (_w, _h) = decoder.dimensions();
@@ -733,13 +738,13 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 Ok(img) => {
                     img_debug!("[jxl] decode successful");
                     return Ok(img);
-                }
+                },
                 Err(e) => {
                     img_debug!("[jxl] decode failed: {:?}", e);
                     return Err(format!("JXL decode failed: {:?}", e));
-                }
+                },
             }
-        }
+        },
 
         "pdf" => {
             img_debug!("[pdf] attempting hayro decode");
@@ -750,7 +755,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 Err(e) => {
                     img_debug!("[pdf] parse failed: {:?}", e);
                     return Err(format!("PDF parse failed: {:?}", e));
-                }
+                },
             };
 
             let pages = pdf.pages();
@@ -788,7 +793,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
 
             img_debug!("[pdf] document has no pages or render failed");
             return Err("PDF document has no pages or render failed".to_string());
-        }
+        },
 
         "tif" | "tiff" => {
             use std::io::Cursor;
@@ -813,7 +818,7 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                     } else if let Ok(img) = image::DynamicImage::from_decoder(decoder) {
                         return Ok(img);
                     }
-                }
+                },
                 Err(e) => {
                     eprintln!(
                         "[DEBUG-TIFF] Wrapper failed: {}. Falling back to native tiff crate...",
@@ -868,13 +873,13 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                     } else {
                         eprintln!("[DEBUG-TIFF] Native tiff decoder also rejected the file.");
                     }
-                }
+                },
             }
-        }
+        },
 
         "heic" | "heif" => return decode_heic(bytes),
 
-        _ => {}
+        _ => {},
     }
 
     // This handles AVIF, WebP, PCX etc (image-extras) and corrupted files.
@@ -948,7 +953,7 @@ fn format_location(country_code: Option<&str>, subdivision_code: Option<&str>) -
         (None, None) => {
             // Fallback: return the raw code if we have one
             country_code.or(subdivision_code).map(|s| s.to_string())
-        }
+        },
     }
 }
 
@@ -1075,7 +1080,7 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
             }
             // Fallback to default Minutes/Seconds display
             clean_exif_string(&value.display_as(tag).to_string())
-        }
+        },
         exif::Tag::ExposureTime => {
             // ExposureTime is stored as Rational; check that first because
             // Value::get_uint() returns None for Rational values.
@@ -1099,7 +1104,7 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
                 return format!("{}s", r);
             }
             clean_exif_string(&value.display_as(tag).to_string())
-        }
+        },
         exif::Tag::ExposureBiasValue => {
             // ExposureBias is stored as SRational; widen to i64 first so that
             // negating i32::MIN (-2147483648) never overflows or panics in gcd().
@@ -1124,7 +1129,7 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
                 };
             }
             clean_exif_string(&value.display_as(tag).to_string())
-        }
+        },
         exif::Tag::FNumber => {
             if let exif::Value::Rational(rats) = value
                 && !rats.is_empty()
@@ -1133,7 +1138,7 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
                 return format!("f/{:.1}", rats[0].num as f64 / rats[0].denom as f64);
             }
             clean_exif_string(&value.display_as(tag).to_string())
-        }
+        },
         exif::Tag::FocalLength => {
             if let exif::Value::Rational(rats) = value
                 && !rats.is_empty()
@@ -1142,25 +1147,25 @@ fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) 
                 return format!("{}mm", rats[0].num as f64 / rats[0].denom as f64);
             }
             clean_exif_string(&value.display_as(tag).to_string())
-        }
+        },
         exif::Tag::PhotographicSensitivity => {
             if let Some(iso) = value.get_uint(0) {
                 format!("ISO {}", iso)
             } else {
                 clean_exif_string(&value.display_as(tag).to_string())
             }
-        }
+        },
         exif::Tag::FocalLengthIn35mmFilm => {
             if let Some(fl) = value.get_uint(0) {
                 format!("{}mm (35mm equiv)", fl)
             } else {
                 clean_exif_string(&value.display_as(tag).to_string())
             }
-        }
+        },
         _ => {
             // Default: use the library's display formatting, then clean it
             clean_exif_string(&value.display_as(tag).to_string())
-        }
+        },
     }
 }
 
@@ -1209,7 +1214,7 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
             None => {
                 data_cow = fs::read(path).ok()?;
                 &data_cow
-            }
+            },
         };
 
         if let Ok(raw) = rsraw::RawImage::open(data_slice) {
@@ -1240,7 +1245,7 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
                 None => {
                     data_cow = fs::read(path).ok()?;
                     &data_cow
-                }
+                },
             };
 
             if let Ok(decoder) =
@@ -1259,7 +1264,7 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
             // Manually open the file so we can wrap it in BufReader + Box
             let file = fs::File::open(path).ok()?;
             Box::new(std::io::BufReader::new(file))
-        }
+        },
     };
 
     // Now we create the ImageReader using the unified Box type
@@ -2275,13 +2280,13 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
             files.sort_by_cached_key(|f| {
                 f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
             });
-        }
+        },
         "name-desc" => {
             files.sort_by_cached_key(|f| {
                 f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
             });
             files.reverse();
-        }
+        },
         "name-natural" => {
             // Use wrapper struct to cache string AND use natural compare
             files.sort_by_cached_key(|f| {
@@ -2289,7 +2294,7 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
                     f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
                 )
             });
-        }
+        },
         "name-natural-desc" => {
             files.sort_by_cached_key(|f| {
                 NaturalSortKey(
@@ -2297,7 +2302,7 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
                 )
             });
             files.reverse();
-        }
+        },
         "date" => files.sort_by_key(|a| a.modified),
         "date-desc" => files.sort_by_key(|b| std::cmp::Reverse(b.modified)),
         "size" => files.sort_by_key(|a| a.size),
@@ -2311,7 +2316,7 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => a.modified.cmp(&b.modified),
             });
-        }
+        },
         "exif-date-desc" => {
             // Sort by EXIF timestamp (newest first).
             // Files with EXIF timestamps come first, then files without (sorted by mtime desc).
@@ -2321,11 +2326,11 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => b.modified.cmp(&a.modified),
             });
-        }
+        },
         "random" => {
             let mut rng = rand::rng();
             files.shuffle(&mut rng);
-        }
+        },
         "location" => (), // Sorting logic is performed in the GUI layer using GPS state
         _ => {
             // Default fallback (Name Natural)
@@ -2334,7 +2339,7 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
                     f.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
                 )
             });
-        }
+        },
     }
 }
 
@@ -2346,20 +2351,20 @@ pub fn sort_directories(dirs: &mut [std::path::PathBuf], sort_order: &str) {
             dirs.sort_by_cached_key(|d| {
                 d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
             });
-        }
+        },
         "name-desc" => {
             dirs.sort_by_cached_key(|d| {
                 d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
             });
             dirs.reverse();
-        }
+        },
         "name-natural" | "" => {
             dirs.sort_by_cached_key(|d| {
                 NaturalSortKey(
                     d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
                 )
             });
-        }
+        },
         "name-natural-desc" => {
             dirs.sort_by_cached_key(|d| {
                 NaturalSortKey(
@@ -2367,19 +2372,19 @@ pub fn sort_directories(dirs: &mut [std::path::PathBuf], sort_order: &str) {
                 )
             });
             dirs.reverse();
-        }
+        },
         "date" => {
             dirs.sort_by_cached_key(|d| {
                 fs::metadata(d).ok().and_then(|m| m.modified().ok()).unwrap_or(UNIX_EPOCH)
             });
-        }
+        },
         "date-desc" => {
             dirs.sort_by_cached_key(|d| {
                 std::cmp::Reverse(
                     fs::metadata(d).ok().and_then(|m| m.modified().ok()).unwrap_or(UNIX_EPOCH),
                 )
             });
-        }
+        },
         "size" => {
             // For directories, size doesn't make much sense, so sort by name
             dirs.sort_by_cached_key(|d| {
@@ -2387,18 +2392,18 @@ pub fn sort_directories(dirs: &mut [std::path::PathBuf], sort_order: &str) {
                     d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
                 )
             });
-        }
+        },
         "size-desc" => {
             dirs.sort_by_cached_key(|d| {
                 NaturalSortKey(
                     d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
                 )
             });
-        }
+        },
         "random" => {
             let mut rng = rand::rng();
             dirs.shuffle(&mut rng);
-        }
+        },
         _ => {
             // Default fallback (Name Natural)
             dirs.sort_by_cached_key(|d| {
@@ -2406,7 +2411,7 @@ pub fn sort_directories(dirs: &mut [std::path::PathBuf], sort_order: &str) {
                     d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
                 )
             });
-        }
+        },
     }
 }
 
@@ -2820,7 +2825,7 @@ pub fn spawn_background_flatten_scan(
 ///
 /// The GUI can then use unique_file_id for O(1) lookup to update FileMetadata.
 pub fn spawn_background_enrichment(
-    files_to_enrich: Vec<(std::path::PathBuf, u128, Option<(u32, u32)>, u8)>, // (path, unique_file_id, resolution, orientation)
+    files_to_enrich: Vec<(std::path::PathBuf, u128, Option<(u32, u32)>, u8)>, /* (path, unique_file_id, resolution, orientation) */
     content_key: [u8; 32],
     meta_key_secret: [u8; 32],
     db_tx: Option<Sender<DbUpdate>>,

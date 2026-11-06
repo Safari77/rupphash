@@ -1,29 +1,33 @@
-use crate::scanner::is_raw_ext;
+use std::{
+    borrow::Cow,
+    f32::consts::PI,
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
 use egui_wgpu::wgpu;
-use fast_image_resize::images::Image as FastImage;
-use fast_image_resize::{PixelType, ResizeOptions, Resizer};
+use fast_image_resize::{PixelType, ResizeOptions, Resizer, images::Image as FastImage};
 use half::f16;
 use image::GenericImageView;
 use oklab::{LinearRgb, Oklab, linear_srgb_to_oklab, oklab_to_linear_srgb};
-use std::borrow::Cow;
-use std::f32::consts::PI;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use super::app::GuiApp;
-use crate::exif_types::{
-    ExifValue, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE, TAG_ORIENTATION,
+use crate::{
+    exif_types::{
+        ExifValue, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE, TAG_ORIENTATION,
+    },
+    image_features::ImageFeatures,
+    img_debug, raw_exif, scanner,
+    scanner::is_raw_ext,
 };
-use crate::image_features::ImageFeatures;
-use crate::img_debug;
-use crate::raw_exif;
-use crate::scanner;
 
 pub const MAX_TEXTURE_SIDE: usize = 8192;
 
@@ -560,7 +564,7 @@ impl ImagePlacement {
 }
 
 pub enum ImageLoadResult {
-    Loaded(egui::ColorImage, (u32, u32), u8, [u8; 32], Option<i64>, Option<HistPalette>), // image, resolution, orientation, content_hash, exif_timestamp, histogram+palette
+    Loaded(egui::ColorImage, (u32, u32), u8, [u8; 32], Option<i64>, Option<HistPalette>), /* image, resolution, orientation, content_hash, exif_timestamp, histogram+palette */
     /// Deep-colour variant of `Loaded`. `width`/`height` are the texture
     /// dimensions (possibly downscaled to MAX_TEXTURE_SIDE); `resolution` is
     /// the file's true resolution, as for `Loaded`.
@@ -915,7 +919,7 @@ pub(super) fn upload_gpu_image(
                 width * 4,
                 bytemuck::cast_slice(v),
             )
-        }
+        },
         DeepPixels::Rgba16(v) => {
             if v.len() < px * 4 {
                 return None;
@@ -926,7 +930,7 @@ pub(super) fn upload_gpu_image(
                 width * 8,
                 bytemuck::cast_slice(v),
             )
-        }
+        },
     };
 
     if width == 0 || height == 0 {
@@ -1186,7 +1190,7 @@ pub(super) fn spawn_image_loader_pool(
                                     content_hash,
                                     exif_timestamp,
                                 }
-                            }
+                            },
                             Err(e) => ImageLoadResult::Failed(e),
                         };
                         let _ = tx_clone.send(((path, g_idx, f_idx), result));
@@ -1263,9 +1267,9 @@ pub(super) fn spawn_image_loader_pool(
                                     exif_timestamp,
                                     hist_palette,
                                 }
-                            }
+                            },
                         }
-                    }
+                    },
                     Err(err_msg) => ImageLoadResult::Failed(err_msg),
                 };
                 let _ = tx_clone.send(((path, g_idx, f_idx), result));
@@ -1454,19 +1458,19 @@ fn finish_dynamic(
             (true, Some(c)) => {
                 let (w, h, data) = crate::hdr::convert_sdr_to_srgb_rgba16(&dyn_img, c);
                 (w, h, DeepPixels::Rgba16(data))
-            }
+            },
             (true, None) => {
                 let (w, h, data) = crate::hdr::requantize_srgb16_to_rgba16(&dyn_img);
                 (w, h, DeepPixels::Rgba16(data))
-            }
+            },
             (false, Some(c)) => {
                 let (w, h, data) = crate::hdr::convert_sdr_to_srgb_rgb10a2(&dyn_img, c);
                 (w, h, DeepPixels::Rgb10a2(data))
-            }
+            },
             (false, None) => {
                 let (w, h, data) = crate::hdr::requantize_srgb16_to_rgb10a2(&dyn_img);
                 (w, h, DeepPixels::Rgb10a2(data))
-            }
+            },
         };
         return (DecodedImage::Deep { width: w, height: h, pixels }, real_dims, orientation);
     }
@@ -1621,8 +1625,7 @@ fn is_animated_webp(bytes: &[u8]) -> bool {
 /// Asks the GIF decoder for frames and reports animation when a second frame
 /// exists. Lazily decodes at most two frames, so it stays cheap on stills.
 fn is_animated_gif(bytes: &[u8]) -> bool {
-    use image::AnimationDecoder;
-    use image::codecs::gif::GifDecoder;
+    use image::{AnimationDecoder, codecs::gif::GifDecoder};
 
     // GIF87a / GIF89a header is 6 bytes
     if bytes.len() < 10 || (&bytes[0..4] != b"GIF8") {
@@ -1735,9 +1738,7 @@ fn decode_animated_webp_frames(
     path: &Path,
     bytes: &[u8],
 ) -> Result<(Vec<egui::ColorImage>, Vec<Duration>, (u32, u32), u8), String> {
-    use image::AnimationDecoder;
-    use image::ImageDecoder;
-    use image::codecs::webp::WebPDecoder;
+    use image::{AnimationDecoder, ImageDecoder, codecs::webp::WebPDecoder};
 
     let orientation = crate::exif_extract::get_orientation(path, Some(bytes));
 
@@ -1774,9 +1775,7 @@ fn decode_animated_gif_frames(
     path: &Path,
     bytes: &[u8],
 ) -> Result<(Vec<egui::ColorImage>, Vec<Duration>, (u32, u32), u8), String> {
-    use image::AnimationDecoder;
-    use image::ImageDecoder;
-    use image::codecs::gif::GifDecoder;
+    use image::{AnimationDecoder, ImageDecoder, codecs::gif::GifDecoder};
 
     let orientation = crate::exif_extract::get_orientation(path, Some(bytes));
 
@@ -1863,7 +1862,7 @@ fn load_and_process_image_from_bytes(
 
                 // If the fallback fails or we aren't using thumbnails, return the original error
                 return Err(format!("Failed to open RAW file (and EXIF fallback failed): {}", e));
-            }
+            },
         };
 
         // Sensor-crop dimensions, in the sensor's own orientation. These are
@@ -1949,7 +1948,7 @@ fn load_and_process_image_from_bytes(
                             (DecodedImage::Srgb8(maybe_resize_image(img, dims, 1, path).0), dims)
                         })
                 }
-            }
+            },
             Err(e) => Err(format!("Failed to unpack RAW: {}", e)),
         };
         // rsraw handles rotation, so orientation = 1 for a full decode — and
@@ -1966,7 +1965,7 @@ fn load_and_process_image_from_bytes(
                     return Ok(srgb8_result(thumb, raw_dims, actual_orientation, path));
                 }
                 return Err(e);
-            }
+            },
         }
     }
 
@@ -2022,11 +2021,11 @@ fn load_and_process_image_from_bytes(
                 // 16-bit TIFF and JXL reach this branch, so let finish_dynamic
                 // decide whether they are worth keeping at 10 bits.
                 return Ok(finish_dynamic(dyn_img, (w, h), orientation, caps, final_cicp, path));
-            }
+            },
             Err(err_msg) => {
                 eprintln!("[DEBUG-GUI] scanner decode FAILED for {:?}: {}", path, err_msg);
                 return Err(format!("Failed to decode {} file: {}", ext.to_uppercase(), err_msg));
-            }
+            },
         }
     }
 
@@ -2424,7 +2423,7 @@ pub(super) fn render_image_texture(
 
                 (z * resolution_scale) / ppp
             }
-        }
+        },
     };
 
     // Size of the image on screen (visually)
@@ -2487,7 +2486,7 @@ pub(super) fn render_image_texture(
                 .uv(uv)
                 .rotate(total_angle, egui::Vec2::splat(0.5))
                 .paint_at(ui, paint_rect);
-        }
+        },
         ImageSource::Gpu { bind_group, .. } => {
             // Same painter, and therefore the same clip rect, that paint_at
             // uses in the branch above.
@@ -2560,7 +2559,7 @@ pub(super) fn render_image_texture(
                     },
                 ));
             }
-        }
+        },
     }
 
     // --- 7. Interaction ---
@@ -3427,7 +3426,7 @@ fn compute_histogram_from_image(
                 Ok(dyn_img) => {
                     // Explicit return here exits the function early with our data
                     return Some(compute_histogram_from_dynamic_image(&dyn_img, palette_config));
-                }
+                },
                 Err(e) => {
                     // Log the actual error that bubbled up and explicitly return None
                     eprintln!(
@@ -3435,7 +3434,7 @@ fn compute_histogram_from_image(
                         path, e
                     );
                     return None;
-                }
+                },
             }
         } else {
             eprintln!("[DEBUG-HISTOGRAM] Failed to read bytes for {:?}", path);
@@ -3449,7 +3448,7 @@ fn compute_histogram_from_image(
         Err(e) => {
             eprintln!("[DEBUG-HISTOGRAM] image::open failed for {:?}: {}", path, e);
             return None;
-        }
+        },
     };
 
     Some(compute_histogram_from_dynamic_image(&img, palette_config))
@@ -3465,7 +3464,7 @@ fn compute_histogram_from_raw(
         Err(e) => {
             eprintln!("[DEBUG-HISTOGRAM] Failed to read RAW file {:?}: {}", path, e);
             return None;
-        }
+        },
     };
 
     let mut raw = match rsraw::RawImage::open(&data) {
@@ -3483,7 +3482,7 @@ fn compute_histogram_from_raw(
                 eprintln!("[DEBUG-HISTOGRAM] EXIF fallback also failed for {:?}", path);
                 return None;
             }
-        }
+        },
     };
 
     // Try to extract thumbnail first (faster)
@@ -3497,7 +3496,7 @@ fn compute_histogram_from_raw(
                 match image::load_from_memory(&best_thumb.data) {
                     Ok(img) => {
                         return Some(compute_histogram_from_dynamic_image(&img, palette_config));
-                    }
+                    },
                     Err(e) => eprintln!(
                         "[DEBUG-HISTOGRAM] image::load_from_memory failed on rsraw thumb for {:?}: {}",
                         path, e
@@ -3509,7 +3508,7 @@ fn compute_histogram_from_raw(
                     path
                 );
             }
-        }
+        },
         Err(e) => eprintln!("[DEBUG-HISTOGRAM] rsraw.extract_thumbs failed for {:?}: {}", path, e),
     }
 
@@ -3563,10 +3562,10 @@ fn compute_histogram_from_raw(
                     processed.len()
                 );
             }
-        }
+        },
         Err(e) => {
             eprintln!("[DEBUG-HISTOGRAM] rsraw.process failed for {:?}: {}", path, e);
-        }
+        },
     }
 
     None

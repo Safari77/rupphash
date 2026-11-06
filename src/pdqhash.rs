@@ -5,14 +5,14 @@
 //
 // ---------------------------------------------------------------------------
 
+use std::{borrow::Cow, cell::RefCell, f32::consts::PI, sync::LazyLock};
+
 use fast_image_resize as fr;
-use fast_image_resize::images::{Image, ImageRef};
-use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions};
+use fast_image_resize::{
+    FilterType, ResizeAlg, ResizeOptions,
+    images::{Image, ImageRef},
+};
 pub use image;
-use std::borrow::Cow;
-use std::cell::RefCell;
-use std::f32::consts::PI;
-use std::sync::LazyLock;
 
 const MIN_HASHABLE_DIM: u32 = 5;
 const PDQ_NUM_JAROSZ_XY_PASSES: usize = 2;
@@ -651,9 +651,9 @@ mod tests {
 
 #[cfg(test)]
 mod benchmarks {
+    use std::{path::Path, time::Instant};
+
     use super::*;
-    use std::path::Path;
-    use std::time::Instant;
 
     #[test]
     fn bench_pdq_performance() {

@@ -1,5 +1,4 @@
-use std::path::Path;
-use std::{env, process};
+use std::{env, path::Path, process};
 
 use crate::phash::*;
 
@@ -21,7 +20,7 @@ fn main() {
         Err(e) => {
             eprintln!("Error opening file '{}': {}", file_path, e);
             process::exit(1);
-        }
+        },
     };
 
     // Initialize Hasher

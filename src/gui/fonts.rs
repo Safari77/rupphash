@@ -4,16 +4,19 @@
 //! hardcoded collection indices — those shift between font releases and differ
 //! per weight file.
 
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
+
 use eframe::egui;
-use skrifa::instance::{LocationRef, Size};
-use skrifa::raw::{FileRef, TableProvider};
-use skrifa::string::StringId;
-use skrifa::{FontRef, MetadataProvider};
-use std::collections::HashMap;
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+use skrifa::{
+    FontRef, MetadataProvider,
+    instance::{LocationRef, Size},
+    raw::{FileRef, TableProvider},
+    string::StringId,
+};
 
 /// Which egui family we are trying to fill.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,7 +127,7 @@ fn score_face(face: &FaceInfo, role: FontRole, orthography: &[&str]) -> Option<i
                 } else {
                     return None; // Gothic / UI are not monospace
                 }
-            }
+            },
             FontRole::Proportional => {
                 if has("ui") {
                     50 // tighter line height, designed for UI chrome
@@ -133,7 +136,7 @@ fn score_face(face: &FaceInfo, role: FontRole, orthography: &[&str]) -> Option<i
                 } else {
                     10 // a mono face works, it just isn't the intent
                 }
-            }
+            },
         };
         if has("slab") {
             score -= 8; // stylistic variant, only if nothing else fits
@@ -150,12 +153,12 @@ fn score_face(face: &FaceInfo, role: FontRole, orthography: &[&str]) -> Option<i
                 if has("mono") || has("term") || has("fixed") {
                     score += 10;
                 }
-            }
+            },
             FontRole::Proportional => {
                 if face.monospace {
                     score -= 15;
                 }
-            }
+            },
         }
         if has("regular") || has("book") {
             score += 5;
@@ -213,11 +216,11 @@ pub fn load_font_data(path: &Path) -> Option<&'static [u8]> {
             let leaked: &'static [u8] = Box::leak(data.into_boxed_slice());
             cache.insert(path.to_path_buf(), leaked);
             Some(leaked)
-        }
+        },
         Err(e) => {
             eprintln!("[FONT] cannot read {}: {e}", path.display());
             None
-        }
+        },
     }
 }
 

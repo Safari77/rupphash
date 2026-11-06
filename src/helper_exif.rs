@@ -71,8 +71,8 @@ pub fn get_date_str(exif: &exif::Exif, use_gps: bool) -> Option<String> {
                     dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
                 ));
             }
-        }
-        _ => {}
+        },
+        _ => {},
     }
     None
 }

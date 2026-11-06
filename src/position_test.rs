@@ -4,10 +4,10 @@ mod helper_exif;
 mod image_features;
 mod position;
 
+use std::{fs::File, io::BufReader};
+
 use clap::Parser;
 use exif::Reader;
-use std::fs::File;
-use std::io::BufReader;
 
 /// Simple program to calculate sun position from EXIF data
 #[derive(Parser, Debug)]
@@ -45,7 +45,7 @@ fn main() {
         Err(e) => {
             eprintln!("Error reading EXIF data: {}", e);
             std::process::exit(1);
-        }
+        },
     };
 
     let coords = exif_extract::extract_gps_lat_lon(&exif);
@@ -75,13 +75,13 @@ fn main() {
                     println!("Sun Altitude:  {:.4} deg", sun_alt);
                     println!("Sun Azimuth:   {:.4} deg", sun_az);
                     println!("Timezone:      {}", tzstring);
-                }
+                },
                 Err(e) => {
                     println!("\n--- Calculation Error ---");
                     println!("Error: {}", e);
-                }
+                },
             }
-        }
+        },
         _ => {
             println!("--- Missing Data ---");
             if coords.is_none() {
@@ -93,6 +93,6 @@ fn main() {
                     if args.gpstime { "GPS" } else { "Original" }
                 );
             }
-        }
+        },
     }
 }

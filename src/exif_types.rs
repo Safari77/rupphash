@@ -46,7 +46,7 @@ impl ExifValue {
             ExifValue::Float(v) => format!("{:.4}", v),
             ExifValue::Floats(v) => {
                 v.iter().map(|f| format!("{:.6}", f)).collect::<Vec<_>>().join(", ")
-            }
+            },
             ExifValue::String(s) => s.clone(),
         }
     }

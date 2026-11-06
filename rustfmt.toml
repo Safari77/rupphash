@@ -3,7 +3,22 @@ max_width = 100
 use_small_heuristics = "Max"
 use_field_init_shorthand = true
 newline_style = "Unix"
+reorder_imports = true
+unstable_features = true
 
-# nightly
-#group_imports = "StdExternalCrate"
-#imports_granularity = "Crate"
+# Nightly imports
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+reorder_modules = true
+
+# Nightly comments & documentation
+format_code_in_doc_comments = true
+doc_comment_code_block_width = 90
+comment_width = 90
+normalize_comments = true
+
+# Nightly layout & clean diffs
+trailing_comma = "Vertical"
+match_block_trailing_comma = true
+inline_attribute_width = 40
+hex_literal_case = "Upper"

@@ -1,12 +1,16 @@
-use regex::RegexBuilder;
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
-use crate::fileops;
-use crate::gui::slideshow::SlideshowEffectChoice;
-use crate::scanner::{analyze_group, sort_files};
-use crate::{FileMetadata, GroupInfo};
+use regex::RegexBuilder;
+
+use crate::{
+    FileMetadata, GroupInfo, fileops,
+    gui::slideshow::SlideshowEffectChoice,
+    scanner::{analyze_group, sort_files},
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputIntent {
@@ -259,11 +263,11 @@ impl AppState {
                 InputIntent::ChangeSortOrder(sort) => {
                     self.show_sort_selection = false;
                     self.perform_sort(sort);
-                }
+                },
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_sort_selection = false;
-                }
-                _ => {}
+                },
+                _ => {},
             }
             return;
         }
@@ -274,11 +278,11 @@ impl AppState {
                 InputIntent::ConfirmDelete => {
                     self.show_confirmation = false;
                     self.perform_deletion();
-                }
+                },
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_confirmation = false;
-                }
-                _ => {}
+                },
+                _ => {},
             }
             return;
         }
@@ -289,13 +293,13 @@ impl AppState {
                 InputIntent::ConfirmMoveMarked => {
                     self.show_move_confirmation = false;
                     self.perform_move_marked();
-                }
+                },
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_move_confirmation = false;
                     // Drop the open dirfd so we don't hold it longer than needed.
                     self.move_dest_info = None;
-                }
-                _ => {}
+                },
+                _ => {},
             }
             return;
         }
@@ -306,11 +310,11 @@ impl AppState {
                 InputIntent::ConfirmDeleteImmediate => {
                     self.show_delete_immediate_confirmation = false;
                     self.perform_delete_immediate();
-                }
+                },
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_delete_immediate_confirmation = false;
-                }
-                _ => {}
+                },
+                _ => {},
             }
             return;
         }
@@ -321,11 +325,11 @@ impl AppState {
                 InputIntent::ConfirmIgnoreGroup => {
                     self.show_ignore_group_confirmation = false;
                     // Actual DB work is done in dialogs.rs handle_dialogs
-                }
+                },
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_ignore_group_confirmation = false;
-                }
-                _ => {}
+                },
+                _ => {},
             }
             return;
         }
@@ -334,7 +338,7 @@ impl AppState {
             match intent {
                 InputIntent::SubmitRename(new_name) => self.perform_rename(new_name),
                 InputIntent::Cancel => self.renaming = None,
-                _ => {}
+                _ => {},
             }
             return;
         }
@@ -344,35 +348,35 @@ impl AppState {
             InputIntent::NextItem => {
                 self.next_item();
                 self.selection_changed = true;
-            }
+            },
             InputIntent::PrevItem => {
                 self.prev_item();
                 self.selection_changed = true;
-            }
+            },
             InputIntent::NextGroup => {
                 self.next_group();
                 self.selection_changed = true;
-            }
+            },
             InputIntent::PrevGroup => {
                 self.prev_group();
                 self.selection_changed = true;
-            }
+            },
             InputIntent::PageDown => {
                 self.move_page(true, 15);
                 self.selection_changed = true;
-            }
+            },
             InputIntent::PageUp => {
                 self.move_page(false, 15);
                 self.selection_changed = true;
-            }
+            },
             InputIntent::Home => {
                 self.go_home();
                 self.selection_changed = true;
-            }
+            },
             InputIntent::End => {
                 self.go_end();
                 self.selection_changed = true;
-            }
+            },
             InputIntent::ToggleMark => self.toggle_delete(),
             InputIntent::ExecuteDelete => {
                 if !self.marked_for_deletion.is_empty() {
@@ -383,13 +387,13 @@ impl AppState {
                 } else {
                     self.set_status("No files to delete.".to_string(), false);
                 }
-            }
+            },
             InputIntent::DeleteImmediate => {
                 if self.get_current_image_path().is_some() {
                     self.show_delete_immediate_confirmation = true;
                 }
-            }
-            InputIntent::ConfirmDeleteImmediate => {}
+            },
+            InputIntent::ConfirmDeleteImmediate => {},
             InputIntent::MoveMarked => {
                 if self.move_target.is_none() {
                     self.set_status("No move target set (use --move-marked)".to_string(), true);
@@ -404,26 +408,26 @@ impl AppState {
                         Ok(dest) => {
                             self.move_dest_info = Some(dest);
                             self.show_move_confirmation = true;
-                        }
+                        },
                         Err(e) => {
                             self.error_popup = Some(format!(
                                 "Could not open move target {:?}:\n{}\n\n(Press any key to dismiss)",
                                 target, e
                             ));
-                        }
+                        },
                     }
                 }
-            }
-            InputIntent::ConfirmMoveMarked => {}
+            },
+            InputIntent::ConfirmMoveMarked => {},
             InputIntent::ToggleRelativeTime => {
                 self.show_relative_times = !self.show_relative_times;
                 self.selection_changed = true;
-            }
-            InputIntent::ConfirmDelete => {}
+            },
+            InputIntent::ConfirmDelete => {},
             InputIntent::Cancel => {
                 self.status_message = None;
-            }
-            InputIntent::CycleViewMode | InputIntent::CycleZoom => {}
+            },
+            InputIntent::CycleViewMode | InputIntent::CycleZoom => {},
             InputIntent::StartRename => {
                 if let Some(path) = self.get_current_image_path().cloned() {
                     self.renaming = Some(RenameState {
@@ -432,13 +436,13 @@ impl AppState {
                         original_path: path,
                     });
                 }
-            }
-            InputIntent::SubmitRename(_) => {}
-            InputIntent::RefreshDirCache => {}
+            },
+            InputIntent::SubmitRename(_) => {},
+            InputIntent::RefreshDirCache => {},
             InputIntent::ToggleZoomRelative => {
                 self.zoom_relative = !self.zoom_relative;
                 self.selection_changed = true;
-            }
+            },
             InputIntent::TogglePathVisibility => {
                 if let Some(path) = self.get_current_image_path() {
                     let total_components = path.components().count();
@@ -449,7 +453,7 @@ impl AppState {
                     }
                     self.selection_changed = true;
                 }
-            }
+            },
             InputIntent::ToggleSlideshow => {
                 if self.slideshow_interval.is_none() {
                     // Initialize with 3 second interval if it wasn't set via CLI
@@ -462,10 +466,10 @@ impl AppState {
                 let status =
                     if self.slideshow_paused { "Slideshow paused" } else { "Slideshow active" };
                 self.set_status(status.to_string(), false);
-            }
+            },
             InputIntent::ToggleFullscreen => {
                 self.is_fullscreen = !self.is_fullscreen;
-            }
+            },
             InputIntent::RotateCW => {
                 // Per-file rotation
                 if let Some(group) = self.groups.get(self.current_group_idx)
@@ -478,7 +482,7 @@ impl AppState {
 
                 // Also update legacy manual_rotation for compatibility
                 self.manual_rotation = (self.manual_rotation + 1) % 4;
-            }
+            },
             InputIntent::ToggleLut => {
                 if self.has_lut {
                     self.lut_enabled = !self.lut_enabled;
@@ -492,7 +496,7 @@ impl AppState {
                 } else {
                     self.set_status("No 3D LUT loaded (use --3dlut <file.cube>)".to_string(), true);
                 }
-            }
+            },
             InputIntent::CycleLut => {
                 let count = self.lut_names.len();
                 if self.has_lut && count > 0 {
@@ -507,7 +511,7 @@ impl AppState {
                 } else {
                     self.set_status("No 3D LUT loaded (use --3dlut <file.cube>)".to_string(), true);
                 }
-            }
+            },
             InputIntent::FlipHorizontal => {
                 // Per-file horizontal flip (left-right)
                 if let Some(group) = self.groups.get(self.current_group_idx)
@@ -516,7 +520,7 @@ impl AppState {
                     let transform = self.file_transforms.entry(file.unique_file_id).or_default();
                     transform.flip_horizontal = !transform.flip_horizontal;
                 }
-            }
+            },
             InputIntent::FlipVertical => {
                 // Per-file vertical flip (up-down)
                 if let Some(group) = self.groups.get(self.current_group_idx)
@@ -525,16 +529,16 @@ impl AppState {
                     let transform = self.file_transforms.entry(file.unique_file_id).or_default();
                     transform.flip_vertical = !transform.flip_vertical;
                 }
-            }
+            },
             InputIntent::ResetTransform => {
                 // Reset transforms for ALL files
                 self.file_transforms.clear();
                 // Also reset legacy manual_rotation
                 self.manual_rotation = 0;
-            }
+            },
             InputIntent::ShowSortSelection => {
                 self.show_sort_selection = true;
-            }
+            },
             InputIntent::NextGroupByDist => {
                 if self.groups.is_empty() {
                     return;
@@ -561,7 +565,7 @@ impl AppState {
                 } else {
                     self.set_status("No groups with higher distance found.".to_string(), false);
                 }
-            }
+            },
             InputIntent::PreviousGroupByDist => {
                 if self.groups.is_empty() {
                     return;
@@ -587,33 +591,33 @@ impl AppState {
                 } else {
                     self.set_status("No groups with smaller distance found.".to_string(), false);
                 }
-            }
+            },
             InputIntent::StartSearch => {
                 self.show_search = true;
-            }
+            },
             InputIntent::SubmitSearch(query) => {
                 self.perform_search(query);
-            }
+            },
             InputIntent::CancelSearch => {
                 self.show_search = false;
-            }
+            },
             InputIntent::NextSearchResult => {
                 self.jump_search(true);
-            }
+            },
             InputIntent::PrevSearchResult => {
                 self.jump_search(false);
-            }
+            },
             InputIntent::FindInMap => { // handled in handle_dialogs
-            }
-            InputIntent::ChangeSortOrder(_) => {}
-            InputIntent::IgnoreCurrent => {} // handled in dialogs.rs
+            },
+            InputIntent::ChangeSortOrder(_) => {},
+            InputIntent::IgnoreCurrent => {}, // handled in dialogs.rs
             InputIntent::IgnoreGroup => {
                 // Show confirmation dialog (actual DB work in dialogs.rs)
                 if !self.view_mode {
                     self.show_ignore_group_confirmation = true;
                 }
-            }
-            InputIntent::ConfirmIgnoreGroup => {} // handled in dialogs.rs
+            },
+            InputIntent::ConfirmIgnoreGroup => {}, // handled in dialogs.rs
         }
     }
 
@@ -675,10 +679,10 @@ impl AppState {
                         self.set_status(format!("Renamed to '{}'", new_name), false);
                     }
                     self.selection_changed = true;
-                }
+                },
                 Err(e) => {
                     self.error_popup = Some(format!("Failed to rename:\n{}", e));
-                }
+                },
             }
         }
     }
@@ -844,7 +848,7 @@ impl AppState {
                     success_count += 1;
                     let action = if self.use_trash { "TRASHED " } else { "DELETED " };
                     eprintln!("[DELETE] {}{}", action, path.display());
-                }
+                },
                 Err(e) => {
                     error_details.push(format!(
                         "• {:?}: {}",
@@ -852,7 +856,7 @@ impl AppState {
                         e
                     ));
                     failed_paths.insert(path.clone());
-                }
+                },
             }
         }
         self.marked_for_deletion.retain(|p| failed_paths.contains(p));
@@ -950,10 +954,10 @@ impl AppState {
                 let action = if self.use_trash { "Trashed" } else { "Deleted" };
                 self.set_status(format!("{}: {}", action, filename), false);
                 self.selection_changed = true;
-            }
+            },
             Err(e) => {
                 self.error_popup = Some(format!("Failed to delete:\n{}", e));
-            }
+            },
         }
     }
 
@@ -971,7 +975,7 @@ impl AppState {
             Err(e) => {
                 self.error_popup = Some(format!("Invalid Regex:\n{}", e));
                 return;
-            }
+            },
         };
 
         for (g_idx, group) in self.groups.iter().enumerate() {
@@ -1071,13 +1075,13 @@ impl AppState {
                 Ok(()) => {
                     success_count += 1;
                     moved_ok.push((result.source, result.destination));
-                }
+                },
                 Err(e) => {
                     // e is a standard std::io::Error with a descriptive message
                     error_details.push(format!("• {:?}: {}", filename, e));
                     moved_failed.push((result.source.clone(), result.destination, e.to_string()));
                     failed_paths.insert(result.source);
-                }
+                },
             }
         }
         self.marked_for_deletion.retain(|p| failed_paths.contains(p));

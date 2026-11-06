@@ -290,11 +290,12 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
 
 #[cfg(test)]
 mod tests {
+    use std::{path::Path, time::Instant};
+
+    use rand::prelude::*;
+
     use super::*;
     use crate::pdqhash;
-    use rand::prelude::*;
-    use std::path::Path;
-    use std::time::Instant;
 
     // --- TEST 1: High Similarity Logic (Generics check) ---
     #[test]

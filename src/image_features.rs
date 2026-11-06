@@ -1,13 +1,15 @@
 // Image features storage for database.
 // Uses BTreeMap for flexible EXIF tag storage with postcard serialization.
 
+use std::collections::BTreeMap;
+
+use geo::Point;
+use serde::{Deserialize, Serialize};
+
 use crate::exif_types::{
     ExifValue, TAG_DERIVED_PDQ_QUALITY, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE,
     TAG_ORIENTATION,
 };
-use geo::Point;
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 /// Image features with flexible EXIF tag storage
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -1,16 +1,15 @@
-use crate::format_relative_time;
-use crate::scanner;
-use crate::search_index::{SearchCriterion, parse_search_query};
-use crate::state::InputIntent;
+use std::{cell::RefCell, fs, path::Path};
+
 use eframe::egui;
 use jiff::Timestamp;
 use regex::RegexBuilder;
-use std::cell::RefCell;
-use std::fs;
-use std::path::Path;
 
-use super::app::GuiApp;
-use super::image::ViewMode;
+use super::{app::GuiApp, image::ViewMode};
+use crate::{
+    format_relative_time, scanner,
+    search_index::{SearchCriterion, parse_search_query},
+    state::InputIntent,
+};
 
 struct GeoDistanceFilter {
     target_point: geo::Point<f64>,
@@ -651,25 +650,25 @@ pub(super) fn handle_dialogs(
                         _ => ViewMode::FitWindow,
                     };
                 });
-            }
+            },
             InputIntent::CycleZoom => {
                 app.update_view_state(|v| {
                     v.mode = match v.mode {
                         ViewMode::FitWindow => ViewMode::ManualZoom(1.0), // 1:1 native pixels
                         ViewMode::ManualZoom(z) if (z - 1.0).abs() < 0.1 => {
                             ViewMode::ManualZoom(2.0)
-                        }
+                        },
                         ViewMode::ManualZoom(z) if (z - 2.0).abs() < 0.1 => {
                             ViewMode::ManualZoom(4.0)
-                        }
+                        },
                         ViewMode::ManualZoom(z) if (z - 4.0).abs() < 0.1 => {
                             ViewMode::ManualZoom(8.0)
-                        }
+                        },
                         ViewMode::ManualZoom(_) => ViewMode::FitWindow,
                         _ => ViewMode::ManualZoom(1.0),
                     };
                 });
-            }
+            },
             InputIntent::StartRename => {
                 if let Some(path) = app.state.get_current_image_path() {
                     app.rename_input =
@@ -679,7 +678,7 @@ pub(super) fn handle_dialogs(
                     app.rename_focus_requested = false;
                     app.state.handle_input(i);
                 }
-            }
+            },
             InputIntent::FindInMap => {
                 if let Some(group) = app.state.groups.get(app.state.current_group_idx) {
                     let positions: Vec<_> = group
@@ -699,7 +698,7 @@ pub(super) fn handle_dialogs(
                         app.set_status("No GPS markers found in current group".to_string(), true);
                     }
                 }
-            }
+            },
             InputIntent::IgnoreCurrent => {
                 // Q key in duplicate finder mode:
                 // If files are marked → ignore all marked files
@@ -788,14 +787,14 @@ pub(super) fn handle_dialogs(
                                 app.state.last_file_count =
                                     app.state.groups.iter().map(|g| g.len()).sum();
                                 app.set_status(format!("Ignored {} files", count), false);
-                            }
+                            },
                             Err(e) => {
                                 app.set_status(format!("Ignore failed: {}", e), true);
-                            }
+                            },
                         }
                     }
                 }
-            }
+            },
             _ => app.state.handle_input(i),
         }
     }
@@ -1449,7 +1448,7 @@ pub(super) fn handle_dialogs(
                                     } else {
                                         dt.format("%Y-%m-%d %H:%M").to_string()
                                     }
-                                }
+                                },
                                 None => String::new(),
                             };
 
@@ -1581,7 +1580,7 @@ pub(super) fn handle_dialogs(
                 // Initialize timer on first frame so image 0 is shown for the full interval
                 app.slideshow_last_advance = Some(std::time::Instant::now());
                 false
-            }
+            },
         };
 
         if should_advance {
@@ -1704,10 +1703,10 @@ fn perform_ignore_group(app: &mut GuiApp) {
             app.cache_dirty = true;
             app.state.last_file_count = app.state.groups.iter().map(|g| g.len()).sum();
             app.set_status(format!("Ignored {} files (group uuid: {})", count, uuid_str), false);
-        }
+        },
         Err(e) => {
             app.set_status(format!("Ignore group failed: {}", e), true);
-        }
+        },
     }
 }
 
@@ -1783,11 +1782,11 @@ fn perform_advanced_search(app: &mut GuiApp) {
                                 .push(format!("Invalid range '{}' in term '{}'", range_str, term));
                         }
                     }
-                }
+                },
                 _ => {
                     search_errors
                         .push(format!("Invalid coordinates in '{}'. Expected numbers.", term));
-                }
+                },
             }
         } else {
             standard_query_parts.push(term);
@@ -1809,7 +1808,7 @@ fn perform_advanced_search(app: &mut GuiApp) {
             Err(e) => {
                 app.state.error_popup = Some(format!("Invalid filename regex:\n{}", e));
                 return;
-            }
+            },
         }
     } else {
         None
@@ -1821,7 +1820,7 @@ fn perform_advanced_search(app: &mut GuiApp) {
             Err(e) => {
                 app.state.error_popup = Some(format!("Invalid EXIF query:\n{}", e));
                 return;
-            }
+            },
         }
     } else {
         Vec::new()
@@ -1922,7 +1921,7 @@ fn perform_advanced_search(app: &mut GuiApp) {
         let search_desc = match (filename_regex.is_some(), has_exif_or_geo) {
             (true, true) => {
                 format!("filename '{}' AND EXIF '{}'", filename_query_raw, exif_query_raw)
-            }
+            },
             (true, false) => format!("filename '{}'", filename_query_raw),
             (false, true) => format!("EXIF '{}'", exif_query_raw),
             (false, false) => "empty query".to_string(),
@@ -1958,8 +1957,7 @@ fn check_exif_criteria_fallback(
     file: &crate::FileMetadata,
     criteria: &[crate::search_index::SearchCriterion],
 ) -> bool {
-    use crate::exif_types::*;
-    use crate::search_index::SearchOp;
+    use crate::{exif_types::*, search_index::SearchOp};
 
     // Sentinel appended to a cached tag list to record that derived tags were
     // requested when it was built. The cache is keyed by path alone, so without
@@ -2051,10 +2049,10 @@ fn check_exif_criteria_fallback(
                 } else {
                     value_str.eq_ignore_ascii_case(&criterion.value)
                 }
-            }
+            },
             SearchOp::Contains => {
                 value_str.to_lowercase().contains(&criterion.value.to_lowercase())
-            }
+            },
             SearchOp::LessThan
             | SearchOp::LessOrEqual
             | SearchOp::GreaterThan
@@ -2082,7 +2080,7 @@ fn check_exif_criteria_fallback(
                 } else {
                     false
                 }
-            }
+            },
             SearchOp::Between => {
                 if let (Some(file_val), Ok(min_val), Some(max_str)) = (
                     crate::search_index::extract_number_from_string(value_str),
@@ -2098,7 +2096,7 @@ fn check_exif_criteria_fallback(
                 } else {
                     false
                 }
-            }
+            },
             SearchOp::Regex => {
                 if let Ok(re) =
                     regex::RegexBuilder::new(&criterion.value).case_insensitive(true).build()
@@ -2107,7 +2105,7 @@ fn check_exif_criteria_fallback(
                 } else {
                     false
                 }
-            }
+            },
         };
 
         if !matches {

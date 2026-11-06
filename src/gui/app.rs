@@ -1,35 +1,44 @@
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    fs,
+    path::PathBuf,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver as StdReceiver, channel},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
 use egui_wgpu::wgpu;
 use geo::Point;
 use jiff::Timestamp;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver as StdReceiver, channel};
-use std::sync::{Arc, RwLock};
-use std::thread;
-use std::time::{Duration, Instant};
 
-use super::gps_map::GpsMapState;
-use super::image::{GroupViewState, ViewMode};
-use crate::GroupStatus;
-use crate::db::{AppContext, EnrichmentResult};
-use crate::format_relative_time;
-use crate::gui::APP_TITLE;
-use crate::gui::image::{ImageLoadResult, MAX_TEXTURE_SIDE};
-use crate::gui::slideshow::SlideshowEffectChoice;
-use crate::img_debug;
-use crate::position;
-use crate::scanner::{self, ScanConfig};
-use crate::state::{
-    AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_content_subgroups,
-    get_hardlink_groups,
+use super::{
+    gps_map::GpsMapState,
+    image::{GroupViewState, ViewMode},
 };
-use crate::{FileMetadata, GroupInfo};
+use crate::{
+    FileMetadata, GroupInfo, GroupStatus,
+    db::{AppContext, EnrichmentResult},
+    format_relative_time,
+    gui::{
+        APP_TITLE,
+        image::{ImageLoadResult, MAX_TEXTURE_SIDE},
+        slideshow::SlideshowEffectChoice,
+    },
+    img_debug, position,
+    scanner::{self, ScanConfig},
+    state::{
+        AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_content_subgroups,
+        get_hardlink_groups,
+    },
+};
 
 // Define a cache struct to hold the data we previously fetched every frame
 #[derive(Clone)]
@@ -141,10 +150,10 @@ pub struct GuiApp {
     /// Cached modification times for `dir_list`, populated alongside it in `open_dir_picker`.
     pub(super) dir_list_mtime: Vec<Option<chrono::DateTime<chrono::Utc>>>,
     pub(super) dir_picker_selection: usize,
-    pub(super) dir_picker_scroll_to_selection: bool, // True when keyboard nav should scroll to selection
+    pub(super) dir_picker_scroll_to_selection: bool, /* True when keyboard nav should scroll to selection */
     pub(super) subdirs: Vec<std::path::PathBuf>,     // Subdirectories in current directory
-    pub(super) dir_selection_idx: Option<usize>, // None = files selected, Some(idx) = directory idx selected
-    pub(super) dir_scroll_to_selection: bool, // True when keyboard nav should scroll to dir in main panel
+    pub(super) dir_selection_idx: Option<usize>, /* None = files selected, Some(idx) = directory idx selected */
+    pub(super) dir_scroll_to_selection: bool, /* True when keyboard nav should scroll to dir in main panel */
     // Tab Completion State
     pub(super) completion_candidates: Vec<String>,
     pub(super) completion_index: usize,
@@ -306,17 +315,17 @@ impl GuiApp {
                     Ok(Some(features)) => {
                         self.search_index.insert(file.unique_file_id, &features);
                         indexed += 1;
-                    }
+                    },
                     Ok(None) => {
                         missing_features += 1;
-                    }
+                    },
                     Err(e) => {
                         eprintln!(
                             "[SEARCH] Error getting features for {:?}: {}",
                             file.path.file_name().unwrap_or_default(),
                             e
                         );
-                    }
+                    },
                 }
             }
         }
@@ -1019,7 +1028,7 @@ impl GuiApp {
                 }
                 self.watcher = Some(watcher);
                 self.fs_event_rx = Some(rx);
-            }
+            },
             Err(e) => eprintln!("Failed to create watcher: {:?}", e),
         }
     }
@@ -1326,12 +1335,12 @@ impl GuiApp {
                             }
                         }
                     }
-                }
+                },
                 notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
                     notify::event::MetadataKind::AccessTime,
                 )) => {
                     continue;
-                }
+                },
                 // File finished being written (inotify CLOSE_WRITE).
                 notify::EventKind::Access(notify::event::AccessKind::Close(
                     notify::event::AccessMode::Write,
@@ -1360,7 +1369,7 @@ impl GuiApp {
                             }
                         }
                     }
-                }
+                },
                 notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
                     for path in &event.paths {
                         if classify(path) {
@@ -1385,8 +1394,8 @@ impl GuiApp {
                             }
                         }
                     }
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
 
@@ -1553,7 +1562,7 @@ impl GuiApp {
                                 } else {
                                     ha.cmp(&hb)
                                 }
-                            }
+                            },
                             // Put files WITH pixel hash (potential content matches) before those without?
                             // Or standard Option ordering: None < Some.
                             // Let's use standard Ord which puts None first.
@@ -1566,7 +1575,7 @@ impl GuiApp {
                                 } else {
                                     ord
                                 }
-                            }
+                            },
                         }
                     });
                 }
@@ -1910,7 +1919,7 @@ impl GuiApp {
         let width = self.ctx.gui_config.width.unwrap_or(1280) as f32;
         let height = self.ctx.gui_config.height.unwrap_or(720) as f32;
 
-        //eprintln!("[DEBUG-RUN] Setting window size to {}x{} (physical pixels = logical points at ppp=1)", width, height);
+        // eprintln!("[DEBUG-RUN] Setting window size to {}x{} (physical pixels = logical points at ppp=1)", width, height);
 
         let is_windows = cfg!(target_os = "windows");
 
@@ -2246,7 +2255,7 @@ impl eframe::App for GuiApp {
                             let name = format!("img_{}", path.display());
                             let texture = ctx.load_texture(name, color_image, Default::default());
                             self.raw_cache.insert(path.clone(), texture);
-                        }
+                        },
                         ImageLoadResult::LoadedDeep {
                             pixels,
                             width,
@@ -2291,7 +2300,7 @@ impl eframe::App for GuiApp {
                             match uploaded {
                                 Some(gpu) => {
                                     self.gpu_cache.insert(path.clone(), gpu);
-                                }
+                                },
                                 None => {
                                     eprintln!(
                                         "[GPU] texture upload failed for {:?} ({}x{})",
@@ -2301,9 +2310,9 @@ impl eframe::App for GuiApp {
                                         path.clone(),
                                         "GPU texture upload failed".to_string(),
                                     );
-                                }
+                                },
                             }
-                        }
+                        },
                         ImageLoadResult::AnimatedLoaded {
                             frames,
                             durations,
@@ -2349,7 +2358,7 @@ impl eframe::App for GuiApp {
                                     last_frame_time: Instant::now(),
                                 },
                             );
-                        }
+                        },
                         ImageLoadResult::Failed(err_msg) => {
                             let lower = err_msg.to_lowercase();
                             let is_transient = lower.contains("premature")
@@ -2371,23 +2380,23 @@ impl eframe::App for GuiApp {
                             } else {
                                 self.failed_images.insert(path.clone(), err_msg);
                             }
-                        }
+                        },
                     }
 
                     // Always remove from loading set
                     self.raw_loading.remove(&path);
                     ctx.request_repaint();
-                }
+                },
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     break;
-                }
+                },
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     // Channel disconnected (worker threads terminated)
                     eprintln!(
                         "[WARN] Image preload channel disconnected - worker threads may have terminated"
                     );
                     break;
-                }
+                },
             }
         }
 
@@ -2408,7 +2417,7 @@ impl eframe::App for GuiApp {
                             }
                         }
                         self.cache_dirty = true;
-                    }
+                    },
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         // Scan complete - start enrichment for files missing GPS
@@ -2448,7 +2457,7 @@ impl eframe::App for GuiApp {
 
                         self.dir_scan_rx = None;
                         break;
-                    }
+                    },
                 }
             }
             if received_any {
@@ -2509,12 +2518,12 @@ impl eframe::App for GuiApp {
                                 self.search_index.insert(result.unique_file_id, &features);
                             }
                         }
-                    }
+                    },
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         enrichment_done = true;
                         break;
-                    }
+                    },
                 }
             }
 
@@ -2587,7 +2596,7 @@ impl eframe::App for GuiApp {
                             } else {
                                 " 1:1".to_string()
                             }
-                        }
+                        },
                         ViewMode::ManualZoom(z) => format!(" {:.0}x", z),
                         _ => "".to_string(),
                     };

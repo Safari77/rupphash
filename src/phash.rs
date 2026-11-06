@@ -1,6 +1,7 @@
+use std::sync::Arc;
+
 use image::DynamicImage;
 use rustdct::{DctPlanner, TransformType2And3};
-use std::sync::Arc;
 
 // Before crying, there can be 1-2-bit differences when comparing to Python imagehash,
 // it is caused by the interpolation artifacts when Python rotates the actual pixel grid (img.rotate).

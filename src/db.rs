@@ -1,5 +1,13 @@
-use crate::image_features::ImageFeatures;
-use crate::scanner::RAW_EXTS;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
 use chacha20poly1305::{
     XChaCha20Poly1305,
     XNonce, // XChaCha20 uses 24-byte nonces
@@ -12,18 +20,10 @@ use redb::{
     TableDefinition, WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::fs;
-use std::io::Write;
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
 use tempfile::NamedTempFile;
 use zeroize::Zeroize;
+
+use crate::{image_features::ImageFeatures, scanner::RAW_EXTS};
 
 const CONFIG_FILE_NAME: &str = "phdupes.conf";
 const DB_FILE_NAME_PDQHASH: &str = "phdupes_redb";
@@ -312,7 +312,7 @@ pub type DbUpdate = (
     Option<([u8; 32], [u8; 32])>,           // Meta: meta_key -> content_hash
     Option<([u8; 32], HashValue)>,          // Hash: content_hash -> pdqhash
     Option<([u8; 32], ImageFeatures)>,      // Features: content_hash -> ImageFeatures
-    Option<([u8; 32], CachedCoefficients)>, // Coefficients: content_hash -> coefficients (dupe mode only)
+    Option<([u8; 32], CachedCoefficients)>, /* Coefficients: content_hash -> coefficients (dupe mode only) */
     Option<([u8; 32], [u8; 32])>,           // Pixel Hash
 );
 
@@ -537,7 +537,7 @@ impl AppContext {
                 );
 
                 new_key
-            }
+            },
         };
         // Scrub hex-encoded master key from heap memory now that we have the raw bytes
         config.master_key.zeroize();
@@ -585,7 +585,7 @@ impl AppContext {
                         Err(e) => return Err(e.into()),
                     }
                 }
-            }
+            },
             Err(e) => return Err(e.into()),
         };
 
@@ -712,14 +712,14 @@ impl AppContext {
                             let mut arr = [0u8; 32];
                             arr.copy_from_slice(rest);
                             Ok(Some(arr))
-                        }
+                        },
                         _ => Ok(None),
                     }
                 } else {
                     eprintln!("[ERROR-DB] get_pdqhash Corrupted content_hash={:x?}", content_hash);
                     Err(corrupted_err("get_pdqhash decryption failed"))
                 }
-            }
+            },
             None => Ok(None),
         }
     }
@@ -742,7 +742,7 @@ impl AppContext {
                     eprintln!("[ERROR] get_features Corrupted ch={:x?}", content_hash);
                     Err(corrupted_err("get_features decryption failed"))
                 }
-            }
+            },
             None => Ok(None),
         }
     }
@@ -773,14 +773,14 @@ impl AppContext {
                             } else {
                                 Err(corrupted_err("get_coefficients deserialization failed"))
                             }
-                        }
+                        },
                         // Older algorithm version: treat as absent, not corrupt.
                         _ => Ok(None),
                     }
                 } else {
                     Err(corrupted_err("get_coefficients decryption failed"))
                 }
-            }
+            },
             None => Ok(None),
         }
     }
@@ -807,7 +807,7 @@ impl AppContext {
                 } else {
                     Err(corrupted_err("get_content_hash decryption failed"))
                 }
-            }
+            },
             None => Ok(None),
         }
     }
@@ -826,7 +826,7 @@ impl AppContext {
                 } else {
                     Err(corrupted_err("get_pixel_hash decryption failed"))
                 }
-            }
+            },
             None => Ok(None),
         }
     }
@@ -1095,7 +1095,7 @@ impl AppContext {
                         if let Some(up) = p {
                             pixel_updates.push(up);
                         }
-                    }
+                    },
                     Err(RecvTimeoutError::Disconnected) => {
                         // Channel closed: attempt a final flush. Retry a few times
                         // because losing the last batch loses cache entries that
@@ -1136,12 +1136,12 @@ impl AppContext {
                                         break;
                                     }
                                     thread::sleep(Duration::from_millis(50));
-                                }
+                                },
                             }
                         }
                         break;
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
 
                 let any_pending = !meta_updates.is_empty()
@@ -1184,7 +1184,7 @@ impl AppContext {
                             coeff_updates.clear();
                             pixel_updates.clear();
                             last_write_failed = false;
-                        }
+                        },
                         Err(e) => {
                             eprintln!("[ERROR-DB] write_batch failed: {:?} (will retry)", e);
                             last_write_failed = true;
@@ -1208,7 +1208,7 @@ impl AppContext {
                                 coeff_updates.clear();
                                 pixel_updates.clear();
                             }
-                        }
+                        },
                     }
                     last_flush = Instant::now();
                 }
@@ -1260,7 +1260,7 @@ impl AppContext {
 
                         let encrypted = Self::encrypt_value(cipher, key, &data);
                         table.insert(key, encrypted.as_slice())?;
-                    }
+                    },
                 }
             }
         }
@@ -1347,7 +1347,7 @@ impl AppContext {
                 } else {
                     false
                 }
-            }
+            },
             _ => false,
         }
     }
@@ -1423,7 +1423,7 @@ impl AppContext {
     /// Returns the total number of newly registered entries.
     pub fn register_duplicate_groups(
         &self,
-        groups: &[Vec<([u8; 32], Option<[u8; 32]>)>], // Vec of groups, each (content_hash, pdqhash)
+        groups: &[Vec<([u8; 32], Option<[u8; 32]>)>], /* Vec of groups, each (content_hash, pdqhash) */
     ) -> Result<usize, redb::Error> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut total_registered = 0;
@@ -1588,7 +1588,7 @@ impl AppContext {
                 } else {
                     Err(corrupted_err("get_ignored decryption failed"))
                 }
-            }
+            },
             None => Ok(None),
         }
     }

@@ -1,6 +1,8 @@
-use std::fs;
-use std::io::{self, Stdout};
 use std::time::Duration; // Added for directory scanning
+use std::{
+    fs,
+    io::{self, Stdout},
+};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -13,10 +15,11 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::GroupStatus;
-use crate::format_relative_time;
-use crate::state::{
-    AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_hardlink_groups,
+use crate::{
+    GroupStatus, format_relative_time,
+    state::{
+        AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_hardlink_groups,
+    },
 };
 
 pub struct TuiApp {
@@ -112,7 +115,7 @@ impl TuiApp {
                 KeyCode::Esc => {
                     self.show_move_input = false;
                     self.move_buffer.clear();
-                }
+                },
                 KeyCode::Enter => {
                     let path = std::path::PathBuf::from(&self.move_buffer);
                     if path.is_dir() {
@@ -122,13 +125,13 @@ impl TuiApp {
                     } else {
                         // Flash error or set error state
                     }
-                }
+                },
                 KeyCode::Backspace => {
                     self.move_buffer.pop();
-                }
+                },
                 KeyCode::Char(c) => {
                     self.move_buffer.push(c);
-                }
+                },
                 KeyCode::Tab => {
                     // Similar Directory-Only Completion Logic as GUI
                     let path_buf = std::path::PathBuf::from(&self.move_buffer);
@@ -182,8 +185,8 @@ impl TuiApp {
                                 % self.move_completion_candidates.len();
                         }
                     }
-                }
-                _ => {}
+                },
+                _ => {},
             }
             return;
         }
@@ -195,18 +198,18 @@ impl TuiApp {
                     self.state.handle_input(InputIntent::Cancel);
                     self.rename_buffer.clear();
                     self.completion_candidates.clear();
-                }
+                },
                 KeyCode::Enter => {
                     self.state.handle_input(InputIntent::SubmitRename(self.rename_buffer.clone()));
                     self.rename_buffer.clear();
                     self.completion_candidates.clear();
-                }
+                },
                 KeyCode::Backspace => {
                     self.rename_buffer.pop();
-                }
+                },
                 KeyCode::Char(c) => {
                     self.rename_buffer.push(c);
-                }
+                },
                 KeyCode::Tab => {
                     let parent = if let Some(state) = &self.state.renaming {
                         state.original_path.parent().map(|p| p.to_path_buf())
@@ -251,8 +254,8 @@ impl TuiApp {
                                 (self.completion_index + 1) % self.completion_candidates.len();
                         }
                     }
-                }
-                _ => {}
+                },
+                _ => {},
             }
             return;
         }
@@ -262,11 +265,11 @@ impl TuiApp {
             match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.state.handle_input(InputIntent::ConfirmDelete)
-                }
+                },
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.state.handle_input(InputIntent::Cancel)
-                }
-                _ => {}
+                },
+                _ => {},
             }
             return;
         }
@@ -276,11 +279,11 @@ impl TuiApp {
             match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.state.handle_input(InputIntent::ConfirmMoveMarked)
-                }
+                },
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.state.handle_input(InputIntent::Cancel)
-                }
-                _ => {}
+                },
+                _ => {},
             }
             return;
         }
@@ -290,11 +293,11 @@ impl TuiApp {
             match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.state.handle_input(InputIntent::ConfirmDeleteImmediate)
-                }
+                },
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.state.handle_input(InputIntent::Cancel)
-                }
-                _ => {}
+                },
+                _ => {},
             }
             return;
         }
@@ -304,10 +307,10 @@ impl TuiApp {
             match code {
                 KeyCode::Char('1') => {
                     self.state.handle_input(InputIntent::ChangeSortOrder("name".to_string()))
-                }
+                },
                 KeyCode::Char('2') => {
                     self.state.handle_input(InputIntent::ChangeSortOrder("name-desc".to_string()))
-                }
+                },
                 KeyCode::Char('3') => self
                     .state
                     .handle_input(InputIntent::ChangeSortOrder("name-natural".to_string())),
@@ -316,21 +319,21 @@ impl TuiApp {
                     .handle_input(InputIntent::ChangeSortOrder("name-natural-desc".to_string())),
                 KeyCode::Char('5') => {
                     self.state.handle_input(InputIntent::ChangeSortOrder("date".to_string()))
-                }
+                },
                 KeyCode::Char('6') => {
                     self.state.handle_input(InputIntent::ChangeSortOrder("date-desc".to_string()))
-                }
+                },
                 KeyCode::Char('7') => {
                     self.state.handle_input(InputIntent::ChangeSortOrder("size".to_string()))
-                }
+                },
                 KeyCode::Char('8') => {
                     self.state.handle_input(InputIntent::ChangeSortOrder("size-desc".to_string()))
-                }
+                },
                 KeyCode::Char('9') => {
                     self.state.handle_input(InputIntent::ChangeSortOrder("random".to_string()))
-                }
+                },
                 KeyCode::Esc | KeyCode::Char('n') => self.state.handle_input(InputIntent::Cancel),
-                _ => {}
+                _ => {},
             }
             return;
         }
@@ -339,18 +342,18 @@ impl TuiApp {
                 KeyCode::Esc => {
                     self.state.handle_input(InputIntent::CancelSearch);
                     self.search_buffer.clear();
-                }
+                },
                 KeyCode::Enter => {
                     self.state.handle_input(InputIntent::SubmitSearch(self.search_buffer.clone()));
                     self.search_buffer.clear();
-                }
+                },
                 KeyCode::Backspace => {
                     self.search_buffer.pop();
-                }
+                },
                 KeyCode::Char(c) => {
                     self.search_buffer.push(c);
-                }
-                _ => {}
+                },
+                _ => {},
             }
             return;
         }
@@ -368,14 +371,14 @@ impl TuiApp {
                 } else {
                     Some(InputIntent::PageDown)
                 }
-            }
+            },
             KeyCode::PageUp => {
                 if modifiers.contains(KeyModifiers::SHIFT) {
                     Some(InputIntent::PreviousGroupByDist)
                 } else {
                     Some(InputIntent::PageUp)
                 }
-            }
+            },
             KeyCode::Tab => Some(InputIntent::NextGroup),
             KeyCode::BackTab => Some(InputIntent::PrevGroup),
             KeyCode::Home => Some(InputIntent::Home),
@@ -391,7 +394,7 @@ impl TuiApp {
                     self.move_buffer.clear();
                     None
                 }
-            }
+            },
             KeyCode::Char('r') => {
                 // Pre-fill buffer with current filename
                 if let Some(path) = self.state.get_current_image_path() {
@@ -402,10 +405,10 @@ impl TuiApp {
                 self.completion_candidates.clear();
                 self.completion_index = 0;
                 Some(InputIntent::StartRename)
-            }
+            },
             KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(InputIntent::StartSearch)
-            }
+            },
             KeyCode::F(3) | KeyCode::Char('n') => {
                 // 'n' for next is common tui convention
                 if modifiers.contains(KeyModifiers::SHIFT) || code == KeyCode::Char('N') {
@@ -413,7 +416,7 @@ impl TuiApp {
                 } else {
                     Some(InputIntent::NextSearchResult)
                 }
-            }
+            },
             KeyCode::Char('s') => Some(InputIntent::ShowSortSelection),
             KeyCode::Char('h') => Some(InputIntent::ToggleRelativeTime),
             KeyCode::Char('p') => Some(InputIntent::TogglePathVisibility),
@@ -472,7 +475,7 @@ impl TuiApp {
                 ),
                 GroupStatus::SomeIdentical => {
                     (format!("--- Group {} - Some Identical ---", g_idx + 1), Color::Green)
-                }
+                },
                 GroupStatus::None => (
                     format!("--- Group {} (Dist: {}) ---", g_idx + 1, info.max_dist),
                     Color::Yellow,

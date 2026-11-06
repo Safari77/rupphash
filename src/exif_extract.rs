@@ -1,17 +1,20 @@
 // EXIF extraction functions that convert exif crate data to our storage format.
 // Integrates functionality from helper_exif.rs.
 // Filters out thumbnails and large binary blobs.
-use crate::exif_types::{
-    ExifValue, MAX_TAG_SIZE, TAG_DERIVED_COUNTRY, TAG_DERIVED_SUBDIVISION,
-    TAG_DERIVED_SUN_ALTITUDE, TAG_DERIVED_SUN_AZIMUTH, TAG_DERIVED_TIMESTAMP, TAG_DERIVED_TIMEZONE,
-    TAG_GPS_ALTITUDE, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE, TAG_ORIENTATION, is_excluded_tag,
-};
-use crate::image_features::ImageFeatures;
+use std::{collections::BTreeMap, path::Path, str::FromStr};
+
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use exif::{In, Tag, Value};
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::str::FromStr;
+
+use crate::{
+    exif_types::{
+        ExifValue, MAX_TAG_SIZE, TAG_DERIVED_COUNTRY, TAG_DERIVED_SUBDIVISION,
+        TAG_DERIVED_SUN_ALTITUDE, TAG_DERIVED_SUN_AZIMUTH, TAG_DERIVED_TIMESTAMP,
+        TAG_DERIVED_TIMEZONE, TAG_GPS_ALTITUDE, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE,
+        TAG_ORIENTATION, is_excluded_tag,
+    },
+    image_features::ImageFeatures,
+};
 
 // =============================================================================
 // Core EXIF Reading (from helper_exif.rs)
@@ -27,7 +30,7 @@ pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exi
         None => {
             let file = std::fs::File::open(path).ok()?;
             Box::new(std::io::BufReader::new(file))
-        }
+        },
     };
 
     exif::Reader::new().read_from_container(&mut reader).ok()
@@ -137,8 +140,8 @@ pub fn get_date_str(exif: &exif::Exif, use_gps: bool) -> Option<String> {
                     dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
                 ));
             }
-        }
-        _ => {}
+        },
+        _ => {},
     }
     None
 }
@@ -232,7 +235,7 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                 } else {
                     continue;
                 }
-            }
+            },
 
             Value::Short(v) => {
                 if v.len() == 1 {
@@ -242,7 +245,7 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                 } else {
                     continue;
                 }
-            }
+            },
 
             Value::Long(v) => {
                 if v.len() == 1 {
@@ -250,7 +253,7 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                 } else {
                     continue;
                 }
-            }
+            },
 
             Value::SLong(v) => {
                 if v.len() == 1 {
@@ -258,7 +261,7 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                 } else {
                     continue;
                 }
-            }
+            },
 
             Value::Rational(v) => {
                 if v.is_empty() {
@@ -282,7 +285,7 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                     }
                     ExifValue::Floats(floats)
                 }
-            }
+            },
 
             Value::SRational(v) => {
                 if v.is_empty() {
@@ -305,7 +308,7 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                     }
                     ExifValue::Floats(floats)
                 }
-            }
+            },
 
             Value::Ascii(v) => {
                 // Concatenate all ASCII strings, clean null bytes
@@ -321,7 +324,7 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                     continue;
                 }
                 ExifValue::String(s)
-            }
+            },
 
             Value::Undefined(bytes, _) => {
                 // Skip large undefined blobs (MakerNotes, etc.)
@@ -342,7 +345,7 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                 } else {
                     continue;
                 }
-            }
+            },
 
             _ => continue,
         };
@@ -425,7 +428,7 @@ fn add_derived_values(
     if let Some((azimuth, altitude, timezone)) =
         derive_sun_position(lat, lon, exif_data, use_gps_utc)
     {
-        //eprintln!("exif_extract sun az={} alt={} tz={}", azimuth, altitude, timezone);
+        // eprintln!("exif_extract sun az={} alt={} tz={}", azimuth, altitude, timezone);
         features.insert_tag(TAG_DERIVED_SUN_AZIMUTH, ExifValue::Float(azimuth));
         features.insert_tag(TAG_DERIVED_SUN_ALTITUDE, ExifValue::Float(altitude));
         features.insert_tag(TAG_DERIVED_TIMEZONE, ExifValue::String(timezone));

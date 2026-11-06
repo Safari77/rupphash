@@ -1,11 +1,14 @@
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use clap::ValueEnum;
 use eframe::egui;
 use egui_wgpu::wgpu;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 /// Configuration choice for slideshow transitions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
@@ -71,7 +74,7 @@ impl SlideshowEffectChoice {
             "slic" | "superpixel" | "superpixels" => Ok(SlideshowEffectChoice::Slic),
             "pageflip" | "pageturn" | "page" | "curl" | "flip" | "book" => {
                 Ok(SlideshowEffectChoice::PageFlip)
-            }
+            },
             "vacuum" | "suck" | "blackhole" | "vortexcursor" => Ok(SlideshowEffectChoice::Vacuum),
             "random" | "all" | "any" => Ok(SlideshowEffectChoice::Random),
             _ => Err(format!(
@@ -103,7 +106,7 @@ impl SlideshowEffectChoice {
                 } else {
                     chosen
                 }
-            }
+            },
         }
     }
 
@@ -207,23 +210,25 @@ impl SlideshowEffect {
 
 /// Thread-safe pseudo-random number generator (SplitMix64)
 fn random_u64() -> u64 {
-    use std::sync::LazyLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        LazyLock,
+        atomic::{AtomicU64, Ordering},
+    };
 
     static SEED: LazyLock<AtomicU64> = LazyLock::new(|| {
         let mut buf = [0u8; 8];
         let initial_seed = match getrandom::fill(&mut buf) {
             Ok(()) => u64::from_ne_bytes(buf),
-            Err(_) => 0x853c49e6748fea9b,
+            Err(_) => 0x853C49E6748FEA9B,
         };
         AtomicU64::new(initial_seed)
     });
 
-    let mut x = SEED.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed);
+    let mut x = SEED.fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed);
     x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x = x.wrapping_mul(0xBF58476D1CE4E5B9);
     x ^= x >> 27;
-    x = x.wrapping_mul(0x94d049bb133111eb);
+    x = x.wrapping_mul(0x94D049BB133111EB);
     x ^= x >> 31;
     x
 }
@@ -1233,7 +1238,7 @@ impl SlideshowManager {
             ),
             super::image::DeepPixels::Rgba16(v) => {
                 (bytemuck::cast_slice::<u16, u8>(v.as_slice()), 8, wgpu::TextureFormat::Rgba16Unorm)
-            }
+            },
         };
 
         let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };

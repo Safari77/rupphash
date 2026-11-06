@@ -1,11 +1,12 @@
+#[cfg(unix)] use std::os::fd::OwnedFd;
+use std::{
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
+
 use file_id::FileId;
 use filetime::FileTime;
-use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-
-#[cfg(unix)]
-use std::os::fd::OwnedFd;
 
 // Standard filename limit for most filesystems
 const MAX_FILENAME_BYTES: usize = 255;
@@ -160,7 +161,7 @@ fn try_move(dest: &DestinationDir, src: &Path, dst_name: &OsStr) -> std::io::Res
                     "[DEBUG] renameat2 failed: {} (errno: {:?}). Trying copy fallback...",
                     e, raw
                 );
-            }
+            },
         }
 
         // 2. Fallback: copy via openat with O_EXCL on the kept-open dirfd, then unlink src.
@@ -201,8 +202,9 @@ fn try_renameat_noreplace(
     src: &Path,
     dst_name: &OsStr,
 ) -> std::io::Result<()> {
-    use rustix::fs::{CWD, RenameFlags, renameat_with};
     use std::os::fd::AsFd;
+
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
 
     // Source path resolves against CWD; destination resolves against the
     // kept-open dirfd, so the destination half is TOCTOU-safe.
@@ -214,8 +216,9 @@ fn try_renameat_noreplace(
 /// and restores permissions / timestamps / xattrs on a best-effort basis.
 #[cfg(unix)]
 fn copy_move_into(dest: &DestinationDir, src: &Path, dst_name: &OsStr) -> std::io::Result<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
     use std::os::fd::AsFd;
+
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
 
     // Open source for reading.
     let reader = std::fs::File::open(src)?;
@@ -317,7 +320,7 @@ fn detect_fs_type(dir_fd: &OwnedFd) -> String {
             fs_magic_to_name(magic)
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("unknown (0x{:x})", magic))
-        }
+        },
         Err(_) => "unknown".to_string(),
     }
 }
@@ -454,13 +457,13 @@ pub fn get_file_key(path: &Path) -> Option<u128> {
         Some(match id {
             FileId::Inode { device_id, inode_number } => {
                 ((device_id as u128) << 64) | (inode_number as u128)
-            }
+            },
             FileId::LowRes { volume_serial_number, file_index } => {
                 ((volume_serial_number as u128) << 64) | (file_index as u128)
-            }
+            },
             FileId::HighRes { volume_serial_number, file_id } => {
                 file_id ^ ((volume_serial_number as u128) << 64)
-            }
+            },
         })
     }
 }

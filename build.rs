@@ -1,9 +1,7 @@
+use std::{env, fs, path::Path, process::Command};
+
 use cargo_lock::Lockfile;
 use serde::Serialize;
-use std::env;
-use std::fs;
-use std::path::Path;
-use std::process::Command;
 
 #[derive(Serialize)]
 struct DepInfo {

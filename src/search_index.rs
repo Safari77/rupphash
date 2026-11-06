@@ -1,10 +1,14 @@
 // In-memory search index using RoaringBitmap for O(1) tag-based queries.
 // Built on application startup by iterating the feature database.
 
-use crate::exif_types::{ExifValue, tag_id_to_name};
-use crate::image_features::ImageFeatures;
-use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
+
+use roaring::RoaringBitmap;
+
+use crate::{
+    exif_types::{ExifValue, tag_id_to_name},
+    image_features::ImageFeatures,
+};
 
 // Maximum precision in search results for numbers
 const SEARCH_VALUE_EPSILON: f64 = 0.00001;
@@ -291,43 +295,43 @@ impl SearchIndex {
                     if let Some(num) = extract_number_from_string(s) {
                         self.insert_numeric(*tag_id, num, file_idx);
                     }
-                }
+                },
 
                 ExifValue::Short(v) => {
                     self.insert_numeric(*tag_id, *v as f64, file_idx);
                     // Also index as string for contains search
                     self.insert_string(*tag_id, &v.to_string(), file_idx);
-                }
+                },
 
                 ExifValue::Long(v) => {
                     self.insert_numeric(*tag_id, *v as f64, file_idx);
                     self.insert_string(*tag_id, &v.to_string(), file_idx);
-                }
+                },
 
                 ExifValue::Signed(v) => {
                     self.insert_numeric(*tag_id, *v as f64, file_idx);
                     self.insert_string(*tag_id, &v.to_string(), file_idx);
-                }
+                },
 
                 ExifValue::Long64(v) => {
                     self.insert_numeric(*tag_id, *v as f64, file_idx);
                     self.insert_string(*tag_id, &v.to_string(), file_idx);
-                }
+                },
 
                 ExifValue::Float(v) => {
                     self.insert_numeric(*tag_id, *v, file_idx);
                     // Format float for string search
                     self.insert_string(*tag_id, &format!("{:.2}", v), file_idx);
-                }
+                },
 
                 ExifValue::Byte(v) => {
                     self.insert_numeric(*tag_id, *v as f64, file_idx);
                     self.insert_string(*tag_id, &v.to_string(), file_idx);
-                }
+                },
 
                 _ => {
                     // Skip arrays for now
-                }
+                },
             }
         }
     }
@@ -494,25 +498,25 @@ impl SearchIndex {
                     }
                     result.insert(idx);
                 }
-            }
+            },
             SearchOp::LessThan => {
                 let end = list.partition_point(|&(v, _)| v < value);
                 for &(_, idx) in &list[..end] {
                     result.insert(idx);
                 }
-            }
+            },
             SearchOp::LessOrEqual => {
                 let end = list.partition_point(|&(v, _)| v <= value + epsilon);
                 for &(_, idx) in &list[..end] {
                     result.insert(idx);
                 }
-            }
+            },
             SearchOp::GreaterThan => {
                 let start = list.partition_point(|&(v, _)| v <= value);
                 for &(_, idx) in &list[start..] {
                     result.insert(idx);
                 }
-            }
+            },
             SearchOp::GreaterOrEqual => {
                 // partition_point needs the predicate true for the prefix and
                 // false for the suffix. The threshold test must therefore be
@@ -522,8 +526,8 @@ impl SearchIndex {
                 for &(_, idx) in &list[start..] {
                     result.insert(idx);
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
         result
     }
@@ -576,7 +580,7 @@ impl SearchIndex {
                 } else {
                     self.search_exact(criterion.tag_id, &criterion.value)
                 }
-            }
+            },
             SearchOp::Contains => self.search_contains(criterion.tag_id, &criterion.value),
             SearchOp::Regex => self.search_regex(criterion.tag_id, &criterion.value),
             SearchOp::LessThan
@@ -588,7 +592,7 @@ impl SearchIndex {
                 } else {
                     RoaringBitmap::new()
                 }
-            }
+            },
             SearchOp::Between => {
                 if let (Ok(min), Some(Ok(max))) =
                     (criterion.value.parse::<f64>(), criterion.value2.as_ref().map(|v| v.parse()))
@@ -597,7 +601,7 @@ impl SearchIndex {
                 } else {
                     RoaringBitmap::new()
                 }
-            }
+            },
         }
     }
 
@@ -871,8 +875,8 @@ fn resolve_tag_name(name: &str) -> Option<u16> {
         "sunazimuth" | "sun_azimuth" | "sun_az" | "azimuth" | "az" => Some(TAG_DERIVED_SUN_AZIMUTH),
         "sunaltitude" | "sun_altitude" | "sun_alt" | "altitude" | "alt" | "elevation" => {
             Some(TAG_DERIVED_SUN_ALTITUDE)
-        }
-        "sunposition" | "sun_position" | "sun" => Some(TAG_DERIVED_SUN_AZIMUTH), // Default to azimuth
+        },
+        "sunposition" | "sun_position" | "sun" => Some(TAG_DERIVED_SUN_AZIMUTH), /* Default to azimuth */
 
         // Location aliases
         "country" | "derivedcountry" => Some(TAG_DERIVED_COUNTRY),

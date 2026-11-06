@@ -21,9 +21,10 @@
 //!   6. Apply the sRGB OETF (gamma encoding).
 //!   7. Quantize to u8 or Rgb10a2.
 
-use crate::img_debug;
 use image::{DynamicImage, ImageBuffer, ImageDecoder, Rgba, RgbaImage};
 use rayon::prelude::*;
+
+use crate::img_debug;
 
 // ---------------------------------------------------------------------------
 // cICP detection
@@ -215,12 +216,12 @@ pub fn detect_cicp_png(bytes: &[u8]) -> Option<Cicp> {
                     matrix_coefficients: bytes[data_start + 2],
                     full_range: bytes[data_start + 3] != 0,
                 });
-            }
+            },
             // IDAT marks start of image data; cICP is always before it.
             b"IDAT" => return None,
             // IEND is the terminating chunk.
             b"IEND" => return None,
-            _ => {}
+            _ => {},
         }
 
         i = next;
@@ -243,11 +244,11 @@ fn detect_cicp_from_icc_profile(bytes: &[u8]) -> Option<Cicp> {
         image::ImageFormat::Jpeg => {
             let mut d = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(bytes)).ok()?;
             d.icc_profile().ok().flatten()?
-        }
+        },
         image::ImageFormat::Png => {
             let mut d = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes)).ok()?;
             d.icc_profile().ok().flatten()?
-        }
+        },
         _ => return None,
     };
     detect_cicp_icc(&icc)
@@ -603,18 +604,18 @@ fn to_rgba16_flat(img: &DynamicImage) -> (u32, u32, Vec<u16>) {
                 out.push(u16::MAX);
             }
             (w, h, out)
-        }
+        },
         DynamicImage::ImageRgba16(buf) => {
             let (w, h) = (buf.width(), buf.height());
             (w, h, buf.as_raw().to_vec())
-        }
+        },
         // For 8-bit or other formats we still do the math if cICP says HDR
         // (unusual but possible): promote to 16-bit first.
         other => {
             let rgba16 = other.to_rgba16();
             let (w, h) = (rgba16.width(), rgba16.height());
             (w, h, rgba16.into_raw())
-        }
+        },
     }
 }
 
@@ -667,14 +668,14 @@ fn tonemap_px(src: &[u16], p: TonemapParams) -> (f32, f32, f32, f32) {
             r = nr;
             g = ng;
             b = nb;
-        }
+        },
         SourceGamut::DisplayP3 => {
             let (nr, ng, nb) = p3_to_bt709_linear(r, g, b);
             r = nr;
             g = ng;
             b = nb;
-        }
-        SourceGamut::Bt709 => {}
+        },
+        SourceGamut::Bt709 => {},
     }
 
     // 3. Tone map via BT.2390 on MaxRGB, then scale channels.
@@ -870,14 +871,14 @@ fn sdr_px(src: &[u16], p: SdrParams) -> (f32, f32, f32, f32) {
             r = nr;
             g = ng;
             b = nb;
-        }
+        },
         SourceGamut::DisplayP3 => {
             let (nr, ng, nb) = p3_to_bt709_linear(r, g, b);
             r = nr;
             g = ng;
             b = nb;
-        }
-        SourceGamut::Bt709 => {}
+        },
+        SourceGamut::Bt709 => {},
     }
 
     // Out-of-gamut components after the matrix are simply clipped; SDR has

@@ -1,10 +1,9 @@
+use std::path::Path;
+
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use image::{DynamicImage, Rgb, RgbImage};
 use rand::prelude::*;
-use std::path::Path;
-
-use rupphash::hamminghash::HammingHash;
-use rupphash::pdqhash;
+use rupphash::{hamminghash::HammingHash, pdqhash};
 
 fn bench_hamming_distance(c: &mut Criterion) {
     let mut group = c.benchmark_group("hamming_distance");

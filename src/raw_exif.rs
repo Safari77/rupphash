@@ -20,14 +20,18 @@
 // - We provide dms_to_decimal() specifically for rsraw's format
 // - exif_extract::parse_gps_coordinate() handles kamadak-exif's format
 
-use crate::exif_types::{
-    ExifValue, TAG_ARTIST, TAG_DERIVED_TIMESTAMP, TAG_EXPOSURE_TIME, TAG_FNUMBER, TAG_FOCAL_LENGTH,
-    TAG_FOCAL_LENGTH_35MM, TAG_GPS_ALTITUDE, TAG_GPS_LATITUDE, TAG_GPS_LONGITUDE, TAG_ISO,
-    TAG_LENS_MAKE, TAG_LENS_MODEL, TAG_MAKE, TAG_MODEL, TAG_SOFTWARE,
-};
-use crate::image_features::ImageFeatures;
 use geo::Point;
 use rsraw::RawImage;
+
+use crate::{
+    exif_types::{
+        ExifValue, TAG_ARTIST, TAG_DERIVED_TIMESTAMP, TAG_EXPOSURE_TIME, TAG_FNUMBER,
+        TAG_FOCAL_LENGTH, TAG_FOCAL_LENGTH_35MM, TAG_GPS_ALTITUDE, TAG_GPS_LATITUDE,
+        TAG_GPS_LONGITUDE, TAG_ISO, TAG_LENS_MAKE, TAG_LENS_MODEL, TAG_MAKE, TAG_MODEL,
+        TAG_SOFTWARE,
+    },
+    image_features::ImageFeatures,
+};
 
 /// Check whether LibRaw parsed valid GPS EXIF metadata from the RAW container.
 #[inline]
