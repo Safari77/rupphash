@@ -1079,9 +1079,11 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
 /// Only for histogram and palette analysis, which downsamples to 128x128 and
 /// buckets into 256 bins — the discarded low bits cannot affect the result.
 fn deep_to_colorimage(pixels: &DeepPixels, width: u32, height: u32) -> egui::ColorImage {
-    let px: Vec<egui::Color32> = match pixels {
+    let expected = (width as usize).saturating_mul(height as usize);
+    let mut px: Vec<egui::Color32> = match pixels {
         DeepPixels::Rgb10a2(data) => data
             .iter()
+            .take(expected)
             .map(|&p| {
                 let r = ((p & 0x3FF) >> 2) as u8;
                 let g = (((p >> 10) & 0x3FF) >> 2) as u8;
@@ -1095,6 +1097,7 @@ fn deep_to_colorimage(pixels: &DeepPixels, width: u32, height: u32) -> egui::Col
             .as_chunks::<4>()
             .0
             .iter()
+            .take(expected)
             .map(|c| {
                 egui::Color32::from_rgba_unmultiplied(
                     (c[0] >> 8) as u8,
@@ -1105,6 +1108,9 @@ fn deep_to_colorimage(pixels: &DeepPixels, width: u32, height: u32) -> egui::Col
             })
             .collect(),
     };
+    if px.len() < expected {
+        px.resize(expected, egui::Color32::TRANSPARENT);
+    }
     egui::ColorImage {
         size: [width as usize, height as usize],
         pixels: px,
