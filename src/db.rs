@@ -8,8 +8,8 @@ use chacha20poly1305::{
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use geo::Point;
 use redb::{
-    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
-    WriteTransaction,
+    ConcurrencyMode, Database, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition, WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -564,8 +564,11 @@ impl AppContext {
         );
 
         // Open database with retry loop to support parallel/concurrent process access
-        // Next redb supports Builder::set_concurrency_mode() ConcurrencyMode::MultiWriter
-        let env = match Database::builder().set_cache_size(cache_size).create(&db_path) {
+        let env = match Database::builder()
+            .set_cache_size(cache_size)
+            .set_concurrency_mode(ConcurrencyMode::MultiWriter)
+            .create(&db_path)
+        {
             Ok(db) => db,
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
                 eprintln!("[WARN-DB] Database is locked by another process. Waiting for lock...");
