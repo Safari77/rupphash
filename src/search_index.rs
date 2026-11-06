@@ -29,47 +29,59 @@ pub fn extract_number_from_string(s: &str) -> Option<f64> {
 
     // 2. Handle "f/" prefix (e.g. "f/2.8" or "F/2.8")
     // For aperture, we want the number itself (2.8), NOT the fraction (f divided by 2.8)
-    if s.to_lowercase().starts_with("f/")
-        && let Ok(val) = s[2..].trim().parse::<f64>()
+    if let Some(rest) = s.strip_prefix("f/").or_else(|| s.strip_prefix("F/"))
+        && let Ok(val) = rest.trim().parse::<f64>()
+        && val.is_finite()
     {
         return Some(val);
     }
 
     // 3. Handle fractions (e.g. "1/320" or "1/37.738...")
-    if let Some(slash_pos) = s.find('/') {
-        let before = s[..slash_pos].trim();
-        let after = &s[slash_pos + 1..].trim();
+    if let Some((before, after)) = s.split_once('/') {
+        let before = before.trim();
+        let after = after.trim();
 
         if let (Ok(num), Ok(denom)) = (before.parse::<f64>(), after.parse::<f64>())
             && denom != 0.0
         {
-            return Some(num / denom);
+            let val = num / denom;
+            if val.is_finite() {
+                return Some(val);
+            }
         }
     }
 
     // 4. Handle "ISO" or "mm" style strings (remove non-numeric prefix/suffix)
-    // Extract first continuous sequence of digits/dots
+    // Extract first continuous sequence of digits/dots (with optional leading '-')
     let mut num_str = String::new();
     let mut found_digit = false;
 
     for c in s.chars() {
-        if c.is_ascii_digit() || c == '.' || c == '-' {
+        if c.is_ascii_digit() {
             num_str.push(c);
             found_digit = true;
+        } else if c == '.' && !num_str.contains('.') {
+            num_str.push(c);
+        } else if c == '-' && num_str.is_empty() {
+            num_str.push(c);
         } else if found_digit {
             // Stop at first non-numeric char after finding numbers (e.g. "24mm" -> stop at m)
             break;
+        } else {
+            // Reset lonely '-' or '.' before any digit was seen
+            num_str.clear();
         }
     }
 
-    if !num_str.is_empty()
+    if found_digit
         && let Ok(val) = num_str.parse::<f64>()
+        && val.is_finite()
     {
         return Some(val);
     }
 
     // 5. Last resort: direct parse
-    s.parse::<f64>().ok()
+    s.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
 /// Search operator for queries
@@ -222,7 +234,7 @@ impl SearchIndex {
 
     /// Get the number of indexed files (excludes slots freed by remove())
     pub fn len(&self) -> usize {
-        self.file_count as usize - self.free_slots.len() as usize
+        (self.file_count as usize).saturating_sub(self.free_slots.len() as usize)
     }
 
     /// Check if index is empty
@@ -239,14 +251,16 @@ impl SearchIndex {
             // index. The slot was already cleared of all bitmap/numeric entries.
             self.free_slots.remove(idx);
             self.id_to_index.insert(unique_file_id, idx);
-            self.index_to_id[idx as usize] = unique_file_id;
+            if let Some(slot) = self.index_to_id.get_mut(idx as usize) {
+                *slot = unique_file_id;
+            }
             self.is_finalized = false;
             idx
         } else {
             let idx = self.file_count;
             self.id_to_index.insert(unique_file_id, idx);
             self.index_to_id.push(unique_file_id);
-            self.file_count += 1;
+            self.file_count = self.file_count.saturating_add(1);
             self.is_finalized = false;
             idx
         }
@@ -267,6 +281,11 @@ impl SearchIndex {
 
     /// Insert a file's features into the index
     pub fn insert(&mut self, unique_file_id: u128, features: &ImageFeatures) {
+        // If this file is already present, remove its old entries first so its
+        // slot is cleanly reused without leaving stale tag values behind.
+        if self.id_to_index.contains_key(&unique_file_id) {
+            self.remove(unique_file_id);
+        }
         let file_idx = self.get_or_create_index(unique_file_id);
         self.is_finalized = false;
 
@@ -346,6 +365,9 @@ impl SearchIndex {
 
     /// Insert a numeric value for range queries
     fn insert_numeric(&mut self, tag_id: u16, value: f64, file_idx: u32) {
+        if !value.is_finite() {
+            return;
+        }
         let list = self.numeric_index.entry(tag_id).or_default();
         list.push((value, file_idx));
     }
@@ -353,7 +375,10 @@ impl SearchIndex {
     /// Hash a string for the exact index
     fn hash_string(s: &str) -> u64 {
         let hash = blake3::hash(s.as_bytes());
-        u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+        let bytes = hash.as_bytes();
+        u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
     }
 
     /// Finalize the index after bulk insertion.
@@ -363,7 +388,7 @@ impl SearchIndex {
             return;
         }
         for list in self.numeric_index.values_mut() {
-            list.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            list.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
         self.is_finalized = true;
     }
@@ -465,6 +490,9 @@ impl SearchIndex {
 
     pub fn search_numeric(&self, tag_id: u16, op: SearchOp, value: f64) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
+        if !value.is_finite() {
+            return result;
+        }
         let epsilon = SEARCH_VALUE_EPSILON;
 
         let Some(list) = self.numeric_index.get(&tag_id) else {
@@ -475,10 +503,6 @@ impl SearchIndex {
         // to be sorted, which only holds after finalize(). If the index was
         // mutated since the last finalize(), fall back to a correct linear scan so
         // callers can never get silently-wrong results.
-        debug_assert!(
-            self.is_finalized,
-            "search_numeric called on a non-finalized index; call finalize() first"
-        );
         if !self.is_finalized {
             for &(v, idx) in list {
                 if numeric_value_matches(op, v, value, epsilon) {
@@ -535,6 +559,9 @@ impl SearchIndex {
     /// Search for numeric range (inclusive)
     pub fn search_range(&self, tag_id: u16, min: f64, max: f64) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
+        if !min.is_finite() || !max.is_finite() || min > max {
+            return result;
+        }
         let epsilon = SEARCH_VALUE_EPSILON;
 
         let Some(list) = self.numeric_index.get(&tag_id) else {
@@ -543,10 +570,6 @@ impl SearchIndex {
 
         // See search_numeric: binary search requires a finalized (sorted) list,
         // otherwise fall back to a correct linear scan.
-        debug_assert!(
-            self.is_finalized,
-            "search_range called on a non-finalized index; call finalize() first"
-        );
         if !self.is_finalized {
             for &(v, idx) in list {
                 if v >= min - epsilon && v <= max + epsilon {
@@ -577,6 +600,7 @@ impl SearchIndex {
             SearchOp::Equals => {
                 if let Ok(v) = criterion.value.parse::<f64>() {
                     self.search_numeric(criterion.tag_id, SearchOp::Equals, v)
+                        | self.search_exact(criterion.tag_id, &criterion.value)
                 } else {
                     self.search_exact(criterion.tag_id, &criterion.value)
                 }
@@ -637,8 +661,9 @@ impl SearchIndex {
             .get(&tag_id)
             .map(|tag_map| {
                 let mut values: Vec<_> = tag_map
-                    .keys()
-                    .filter_map(|hash| self.string_table.get(hash).cloned())
+                    .iter()
+                    .filter(|(_, bitmap)| !bitmap.is_empty())
+                    .filter_map(|(hash, _)| self.string_table.get(hash).cloned())
                     .collect();
                 values.sort();
                 values
@@ -789,7 +814,7 @@ fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
         }
 
         // Fallback to standard parse or contains
-        let op = if value.parse::<f32>().is_ok() { SearchOp::Equals } else { SearchOp::Contains };
+        let op = if value.parse::<f64>().is_ok() { SearchOp::Equals } else { SearchOp::Contains };
         return Ok(SearchCriterion::new(tag_id, op, value.to_string()));
     }
 
@@ -808,15 +833,15 @@ fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
         _ => return Err(format!("Unknown operator: '{}'. Use =, ~, <, >, <=, >=, regex", op_str)),
     };
 
-    // Clean the value for numeric operators if possible
+    // Clean the value for numeric operators (or Equals on numeric tags) if possible
     let final_value = if matches!(
         op,
         SearchOp::LessThan
             | SearchOp::LessOrEqual
             | SearchOp::GreaterThan
             | SearchOp::GreaterOrEqual
-            | SearchOp::Equals
-    ) {
+    ) || (op == SearchOp::Equals && is_numeric_tag(tag_id))
+    {
         if let Some(num) = extract_number_from_string(value) {
             num.to_string()
         } else {
@@ -831,11 +856,9 @@ fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
 
 /// Parse range value like "24-70" or "1600-" (open ended)
 pub fn parse_range_value(value: &str) -> Option<(String, String)> {
-    let chars: Vec<char> = value.chars().collect();
-
-    // Start at 1 to avoid splitting negative numbers at the sign (e.g. "-5")
-    for i in 1..chars.len() {
-        if chars[i] == '-' {
+    // Skip the first character to avoid splitting negative numbers at the leading sign (e.g. "-5")
+    for (i, c) in value.char_indices().skip(1) {
+        if c == '-' {
             let min_str = &value[..i];
             let max_str = &value[i + 1..];
 
@@ -843,15 +866,17 @@ pub fn parse_range_value(value: &str) -> Option<(String, String)> {
             let min_val = extract_number_from_string(min_str);
 
             // Check 2: Parse Max
-            // Handle empty max string as Infinity for open-ended ranges like "1600-"
+            // Handle empty max string as f64::MAX for open-ended ranges like "1600-"
             let max_val = if max_str.trim().is_empty() {
                 Some(f64::MAX)
             } else {
                 extract_number_from_string(max_str)
             };
 
-            if let (Some(min), Some(max)) = (min_val, max_val) {
-                // Return as strings; the SearchCriterion will parse them back to f32 during search
+            if let (Some(min), Some(max)) = (min_val, max_val)
+                && min <= max
+            {
+                // Return as strings; the SearchCriterion will parse them back to f64 during search
                 return Some((min.to_string(), max.to_string()));
             }
         }
