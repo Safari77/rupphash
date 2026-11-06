@@ -221,7 +221,7 @@ pub struct GuiApp {
     // View mode: Map of images that failed to load -> error message
     failed_images: HashMap<PathBuf, String>,
     // Animation state for animated images (e.g. animated WebP)
-    animation_cache: HashMap<PathBuf, super::image::AnimationState>,
+    pub(super) animation_cache: HashMap<PathBuf, super::image::AnimationState>,
     // View mode: Track size of failed_images to detect changes
     last_failed_images_len: usize,
     // Search index for EXIF-based filtering
@@ -271,6 +271,13 @@ impl GuiApp {
             });
         }
 
+        if self.state.view_mode
+            && let Some(group) = self.state.groups.first()
+        {
+            self.file_index =
+                group.iter().enumerate().map(|(idx, f)| (f.unique_file_id, idx)).collect();
+        }
+
         // 4. Restore selection index
         if let Some(path) = current_path
             && let Some(group) = self.state.groups.get(self.state.current_group_idx)
@@ -279,6 +286,7 @@ impl GuiApp {
             self.state.current_file_idx = new_idx;
         }
 
+        self.last_preload_pos = None;
         self.cache_dirty = true;
         self.state.selection_changed = true;
     }
@@ -508,6 +516,7 @@ impl GuiApp {
     }
 
     /// Create a new GuiApp for view mode (image browser without duplicate detection)
+    /// Create a new GuiApp for view mode (image browser without duplicate detection)
     pub fn new_view_mode(
         paths: Vec<String>,
         sort_order: String,
@@ -548,10 +557,14 @@ impl GuiApp {
             .collect();
 
         // Determine initial directory from paths (use canonicalized paths)
-        let current_dir = canonical_paths
-            .first()
-            .map(std::path::PathBuf::from)
-            .and_then(|p| if p.is_dir() { Some(p) } else { p.parent().map(|p| p.to_path_buf()) });
+        // In flatten mode, current_dir is None since we are viewing a recursive list
+        let current_dir = if view_flatten {
+            None
+        } else {
+            canonical_paths.first().map(std::path::PathBuf::from).and_then(|p| {
+                if p.is_dir() { Some(p) } else { p.parent().map(|p| p.to_path_buf()) }
+            })
+        };
 
         // Clone paths for use in flatten mode before moving into scan_config
         let paths_for_flatten = canonical_paths.clone();
@@ -641,7 +654,8 @@ impl GuiApp {
         // Set up empty initial state - files will stream in from background
         state.groups = vec![Vec::new()];
         state.group_infos = vec![GroupInfo { max_dist: 0, status: GroupStatus::None }];
-        state.is_loading = view_flatten || dir_total_count.is_some_and(|c| c > 0);
+        state.is_loading = (view_flatten && dir_total_count.is_some_and(|c| c > 0))
+            || (!view_flatten && dir_total_count.is_some_and(|c| c > 0));
 
         // Extract values before moving ctx to Arc
         let tile_cache_path = ctx.tile_cache_path.clone();
@@ -1015,7 +1029,7 @@ impl GuiApp {
 
     // Setup filesystem watcher for current directory
     fn setup_watcher(&mut self) {
-        if !self.state.view_mode {
+        if !self.state.view_mode || self.state.view_mode_flatten {
             return;
         }
         let Some(dir) = &self.current_dir else { return };
@@ -1104,7 +1118,7 @@ impl GuiApp {
         }
     }
 
-    fn refresh_dir_cache(&mut self, rescan_fs: bool) {
+    pub(super) fn refresh_dir_cache(&mut self, rescan_fs: bool) {
         self.subdirs_cache.clear();
         self.parent_cache = None;
 
@@ -1468,7 +1482,7 @@ impl GuiApp {
     // Handles streaming batches for instant feedback
     pub(super) fn check_reload(&mut self, ctx: &egui::Context) {
         // 1. Start Scan if needed
-        if self.state.is_loading && self.scan_rx.is_none() {
+        if self.state.is_loading && self.scan_rx.is_none() && self.dir_scan_rx.is_none() {
             let cfg = self.scan_config.clone();
             let (tx, rx) = unbounded();
             let (prog_tx, prog_rx) = unbounded();
@@ -1620,14 +1634,12 @@ impl GuiApp {
 
             // Only replace if we have results (duplicate mode) or finished view mode
             self.state.groups = new_groups;
-            if let Some(ref sort) = self.view_mode_sort
-                && sort == "location"
+            if self.state.view_mode
+                && let Some(group) = self.state.groups.first()
             {
-                self.apply_location_sort();
+                self.file_index =
+                    group.iter().enumerate().map(|(idx, f)| (f.unique_file_id, idx)).collect();
             }
-            self.cache_dirty = true;
-            self.state.group_infos = new_infos;
-            self.subdirs = new_subdirs;
 
             if let Some(ref sort) = self.view_mode_sort
                 && sort == "location"
@@ -1635,6 +1647,9 @@ impl GuiApp {
                 // We must ingest markers first (already done by self.ingest_gps_markers)
                 self.apply_location_sort();
             }
+            self.cache_dirty = true;
+            self.state.group_infos = new_infos;
+            self.subdirs = new_subdirs;
 
             self.refresh_dir_cache(false);
             self.state.last_file_count = self.state.groups.iter().map(|g| g.len()).sum();
@@ -1825,7 +1840,7 @@ impl GuiApp {
         // --- Cache Eviction with Hysteresis ---
         // We preload a tight window (active_window_paths) to save CPU,
         // but we RETAIN a much wider window in RAM so going backwards doesn't thrash.
-        let mut retention_paths = HashSet::new();
+        let mut retention_paths = active_window_paths.clone();
         let retention_limit = preload_limit * 3; // Keep 3x as many files in RAM as we actively preload
 
         if self.state.groups.len() == 1 {
@@ -2119,7 +2134,11 @@ impl eframe::App for GuiApp {
         self.sync_fullscreen(ctx);
 
         // Initial setup for view mode: create watcher (but don't refresh while scanning)
-        if self.state.view_mode && self.current_dir.is_some() && self.watcher.is_none() {
+        if self.state.view_mode
+            && !self.state.view_mode_flatten
+            && self.current_dir.is_some()
+            && self.watcher.is_none()
+        {
             self.setup_watcher();
             // Only refresh cache if not currently scanning (scan will populate groups)
             if !self.state.is_loading {
@@ -2432,8 +2451,16 @@ impl eframe::App for GuiApp {
                         // Scan complete - start enrichment for files missing GPS
                         self.state.is_loading = false;
                         self.dir_scan_rx = None;
+                        self.scan_progress_rx = None;
                         self.state.last_file_count =
                             self.state.groups.first().map_or(0, |g| g.len());
+                        self.build_search_index();
+
+                        if let Some(ref sort) = self.view_mode_sort
+                            && sort == "location"
+                        {
+                            self.apply_location_sort();
+                        }
 
                         // Collect files needing enrichment
                         if let Some(group) = self.state.groups.first() {
@@ -2492,6 +2519,16 @@ impl eframe::App for GuiApp {
                             if self.state.show_search {
                                 self.search_index.finalize();
                             }
+                        } else if let Ok(Some(features)) =
+                            self.ctx.get_features(&result.content_hash)
+                        {
+                            // Fallback only if strictly necessary (e.g. legacy logic)
+                            self.search_index.remove(result.unique_file_id);
+                            self.search_index.insert(result.unique_file_id, &features);
+
+                            if self.state.show_search {
+                                self.search_index.finalize();
+                            }
                         }
 
                         // O(1) lookup using file_index
@@ -2516,15 +2553,6 @@ impl eframe::App for GuiApp {
                                     pos.x(),
                                     result.exif_timestamp,
                                 );
-                            }
-
-                            if let Some(features) = &result.features {
-                                self.search_index.insert(result.unique_file_id, features);
-                            } else if let Ok(Some(features)) =
-                                self.ctx.get_features(&result.content_hash)
-                            {
-                                // Fallback only if strictly necessary (e.g. legacy logic)
-                                self.search_index.insert(result.unique_file_id, &features);
                             }
                         }
                     },
@@ -2565,10 +2593,33 @@ impl eframe::App for GuiApp {
 
         // Handle RefreshDirCache (Ctrl+L) - preserves resolution data
         if let Some(InputIntent::RefreshDirCache) = *intent.borrow() {
-            if self.state.view_mode {
+            if self.state.view_mode && !self.state.view_mode_flatten {
                 self.refresh_dir_cache(true);
                 self.cache_dirty = true;
                 // Force re-preload in case current file changed (e.g., after rename)
+                self.last_preload_pos = None;
+            } else if self.state.view_mode_flatten {
+                // Flatten mode: trigger background flatten rescan
+                let (progress_tx, progress_rx) = unbounded::<(usize, usize)>();
+                let (batch_tx, batch_rx) = unbounded::<Vec<FileMetadata>>();
+                let sort_order = self.view_mode_sort.clone().unwrap_or_else(|| "name".to_string());
+                let count = scanner::spawn_background_flatten_scan(
+                    &self.scan_config.paths,
+                    sort_order,
+                    &self.ctx,
+                    batch_tx,
+                    Some(progress_tx),
+                );
+                self.dir_total_count = Some(count);
+                self.dir_scan_rx = Some(batch_rx);
+                self.scan_progress_rx = Some(progress_rx);
+                self.scan_progress = (0, 0);
+                self.state.groups = vec![Vec::new()];
+                self.state.group_infos = vec![GroupInfo { max_dist: 0, status: GroupStatus::None }];
+                self.file_index.clear();
+                self.enrichment_rx = None;
+                self.state.is_loading = count > 0;
+                self.cache_dirty = true;
                 self.last_preload_pos = None;
             } else {
                 // Duplicate mode: trigger full rescan
@@ -3451,12 +3502,16 @@ impl eframe::App for GuiApp {
                                     }
 
                                     // Highlight peers
-                                    if let Some(current_file) =
-                                        group.get(self.state.current_file_idx)
+                                    let is_peer = g_idx == self.state.current_group_idx
                                         && !is_selected
-                                        && current_file.pixel_hash.is_some()
-                                        && current_file.pixel_hash == file.pixel_hash
-                                    {
+                                        && group.get(self.state.current_file_idx).is_some_and(
+                                            |cf| {
+                                                cf.pixel_hash.is_some()
+                                                    && cf.pixel_hash == file.pixel_hash
+                                            },
+                                        );
+
+                                    if is_peer {
                                         let bg = egui::Color32::from_black_alpha(40);
                                         marker_rich = marker_rich.strong().background_color(bg);
                                         filename_rich = filename_rich.strong().background_color(bg);
@@ -3522,13 +3577,7 @@ impl eframe::App for GuiApp {
                                                             main_rich.color(egui::Color32::WHITE);
                                                     }
                                                     // Apply background for peer highlighting
-                                                    if let Some(current_file) =
-                                                        group.get(self.state.current_file_idx)
-                                                        && !is_selected
-                                                        && current_file.pixel_hash.is_some()
-                                                        && current_file.pixel_hash
-                                                            == file.pixel_hash
-                                                    {
+                                                    if is_peer {
                                                         let bg =
                                                             egui::Color32::from_black_alpha(40);
                                                         main_rich =
@@ -3886,10 +3935,11 @@ impl eframe::App for GuiApp {
                             }
                             self.completion_candidates.clear();
                             self.completion_index = 0;
+                            self.rename_focus_requested = false;
                             self.state.handle_input(InputIntent::StartRename);
                         }
                         if action_delete {
-                            self.state.handle_input(InputIntent::ExecuteDelete);
+                            self.state.handle_input(InputIntent::DeleteImmediate);
                         }
 
                         // Defer directory change to avoid borrow conflict
@@ -4024,6 +4074,7 @@ impl eframe::App for GuiApp {
                     if file.path == clicked_path {
                         self.state.current_group_idx = g_idx;
                         self.state.current_file_idx = f_idx;
+                        self.dir_selection_idx = None;
                         self.state.selection_changed = true;
                         break;
                     }

@@ -624,6 +624,17 @@ pub(super) fn handle_dialogs(
     _force_panel_resize: &mut bool,
     intent: &RefCell<Option<InputIntent>>,
 ) {
+    let rebuild_view_index = |app: &mut GuiApp| {
+        if app.state.view_mode
+            && let Some(group) = app.state.groups.first()
+        {
+            app.file_index =
+                group.iter().enumerate().map(|(idx, f)| (f.unique_file_id, idx)).collect();
+        }
+        app.last_preload_pos = None;
+        app.cache_dirty = true;
+    };
+
     let pending = intent.borrow().clone();
     if let Some(i) = pending {
         let requires_cache_rebuild = matches!(
@@ -783,6 +794,7 @@ pub(super) fn handle_dialogs(
                                 }
                                 app.state.marked_for_deletion.clear();
                                 app.state.selection_changed = true;
+                                app.last_preload_pos = None;
                                 app.cache_dirty = true;
                                 app.state.last_file_count =
                                     app.state.groups.iter().map(|g| g.len()).sum();
@@ -795,6 +807,18 @@ pub(super) fn handle_dialogs(
                     }
                 }
             },
+            InputIntent::ConfirmDelete
+            | InputIntent::ConfirmDeleteImmediate
+            | InputIntent::ConfirmMoveMarked
+            | InputIntent::DeleteImmediate
+            | InputIntent::ChangeSortOrder(_) => {
+                app.state.handle_input(i);
+                rebuild_view_index(app);
+            },
+            InputIntent::NextSearchResult | InputIntent::PrevSearchResult => {
+                app.state.handle_input(i);
+                app.dir_selection_idx = None;
+            },
             _ => app.state.handle_input(i),
         }
     }
@@ -804,7 +828,7 @@ pub(super) fn handle_dialogs(
     if app.state.show_confirmation {
         if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
             app.state.handle_input(InputIntent::ConfirmDelete);
-            app.cache_dirty = true;
+            rebuild_view_index(app);
         } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
             app.state.handle_input(InputIntent::Cancel);
         }
@@ -819,7 +843,7 @@ pub(super) fn handle_dialogs(
             ui.horizontal(|ui| {
                 if ui.button("Yes (y)").clicked() {
                     app.state.handle_input(InputIntent::ConfirmDelete);
-                    app.cache_dirty = true;
+                    rebuild_view_index(app);
                 }
                 if ui.button("No (n)").clicked() {
                     app.state.handle_input(InputIntent::Cancel);
@@ -831,7 +855,7 @@ pub(super) fn handle_dialogs(
     if app.state.show_delete_immediate_confirmation {
         if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
             app.state.handle_input(InputIntent::ConfirmDeleteImmediate);
-            app.cache_dirty = true;
+            rebuild_view_index(app);
         } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
             app.state.handle_input(InputIntent::Cancel);
         }
@@ -845,7 +869,7 @@ pub(super) fn handle_dialogs(
             ui.horizontal(|ui| {
                 if ui.button("Yes (y)").clicked() {
                     app.state.handle_input(InputIntent::ConfirmDeleteImmediate);
-                    app.cache_dirty = true;
+                    rebuild_view_index(app);
                 }
                 if ui.button("No (n)").clicked() {
                     app.state.handle_input(InputIntent::Cancel);
@@ -881,7 +905,7 @@ pub(super) fn handle_dialogs(
     if app.state.show_move_confirmation {
         if ctx.input(|i| i.key_pressed(egui::Key::Y)) {
             app.state.handle_input(InputIntent::ConfirmMoveMarked);
-            app.cache_dirty = true;
+            rebuild_view_index(app);
         } else if ctx.input(|i| i.key_pressed(egui::Key::N)) {
             app.state.handle_input(InputIntent::Cancel);
         }
@@ -919,7 +943,7 @@ pub(super) fn handle_dialogs(
             ui.horizontal(|ui| {
                 if ui.button("Yes (y)").clicked() {
                     app.state.handle_input(InputIntent::ConfirmMoveMarked);
-                    app.cache_dirty = true;
+                    rebuild_view_index(app);
                 }
                 if ui.button("No (n)").clicked() {
                     app.state.handle_input(InputIntent::Cancel);
@@ -956,7 +980,18 @@ pub(super) fn handle_dialogs(
             ui.label("Enter destination directory:");
 
             // Color logic: RED if directory doesn't exist, Default (text color) otherwise
-            let path_exists = Path::new(&app.move_input).is_dir();
+            // Resolve relative paths against current_dir just like submit does
+            let check_path = {
+                let p = Path::new(&app.move_input);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else if let Some(ref current) = app.current_dir {
+                    current.join(p)
+                } else {
+                    p.to_path_buf()
+                }
+            };
+            let path_exists = check_path.is_dir();
             let text_color = if !path_exists && !app.move_input.is_empty() {
                 egui::Color32::RED
             } else {
@@ -1085,6 +1120,8 @@ pub(super) fn handle_dialogs(
         }
         if cancel {
             app.show_move_input = false;
+            app.move_completion_candidates.clear();
+            app.move_completion_index = 0;
         }
     }
 
@@ -1101,11 +1138,20 @@ pub(super) fn handle_dialogs(
                 // --- Filename Regex Input ---
                 ui.group(|ui| {
                     ui.label(egui::RichText::new("📁 Filename Filter (Regex)").strong());
-                    ui.add(
+                    let filename_res = ui.add(
                         egui::TextEdit::singleline(&mut app.search_filename_input)
                             .hint_text("e.g., IMG_.*\\.jpg  or  DSC  (leave empty to search all)")
                             .desired_width(400.0),
                     );
+                    if (filename_res.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        || (filename_res.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    {
+                        perform_advanced_search(app);
+                        if app.state.show_search {
+                            filename_res.request_focus();
+                        }
+                    }
                     ui.small("Leave empty to search all files. Case-insensitive.");
                 });
 
@@ -1326,13 +1372,32 @@ pub(super) fn handle_dialogs(
         });
 
         if submit {
-            // Clean up the old texture from cache immediately
+            // Clean up all path-keyed caches for the old path immediately
             if let Some(state) = &app.state.renaming {
-                app.raw_cache.remove(&state.original_path);
+                let old_path = &state.original_path;
+                app.raw_cache.remove(old_path);
+                app.gpu_cache.remove(old_path);
+                app.animation_cache.remove(old_path);
+                app.cached_histogram.remove(old_path);
+                app.blur_textures.remove(old_path);
+                app.histogram_pending.remove(old_path);
+                app.exif_search_cache.remove(old_path);
+                if app.cached_exif.as_ref().is_some_and(|(p, _)| p == old_path) {
+                    app.cached_exif = None;
+                }
+                app.gps_map.remove_marker(old_path);
             }
 
             app.state.handle_input(InputIntent::SubmitRename(app.rename_input.clone()));
             app.completion_candidates.clear();
+
+            // Re-ingest GPS marker at the new path if the renamed file had coordinates
+            if let Some(group) = app.state.groups.get(app.state.current_group_idx)
+                && let Some(file) = group.get(app.state.current_file_idx)
+                && let Some(pos) = file.gps_pos
+            {
+                app.gps_map.add_marker(file.path.clone(), pos.y(), pos.x(), file.exif_timestamp);
+            }
 
             app.last_preload_pos = None;
             app.cache_dirty = true; // Rebuild cache after rename
@@ -1392,15 +1457,18 @@ pub(super) fn handle_dialogs(
                 app.view_mode_sort = Some(sort.clone());
 
                 if sort == "location" {
+                    app.state.show_sort_selection = false;
                     app.apply_location_sort();
                 } else {
                     // Explicitly sort subdirectories (AppState only handles files)
                     scanner::sort_directories(&mut app.subdirs, &sort);
+                    app.refresh_dir_cache(false);
                     // Update GPS map sort mode based on sort order
                     app.gps_map.sort_by_exif_timestamp =
                         sort == "exif-date" || sort == "exif-date-desc";
                     app.gps_map.markers_needs_sort = true; // Force re-sort with new mode
                     app.state.handle_input(InputIntent::ChangeSortOrder(sort));
+                    rebuild_view_index(app);
                 }
                 app.cache_dirty = true;
             }
@@ -1700,6 +1768,7 @@ fn perform_ignore_group(app: &mut GuiApp) {
                 app.state.current_file_idx = 0;
             }
             app.state.selection_changed = true;
+            app.last_preload_pos = None;
             app.cache_dirty = true;
             app.state.last_file_count = app.state.groups.iter().map(|g| g.len()).sum();
             app.set_status(format!("Ignored {} files (group uuid: {})", count, uuid_str), false);
@@ -1713,8 +1782,8 @@ fn perform_ignore_group(app: &mut GuiApp) {
 /// Perform advanced search with filename regex + EXIF tag filtering using SearchIndex
 fn perform_advanced_search(app: &mut GuiApp) {
     app.state.search_results.clear();
-    let filename_query_raw = app.search_filename_input.trim();
-    let exif_query_raw = app.search_exif_input.trim();
+    let filename_query_raw = app.search_filename_input.trim().to_string();
+    let exif_query_raw = app.search_exif_input.trim().to_string();
 
     if filename_query_raw.is_empty() && exif_query_raw.is_empty() {
         app.state.show_search = false;
@@ -1803,7 +1872,7 @@ fn perform_advanced_search(app: &mut GuiApp) {
     let clean_exif_query = standard_query_parts.join(" ");
 
     let filename_regex = if !filename_query_raw.is_empty() {
-        match RegexBuilder::new(filename_query_raw).case_insensitive(true).build() {
+        match RegexBuilder::new(&filename_query_raw).case_insensitive(true).build() {
             Ok(r) => Some(r),
             Err(e) => {
                 app.state.error_popup = Some(format!("Invalid filename regex:\n{}", e));
@@ -1825,6 +1894,10 @@ fn perform_advanced_search(app: &mut GuiApp) {
     } else {
         Vec::new()
     };
+
+    if !exif_criteria.is_empty() && app.search_index_dirty {
+        app.build_search_index();
+    }
 
     // 5. Determine Index Usage
     let use_search_index = !exif_criteria.is_empty() && !app.search_index.is_empty();
@@ -1887,10 +1960,10 @@ fn perform_advanced_search(app: &mut GuiApp) {
             };
 
             if exif_matches && matches_geo {
-                let match_source = if !clean_exif_query.is_empty() && filename_regex.is_some() {
-                    format!("Filename + {}", clean_exif_query)
-                } else if !clean_exif_query.is_empty() {
-                    clean_exif_query.clone()
+                let match_source = if !exif_query_raw.is_empty() && filename_regex.is_some() {
+                    format!("Filename + {}", exif_query_raw)
+                } else if !exif_query_raw.is_empty() {
+                    exif_query_raw.clone()
                 } else {
                     "Filename".to_string()
                 };
@@ -1906,8 +1979,9 @@ fn perform_advanced_search(app: &mut GuiApp) {
         let (g, f, ref match_source) = app.state.search_results[0];
         app.state.current_group_idx = g;
         app.state.current_file_idx = f;
+        app.dir_selection_idx = None;
         app.state.selection_changed = true;
-        app.state.status_message = Some((
+        app.set_status(
             format!(
                 "Found {} matches. Match 1/{} [{}].",
                 app.state.search_results.len(),
@@ -1915,7 +1989,7 @@ fn perform_advanced_search(app: &mut GuiApp) {
                 match_source
             ),
             false,
-        ));
+        );
     } else {
         let has_exif_or_geo = !exif_criteria.is_empty() || !geo_filters.is_empty();
         let search_desc = match (filename_regex.is_some(), has_exif_or_geo) {
@@ -1990,6 +2064,8 @@ fn check_exif_criteria_fallback(
     if needs_derived {
         tag_names.push("DerivedSunPosition".to_string());
         tag_names.push("DerivedCountry".to_string());
+        tag_names.push("DerivedSubdivision".to_string());
+        tag_names.push("DerivedTimezone".to_string());
     }
 
     // A cache entry is usable only if it was built with at least the tag set
@@ -2021,15 +2097,34 @@ fn check_exif_criteria_fallback(
 
         // Map tag_id to tag name for lookup
         let tag_name = tag_id_to_name(criterion.tag_id).unwrap_or("Unknown");
+        let is_sun_altitude = tag_name.eq_ignore_ascii_case("SunAltitude")
+            || tag_name.eq_ignore_ascii_case("DerivedSunAltitude");
 
         // Find the tag value
         let tag_value = exif_tags
             .iter()
             .find(|(name, _)| {
-                name.eq_ignore_ascii_case(tag_name) ||
-                // Handle derived tag aliases
-                (tag_name == "DerivedCountry" && name == "Country") ||
-                (tag_name == "DerivedSunPosition" && name == "Sun Position")
+                name.eq_ignore_ascii_case(tag_name)
+                    || (matches!(tag_name, "DerivedCountry" | "Country")
+                        && (name.eq_ignore_ascii_case("Country")
+                            || name.eq_ignore_ascii_case("DerivedCountry")))
+                    || (matches!(tag_name, "DerivedSubdivision" | "Subdivision")
+                        && (name.eq_ignore_ascii_case("Subdivision")
+                            || name.eq_ignore_ascii_case("DerivedSubdivision")
+                            || name.eq_ignore_ascii_case("Country")))
+                    || (matches!(tag_name, "DerivedTimezone" | "Timezone")
+                        && (name.eq_ignore_ascii_case("Timezone")
+                            || name.eq_ignore_ascii_case("DerivedTimezone")))
+                    || (matches!(
+                        tag_name,
+                        "DerivedSunPosition"
+                            | "SunAzimuth"
+                            | "SunAltitude"
+                            | "DerivedSunAzimuth"
+                            | "DerivedSunAltitude"
+                    ) && (name.eq_ignore_ascii_case("Sun Position")
+                        || name.eq_ignore_ascii_case("DerivedSunPosition")
+                        || name.eq_ignore_ascii_case(tag_name)))
             })
             .map(|(_, v)| v.as_str());
 
@@ -2037,14 +2132,29 @@ fn check_exif_criteria_fallback(
             return false; // Tag not found, criterion not met
         };
 
+        let extract_val = |s: &str| -> Option<f64> {
+            if is_sun_altitude {
+                // If formatted as combined "Azimuth: X°, Altitude: Y°" or two numbers,
+                // extract the second number if present, otherwise fallback to the first.
+                if let Some(idx) = s.to_lowercase().find("alt") {
+                    crate::search_index::extract_number_from_string(&s[idx..])
+                } else if let Some((_, after_comma)) = s.split_once(',') {
+                    crate::search_index::extract_number_from_string(after_comma)
+                } else {
+                    crate::search_index::extract_number_from_string(s)
+                }
+            } else {
+                crate::search_index::extract_number_from_string(s)
+            }
+        };
+
         // Evaluate criterion
         let matches = match &criterion.op {
             SearchOp::Equals => {
                 // FIX: Try numeric equality first (handles "f/2.8" vs "2.8")
-                if let (Some(f_val), Ok(c_val)) = (
-                    crate::search_index::extract_number_from_string(value_str),
-                    criterion.value.parse::<f64>(),
-                ) {
+                if let (Some(f_val), Ok(c_val)) =
+                    (extract_val(value_str), criterion.value.parse::<f64>())
+                {
                     (f_val - c_val).abs() < f64::EPSILON
                 } else {
                     value_str.eq_ignore_ascii_case(&criterion.value)
@@ -2057,10 +2167,9 @@ fn check_exif_criteria_fallback(
             | SearchOp::LessOrEqual
             | SearchOp::GreaterThan
             | SearchOp::GreaterOrEqual => {
-                if let (Some(file_val), Ok(crit_val)) = (
-                    crate::search_index::extract_number_from_string(value_str),
-                    criterion.value.parse::<f64>(),
-                ) {
+                if let (Some(file_val), Ok(crit_val)) =
+                    (extract_val(value_str), criterion.value.parse::<f64>())
+                {
                     let eps = f64::EPSILON;
                     match criterion.op {
                         // "Strictly Less": Ensure it's definitely smaller (not approx equal)
@@ -2082,11 +2191,9 @@ fn check_exif_criteria_fallback(
                 }
             },
             SearchOp::Between => {
-                if let (Some(file_val), Ok(min_val), Some(max_str)) = (
-                    crate::search_index::extract_number_from_string(value_str),
-                    criterion.value.parse::<f64>(),
-                    &criterion.value2,
-                ) {
+                if let (Some(file_val), Ok(min_val), Some(max_str)) =
+                    (extract_val(value_str), criterion.value.parse::<f64>(), &criterion.value2)
+                {
                     if let Ok(max_val) = max_str.parse::<f64>() {
                         let eps = f64::EPSILON;
                         file_val > min_val - eps && file_val < max_val + eps
