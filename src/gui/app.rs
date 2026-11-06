@@ -2154,8 +2154,17 @@ impl eframe::App for GuiApp {
                         egui::Sense::click_and_drag(),
                     );
 
-                    if response.dragged() {
+                    if response.drag_started_by(egui::PointerButton::Primary) {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        // Release egui's drag lock and reset pointer state immediately so the
+                        // missing Wayland button-release event doesn't leave the UI in a stuck drag.
+                        ctx.stop_dragging();
+                        ctx.input_mut(|i| i.pointer = egui::PointerState::default());
+                    }
+
+                    if response.double_clicked() {
+                        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
                     }
 
                     // --- Window Controls ---
