@@ -280,8 +280,9 @@ pub fn upload_lut_to_gpu(rs: &egui_wgpu::RenderState, lut: &CubeLut3d) -> Option
     let pipe = renderer.callback_resources.get::<GpuImagePipeline>()?;
 
     let size = lut.size;
-    // Degenerate LUT; also avoids a zero-size texture validation error.
-    if size == 0 {
+    let max_dim = rs.device.limits().max_texture_dimension_3d;
+    let expected_len = (size as usize).checked_mul(size as usize)?.checked_mul(size as usize)?;
+    if size < 2 || size > max_dim || lut.data.len() != expected_len {
         return None;
     }
 
@@ -308,7 +309,7 @@ pub fn upload_lut_to_gpu(rs: &egui_wgpu::RenderState, lut: &CubeLut3d) -> Option
         bytemuck::cast_slice(&texels),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(size * BYTES_PER_TEXEL), // tight stride, see pack_lut_rgba16f
+            bytes_per_row: Some(size * BYTES_PER_TEXEL),
             rows_per_image: Some(size),
         },
         extent,
