@@ -1830,6 +1830,7 @@ fn raw16_to_dynamic(w: usize, h: usize, samples: &[u16]) -> Result<image::Dynami
         ))
     }
 }
+
 fn load_and_process_image_from_bytes(
     path: &Path,
     bytes: &[u8],
@@ -1837,16 +1838,13 @@ fn load_and_process_image_from_bytes(
     hdr_config: crate::db::HdrConfig,
     caps: &DeepColorCaps,
 ) -> Result<(DecodedImage, (u32, u32), u8), String> {
-    // ---------------------------------------------------------------------
-    // RAW FILES
-    // ---------------------------------------------------------------------
     if is_raw_ext(path) {
         let exif_orientation = crate::exif_extract::get_orientation(path, Some(bytes));
 
         let mut raw = match rsraw::RawImage::open(bytes) {
             Ok(r) => r,
             Err(e) => {
-                // rsraw failed (likely unsupported RAW/ARW)
+                // LibRaw failed
                 if use_thumbnails
                     && let Some((thumb, thumb_orient)) = extract_biggest_exif_preview(path, bytes)
                 {
@@ -1856,25 +1854,14 @@ fn load_and_process_image_from_bytes(
                     return Ok(srgb8_result(thumb, dims, actual_orientation, path));
                 }
 
-                // If the fallback fails or we aren't using thumbnails, return the original error
                 return Err(format!("Failed to open RAW file (and EXIF fallback failed): {}", e));
             },
         };
 
-        // Sensor-crop dimensions, in the sensor's own orientation. These are
-        // only the right answer for the thumbnail paths, which report an EXIF
-        // orientation alongside and leave the rotation to render time. A full
-        // decode is different: LibRaw applies `sizes.flip` inside `process()`,
-        // so for a portrait shot the buffer that comes back is transposed
-        // relative to these. Each full-decode arm therefore reports the
-        // processed buffer's own dimensions instead of reusing this.
+        // Sensor-crop dimensions
         let raw_dims = (raw.width(), raw.height());
-
-        // LibRaw computes the sensor orientation (sizes.flip) even for RAW
-        // containers that kamadak-exif can't parse (e.g. CR3/CRX). The embedded
-        // thumbnails returned by extract_thumbs() are stored in the sensor's
-        // native orientation, so use this when neither the thumbnail's own EXIF
-        // nor the container EXIF supplied an orientation.
+        // LibRaw computes the sensor orientation (sizes.flip) even for
+        // RAW containers that kamadak-exif can´t parse
         let raw_orientation = crate::raw_exif::get_orientation_from_raw(&raw);
         let raw_fallback_orientation =
             if exif_orientation != 1 { exif_orientation } else { raw_orientation };
@@ -1886,18 +1873,8 @@ fn load_and_process_image_from_bytes(
             return Ok(srgb8_result(thumb, raw_dims, actual_orientation, path));
         }
 
-        // 2. Full RAW decode mode
         raw.set_use_camera_wb(true);
-        // Decode at 16 bits only when a deep texture can actually show them.
-        // LibRaw works at 16 bits internally either way, but asking for a
-        // 16-bit buffer doubles peak memory (a 60 MP RGB decode is ~360 MB
-        // rather than ~180 MB), so there is no reason to pay that on an 8-bit
-        // surface. `process` is const-generic over the depth, hence two arms
-        // instead of a runtime flag.
-        //
-        // Either way the pixels come out gamma-encoded with LibRaw's default
-        // output curve, which we treat as sRGB — the same approximation the
-        // 8-bit path has always made. Only the bit depth changes here.
+        // Decode at 16 bits only when a deep texture can actually show them
         let full_decode: Result<(DecodedImage, (u32, u32)), String> = match raw.unpack() {
             Ok(_) => {
                 if caps.enabled() {
@@ -1909,10 +1886,7 @@ fn load_and_process_image_from_bytes(
                             raw16_to_dynamic(w, h, &processed)
                                 .map(|img| (img, (w as u32, h as u32)))
                         })
-                        // RAW carries no alpha, so this always lands on the
-                        // 4-bytes-per-pixel Rgb10a2 path, never Rgba16.
-                        // LibRaw hands back pixels in its own output curve, which we
-                        // treat as sRGB, so there is no cICP to pass on here.
+                        // RAW carries no alpha, so this always lands on the  4-bytes-per-pixel Rgb10a2 path, never Rgba16.
                         .map(|(dyn_img, dims)| {
                             (finish_dynamic(dyn_img, dims, 1, caps, None, path).0, dims)
                         })
@@ -1922,19 +1896,20 @@ fn load_and_process_image_from_bytes(
                         .and_then(|processed| {
                             let w = processed.width() as usize;
                             let h = processed.height() as usize;
-                            let total_pixels = w * h;
-                            // Determine channels dynamically
+                            let total_pixels = w.checked_mul(h).ok_or_else(|| {
+                                "RAW dimensions overflow".to_string()
+                            })?;
                             let img = if processed.len() == total_pixels {
-                                // Monochrome: 1 byte per pixel
+                                // Monochrome
                                 egui::ColorImage::from_gray([w, h], &processed)
-                            } else if processed.len() == total_pixels * 3 {
-                                // RGB: 3 bytes per pixel
+                            } else if processed.len() == total_pixels.saturating_mul(3) {
+                                // RGB
                                 egui::ColorImage::from_rgb([w, h], &processed)
                             } else {
                                 return Err(format!(
                                     "RAW size mismatch: expected {} (Mono) or {} (RGB) bytes, got {}",
                                     total_pixels,
-                                    total_pixels * 3,
+                                    total_pixels.saturating_mul(3),
                                     processed.len()
                                 ));
                             };
@@ -1947,14 +1922,10 @@ fn load_and_process_image_from_bytes(
             },
             Err(e) => Err(format!("Failed to unpack RAW: {}", e)),
         };
-        // rsraw handles rotation, so orientation = 1 for a full decode — and
-        // the resolution we report is the rotated one that came back with the
-        // pixels, not the sensor crop.
+
         match full_decode {
             Ok((decoded, dims)) => return Ok((decoded, dims, 1)),
             Err(e) => {
-                // Fallback to thumbnail on unpack or process error
-                // (unsupported full-decode formats)
                 if let Some((thumb, thumb_orient)) = extract_best_thumbnail(&mut raw) {
                     let actual_orientation =
                         if thumb_orient != 1 { thumb_orient } else { raw_fallback_orientation };
@@ -1965,92 +1936,64 @@ fn load_and_process_image_from_bytes(
         }
     }
 
-    // ---------------------------------------------------------------------
-    // STANDARD FILES (JPEG, PNG, HEIC, JP2, JXL, etc.)
-    // ---------------------------------------------------------------------
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
 
-    // libheif applies the container orientation (irot/imir) while decoding, so
-    // HEIC/HEIF pixels come out already upright. The EXIF Orientation tag that
-    // iPhones additionally embed must therefore NOT be re-applied at render time
-    // or the image gets rotated twice. Unlike JPEG (whose pixels stay in their
-    // stored orientation and rely on the EXIF tag), HEIC needs a neutral 1.
     let orientation = if crate::scanner::orientation_baked_into_pixels(path) {
         1
     } else {
         crate::exif_extract::get_orientation(path, Some(bytes))
     };
 
-    // Detect cICP before decoding — every path below needs it, not just the
-    // HDR one. PNG is the main current carrier of cICP in still images;
-    // AVIF/HEIC signal their color space through ISOBMFF container metadata,
-    // JPEG/TIFF through a v4.4 `cicp` tag inside their ICC profile.
-    let cicp = crate::hdr::detect_cicp(bytes);
-    eprintln!("[DEBUG-IMAGE] {:?}: final detected cICP: {:?}", path, cicp);
+    let mut final_cicp = crate::hdr::detect_cicp(bytes);
+    eprintln!("[DEBUG-IMAGE] {:?}: final detected cICP: {:?}", path, final_cicp);
 
-    // ---------------------------------------------------------------------
-    // JXL / PDF / JPEG / TIFF FAST PATH
-    // ---------------------------------------------------------------------
-    if matches!(ext.as_str(), "jpg" | "jpeg" | "jxl" | "pdf" | "tif" | "tiff" | "heic" | "heif") {
+    let dyn_img = if matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "jxl" | "pdf" | "tif" | "tiff" | "heic" | "heif"
+    ) {
         eprintln!("[DEBUG-GUI] attempting scanner decode for {:?}", path);
 
         match crate::scanner::load_image_fast(path, bytes) {
             Ok(dyn_img) => {
-                let (w, h) = dyn_img.dimensions();
-
                 eprintln!("[DEBUG-GUI] scanner decode SUCCESS for {:?}", path);
-
-                // Adjust HEIC container signaling before handing off to finish_dynamic
-                let mut final_cicp = cicp;
                 if matches!(ext.as_str(), "heic" | "heif")
                     && let Some(ref mut c) = final_cicp
                 {
-                    // libheif expands limited-range YCbCr to full-range RGB during matrix conversion.
-                    // Mark full_range = true so HDR/SDR pipeline won't apply a second range expansion.
+                    // libheif expands limited-range YCbCr to full-range RGB during matrix conversion
                     c.full_range = true;
                 }
-
-                // 16-bit TIFF and JXL reach this branch, so let finish_dynamic
-                // decide whether they are worth keeping at 10 bits.
-                return Ok(finish_dynamic(dyn_img, (w, h), orientation, caps, final_cicp, path));
+                dyn_img
             },
             Err(err_msg) => {
                 eprintln!("[DEBUG-GUI] scanner decode FAILED for {:?}: {}", path, err_msg);
                 return Err(format!("Failed to decode {} file: {}", ext.to_uppercase(), err_msg));
             },
         }
-    }
+    } else {
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .unwrap_or_else(|_| image::ImageReader::new(std::io::Cursor::new(bytes)));
 
-    // ---------------------------------------------------------------------
-    // IMAGE CRATE FALLBACK
-    // ---------------------------------------------------------------------
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .unwrap_or_else(|_| image::ImageReader::new(std::io::Cursor::new(bytes)));
+        if reader.format().is_none()
+            && let Ok(fmt) = image::ImageFormat::from_path(path)
+        {
+            reader.set_format(fmt);
+        }
 
-    if reader.format().is_none()
-        && let Ok(fmt) = image::ImageFormat::from_path(path)
-    {
-        reader.set_format(fmt);
-    }
+        let format_name =
+            reader.format().map(|f| format!("{:?}", f)).unwrap_or_else(|| "unknown".to_string());
 
-    let format_name =
-        reader.format().map(|f| format!("{:?}", f)).unwrap_or_else(|| "unknown".to_string());
-
-    let dyn_img =
-        reader.decode().map_err(|e| format!("Failed to decode {}: {}", format_name, e))?;
+        reader.decode().map_err(|e| format!("Failed to decode {}: {}", format_name, e))?
+    };
 
     img_debug!("[DEBUG-IMAGE] Decoded DynamicImage format: {:?}", dyn_img.color());
     let dims = (dyn_img.width(), dyn_img.height());
 
-    // HDR path: cICP advertised PQ or HLG transfer
-    let needs_hdr_processing = cicp.map(|c| c.is_hdr()).unwrap_or(false);
-    if needs_hdr_processing {
-        let cicp = cicp.unwrap();
+    if let Some(cicp) = final_cicp.filter(|c| c.is_hdr()) {
         eprintln!(
             "[DEBUG-HDR] {:?}: cICP primaries={} transfer={} matrix={} full_range={}",
             path,
@@ -2063,8 +2006,6 @@ fn load_and_process_image_from_bytes(
         if caps.enabled()
             && let Some(wide) = deep_format_for(&dyn_img, caps)
         {
-            // The BT.2390 curve packs 10000 nits into the display range, so the
-            // extra bits per channel matter more here than anywhere else.
             let dyn_img = maybe_downscale_dynamic(dyn_img, path);
             let peak = hdr_config.sdr_peak_nits;
             let (w, h, pixels) = if wide {
@@ -2096,7 +2037,7 @@ fn load_and_process_image_from_bytes(
         return Ok(srgb8_result(img, dims, orientation, path));
     }
 
-    Ok(finish_dynamic(dyn_img, dims, orientation, caps, cicp, path))
+    Ok(finish_dynamic(dyn_img, dims, orientation, caps, final_cicp, path))
 }
 
 pub(super) fn update_file_metadata(
