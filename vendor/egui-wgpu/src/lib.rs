@@ -15,7 +15,7 @@
 //! ## Feature flags
 #![doc = document_features::document_features!()]
 //!
-
+#![recursion_limit = "256"]
 pub use wgpu;
 
 /// Low-level painting of [`egui`](https://github.com/emilk/egui) on [`wgpu`].
