@@ -1547,9 +1547,8 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<(egui::Colo
     let mut cursor = std::io::Cursor::new(bytes);
     let reader = exif::Reader::new().read_from_container(&mut cursor).ok()?;
 
-    let mut best_offset = 0;
-    let mut max_length = 0;
-    // Track which Image File Directory (IFD) we found the best preview in
+    let mut best_offset = 0usize;
+    let mut max_length = 0usize;
     let mut best_ifd = exif::In::PRIMARY;
 
     // Iterate through ALL fields across ALL Image File Directories (IFDs)
@@ -1572,19 +1571,22 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<(egui::Colo
                     _ => continue,
                 };
 
-                max_length = length;
-                best_offset = offset;
-                best_ifd = field.ifd_num;
+                if offset.checked_add(length).is_some_and(|end| end <= bytes.len()) {
+                    max_length = length;
+                    best_offset = offset;
+                    best_ifd = field.ifd_num;
+                }
             }
         }
     }
 
-    if max_length == 0 || best_offset + max_length > bytes.len() {
+    let end = best_offset.checked_add(max_length)?;
+    if max_length == 0 || end > bytes.len() {
         return None;
     }
 
-    let jpeg_bytes = &bytes[best_offset..best_offset + max_length];
     // Parse orientation directly from the embedded JPEG bytes
+    let jpeg_bytes = &bytes[best_offset..end];
     let orientation = crate::exif_extract::get_orientation(Path::new(""), Some(jpeg_bytes));
 
     let img = image::load_from_memory(jpeg_bytes).ok()?;
