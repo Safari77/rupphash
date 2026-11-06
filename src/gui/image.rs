@@ -1504,20 +1504,16 @@ fn maybe_resize_image(
 
     if w > MAX_TEXTURE_SIDE || h > MAX_TEXTURE_SIDE {
         let scale = (MAX_TEXTURE_SIDE as f32) / (w.max(h) as f32);
-        let new_w = (w as f32 * scale).round() as usize;
-        let new_h = (h as f32 * scale).round() as usize;
+        let new_w = ((w as f32 * scale).round() as usize).clamp(1, MAX_TEXTURE_SIDE);
+        let new_h = ((h as f32 * scale).round() as usize).clamp(1, MAX_TEXTURE_SIDE);
 
         let pixel_type = PixelType::U8x4;
 
         let resized = {
-            // View the Color32 pixels as raw bytes in place — Color32 is a
-            // #[repr(C)] [u8; 4] with alignment 1, so the reinterpretation is
-            // sound and no copy or ownership juggling is needed.
             let raw_pixels: &mut [u8] = bytemuck::cast_slice_mut(&mut color_image.pixels);
             FastImage::from_slice_u8(w as u32, h as u32, raw_pixels, pixel_type).ok().and_then(
                 |src_image| {
                     let mut dst_image = FastImage::new(new_w as u32, new_h as u32, pixel_type);
-                    // Resize using default options (Lanczos3 for quality)
                     let mut resizer = Resizer::new();
                     resizer
                         .resize(&src_image, &mut dst_image, &ResizeOptions::default())
@@ -1529,7 +1525,6 @@ fn maybe_resize_image(
 
         if let Some(dst_image) = resized {
             eprintln!("[DEBUG] Fast-Resized {:?} from {}x{} to {}x{}", path, w, h, new_w, new_h);
-            // The resized bytes are already premultiplied Color32 values, so rebuild them verbatim.
             color_image = egui::ColorImage {
                 size: [new_w, new_h],
                 pixels: dst_image
@@ -1542,8 +1537,6 @@ fn maybe_resize_image(
                 source_size: egui::vec2(new_w as f32, new_h as f32),
             };
         }
-        // If the fast resizer failed, color_image still holds the original
-        // oversized pixels, exactly as before the call.
     }
     (color_image, real_dims, orientation)
 }
@@ -1656,8 +1649,6 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
     // Fastest frame rate we honour.
     const MAX_FPS: u64 = 240;
     const MIN_FRAME_US: u64 = 1_000_000 / MAX_FPS;
-    // A zero delay means "unspecified", which by long-standing GIF convention
-    // is treated as ~100 ms.
     const UNSPECIFIED_US: u64 = 100_000;
 
     for frame in raw_frames {
@@ -1668,7 +1659,7 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
         let us = if denom == 0 {
             UNSPECIFIED_US
         } else {
-            (numer as u64 * 1000 + (denom as u64 / 2)) / denom as u64
+            (numer as u64).saturating_mul(1000).saturating_add(denom as u64 / 2) / denom as u64
         };
         let us = if us == 0 { UNSPECIFIED_US } else { us.max(MIN_FRAME_US) };
         durations.push(Duration::from_micros(us));
@@ -1676,6 +1667,9 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
         let rgba = frame.buffer();
         let w = rgba.width() as usize;
         let h = rgba.height() as usize;
+        if w == 0 || h == 0 {
+            continue;
+        }
         let pixels: Vec<egui::Color32> = rgba
             .as_raw()
             .as_chunks::<4>()
@@ -1690,8 +1684,8 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
         // Resize individual frames if they exceed texture limits
         if w > MAX_TEXTURE_SIDE || h > MAX_TEXTURE_SIDE {
             let scale = (MAX_TEXTURE_SIDE as f32) / (w.max(h) as f32);
-            let new_w = (w as f32 * scale).round() as usize;
-            let new_h = (h as f32 * scale).round() as usize;
+            let new_w = ((w as f32 * scale).round() as usize).clamp(1, MAX_TEXTURE_SIDE);
+            let new_h = ((h as f32 * scale).round() as usize).clamp(1, MAX_TEXTURE_SIDE);
 
             let pixel_type = fast_image_resize::PixelType::U8x4;
             if let Ok(src_image) = fast_image_resize::images::Image::from_vec_u8(
@@ -1711,11 +1705,8 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
                     )
                     .is_ok()
                 {
-                    // The resized bytes are already premultiplied Color32
-                    // values, so rebuild them verbatim: from_rgba_unmultiplied
-                    // would premultiply a second time and darken semi-
-                    // transparent pixels.
                     color_image = egui::ColorImage {
+                        // The resized bytes are already premultiplied Color32
                         size: [new_w, new_h],
                         pixels: dst_image
                             .buffer()
