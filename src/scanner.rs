@@ -71,11 +71,18 @@ static BOUNDARIES: OnceLock<Option<country_boundaries::CountryBoundaries>> = Onc
 /// Must be called once during app startup, before any parallel image work.
 pub fn init_smart_limits() -> usize {
     let &(threads, _) = SMART_LIMITS.get_or_init(|| {
-        let mut sys = System::new().expect("failed to initialize sysinfo System");
-        sys.refresh_memory();
+        let total_ram_bytes = match System::new() {
+            Ok(mut sys) => {
+                sys.refresh_memory();
+                sys.total_memory()
+            },
+            Err(e) => {
+                eprintln!("[SYSTEM] Warning: Failed to initialize sysinfo: {e}");
+                0
+            },
+        };
 
-        let total_ram_bytes = sys.total_memory();
-        let max_allowed_ram = (total_ram_bytes * 3) / 4; // 75% global limit
+        let max_allowed_ram = (total_ram_bytes / 4) * 3; // 75% global limit
 
         // How many 1.5GB decodes can fit in 75% of RAM?
         let mut target_threads = (max_allowed_ram / BUDGET_PER_THREAD_BYTES) as usize;
@@ -86,8 +93,9 @@ pub fn init_smart_limits() -> usize {
         // Clamp the threads between 1 and max CPU cores
         target_threads = target_threads.clamp(1, cpu_cores);
 
-        // Calculate the new, highly accurate per-thread limit
-        let limit_per_thread = max_allowed_ram / (target_threads as u64);
+        // Calculate the new, highly accurate per-thread limit (fallback to default if RAM query returned 0)
+        let limit_per_thread =
+            (max_allowed_ram / (target_threads as u64)).max(BUDGET_PER_THREAD_BYTES);
 
         eprintln!(
             "[SYSTEM] Smart Limits: Limiting to {}/{} cores. {} MB limit per thread.",
@@ -503,8 +511,11 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
     let handle = ctx.primary_image_handle().map_err(|e| e.to_string())?;
 
     let bit_depth = handle.luma_bits_per_pixel();
+    if bit_depth == 0 || bit_depth > 16 {
+        return Err(format!("HEIC: Unsupported bit depth {}", bit_depth));
+    }
     let has_alpha = handle.has_alpha_channel();
-    let channels = if has_alpha { 4 } else { 3 };
+    let channels = if has_alpha { 4usize } else { 3usize };
 
     let chroma = match (bit_depth > 8, has_alpha) {
         (true, true) => RgbChroma::HdrRgbaLe,
@@ -519,24 +530,33 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
     let planes = decoded.planes();
     let plane = planes.interleaved.ok_or_else(|| "HEIC: Missing interleaved plane".to_string())?;
 
-    // Pull dimensions from the decoded plane to guarantee buffer safety
     let width = plane.width as usize;
     let height = plane.height as usize;
     let stride = plane.stride;
     let data = plane.data;
 
-    let samples_per_row = width * channels;
+    let samples_per_row =
+        width.checked_mul(channels).ok_or_else(|| "HEIC: Width overflow".to_string())?;
+    let total_samples = samples_per_row
+        .checked_mul(height)
+        .ok_or_else(|| "HEIC: Dimensions overflow".to_string())?;
 
     if bit_depth > 8 {
-        let row_bytes_len = samples_per_row * 2;
-        if stride < row_bytes_len || data.len() < height.saturating_sub(1) * stride + row_bytes_len
-        {
+        let row_bytes_len = samples_per_row
+            .checked_mul(2)
+            .ok_or_else(|| "HEIC: Row byte length overflow".to_string())?;
+        let min_buf_len = height
+            .saturating_sub(1)
+            .checked_mul(stride)
+            .and_then(|v| v.checked_add(row_bytes_len))
+            .ok_or_else(|| "HEIC: Buffer size overflow".to_string())?;
+
+        if stride < row_bytes_len || data.len() < min_buf_len {
             return Err("HEIC: Plane buffer smaller than expected dimensions".to_string());
         }
 
-        let mut out = Vec::with_capacity(samples_per_row * height);
+        let mut out = Vec::with_capacity(total_samples);
 
-        // Hoist the bit_depth check outside the pixel loops so LLVM vectorizes with SIMD
         match bit_depth {
             10 => {
                 for y in 0..height {
@@ -568,15 +588,14 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
                 }
             },
             _ => {
-                // Bit-replication scaling: scales an arbitrary N-bit value (e.g. 10-bit 0..1023)
-                // to standard 16-bit unorm (0..65535).
-                let max_val = ((1u32 << bit_depth) - 1).max(1);
+                // Bit-replication scaling: scales an arbitrary N-bit value to standard 16-bit unorm (0..65535)
+                let max_val = ((1u32 << u32::from(bit_depth)) - 1).max(1);
                 for y in 0..height {
                     let row_start = y * stride;
                     let row_bytes = &data[row_start..row_start + row_bytes_len];
                     out.extend(row_bytes.as_chunks::<2>().0.iter().map(|&c| {
                         let v = u16::from_le_bytes(c) as u32;
-                        ((v * 65535 + (max_val / 2)) / max_val) as u16
+                        ((v * 65535 + (max_val / 2)) / max_val).min(65535) as u16
                     }));
                 }
             },
@@ -592,18 +611,20 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
             Ok(DynamicImage::ImageRgb16(buf))
         }
     } else {
-        // Standard 8-bit decode path
-        if stride < samples_per_row
-            || data.len() < height.saturating_sub(1) * stride + samples_per_row
-        {
+        let min_buf_len = height
+            .saturating_sub(1)
+            .checked_mul(stride)
+            .and_then(|v| v.checked_add(samples_per_row))
+            .ok_or_else(|| "HEIC: Buffer size overflow".to_string())?;
+
+        if stride < samples_per_row || data.len() < min_buf_len {
             return Err("HEIC: Plane buffer smaller than expected dimensions".to_string());
         }
 
         let out = if stride == samples_per_row {
-            // Fast path: single allocation + memcpy when there is no row padding
-            data[..samples_per_row * height].to_vec()
+            data[..total_samples].to_vec()
         } else {
-            let mut out = Vec::with_capacity(samples_per_row * height);
+            let mut out = Vec::with_capacity(total_samples);
             for y in 0..height {
                 let row_start = y * stride;
                 out.extend_from_slice(&data[row_start..row_start + samples_per_row]);
@@ -634,84 +655,64 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
         return Err("RAW formats handled elsewhere".to_string());
     }
 
+    // Helper closure to construct DynamicImage from decoded 8-bit buffers without duplication
+    let build_8bit_image =
+        |w: u32, h: u32, pixels: Vec<u8>, decoder_label: &str| -> Option<DynamicImage> {
+            let wh = (w as usize).checked_mul(h as usize)?;
+            let len = pixels.len();
+            if len == wh {
+                let buf = image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels)?;
+                eprintln!(
+                    "[DEBUG-LOAD] {:?} -> {} (Grayscale)",
+                    path.file_name().unwrap_or_default(),
+                    decoder_label
+                );
+                Some(image::DynamicImage::ImageLuma8(buf))
+            } else if len == wh.checked_mul(3)? {
+                let buf = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels)?;
+                eprintln!(
+                    "[DEBUG-LOAD] {:?} -> {} (RGB)",
+                    path.file_name().unwrap_or_default(),
+                    decoder_label
+                );
+                Some(image::DynamicImage::ImageRgb8(buf))
+            } else if len == wh.checked_mul(4)? {
+                let buf = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, pixels)?;
+                eprintln!(
+                    "[DEBUG-LOAD] {:?} -> {} (RGBA/CMYK)",
+                    path.file_name().unwrap_or_default(),
+                    decoder_label
+                );
+                Some(image::DynamicImage::ImageRgba8(buf))
+            } else {
+                None
+            }
+        };
+
     match ext.as_str() {
         "jpg" | "jpeg" => {
             // TIER 1: Zune-JPEG
             let mut zune = ZuneDecoder::new(std::io::Cursor::new(bytes));
             if let Ok(pixels) = zune.decode()
                 && let Some(info) = zune.info()
+                && let Some(img) =
+                    build_8bit_image(info.width as u32, info.height as u32, pixels, "Zune-JPEG")
             {
-                let w = info.width as u32;
-                let h = info.height as u32;
-                let len = pixels.len();
-                let wh = w as usize * h as usize;
-
-                // Robustly handle Grayscale vs RGB based on buffer size
-                if len == wh {
-                    if let Some(buf) =
-                        image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels)
-                    {
-                        eprintln!(
-                            "[DEBUG-LOAD] {:?} -> Zune-JPEG (Grayscale)",
-                            path.file_name().unwrap_or_default()
-                        );
-                        return Ok(image::DynamicImage::ImageLuma8(buf));
-                    }
-                } else if len == wh * 3 {
-                    if let Some(buf) =
-                        image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels)
-                    {
-                        eprintln!(
-                            "[DEBUG-LOAD] {:?} -> Zune-JPEG (RGB)",
-                            path.file_name().unwrap_or_default()
-                        );
-                        return Ok(image::DynamicImage::ImageRgb8(buf));
-                    }
-                } else if len == wh * 4 {
-                    // CMYK or RGBA (Zune might output RGBA for CMYK)
-                    if let Some(buf) =
-                        image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, pixels)
-                    {
-                        eprintln!(
-                            "[DEBUG-LOAD] {:?} -> Zune-JPEG (RGBA/CMYK)",
-                            path.file_name().unwrap_or_default()
-                        );
-                        return Ok(image::DynamicImage::ImageRgba8(buf));
-                    }
-                }
+                return Ok(img);
             }
 
             // TIER 2: jpeg-decoder (Fallback)
             let mut decoder = Tier2Decoder::new(std::io::Cursor::new(bytes));
             if let Ok(pixels) = decoder.decode()
                 && let Some(info) = decoder.info()
+                && let Some(img) = build_8bit_image(
+                    info.width as u32,
+                    info.height as u32,
+                    pixels,
+                    "jpeg-decoder (Fallback)",
+                )
             {
-                let w = info.width as u32;
-                let h = info.height as u32;
-                let len = pixels.len();
-                // Multiply in usize to avoid u32 overflow on very large images
-                let wh = w as usize * h as usize;
-
-                if len == wh {
-                    if let Some(buf) =
-                        image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w, h, pixels)
-                    {
-                        eprintln!(
-                            "[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback Grayscale)",
-                            path.file_name().unwrap_or_default()
-                        );
-                        return Ok(image::DynamicImage::ImageLuma8(buf));
-                    }
-                } else if len == wh * 3
-                    && let Some(buf) =
-                        image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, pixels)
-                {
-                    eprintln!(
-                        "[DEBUG-LOAD] {:?} -> jpeg-decoder (Fallback RGB)",
-                        path.file_name().unwrap_or_default()
-                    );
-                    return Ok(image::DynamicImage::ImageRgb8(buf));
-                }
+                return Ok(img);
             }
         },
 
@@ -723,40 +724,28 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
 
             img_debug!("[jxl] attempting decode");
 
-            let decoder = match JxlDecoder::new(Cursor::new(bytes)) {
-                Ok(d) => d,
-                Err(e) => {
-                    img_debug!("[jxl] decoder init failed: {:?}", e);
-                    return Err(format!("JXL decoder init failed: {:?}", e));
-                },
-            };
+            let decoder = JxlDecoder::new(Cursor::new(bytes)).map_err(|e| {
+                img_debug!("[jxl] decoder init failed: {:?}", e);
+                format!("JXL decoder init failed: {:?}", e)
+            })?;
 
             let (_w, _h) = decoder.dimensions();
             img_debug!("[jxl] dimensions: {}x{}", _w, _h);
 
-            match DynamicImage::from_decoder(decoder) {
-                Ok(img) => {
-                    img_debug!("[jxl] decode successful");
-                    return Ok(img);
-                },
-                Err(e) => {
-                    img_debug!("[jxl] decode failed: {:?}", e);
-                    return Err(format!("JXL decode failed: {:?}", e));
-                },
-            }
+            return DynamicImage::from_decoder(decoder).map_err(|e| {
+                img_debug!("[jxl] decode failed: {:?}", e);
+                format!("JXL decode failed: {:?}", e)
+            });
         },
 
         "pdf" => {
             img_debug!("[pdf] attempting hayro decode");
 
             let pdf_data = std::sync::Arc::new(bytes.to_vec());
-            let pdf = match hayro::hayro_syntax::Pdf::new(pdf_data) {
-                Ok(p) => p,
-                Err(e) => {
-                    img_debug!("[pdf] parse failed: {:?}", e);
-                    return Err(format!("PDF parse failed: {:?}", e));
-                },
-            };
+            let pdf = hayro::hayro_syntax::Pdf::new(pdf_data).map_err(|e| {
+                img_debug!("[pdf] parse failed: {:?}", e);
+                format!("PDF parse failed: {:?}", e)
+            })?;
 
             let pages = pdf.pages();
             if let Some(first_page) = pages.first() {
@@ -784,7 +773,6 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 let pixel_slice = pixmap.data();
                 let raw_bytes: Vec<u8> = bytemuck::cast_slice(pixel_slice).to_vec();
 
-                // 6. Build the DynamicImage
                 if let Some(rgba_image) = image::RgbaImage::from_raw(width, height, raw_bytes) {
                     img_debug!("[pdf] zero-copy decode successful");
                     return Ok(image::DynamicImage::ImageRgba8(rgba_image));
@@ -803,20 +791,29 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                 path.file_name().unwrap_or_default()
             );
 
+            let mem_limit = get_image_memory_limit();
+
             match image::codecs::tiff::TiffDecoder::new(Cursor::new(bytes)) {
                 Ok(decoder) => {
                     use image::ImageDecoder;
-                    if decoder.color_type() == image::ColorType::Rgb8 {
-                        let (w, h) = decoder.dimensions();
-                        let mut buffer = vec![0u8; decoder.total_bytes() as usize];
-                        if decoder.read_image(&mut buffer).is_ok()
-                            && let Some(buf) =
-                                image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, buffer)
-                        {
-                            return Ok(image::DynamicImage::ImageRgb8(buf));
+                    let total_bytes = decoder.total_bytes();
+                    if total_bytes <= mem_limit {
+                        if decoder.color_type() == image::ColorType::Rgb8 {
+                            let (w, h) = decoder.dimensions();
+                            if let Ok(buf_len) = usize::try_from(total_bytes) {
+                                let mut buffer = vec![0u8; buf_len];
+                                if decoder.read_image(&mut buffer).is_ok()
+                                    && let Some(buf) =
+                                        image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(
+                                            w, h, buffer,
+                                        )
+                                {
+                                    return Ok(image::DynamicImage::ImageRgb8(buf));
+                                }
+                            }
+                        } else if let Ok(img) = image::DynamicImage::from_decoder(decoder) {
+                            return Ok(img);
                         }
-                    } else if let Ok(img) = image::DynamicImage::from_decoder(decoder) {
-                        return Ok(img);
                     }
                 },
                 Err(e) => {
@@ -832,11 +829,13 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
                             matches!(native_decoder.colortype(), Ok(tiff::ColorType::YCbCr(_)));
 
                         if let Ok((w, h)) = native_decoder.dimensions()
+                            && let Some(wh) = (w as usize).checked_mul(h as usize)
+                            && (wh.saturating_mul(4) as u64) <= mem_limit
                             && let Ok(tiff::decoder::DecodingResult::U8(mut data)) =
                                 native_decoder.read_image()
                         {
-                            let expected_rgb_len = w as usize * h as usize * 3;
-                            let expected_rgba_len = w as usize * h as usize * 4;
+                            let expected_rgb_len = wh.saturating_mul(3);
+                            let expected_rgba_len = wh.saturating_mul(4);
 
                             if data.len() == expected_rgb_len {
                                 if is_ycbcr {
@@ -890,19 +889,16 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
         .with_guessed_format()
         .unwrap_or_else(|_| image::ImageReader::new(std::io::Cursor::new(bytes)));
 
-    // Fallback to extension if format is still unknown
     if reader.format().is_none()
         && let Ok(fmt) = image::ImageFormat::from_path(path)
     {
         reader.set_format(fmt);
     }
 
-    // Apply the dynamic memory limit
     let mut custom_limits = image::Limits::default();
     custom_limits.max_alloc = Some(get_image_memory_limit());
     reader.limits(custom_limits);
 
-    // Capture the image crate's format string and map the internal error out
     reader.decode().map_err(|e| e.to_string())
 }
 
@@ -1223,13 +1219,20 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
         return None;
     }
 
-    // 2. Handle HEIC/HEIF specifically
+    // 2. Handle HEIC/HEIF and TIFF specifically
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
         let ext = ext.to_lowercase();
         if ext == "heic" || ext == "heif" {
+            let data_cow;
             let ctx = match bytes {
                 Some(b) => HeifContext::read_from_bytes(b).ok()?,
-                None => HeifContext::read_from_file(path.to_str()?).ok()?,
+                None => match path.to_str() {
+                    Some(s) => HeifContext::read_from_file(s).ok()?,
+                    None => {
+                        data_cow = fs::read(path).ok()?;
+                        HeifContext::read_from_bytes(&data_cow).ok()?
+                    },
+                },
             };
 
             if let Ok(handle) = ctx.primary_image_handle() {
@@ -1239,18 +1242,12 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
 
         // 2.5 Handle TIFF specifically to bypass ImageReader color space limits
         if ext == "tif" || ext == "tiff" {
-            let data_cow;
-            let data_slice = match bytes {
-                Some(b) => b,
-                None => {
-                    data_cow = fs::read(path).ok()?;
-                    &data_cow
-                },
+            let reader_obj: Box<dyn BufReadSeek> = match bytes {
+                Some(b) => Box::new(std::io::Cursor::new(b)),
+                None => Box::new(std::io::BufReader::new(fs::File::open(path).ok()?)),
             };
 
-            if let Ok(decoder) =
-                image::codecs::tiff::TiffDecoder::new(std::io::Cursor::new(data_slice))
-            {
+            if let Ok(decoder) = image::codecs::tiff::TiffDecoder::new(reader_obj) {
                 use image::ImageDecoder;
                 return Some(decoder.dimensions());
             }
@@ -1261,13 +1258,11 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
     let reader_obj: Box<dyn BufReadSeek> = match bytes {
         Some(b) => Box::new(std::io::Cursor::new(b)),
         None => {
-            // Manually open the file so we can wrap it in BufReader + Box
             let file = fs::File::open(path).ok()?;
             Box::new(std::io::BufReader::new(file))
         },
     };
 
-    // Now we create the ImageReader using the unified Box type
     if let Ok(reader) = image::ImageReader::new(reader_obj).with_guessed_format()
         && let Ok(dims) = reader.into_dimensions()
     {
@@ -1275,6 +1270,23 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
     }
 
     None
+}
+
+/// Helper to run a closure inside a constrained Rayon thread pool without panicking
+/// if OS thread creation fails (falls back to running on the current/global pool).
+fn run_in_smart_pool<OP, R>(op: OP) -> R
+where
+    OP: FnOnce() -> R + Send,
+    R: Send,
+{
+    let safe_threads = get_safe_thread_count();
+    match rayon::ThreadPoolBuilder::new().num_threads(safe_threads).build() {
+        Ok(pool) => pool.install(op),
+        Err(e) => {
+            eprintln!("[WARN] Failed to build custom thread pool ({}), using fallback", e);
+            op()
+        },
+    }
 }
 
 #[derive(Clone)]
@@ -1324,6 +1336,21 @@ impl ScannedFile {
     }
 }
 
+/// Canonicalizes `path` and inserts it into `seen_paths`, returning `Some(canonical)` if new.
+fn canonicalize_unique_image(
+    path: &Path,
+    seen_paths: &mut HashSet<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if is_image_ext(path)
+        && let Ok(canonical) = path.canonicalize()
+        && seen_paths.insert(canonical.clone())
+    {
+        Some(canonical)
+    } else {
+        None
+    }
+}
+
 pub fn scan_and_group(
     config: &ScanConfig,
     ctx: &AppContext,
@@ -1340,17 +1367,15 @@ pub fn scan_and_group(
         let path = Path::new(path_str);
         if path.is_dir() {
             for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
-                if is_image_ext(entry.path())
-                    && let Ok(canonical) = entry.path().canonicalize()
-                    && seen_paths.insert(canonical.clone())
+                if entry.path().is_file()
+                    && let Some(canonical) =
+                        canonicalize_unique_image(entry.path(), &mut seen_paths)
                 {
                     all_files.push(canonical);
                 }
             }
         } else if path.is_file()
-            && is_image_ext(path)
-            && let Ok(canonical) = path.canonicalize()
-            && seen_paths.insert(canonical.clone())
+            && let Some(canonical) = canonicalize_unique_image(path, &mut seen_paths)
         {
             all_files.push(canonical);
         }
@@ -1365,22 +1390,13 @@ pub fn scan_and_group(
         let _ = tx.send((0, total_files));
     }
 
-    // 1. Get safe thread count based on RAM (initialized at app startup)
-    let safe_threads = get_safe_thread_count();
-
-    // 2. Build a custom Rayon thread pool
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(safe_threads)
-        .build()
-        .expect("Failed to build smart thread pool");
-
     let hash_start = Instant::now();
     let (tx, rx) = unbounded();
     let db_handle = ctx.start_db_writer(rx);
     let processed_count = AtomicUsize::new(0);
 
-    // 3. Run the heavy parsing inside the constrained pool
-    let mut valid_files: Vec<ScannedFile> = pool.install(|| {
+    // Run the heavy parsing inside the constrained pool
+    let mut valid_files: Vec<ScannedFile> = run_in_smart_pool(|| {
         all_files
             .par_iter()
             .filter_map(|path| {
@@ -1400,15 +1416,6 @@ pub fn scan_and_group(
                 let unique_file_id = fileops::get_file_key(path)?;
 
                 let meta_key = compute_meta_key(&ctx_ref.meta_key, mtime_ns, size, unique_file_id);
-                if false {
-                    eprintln!(
-                        "[DEBUG] mtime_ns/size/unique_file_id {} = {} {} {}",
-                        path.display(),
-                        mtime_ns,
-                        size,
-                        unique_file_id
-                    );
-                }
                 let mut pdqhash: Option<[u8; 32]> = None;
                 let mut pdq_features: Option<Arc<crate::pdqhash::PdqFeatures>> = None;
                 let mut pdq_quality: Option<u16> = None;
@@ -1418,7 +1425,7 @@ pub fn scan_and_group(
 
                 let mut new_hash = None;
                 let mut new_features = None;
-                let mut new_coeffs = None; // Coefficients stored separately
+                let mut new_coeffs = None;
                 let mut resolution = None;
                 let mut ck = [0u8; 32];
                 let mut orientation = 1;
@@ -1426,8 +1433,8 @@ pub fn scan_and_group(
                 let mut exif_timestamp: Option<i64> = None;
                 let mut pdq_cached = false;
                 let mut cache_hit_full = false;
-                let mut pixel_hash: Option<[u8; 32]> = None; // Init
-                let mut new_pixel = None; // For DB update
+                let mut pixel_hash: Option<[u8; 32]> = None;
+                let mut new_pixel = None;
 
                 let mut metadata_hit = false;
                 if !force_rehash && let Ok(Some(ch)) = ctx_ref.get_content_hash(&meta_key) {
@@ -1444,7 +1451,6 @@ pub fn scan_and_group(
                             pdq_quality = feats.pdq_quality();
                             exif_timestamp = feats.exif_timestamp();
 
-                            // Get coefficients from separate db
                             if let Ok(Some(coeff_vec)) = ctx_ref.get_coefficients(&ch)
                                 && coeff_vec.len() == 256
                             {
@@ -1458,12 +1464,10 @@ pub fn scan_and_group(
                             }
                         }
                     }
-                    // If user wants pixel hash, try to fetch it from DB.
                     if config.calc_pixel_hash {
                         if let Ok(Some(ph)) = ctx_ref.get_pixel_hash(&ch) {
                             pixel_hash = Some(ph);
                         } else {
-                            // Missing in DB! Force load below to calculate it.
                             cache_hit_full = false;
                         }
                     }
@@ -1488,16 +1492,15 @@ pub fn scan_and_group(
                         let mut parsed_raw = None;
                         let mut exif_data = None;
 
-                        // 1. Only parse EXIF / RAW metadata if PDQ features were NOT already cached
                         if !pdq_cached {
+                            // Only parse EXIF / RAW metadata if PDQ features were NOT already cached
                             parsed_raw =
                                 if is_raw { rsraw::RawImage::open(b).ok() } else { None };
                             exif_data = read_exif_data(path, Some(b));
 
                             if let Some(ref exif) = exif_data {
-                                // kamadak-exif succeeded - extract data the normal way
                                 if let Some((lat, lon)) = extract_gps_lat_lon(exif) {
-                                    gps_pos = Some(Point::new(lon, lat)); // Geo uses (x, y) = (lon, lat)
+                                    gps_pos = Some(Point::new(lon, lat));
                                 }
                                 if let Some(field) =
                                     exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
@@ -1505,83 +1508,62 @@ pub fn scan_and_group(
                                 {
                                     orientation = v as u8;
                                 }
-                                // HEIC/HEIF: libheif bakes orientation into the decoded pixels,
-                                // so the embedded EXIF Orientation tag must not be applied again.
                                 if orientation_baked_into_pixels(path) {
                                     orientation = 1;
                                 }
                                 exif_timestamp = get_exif_timestamp(exif);
-                            } else if is_raw {
-                                // kamadak-exif failed on RAW file - try rsraw as fallback
-                                if let Some(ref raw) = parsed_raw {
-                                    // Get GPS from rsraw
-                                    if let Some(point) = raw_exif::get_gps_point_from_raw(raw) {
-                                        gps_pos = Some(point);
-                                    }
-                                    // Get timestamp from rsraw
-                                    exif_timestamp = raw_exif::get_timestamp_from_raw(raw);
-                                    // Orientation: kamadak couldn't parse this RAW container
-                                    // (e.g. CR3/CRX), so take LibRaw's value via rsraw.
-                                    orientation = raw_exif::get_orientation_from_raw(raw);
+                            } else if is_raw
+                                && let Some(ref raw) = parsed_raw
+                            {
+                                if let Some(point) = raw_exif::get_gps_point_from_raw(raw) {
+                                    gps_pos = Some(point);
                                 }
+                                exif_timestamp = raw_exif::get_timestamp_from_raw(raw);
+                                orientation = raw_exif::get_orientation_from_raw(raw);
                             }
                         } else if is_raw {
-                            // PDQ is cached, we only need parsed_raw to extract the thumbnail for pixel_hash
                             parsed_raw = rsraw::RawImage::open(b).ok();
                         }
 
-                        // 2. Calculate file hash if needed
-                        if ck == [0u8; 32] {
+                        if !metadata_hit {
                             let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
                             ck = *ch.as_bytes();
                             new_meta = Some((meta_key, ck));
                         }
 
-                        // 3. Load Image ONCE using the FAST loader
                         let mut img_for_hashing: Option<image::DynamicImage> = None;
 
                         if is_raw {
-                            // Extract full sensor dimensions directly from parsed RAW metadata
                             if resolution.is_none()
                                 && let Some(ref raw) = parsed_raw
                             {
                                 resolution = Some((raw.width(), raw.height()));
                             }
 
-                            // RAW FILE: Extract Largest JPEG Thumbnail
                             if let Some(mut raw) = parsed_raw
                                 && let Ok(thumbs) = raw.extract_thumbs()
-                            {
-                                // Find largest JPEG thumbnail
-                                if let Some(thumb) = thumbs
+                                && let Some(thumb) = thumbs // Find largest JPEG thumbnail
                                     .into_iter()
                                     .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
-                                    .max_by_key(|t| t.width * t.height)
-                                {
-                                    // Decode using our robust fast loader.
-                                    img_for_hashing =
-                                        load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data)
-                                            .ok();
-                                }
+                                    .max_by_key(|t| (t.width as u64) * (t.height as u64))
+                            {
+                                img_for_hashing =
+                                    load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data).ok();
                             }
-                            // Fallback for resolution if RAW header parsing failed
                             if resolution.is_none() {
                                 resolution = get_resolution(path, Some(b));
                             }
                         } else {
-                            // STANDARD IMAGE: Use fast loader directly
                             img_for_hashing = load_image_fast(path, b).ok();
                         }
 
                         if let Some(img) = &img_for_hashing {
-                            // Get resolution from the loaded image if not already set (e.g., standard images)
                             if resolution.is_none() {
                                 resolution = Some(img.dimensions());
                             }
 
-                            // 4. Calculate Pixel Hash of 16bit RGBA (Content Identical Check)
                             if config.calc_pixel_hash && pixel_hash.is_none() {
-                                // This ensures 16-bit PNGs != 8-bit PNGs unless the extra bits are purely padding.
+                                // Calculate Pixel Hash of 16bit RGBA (Content Identical Check)
                                 let rgba16 = img.to_rgba16();
                                 let raw_u16 = rgba16.as_raw();
                                 let raw_bytes: &[u8] = cast_slice(raw_u16);
@@ -1595,7 +1577,6 @@ pub fn scan_and_group(
                                 new_pixel = Some((ck, ph));
                             }
 
-                            // 5. Only compute PDQ features and ImageFeatures if not already cached!
                             if !pdq_cached
                                 && let Some((features, quality)) =
                                     crate::pdqhash::generate_pdq_features(img)
@@ -1603,19 +1584,15 @@ pub fn scan_and_group(
                                 let hash = features.to_hash();
                                 pdqhash = Some(hash);
 
-                                // 0-100, the scale reference PDQ tools report.
                                 let quality_100 =
                                     (quality * 100.0).round().clamp(0.0, 100.0) as u16;
                                 pdq_quality = Some(quality_100);
 
-                                // Serialize for the DB first, then move the features
-                                // into the Arc: no intermediate array, no clone.
                                 let cached_coeffs = CachedCoefficients {
                                     coefficients: features.coefficients.to_vec(),
                                 };
                                 pdq_features = Some(Arc::new(features));
 
-                                // Build ImageFeatures from the data we have
                                 let (w, h) = resolution.unwrap_or((0, 0));
                                 let mut img_features = if let Some(ref exif) = exif_data {
                                     crate::exif_extract::build_image_features(
@@ -1625,10 +1602,6 @@ pub fn scan_and_group(
                                     ImageFeatures::new(w, h)
                                 };
 
-                                // Persist orientation. build_image_features copies the raw
-                                // EXIF Orientation tag, so for formats whose decoder bakes
-                                // orientation into the pixels (HEIC/HEIF) overwrite it with 1
-                                // to stop the viewer double-rotating an already-upright image.
                                 if orientation_baked_into_pixels(path) {
                                     img_features.insert_tag(TAG_ORIENTATION, ExifValue::Short(1));
                                 } else if orientation != 1 {
@@ -1638,7 +1611,6 @@ pub fn scan_and_group(
                                     );
                                 }
 
-                                // Add GPS position if available
                                 if let Some(pos) = gps_pos {
                                     img_features
                                         .insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y()));
@@ -1646,17 +1618,11 @@ pub fn scan_and_group(
                                         .insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(pos.x()));
                                 }
 
-                                // Add timestamp if available
                                 if let Some(ts) = exif_timestamp {
                                     img_features
                                         .insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(ts));
                                 }
 
-                                // Persist the PDQ quality so later scans can gate on
-                                // it without decoding the image again. It cannot be
-                                // recovered from the cached coefficients: it is
-                                // measured on the 64x64 image-domain buffer, not on
-                                // the DCT output.
                                 img_features.insert_tag(
                                     TAG_DERIVED_PDQ_QUALITY,
                                     ExifValue::Short(quality_100),
@@ -1668,15 +1634,10 @@ pub fn scan_and_group(
                                 new_features = Some((ck, img_features));
                                 new_coeffs = Some((ck, cached_coeffs));
                             }
-                        } else {
-                            // Fallback: If image failed to decode (e.g. corrupt),
-                            // but we might still get resolution from headers for RAWs
-                            if resolution.is_none() {
-                                resolution = get_resolution(path, Some(b));
-                            }
+                        } else if resolution.is_none() {
+                            resolution = get_resolution(path, Some(b));
                         }
-                    } else if ck == [0u8; 32] {
-                        // bytes is None and ck is still zero (unreadable file)
+                    } else if !metadata_hit {
                         eprintln!("[ERROR] Failed to read file, skipping: {:?}", path.display());
                         return None;
                     }
@@ -1711,7 +1672,9 @@ pub fn scan_and_group(
     });
 
     drop(tx);
-    db_handle.join().expect("DB writer thread panicked");
+    if let Err(e) = db_handle.join() {
+        eprintln!("[ERROR] DB writer thread panicked: {:?}", e);
+    }
 
     // Deduplicate PDQ Features for Hardlinks
     let mut feature_cache: HashMap<u128, Arc<crate::pdqhash::PdqFeatures>> = HashMap::new();
@@ -1720,10 +1683,8 @@ pub fn scan_and_group(
         let unique_file_id = file.unique_file_id;
         if let Some(features) = &file.pdq_features {
             if let Some(cached) = feature_cache.get(&unique_file_id) {
-                // Found existing features for this ID, reuse the pointer!
                 file.pdq_features = Some(cached.clone());
             } else {
-                // First time seeing this ID, cache it
                 feature_cache.insert(unique_file_id, features.clone());
             }
         }
@@ -1836,15 +1797,18 @@ where
     H: HammingHash + std::fmt::Debug + Clone + Copy + Default,
     S: GroupingStrategy<H>,
 {
-    // The current MIH implementation only guarantees 100% recall up to distance 63 (R=3).
+    // Clamp similarity instead of panicking if config.similarity > MAX_SIMILARITY_256
     let maxsim = crate::hamminghash::MAX_SIMILARITY_256;
-    assert!(
-        config.similarity <= maxsim,
-        "Similarity distances above {} require R=4 bit-flip checks, which are not implemented.",
+    let effective_similarity = if config.similarity > maxsim {
+        eprintln!(
+            "[WARN] Similarity {} exceeds maximum supported ({}); clamping to {}.",
+            config.similarity, maxsim, maxsim
+        );
         maxsim
-    );
+    } else {
+        config.similarity
+    };
 
-    // Collect hashes AND their original indices
     let valid_entries: Vec<(usize, H)> = valid_files
         .iter()
         .enumerate()
@@ -1857,7 +1821,6 @@ where
 
     let hashes: Vec<H> = valid_entries.iter().map(|(_, h)| *h).collect();
     let dense_to_sparse: Vec<usize> = valid_entries.iter().map(|(i, _)| *i).collect();
-    // Indexed by sparse file index, same as valid_files.
     let low_conf: Vec<bool> = valid_files.iter().map(|f| strategy.is_low_confidence(f)).collect();
 
     let mih = MIHIndex::new(hashes);
@@ -1889,11 +1852,7 @@ where
                     let count = strategy.generate_variants(file, hash, variants_buf);
                     let variants = &variants_buf[..count];
 
-                    // A low-quality hash may only match exactly. That still keeps
-                    // byte-identical duplicates (two copies of the same blank scan)
-                    // together, while stopping unrelated featureless images from
-                    // being pulled into the same group.
-                    let base_limit = if low_conf[i] { 0 } else { config.similarity };
+                    let base_limit = if low_conf[i] { 0 } else { effective_similarity };
 
                     matched.clear();
 
@@ -1904,7 +1863,6 @@ where
                             let q_chunk = variant.get_chunk(k);
                             let bits = H::bit_width_per_chunk();
 
-                            // Zero-allocation closure to handle bucket checks
                             let check_bucket =
                                 |val: u16,
                                  v: &mut SparseBitSet,
@@ -1921,11 +1879,10 @@ where
 
                                         let cand_hash = mih.hash(*dense);
                                         let limit = if low_conf[cand_idx] { 0 } else { base_limit };
-                                        if variant.hamming_distance(cand_hash) <= limit {
-                                            // Deduplicate edges across multiple dihedral variants
-                                            if !m.set(cand_idx) {
-                                                edges.push((i as u32, cand_idx as u32));
-                                            }
+                                        if variant.hamming_distance(cand_hash) <= limit
+                                            && !m.set(cand_idx)
+                                        {
+                                            edges.push((i as u32, cand_idx as u32));
                                         }
                                     }
                                 };
@@ -1933,8 +1890,8 @@ where
                             // R=0: Exact chunk match
                             check_bucket(q_chunk, visited, matched, local_edges);
 
-                            // R=1: 1-bit flips (exhaustive up to dist 31 for 16 chunks)
-                            if config.similarity >= H::NUM_CHUNKS as u32 {
+                            // R=1: 1-bit flips
+                            if base_limit >= H::NUM_CHUNKS as u32 {
                                 for i_bit in 0..bits {
                                     check_bucket(
                                         q_chunk ^ (1 << i_bit),
@@ -1945,8 +1902,8 @@ where
                                 }
                             }
 
-                            // R=2: 2-bit flips (exhaustive up to dist 47 for 16 chunks)
-                            if config.similarity >= (H::NUM_CHUNKS * 2) as u32 {
+                            // R=2: 2-bit flips
+                            if base_limit >= (H::NUM_CHUNKS * 2) as u32 {
                                 for i_bit in 0..bits {
                                     for j_bit in (i_bit + 1)..bits {
                                         check_bucket(
@@ -1959,8 +1916,8 @@ where
                                 }
                             }
 
-                            // R=3: 3-bit flips (exhaustive up to dist 63 - safely covers 60)
-                            if config.similarity >= (H::NUM_CHUNKS * 3) as u32 {
+                            // R=3: 3-bit flips
+                            if base_limit >= (H::NUM_CHUNKS * 3) as u32 {
                                 for i_bit in 0..bits {
                                     for j_bit in (i_bit + 1)..bits {
                                         for m_bit in (j_bit + 1)..bits {
@@ -1989,41 +1946,14 @@ where
 
     let comparison_count = edges.len();
 
-    // --- Union-Find ---
     let mut parent: Vec<usize> = (0..n).collect();
-
-    fn find(parent: &mut [usize], i: usize) -> usize {
-        let mut root = i;
-        while root != parent[root] {
-            root = parent[root];
-        }
-        let mut curr = i;
-        while curr != root {
-            let next = parent[curr];
-            parent[curr] = root;
-            curr = next;
-        }
-        root
-    }
-
-    fn union(parent: &mut [usize], i: usize, j: usize) {
-        let ri = find(parent, i);
-        let rj = find(parent, j);
-        if ri != rj {
-            parent[ri] = rj;
-        }
-    }
-
     for (u, v) in edges {
-        union(&mut parent, u as usize, v as usize);
+        uf_union(&mut parent, u as usize, v as usize);
     }
 
-    // Collect all elements by their component root unconditionally so that
-    // a root visited before its children is never dropped. Singletons are
-    // filtered out immediately afterwards by `.filter(|g| g.len() > 1)`.
     let mut groups_map = HashMap::<usize, Vec<u32>>::new();
     for i in 0..n {
-        let root = find(&mut parent, i);
+        let root = uf_find(&mut parent, i);
         groups_map.entry(root).or_default().push(i as u32);
     }
 
@@ -2061,6 +1991,16 @@ fn get_ext_priority(path: &Path, ext_priorities: &HashMap<String, usize>) -> usi
 
 pub fn analyze_group(
     files: &mut Vec<FileMetadata>,
+    sort_order: &str,
+    ext_priorities: &HashMap<String, usize>,
+) -> GroupInfo {
+    let empty_features = HashMap::new();
+    analyze_group_with_features(files, &empty_features, sort_order, ext_priorities)
+}
+
+fn analyze_group_with_features(
+    files: &mut Vec<FileMetadata>,
+    features_map: &HashMap<&std::path::PathBuf, &crate::pdqhash::PdqFeatures>,
     sort_order: &str,
     ext_priorities: &HashMap<String, usize>,
 ) -> GroupInfo {
@@ -2102,17 +2042,29 @@ pub fn analyze_group(
         )
     });
 
-    // 5. Sort Unique: Standard user sort, then stable sort by extension priority if configured
+    // 4. Sort Unique: Standard user sort, then stable sort by extension priority if configured
     sort_files(&mut unique, sort_order);
     if !ext_priorities.is_empty() {
         unique.sort_by_cached_key(|f| get_ext_priority(&f.path, ext_priorities));
     }
 
-    // 6. Combine
     files.append(&mut duplicates);
     files.append(&mut unique);
 
-    let max_d = if let Some(pivot) = files.iter().find_map(|f| f.pdqhash) {
+    let pivot_features: Option<&crate::pdqhash::PdqFeatures> =
+        files.iter().find_map(|f| features_map.get(&f.path).copied());
+
+    let max_d = if let Some(pivot_feats) = pivot_features {
+        let pivot_variants = pivot_feats.generate_dihedral_hashes();
+        files
+            .iter()
+            .filter_map(|f| f.pdqhash)
+            .map(|h| {
+                pivot_variants.iter().fold(u32::MAX, |best, v| best.min(v.hamming_distance(&h)))
+            })
+            .max()
+            .unwrap_or(0)
+    } else if let Some(pivot) = files.iter().find_map(|f| f.pdqhash) {
         files
             .iter()
             .filter_map(|f| f.pdqhash)
@@ -2127,9 +2079,10 @@ pub fn analyze_group(
     let has_pixel_dupes = pixel_counts.values().any(|&c| c > 1);
     let has_duplicates = has_bit_dupes || has_pixel_dupes;
 
-    let all_bit_identical = bit_counts.len() == 1;
-    let all_pixel_identical =
-        pixel_counts.len() == 1 && pixel_counts.values().next() == Some(&total_files);
+    let all_bit_identical = total_files > 1 && bit_counts.len() == 1;
+    let all_pixel_identical = total_files > 1
+        && pixel_counts.len() == 1
+        && pixel_counts.values().next() == Some(&total_files);
     let all_identical = all_bit_identical || all_pixel_identical;
 
     let status = if all_identical {
@@ -2141,6 +2094,32 @@ pub fn analyze_group(
     };
 
     GroupInfo { max_dist: max_d, status }
+}
+
+/// Shared Union-Find `find` with path compression
+#[inline]
+fn uf_find(parent: &mut [usize], i: usize) -> usize {
+    let mut root = i;
+    while root != parent[root] {
+        root = parent[root];
+    }
+    let mut curr = i;
+    while curr != root {
+        let next = parent[curr];
+        parent[curr] = root;
+        curr = next;
+    }
+    root
+}
+
+/// Shared Union-Find `union`
+#[inline]
+fn uf_union(parent: &mut [usize], i: usize, j: usize) {
+    let ri = uf_find(parent, i);
+    let rj = uf_find(parent, j);
+    if ri != rj {
+        parent[ri] = rj;
+    }
 }
 
 fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> Vec<Vec<u32>> {
@@ -2358,14 +2337,14 @@ pub fn sort_directories(dirs: &mut [std::path::PathBuf], sort_order: &str) {
             });
             dirs.reverse();
         },
-        "name-natural" | "" => {
+        "name-natural" | "size" | "" => {
             dirs.sort_by_cached_key(|d| {
                 NaturalSortKey(
                     d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
                 )
             });
         },
-        "name-natural-desc" => {
+        "name-natural-desc" | "size-desc" => {
             dirs.sort_by_cached_key(|d| {
                 NaturalSortKey(
                     d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
@@ -2385,27 +2364,11 @@ pub fn sort_directories(dirs: &mut [std::path::PathBuf], sort_order: &str) {
                 )
             });
         },
-        "size" => {
-            // For directories, size doesn't make much sense, so sort by name
-            dirs.sort_by_cached_key(|d| {
-                NaturalSortKey(
-                    d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
-                )
-            });
-        },
-        "size-desc" => {
-            dirs.sort_by_cached_key(|d| {
-                NaturalSortKey(
-                    d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
-                )
-            });
-        },
         "random" => {
             let mut rng = rand::rng();
             dirs.shuffle(&mut rng);
         },
         _ => {
-            // Default fallback (Name Natural)
             dirs.sort_by_cached_key(|d| {
                 NaturalSortKey(
                     d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
@@ -2413,107 +2376,6 @@ pub fn sort_directories(dirs: &mut [std::path::PathBuf], sort_order: &str) {
             });
         },
     }
-}
-
-fn analyze_group_with_features(
-    files: &mut Vec<FileMetadata>,
-    features_map: &HashMap<&std::path::PathBuf, &crate::pdqhash::PdqFeatures>,
-    sort_order: &str,
-    ext_priorities: &HashMap<String, usize>,
-) -> GroupInfo {
-    if files.is_empty() {
-        return GroupInfo { max_dist: 0, status: GroupStatus::None };
-    }
-
-    let total_files = files.len();
-
-    // 1. Count Bit-Identical (Content Hash)
-    let mut bit_counts = HashMap::new();
-    for f in files.iter() {
-        *bit_counts.entry(f.content_hash).or_insert(0) += 1;
-    }
-
-    // 2. Count Pixel-Identical (Pixel Hash)
-    let mut pixel_counts = HashMap::new();
-    for f in files.iter() {
-        if let Some(ph) = f.pixel_hash {
-            *pixel_counts.entry(ph).or_insert(0) += 1;
-        }
-    }
-
-    // 3. Partition: Anything that is a duplicate (Bit OR Pixel) goes to the top
-    let (mut duplicates, mut unique): (Vec<FileMetadata>, Vec<FileMetadata>) =
-        files.drain(..).partition(|f| {
-            let is_bit_dupe = *bit_counts.get(&f.content_hash).unwrap_or(&0) > 1;
-            let is_pixel_dupe =
-                f.pixel_hash.map(|ph| *pixel_counts.get(&ph).unwrap_or(&0) > 1).unwrap_or(false);
-            is_bit_dupe || is_pixel_dupe
-        });
-
-    duplicates.sort_by_cached_key(|f| {
-        (
-            f.pixel_hash,
-            f.content_hash,
-            get_ext_priority(&f.path, ext_priorities),
-            f.path.file_name().unwrap_or_default().to_string_lossy().to_string(),
-        )
-    });
-
-    // 4. Sort Unique: Standard user sort, then stable sort by extension priority if configured
-    sort_files(&mut unique, sort_order);
-    if !ext_priorities.is_empty() {
-        unique.sort_by_cached_key(|f| get_ext_priority(&f.path, ext_priorities));
-    }
-
-    files.append(&mut duplicates);
-    files.append(&mut unique);
-
-    // Pivot on the first file that actually has features / a hash. Using
-    // files.first() unconditionally collapsed max_dist to 0 for the whole
-    // group whenever the first file after sorting had neither (decode
-    // failure, or an entry that was never PDQ hashed).
-    let pivot_features: Option<&crate::pdqhash::PdqFeatures> =
-        files.iter().find_map(|f| features_map.get(&f.path).copied());
-
-    let max_d = if let Some(pivot_feats) = pivot_features {
-        let pivot_variants = pivot_feats.generate_dihedral_hashes();
-        files
-            .iter()
-            .filter_map(|f| f.pdqhash)
-            .map(|h| {
-                pivot_variants.iter().fold(u32::MAX, |best, v| best.min(v.hamming_distance(&h)))
-            })
-            .max()
-            .unwrap_or(0)
-    } else if let Some(pivot) = files.iter().find_map(|f| f.pdqhash) {
-        files
-            .iter()
-            .filter_map(|f| f.pdqhash)
-            .map(|h| pivot.hamming_distance(&h))
-            .max()
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
-    let has_bit_dupes = bit_counts.values().any(|&c| c > 1);
-    let has_pixel_dupes = pixel_counts.values().any(|&c| c > 1);
-    let has_duplicates = has_bit_dupes || has_pixel_dupes;
-
-    let all_bit_identical = bit_counts.len() == 1;
-    let all_pixel_identical =
-        pixel_counts.len() == 1 && pixel_counts.values().next() == Some(&total_files);
-    let all_identical = all_bit_identical || all_pixel_identical;
-
-    let status = if all_identical {
-        GroupStatus::AllIdentical
-    } else if has_duplicates {
-        GroupStatus::SomeIdentical
-    } else {
-        GroupStatus::None
-    };
-
-    GroupInfo { max_dist: max_d, status }
 }
 
 pub fn is_raw_ext(path: &Path) -> bool {
@@ -2565,23 +2427,19 @@ pub fn scan_for_view(
                             subdirs.push(canonical);
                         }
                     } else if entry_path.is_file()
-                        && is_image_ext(&entry_path)
-                        && let Ok(canonical) = entry_path.canonicalize()
-                        && seen_paths.insert(canonical.clone())
+                        && let Some(canonical) =
+                            canonicalize_unique_image(&entry_path, &mut seen_paths)
                     {
                         raw_paths.push(canonical);
                     }
                 }
             }
         } else if path.is_file()
-            && is_image_ext(path)
-            && let Ok(canonical) = path.canonicalize()
-            && seen_paths.insert(canonical.clone())
+            && let Some(canonical) = canonicalize_unique_image(path, &mut seen_paths)
         {
             raw_paths.push(canonical);
         }
     }
-    // Apply same sort order to directories as files
     sort_directories(&mut subdirs, sort_order);
 
     let total_files = raw_paths.len();
@@ -2593,25 +2451,17 @@ pub fn scan_for_view(
         return (Vec::new(), Vec::new(), subdirs);
     }
 
-    // 2. Build a constrained thread pool (initialized at app startup)
-    let safe_threads = get_safe_thread_count();
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(safe_threads)
-        .build()
-        .expect("Failed to build smart thread pool");
-
-    // 3. Parallel Processing with Streaming
+    // 2. Parallel Processing with Streaming inside constrained pool
     let chunk_size = 100;
     let processed_count = AtomicUsize::new(0);
 
-    // Split into chunks to stream results to UI
     let chunks: Vec<Vec<std::path::PathBuf>> =
         raw_paths.chunks(chunk_size).map(|c| c.to_vec()).collect();
     let mut all_files = Vec::new();
 
-    for chunk in chunks {
-        let batch_results: Vec<FileMetadata> = pool.install(|| {
-            chunk
+    run_in_smart_pool(|| {
+        for chunk in chunks {
+            let batch_results: Vec<FileMetadata> = chunk
                 .par_iter()
                 .filter_map(|path| {
                     if let Some(prog_tx) = &progress_tx {
@@ -2633,10 +2483,6 @@ pub fn scan_for_view(
                         }
                         exif_timestamp = get_exif_timestamp(&exif);
                     }
-                    // Required for RAWs to look correct immediately.
-                    // Streaming (batch_tx) ensures the UI is still responsive.
-                    // Note: For RAW files, the actual orientation used depends on whether thumbnails
-                    // or full decode is used. The image loader will return the correct value.
                     let orientation = get_orientation(path, None);
                     img_debug!(
                         "[DEBUG-SCAN] scan_for_view get_orientation={} for {:?}",
@@ -2651,8 +2497,6 @@ pub fn scan_for_view(
                         size,
                         modified,
                         pdqhash: None,
-                        // scan_for_view has no AppContext, so there is no cached
-                        // ImageFeatures record to read a quality out of.
                         pdq_quality: None,
                         resolution: None,
                         content_hash: [0u8; 32],
@@ -2663,19 +2507,18 @@ pub fn scan_for_view(
                         exif_timestamp,
                     })
                 })
-                .collect()
-        });
+                .collect();
 
-        // Stream this batch to the GUI immediately
-        if !batch_results.is_empty() {
-            if let Some(tx) = &batch_tx {
-                let _ = tx.send(batch_results.clone());
+            if !batch_results.is_empty() {
+                if let Some(tx) = &batch_tx {
+                    let _ = tx.send(batch_results.clone());
+                }
+                all_files.extend(batch_results);
             }
-            all_files.extend(batch_results);
         }
-    }
+    });
 
-    // 4. Final Sort
+    // 3. Final Sort
     sort_files(&mut all_files, sort_order);
 
     let info = GroupInfo { max_dist: 0, status: GroupStatus::None };
@@ -2696,40 +2539,25 @@ pub fn spawn_background_flatten_scan(
     let mut seen_paths = HashSet::new();
     let mut entries: Vec<DirEntry> = Vec::new();
 
-    // Phase 1: Fast recursive directory enumeration using WalkDir
     for path_str in paths {
         let path = Path::new(path_str);
         if path.is_dir() {
             for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
                 let entry_path = entry.path();
                 if entry_path.is_file()
-                    && is_image_ext(entry_path)
-                    && let Ok(canonical) = entry_path.canonicalize()
-                    && seen_paths.insert(canonical.clone())
+                    && let Some(canonical) = canonicalize_unique_image(entry_path, &mut seen_paths)
                     && let Ok(meta) = fs::metadata(&canonical)
-                    && let Some(unique_file_id) = get_file_key(&canonical)
+                    && let Some(dir_entry) = try_make_dir_entry(canonical, meta)
                 {
-                    entries.push(DirEntry {
-                        path: canonical,
-                        size: meta.len(),
-                        modified: meta.modified().unwrap_or(UNIX_EPOCH).into(),
-                        unique_file_id,
-                    });
+                    entries.push(dir_entry);
                 }
             }
         } else if path.is_file()
-            && is_image_ext(path)
-            && let Ok(canonical) = path.canonicalize()
-            && seen_paths.insert(canonical.clone())
+            && let Some(canonical) = canonicalize_unique_image(path, &mut seen_paths)
             && let Ok(meta) = fs::metadata(&canonical)
-            && let Some(unique_file_id) = get_file_key(&canonical)
+            && let Some(dir_entry) = try_make_dir_entry(canonical, meta)
         {
-            entries.push(DirEntry {
-                path: canonical,
-                size: meta.len(),
-                modified: meta.modified().unwrap_or(UNIX_EPOCH).into(),
-                unique_file_id,
-            });
+            entries.push(dir_entry);
         }
     }
 
@@ -2743,75 +2571,7 @@ pub fn spawn_background_flatten_scan(
         return 0;
     }
 
-    // Prepare batch lookup data
-    let lookup_data: Vec<(u128, u64, u64)> = entries
-        .iter()
-        .map(|e| {
-            let mtime_ns = e.modified.timestamp_nanos_opt().unwrap_or(0) as u64;
-            (e.unique_file_id, e.size, mtime_ns)
-        })
-        .collect();
-
-    // Batch database lookup (single transaction)
-    let cached: std::collections::HashMap<u128, ImageFeatures> =
-        ctx.lookup_cached_features_batch(&lookup_data);
-
-    // Phase 2: Background processing with batch results
-    let sort_order_clone = sort_order.clone();
-    let progress_tx_clone = progress_tx;
-    std::thread::spawn(move || {
-        const BATCH_SIZE: usize = 500;
-        let mut processed = 0;
-
-        // Convert entries to FileMetadata using cached data
-        let mut files: Vec<FileMetadata> = entries
-            .into_iter()
-            .map(|e| {
-                // Extract fields from ImageFeatures if cached.
-                // pdq_quality is part of the same record, so it costs nothing
-                // extra here even though view mode never hashes anything.
-                let (resolution, orientation, gps_pos, exif_timestamp, pdq_quality) =
-                    if let Some(feats) = cached.get(&e.unique_file_id) {
-                        (
-                            feats.resolution(),
-                            feats.orientation(),
-                            feats.gps_pos(),
-                            feats.exif_timestamp(),
-                            feats.pdq_quality(),
-                        )
-                    } else {
-                        (None, 1, None, None, None)
-                    };
-
-                FileMetadata {
-                    path: e.path,
-                    size: e.size,
-                    modified: e.modified,
-                    pdqhash: None,
-                    pdq_quality,
-                    resolution,
-                    content_hash: [0u8; 32],
-                    pixel_hash: None,
-                    orientation,
-                    gps_pos,
-                    unique_file_id: e.unique_file_id,
-                    exif_timestamp,
-                }
-            })
-            .collect();
-
-        // Sort all files
-        sort_files(&mut files, &sort_order_clone);
-
-        // Stream in batches and report progress
-        for chunk in files.chunks(BATCH_SIZE) {
-            processed += chunk.len();
-            if let Some(ref tx) = progress_tx_clone {
-                let _ = tx.send((processed, file_count));
-            }
-            let _ = batch_tx.send(chunk.to_vec());
-        }
-    });
+    process_and_stream_dir_entries(entries, sort_order, ctx, batch_tx, progress_tx);
 
     file_count
 }
@@ -2996,93 +2756,44 @@ pub struct DirEntry {
     pub path: std::path::PathBuf,
     pub size: u64,
     pub modified: DateTime<Utc>,
+    pub mtime_ns: u64,
     pub unique_file_id: u128,
 }
 
-/// Spawn background directory scanning with batch database lookups.
-/// This function:
-/// 1. Quickly collects directory entries (paths only) - returns immediately via count_tx
-/// 2. Performs batch database lookup for cached features
-/// 3. Streams FileMetadata results in batches to the GUI
-///
-/// Returns (subdirs, file_count) synchronously for immediate UI setup.
-pub fn spawn_background_dir_scan(
-    dir: std::path::PathBuf,
+fn try_make_dir_entry(canonical: std::path::PathBuf, meta: fs::Metadata) -> Option<DirEntry> {
+    let unique_file_id = get_file_key(&canonical)?;
+    let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+    let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    Some(DirEntry {
+        path: canonical,
+        size: meta.len(),
+        modified: mtime.into(),
+        mtime_ns,
+        unique_file_id,
+    })
+}
+
+/// Shared helper to batch-lookup cached features and stream `DirEntry` batches to the GUI.
+fn process_and_stream_dir_entries(
+    entries: Vec<DirEntry>,
     sort_order: String,
     ctx: &crate::db::AppContext,
     batch_tx: Sender<Vec<FileMetadata>>,
-) -> (Vec<std::path::PathBuf>, usize) {
-    let mut subdirs = Vec::new();
-    let mut entries: Vec<DirEntry> = Vec::new();
-    let follow_symlinks = false; // Reserved for future feature
-
-    // Phase 1: Fast directory enumeration (synchronous, no I/O beyond readdir)
-    if let Ok(dir_entries) = fs::read_dir(&dir) {
-        for entry in dir_entries.flatten() {
-            if !follow_symlinks {
-                if let Ok(ft) = entry.file_type() {
-                    if ft.is_symlink() {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            }
-
-            let entry_path = entry.path();
-            if let Ok(canonical) = entry_path.canonicalize() {
-                if canonical.is_dir() {
-                    subdirs.push(canonical);
-                } else if is_image_ext(&canonical) {
-                    let meta_res =
-                        if follow_symlinks { fs::metadata(&canonical) } else { entry.metadata() };
-                    if let Ok(meta) = meta_res
-                        && let Some(unique_file_id) = get_file_key(&canonical)
-                    {
-                        entries.push(DirEntry {
-                            path: canonical,
-                            size: meta.len(),
-                            modified: meta.modified().unwrap_or(UNIX_EPOCH).into(),
-                            unique_file_id,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    sort_directories(&mut subdirs, &sort_order);
+    progress_tx: Option<Sender<(usize, usize)>>,
+) {
     let file_count = entries.len();
+    let lookup_data: Vec<(u128, u64, u64)> =
+        entries.iter().map(|e| (e.unique_file_id, e.size, e.mtime_ns)).collect();
 
-    if entries.is_empty() {
-        return (subdirs, 0);
-    }
+    let cached: HashMap<u128, ImageFeatures> = ctx.lookup_cached_features_batch(&lookup_data);
 
-    // Prepare batch lookup data
-    let lookup_data: Vec<(u128, u64, u64)> = entries
-        .iter()
-        .map(|e| {
-            let mtime_ns = e.modified.timestamp_nanos_opt().unwrap_or(0) as u64;
-            (e.unique_file_id, e.size, mtime_ns)
-        })
-        .collect();
-
-    // Batch database lookup (single transaction)
-    let cached: std::collections::HashMap<u128, ImageFeatures> =
-        ctx.lookup_cached_features_batch(&lookup_data);
-
-    // Phase 2: Background processing with batch results
-    let sort_order_clone = sort_order.clone();
     std::thread::spawn(move || {
         const BATCH_SIZE: usize = 500;
+        let mut processed = 0;
 
-        // Convert entries to FileMetadata using cached data
         let mut files: Vec<FileMetadata> = entries
             .into_iter()
             .map(|e| {
-                // Extract fields from ImageFeatures if cached.
-                // pdq_quality is part of the same record, so it costs nothing
-                // extra here even though view mode never hashes anything.
                 let (resolution, orientation, gps_pos, exif_timestamp, pdq_quality) =
                     if let Some(feats) = cached.get(&e.unique_file_id) {
                         (
@@ -3113,14 +2824,73 @@ pub fn spawn_background_dir_scan(
             })
             .collect();
 
-        // Sort all files
-        sort_files(&mut files, &sort_order_clone);
+        sort_files(&mut files, &sort_order);
 
-        // Stream in batches
         for chunk in files.chunks(BATCH_SIZE) {
+            processed += chunk.len();
+            if let Some(ref tx) = progress_tx {
+                let _ = tx.send((processed, file_count));
+            }
             let _ = batch_tx.send(chunk.to_vec());
         }
     });
+}
+
+/// Spawn background directory scanning with batch database lookups.
+/// This function:
+/// 1. Quickly collects directory entries (paths only) - returns immediately via count_tx
+/// 2. Performs batch database lookup for cached features
+/// 3. Streams FileMetadata results in batches to the GUI
+///
+/// Returns (subdirs, file_count) synchronously for immediate UI setup.
+pub fn spawn_background_dir_scan(
+    dir: std::path::PathBuf,
+    sort_order: String,
+    ctx: &crate::db::AppContext,
+    batch_tx: Sender<Vec<FileMetadata>>,
+) -> (Vec<std::path::PathBuf>, usize) {
+    let mut subdirs = Vec::new();
+    let mut entries: Vec<DirEntry> = Vec::new();
+    let follow_symlinks = false; // Reserved for future feature
+
+    // Fast directory enumeration (synchronous, no I/O beyond readdir)
+    if let Ok(dir_entries) = fs::read_dir(&dir) {
+        for entry in dir_entries.flatten() {
+            if !follow_symlinks {
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_symlink() {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+
+            let entry_path = entry.path();
+            if let Ok(canonical) = entry_path.canonicalize() {
+                if canonical.is_dir() {
+                    subdirs.push(canonical);
+                } else if is_image_ext(&canonical) {
+                    let meta_res =
+                        if follow_symlinks { fs::metadata(&canonical) } else { entry.metadata() };
+                    if let Ok(meta) = meta_res
+                        && let Some(dir_entry) = try_make_dir_entry(canonical, meta)
+                    {
+                        entries.push(dir_entry);
+                    }
+                }
+            }
+        }
+    }
+
+    sort_directories(&mut subdirs, &sort_order);
+    let file_count = entries.len();
+
+    if entries.is_empty() {
+        return (subdirs, 0);
+    }
+
+    process_and_stream_dir_entries(entries, sort_order, ctx, batch_tx, None);
 
     (subdirs, file_count)
 }
