@@ -2718,18 +2718,12 @@ fn kmeans_palette(
         return vec![(egui::Color32::BLACK, 1.0 / k as f32); k];
     }
 
-    // 1. logarithmic filtering & exponential weights
     let mut working_pixels = Vec::with_capacity(pixels.len());
     let mut weights = Vec::with_capacity(pixels.len());
 
-    // The cutoff is now 1.0 / 5.5 = 0.18 Oklab Lightness.
-    // sRGB(1, 4, 6) is L~0.10 -> Dead.
-    // sRGB(25, 38, 54) is L~0.25 -> Alive and well!
     let dark_tuning = 8.0;
 
     for &p in pixels {
-        // THE HARD FLOOR: Don't even run the math if it's visually near-black.
-        // This ruthlessly culls the abyss before it can infect the K-means weights.
         if p.l < 0.05 {
             continue;
         }
@@ -2745,60 +2739,48 @@ fn kmeans_palette(
         }
     }
 
-    // Fallback: If the image is literally a pitch-black square, don't crash.
     if working_pixels.len() < k {
         working_pixels = pixels.to_vec();
         weights = vec![1.0; pixels.len()];
     }
 
-    // We group every pixel into one of 4 dominant color zones using Oklab's native axes.
+    // We group every pixel into one of 4 dominant color zones using Oklab's native axes
     let mut zone_weights = [0.0f32; 4];
 
     for (p, &w) in working_pixels.iter().zip(weights.iter()) {
         if p.a.abs() > p.b.abs() {
             if p.a > 0.0 {
                 zone_weights[0] += w;
-            }
-            // RED dominant
-            else {
+            } else {
                 zone_weights[1] += w;
-            } // GREEN dominant
-        } else {
-            if p.b > 0.0 {
-                zone_weights[2] += w;
             }
-            // YELLOW dominant
-            else {
-                zone_weights[3] += w;
-            } // BLUE dominant
+        } else if p.b > 0.0 {
+            zone_weights[2] += w;
+        } else {
+            zone_weights[3] += w;
         }
     }
 
-    // Find the average weight of an active zone
     let active_zones = zone_weights.iter().filter(|&&w| w > 0.0).count() as f32;
     let avg_zone_weight =
         if active_zones > 0.0 { zone_weights.iter().sum::<f32>() / active_zones } else { 1.0 };
 
-    // Equalize! If Orange/Brown (Red+Yellow) is hoarding 1,000,000 weight
-    // and Blue only has 10,000, this will mathematically level the playing field.
+    // Equalizing
     for (p, w) in working_pixels.iter().zip(weights.iter_mut()) {
         let zone = if p.a.abs() > p.b.abs() {
             if p.a > 0.0 { 0 } else { 1 }
+        } else if p.b > 0.0 {
+            2
         } else {
-            if p.b > 0.0 { 2 } else { 3 }
+            3
         };
 
         if zone_weights[zone] > 0.0 {
-            // We use .sqrt() on the ratio so we don't accidentally give a single
-            // stray blue noise pixel the power of a million suns. It's a gentle but firm equalization.
             let equalization_factor = (avg_zone_weight / zone_weights[zone]).sqrt();
             *w *= equalization_factor;
         }
     }
 
-    // 2. Pre-pack data (Array of Structs) & Precompute expensive math
-    // This entirely removes millions of .sqrt() and .atan2() calls from the inner loops
-    // and guarantees sequential L1 cache access.
     #[derive(Clone, Copy)]
     struct PackedPixel {
         l: f32,
@@ -2824,11 +2806,10 @@ fn kmeans_palette(
         })
         .collect();
 
-    // 3. K-Means++ initialization
     let mut centroids = vec![working_pixels[0]; k];
     let mut centroid_chromas = vec![0.0f32; k];
     let mut centroid_hues = vec![0.0f32; k];
-    let mut min_dists = vec![f32::MAX; packed_pixels.len()]; // Cache nearest distance
+    let mut min_dists = vec![f32::MAX; packed_pixels.len()];
 
     let mut rng_state: u64 = 0x5EED_C0DE_1234_5678;
     let mut xorshift = || -> u64 {
@@ -2848,7 +2829,6 @@ fn kmeans_palette(
         }
     }
 
-    // Helper data struct for centroid comparisons
     #[derive(Clone, Copy)]
     struct CentroidData {
         l: f32,
@@ -2870,7 +2850,6 @@ fn kmeans_palette(
         is_dark: centroids[0].l < 0.6,
     };
 
-    // Fast packed distance calculator for initialization
     let calc_packed_dist = |p: &PackedPixel, cd: &CentroidData| -> f32 {
         let dl = (p.l - cd.l) * 2.0;
         let dc = (p.c - cd.c) * 4.0;
@@ -2888,7 +2867,6 @@ fn kmeans_palette(
         dl * dl + dc * dc + dh_weighted * dh_weighted
     };
 
-    // Initial pass: populate min_dists for the first centroid
     for (i, p) in packed_pixels.iter().enumerate() {
         min_dists[i] = calc_packed_dist(p, &new_cd);
     }
@@ -2897,7 +2875,7 @@ fn kmeans_palette(
         let total: f32 =
             min_dists.iter().zip(packed_pixels.iter()).map(|(&d, p)| d * p.weight).sum();
 
-        if total <= 0.0 {
+        if total <= 0.0 || !total.is_finite() {
             centroids[ki] = working_pixels[(xorshift() as usize) % working_pixels.len()];
         } else {
             let mut target = (xorshift() as f32 / u64::MAX as f32) * total;
@@ -2910,7 +2888,6 @@ fn kmeans_palette(
             }
         }
 
-        // Only check pixels against the newly added centroid
         centroid_chromas[ki] = (centroids[ki].a.powi(2) + centroids[ki].b.powi(2)).sqrt();
         centroid_hues[ki] = centroids[ki].b.atan2(centroids[ki].a);
         new_cd = CentroidData {
@@ -2930,7 +2907,6 @@ fn kmeans_palette(
         }
     }
 
-    // Helper for shift checking and deduplication later
     let calc_dist_centroids = |p: &Oklab, c: &Oklab| -> f32 {
         let p_c = (p.a.powi(2) + p.b.powi(2)).sqrt();
         let c_c = (c.a.powi(2) + c.b.powi(2)).sqrt();
@@ -2949,13 +2925,12 @@ fn kmeans_palette(
         dl * dl + dc * dc + dh_weighted * dh_weighted
     };
 
-    // 4. K-Means iterations
+    // K-Means iterations
     let mut final_counts = vec![0.0f32; k];
     for _ in 0..20 {
         let mut counts = vec![0.0f32; k];
         let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
 
-        // Pre-pack ONLY the centroids to save billions of operations
         let cent_data: Vec<CentroidData> = centroids
             .iter()
             .map(|c| CentroidData {
@@ -2974,14 +2949,12 @@ fn kmeans_palette(
             let mut best_idx = 0;
 
             for (i, cd) in cd_slice.iter().enumerate() {
-                // ── EARLY EXIT 1: Lightness ──
                 let dl = (p.l - cd.l) * 2.0;
                 let dl_sq = dl * dl;
                 if dl_sq >= min_dist {
                     continue;
                 }
 
-                // ── EARLY EXIT 2: Chroma ──
                 let dc = (p.c - cd.c) * 4.0;
                 let dc_sq = dc * dc;
                 let base_dist = dl_sq + dc_sq;
@@ -2989,7 +2962,6 @@ fn kmeans_palette(
                     continue;
                 }
 
-                // ── EXPENSIVE MATH ──
                 let mut d_h_angle = (p.h - cd.h).abs();
                 if d_h_angle > std::f32::consts::PI {
                     d_h_angle = std::f32::consts::PI * 2.0 - d_h_angle;
@@ -3039,7 +3011,6 @@ fn kmeans_palette(
         final_counts = counts;
     }
 
-    // 4.5. Anti-crowding deduplication (the tuning knob)
     let mut clusters: Vec<(f32, Oklab)> =
         centroids.into_iter().enumerate().map(|(i, c)| (final_counts[i], c)).collect();
 
@@ -3049,19 +3020,15 @@ fn kmeans_palette(
     let total_pixels: f32 = clusters.iter().map(|(count, _)| count).sum();
 
     for (count, c) in clusters {
-        if count == 0.0 {
+        if count <= 0.0 {
             continue;
         }
 
         let mut too_close = false;
-        // Lower the tiny spot threshold so it doesn't trigger on medium-small details
         let is_tiny_spot = count < (total_pixels * 0.015);
 
         for &(kept_count, kept_c) in &unique_centroids {
             let dist = calc_dist_centroids(&c, &kept_c);
-
-            // Give dark colors a "shield" against aggressive merging.
-            // If both colors are dark, they must be VERY close to merge.
             let is_dark_collision = c.l < 0.35 && kept_c.l < 0.35;
 
             let tiny_merge_dist = if is_dark_collision { 0.0005 } else { 0.0015 };
@@ -3079,21 +3046,14 @@ fn kmeans_palette(
             unique_centroids.push((count, c));
         }
     }
-    let unique_centroids: Vec<(f32, Oklab)> = unique_centroids;
 
-    // 5. Convert and sort (hue buckets + lightness)
-    // ==========================================================
-    // Returning 6 distinct, beautiful colors is vastly superior to
-    // returning 10 colors where 4 are identical bright spots.
+    if unique_centroids.is_empty() {
+        return vec![(egui::Color32::BLACK, 1.0 / k as f32); k];
+    }
+
     let final_k = unique_centroids.len();
-
-    // Classify each centroid as chromatic or achromatic.
-    // When chroma is near-zero the hue angle from atan2 is meaningless
-    // noise, so we must not let it drive sorting.
     let grey_threshold = 0.01;
 
-    // Compute hue buckets only for chromatic centroids; count distinct buckets
-    // to decide whether hue-bucket sorting adds value or just scrambles things.
     let mut chromatic_buckets: std::collections::HashSet<i32> = std::collections::HashSet::new();
     let mut bucket_counts: [u32; 8] = [0; 8];
     for (_, c) in &unique_centroids {
@@ -3103,21 +3063,15 @@ fn kmeans_palette(
             if h < 0.0 {
                 h += std::f32::consts::PI * 2.0;
             }
-            let bucket = ((h * 8.0) / (std::f32::consts::PI * 2.0)).round() as i32 % 8;
+            let bucket = (((h * 8.0) / (std::f32::consts::PI * 2.0)).round() as i32).rem_euclid(8);
             chromatic_buckets.insert(bucket);
             bucket_counts[bucket as usize] += 1;
         }
     }
 
-    // If the palette spans 2 or fewer hue buckets (earth tones, monochrome,
-    // all-grey), a clean dark-to-light gradient is more useful than hue grouping.
-    // When luminance sort is explicitly requested, always sort by lightness.
     let use_lightness_only =
         pal_sort == crate::db::PaletteSort::Luminance || chromatic_buckets.len() <= 2;
 
-    // When hue-bucket sorting IS used, achromatic colors get the dominant
-    // (most populated) hue bucket so they blend in by lightness instead of
-    // landing in a random bucket from atan2 noise.
     let dominant_bucket = bucket_counts
         .iter()
         .enumerate()
@@ -3125,7 +3079,6 @@ fn kmeans_palette(
         .map(|(i, _)| i as i32)
         .unwrap_or(0);
 
-    // Total weight for computing fractions
     let total_weight: f32 = unique_centroids.iter().map(|(w, _)| w).sum();
     let total_weight = if total_weight > 0.0 { total_weight } else { 1.0 };
 
@@ -3133,23 +3086,21 @@ fn kmeans_palette(
     let mut sort_keys: Vec<(i32, u32)> = Vec::with_capacity(final_k);
 
     for &(weight, ref centroid) in unique_centroids.iter().take(final_k) {
-        let l_key = (centroid.l * 1000.0) as u32;
+        let l_key = (centroid.l.clamp(0.0, 1.0) * 1000.0) as u32;
 
         if use_lightness_only {
-            // Pure lightness sort: hue bucket forced to 0 so only l_key matters
             sort_keys.push((0, l_key));
         } else {
             let chroma = (centroid.a.powi(2) + centroid.b.powi(2)).sqrt();
             if chroma < grey_threshold {
-                // Achromatic: slot into the dominant hue bucket so it sorts
-                // by lightness among its chromatic neighbours
                 sort_keys.push((dominant_bucket, l_key));
             } else {
                 let mut h = centroid.b.atan2(centroid.a);
                 if h < 0.0 {
                     h += std::f32::consts::PI * 2.0;
                 }
-                let hue_bucket = ((h * 8.0) / (std::f32::consts::PI * 2.0)).round() as i32 % 8;
+                let hue_bucket =
+                    (((h * 8.0) / (std::f32::consts::PI * 2.0)).round() as i32).rem_euclid(8);
                 sort_keys.push((hue_bucket, l_key));
             }
         }
