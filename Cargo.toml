@@ -30,7 +30,7 @@ geo = { version = "0.33", features = ["serde"] }
 getrandom = "0.4"
 hayro = "0"
 hayro-syntax = "0"
-hayro-jpeg2000 = "0.4"
+hayro-jpeg2000 = "0.5"
 hex = "0.4"
 image-extras = { git = "https://github.com/Safari77/image-extras", branch = "main" }
 image = { version = "0.25", features = ["avif-native"] }
@@ -84,7 +84,7 @@ egui = { version = "0.37", default-features = false, features = [
 ] }
 egui_extras = { version = "0.37", features = ["all_loaders"] }
 egui-wgpu = "0.37"
-walkers = { version = "0.64", features = ["mvt"] }
+walkers = { version = "0.65", features = ["mvt"] }
 #walkers = { git = "https://github.com/Safari77/walkers", branch = "main" }
 roaring = { version = "0.12", features = ["serde"] }
 skrifa = "0.49"
