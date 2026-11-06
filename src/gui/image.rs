@@ -2290,24 +2290,19 @@ pub(super) fn render_image_texture(
     current_group_idx: usize,
 ) {
     let texture_size = source.size();
-    // --- 1. Calculate Rotation and Flip ---
+    if texture_size.x <= 0.0 || texture_size.y <= 0.0 || !available_rect.is_positive() {
+        return;
+    }
+
     let orientation = if let Some(group) = app.state.groups.get(app.state.current_group_idx) {
         if let Some(file) = group.get(app.state.current_file_idx) { file.orientation } else { 1 }
     } else {
         1
     };
 
-    // Get per-file transform state
     let file_transform = app.state.get_current_file_transform();
+    let manual_rot = file_transform.rotation.rem_euclid(4);
 
-    // Use per-file rotation instead of global manual_rotation
-    let manual_rot = file_transform.rotation % 4;
-
-    // Decompose the EXIF orientation into quarter-turns (clockwise) plus
-    // mirrors. The mirror applies in texture space before the rotation on
-    // both render paths, matching the EXIF convention: 2 = mirror H,
-    // 3 = rotate 180, 4 = mirror V, 5 = mirror H + rotate 270 CW,
-    // 6 = rotate 90 CW, 7 = mirror H + rotate 90 CW, 8 = rotate 270 CW.
     let (exif_steps, exif_flip_h, exif_flip_v) = match orientation {
         2 => (0, true, false),
         3 => (2, false, false),
@@ -2322,19 +2317,15 @@ pub(super) fn render_image_texture(
     let manual_angle = manual_rot as f32 * (PI / 2.0);
     let total_angle = exif_steps as f32 * (PI / 2.0) + manual_angle;
 
-    let total_steps = (exif_steps + manual_rot) % 4;
+    let total_steps = (exif_steps + manual_rot).rem_euclid(4);
     let is_rotated_90_270 = total_steps == 1 || total_steps == 3;
-
-    // EXIF mirrors combine with the user's manual flips; two flips on the
-    // same axis cancel out.
+    // EXIF mirrors combine with the user's manual flips
     let flip_h = exif_flip_h ^ file_transform.flip_horizontal;
     let flip_v = exif_flip_v ^ file_transform.flip_vertical;
-
-    // --- 2. Determine Visual Size (Swapped if rotated) ---
+    // Determine Visual Size
     let visual_size =
         if is_rotated_90_270 { egui::vec2(texture_size.y, texture_size.x) } else { texture_size };
-
-    // --- 3. Calculate Zoom & Layout ---
+    // Calculate Zoom & Layout
     let (screen_w, screen_h) = (available_rect.width(), available_rect.height());
     let view_state = *app.group_views.get(&current_group_idx).unwrap_or(&GroupViewState::default());
 
@@ -2344,22 +2335,22 @@ pub(super) fn render_image_texture(
         ViewMode::FitHeight => screen_h / visual_size.y,
         ViewMode::ManualZoom(z) => {
             if app.state.zoom_relative {
-                // Relative zoom implicitly handles texture downscaling because fit_scale
-                // dynamically maps whatever the visual_size is to the screen bounds.
+                // Relative zoom implicitly handles texture downscaling
                 let fit_scale = (screen_w / visual_size.x).min(screen_h / visual_size.y);
                 z * fit_scale
             } else {
-                // 1. Divide by pixels_per_point so 1 image pixel = 1 physical screen pixel (ignores font_scale)
-                let ppp = ui.ctx().pixels_per_point();
-
-                // 2. Compensate for textures downscaled due to MAX_TEXTURE_SIDE (>8192px limits)
+                let ppp = ui.ctx().pixels_per_point().max(f32::EPSILON);
+                let tex_max = texture_size.x.max(texture_size.y).max(1.0);
                 let resolution_scale = app
                     .state
                     .groups
                     .get(app.state.current_group_idx)
                     .and_then(|g| g.get(app.state.current_file_idx))
                     .and_then(|f| f.resolution)
-                    .map(|(w, _)| w as f32 / texture_size.x)
+                    .map(|(w, h)| {
+                        let res_max = w.max(h) as f32;
+                        if res_max > 0.0 { res_max / tex_max } else { 1.0 }
+                    })
                     .unwrap_or(1.0);
 
                 (z * resolution_scale) / ppp
@@ -2367,51 +2358,31 @@ pub(super) fn render_image_texture(
         },
     };
 
-    // Size of the image on screen (visually)
+    let zoom_factor = if zoom_factor.is_finite() && zoom_factor > 0.0 { zoom_factor } else { 1.0 };
     let virtual_visual_size = visual_size * zoom_factor;
 
-    // --- 4. Handle Pan (Geometry-based) ---
-    // Center of the viewport
     let screen_center = available_rect.center();
-
     // Offset from screen center to image center.
     let offset_x = (0.5 - view_state.pan_center.x) * virtual_visual_size.x;
     let offset_y = (0.5 - view_state.pan_center.y) * virtual_visual_size.y;
-
     let visual_center = screen_center + egui::vec2(offset_x, offset_y);
-
     // If image is smaller than screen, force centering (override pan)
     let final_center = egui::pos2(
         if virtual_visual_size.x <= screen_w { screen_center.x } else { visual_center.x },
         if virtual_visual_size.y <= screen_h { screen_center.y } else { visual_center.y },
     );
-
     // The target rect represents the bounds of the ROTATED image on screen.
     let target_rect = egui::Rect::from_center_size(final_center, virtual_visual_size);
-
-    // --- 5. Determine Paint Rect (Unrotated Geometry) ---
+    // Determine Paint Rect
     let paint_size = if is_rotated_90_270 {
         egui::vec2(target_rect.height(), target_rect.width())
     } else {
         target_rect.size()
     };
     let paint_rect = egui::Rect::from_center_size(target_rect.center(), paint_size);
-
-    // --- 6. Render ---
     // Allocate space for the WHOLE available area to catch mouse events everywhere
     let response = ui.allocate_rect(available_rect, egui::Sense::click_and_drag());
 
-    // NOTE: do NOT clip to available_rect here. `available_rect` comes from
-    // `ui.available_rect_before_wrap()`, which is the panel rect minus the
-    // CentralPanel frame's inner margin (8 points by default). `Image::paint_at`
-    // below paints through `ui.painter()`, whose clip rect is the full panel
-    // rect, so clipping the callback to available_rect insets it by that margin
-    // on every side — a uniform border on the deep path and not the 8-bit one.
-    // Both paths must use the same painter to line up.
-
-    // Rotation and flips ride in the UV transform, not the mesh. Computed for
-    // both paths, not just the deep one: the histogram's frosted backdrop needs
-    // the same mapping to find out what is behind it.
     let (uv_mat, uv_off) = image_uv_transform(total_steps as u32, flip_h, flip_v);
     app.last_image_placement = Some(ImagePlacement { rect: target_rect, uv_mat, uv_off });
 
@@ -2421,27 +2392,17 @@ pub(super) fn render_image_texture(
             let (u_min, u_max) = if flip_h { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v_min, v_max) = if flip_v { (1.0, 0.0) } else { (0.0, 1.0) };
             let uv = egui::Rect::from_min_max(egui::pos2(u_min, v_min), egui::pos2(u_max, v_max));
-
-            // Paint the image into the calculated paint_rect, applying rotation and flips.
+            // Paint the image into the calculated paint_rect, applying rotation and flips
             egui::Image::from_texture((id, size))
                 .uv(uv)
                 .rotate(total_angle, egui::Vec2::splat(0.5))
                 .paint_at(ui, paint_rect);
         },
         ImageSource::Gpu { bind_group, .. } => {
-            // Same painter, and therefore the same clip rect, that paint_at
-            // uses in the branch above.
             let painter = ui.painter();
             let clip_rect = painter.clip_rect();
-
-            // The callback rect only has to be non-degenerate for egui to
-            // invoke us. The quad's actual position comes from target_rect in
-            // clip space, and cropping is the scissor's job.
             let draw_rect = target_rect.intersect(clip_rect);
 
-            // Degenerate means nothing is visible. Skip the draw but fall
-            // through to the interaction handling below, so panning still works
-            // and the user can bring the image back.
             if draw_rect.is_positive() {
                 if gpu_debug_mode() > 0 {
                     static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
@@ -2465,10 +2426,8 @@ pub(super) fn render_image_texture(
                     );
                 }
                 let (lut_bind_group, lut_size, domain_min, domain_scale) = if app.state.lut_enabled
-                    && !app.lut_gpu_resources.is_empty()
-                    && app.state.lut_index < app.lut_gpu_resources.len()
+                    && let Some(res) = app.lut_gpu_resources.get(app.state.lut_index)
                 {
-                    let res = &app.lut_gpu_resources[app.state.lut_index];
                     (res.bind_group.clone(), res.lut_size, res.domain_min, res.domain_scale)
                 } else {
                     let fallback = app.render_state.as_ref().and_then(|rs| {
@@ -2480,7 +2439,7 @@ pub(super) fn render_image_texture(
                     if let Some(fb) = fallback {
                         fb
                     } else {
-                        return; // Skip draw safely if render pipeline is unavailable
+                        return;
                     }
                 };
 
@@ -2503,8 +2462,10 @@ pub(super) fn render_image_texture(
         },
     }
 
-    // --- 7. Interaction ---
-    if response.dragged() {
+    if response.dragged()
+        && virtual_visual_size.x > f32::EPSILON
+        && virtual_visual_size.y > f32::EPSILON
+    {
         let d = response.drag_delta();
         let uv_dx = -d.x / virtual_visual_size.x;
         let uv_dy = -d.y / virtual_visual_size.y;
