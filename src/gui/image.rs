@@ -906,37 +906,35 @@ pub(super) fn upload_gpu_image(
     width: u32,
     height: u32,
 ) -> Option<GpuImage> {
-    let px = (width as usize) * (height as usize);
-    // Both branches sample to vec4<f32>, so only the format and stride differ —
-    // the pipeline, layout, samplers and shader are shared.
+    let max_dim = rs.device.limits().max_texture_dimension_2d;
+    if width == 0 || height == 0 || width > max_dim || height > max_dim {
+        return None;
+    }
+
+    let px = (width as usize).checked_mul(height as usize)?;
     let (label, format, stride, bytes): (&str, wgpu::TextureFormat, u32, &[u8]) = match pixels {
         DeepPixels::Rgb10a2(v) => {
-            if v.len() < px {
-                return None;
-            }
+            let slice = v.get(..px)?;
             (
                 "phdupes_image_rgb10a2",
                 wgpu::TextureFormat::Rgb10a2Unorm,
-                width * 4,
-                bytemuck::cast_slice(v),
+                width.checked_mul(4)?,
+                bytemuck::cast_slice(slice),
             )
         },
         DeepPixels::Rgba16(v) => {
-            if v.len() < px * 4 {
+            if !rs.device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
                 return None;
             }
+            let slice = v.get(..px.checked_mul(4)?)?;
             (
                 "phdupes_image_rgba16",
                 wgpu::TextureFormat::Rgba16Unorm,
-                width * 8,
-                bytemuck::cast_slice(v),
+                width.checked_mul(8)?,
+                bytemuck::cast_slice(slice),
             )
         },
     };
-
-    if width == 0 || height == 0 {
-        return None;
-    }
 
     let renderer = rs.renderer.read();
     let pipe = renderer.callback_resources.get::<GpuImagePipeline>()?;
@@ -953,8 +951,6 @@ pub(super) fn upload_gpu_image(
         view_formats: &[],
     });
 
-    // Queue::write_texture has no 256-byte row alignment requirement (that
-    // applies to buffer-to-texture copies), so a tight stride is fine.
     rs.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
@@ -2289,9 +2285,13 @@ pub(super) fn upload_gpu_image_8bit(
 ) -> Option<GpuImage> {
     let width = color_image.width() as u32;
     let height = color_image.height() as u32;
-    if width == 0 || height == 0 {
+    let max_dim = rs.device.limits().max_texture_dimension_2d;
+    if width == 0 || height == 0 || width > max_dim || height > max_dim {
         return None;
     }
+
+    let expected_bytes = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    let raw_bytes = color_image.as_raw().get(..expected_bytes)?;
 
     let renderer = rs.renderer.read();
     let pipe = renderer.callback_resources.get::<GpuImagePipeline>()?;
@@ -2315,10 +2315,10 @@ pub(super) fn upload_gpu_image_8bit(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        color_image.as_raw(),
+        raw_bytes,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(width * 4),
+            bytes_per_row: Some(width.checked_mul(4)?),
             rows_per_image: Some(height),
         },
         extent,
