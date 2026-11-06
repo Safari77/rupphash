@@ -87,19 +87,22 @@ fn detect_cicp_isobmff(bytes: &[u8]) -> Option<Cicp> {
         let flags = haystack[pos + 14];
         let full_range = (flags & 0x80) != 0;
 
-        let tc = transfer as u8;
-        // H.273: 2 = Unspecified, 0 = Reserved
-        if tc != 2 && tc != 0 {
-            let cicp = Cicp {
-                color_primaries: primaries as u8,
-                transfer_characteristics: tc,
-                matrix_coefficients: matrix as u8,
-                full_range,
-            };
-            img_debug!("[DEBUG-CICP] Fast-scan successfully extracted NCLX: {:?}", cicp);
-            return Some(cicp);
-        } else {
-            img_debug!("[DEBUG-CICP] NCLX transfer is Unspecified. Looking for ICC profile...");
+        if let (Ok(cp), Ok(tc), Ok(mc)) =
+            (u8::try_from(primaries), u8::try_from(transfer), u8::try_from(matrix))
+        {
+            // H.273: 2 = Unspecified, 0 = Reserved
+            if tc != 2 && tc != 0 {
+                let cicp = Cicp {
+                    color_primaries: cp,
+                    transfer_characteristics: tc,
+                    matrix_coefficients: mc,
+                    full_range,
+                };
+                img_debug!("[DEBUG-CICP] Fast-scan successfully extracted NCLX: {:?}", cicp);
+                return Some(cicp);
+            } else {
+                img_debug!("[DEBUG-CICP] NCLX transfer is Unspecified. Looking for ICC profile...");
+            }
         }
     }
 
@@ -118,9 +121,11 @@ fn detect_cicp_isobmff(bytes: &[u8]) -> Option<Cicp> {
 
                 // Normal box sizes include the 12-byte header.
                 // A size of 1 indicates a 64-bit extended size, which we skip.
-                if box_size > 12 && (pos - 4 + box_size) <= bytes.len() {
+                if box_size > 12
+                    && let Some(icc_end) = (pos - 4).checked_add(box_size)
+                    && icc_end <= bytes.len()
+                {
                     let icc_start = pos + 8;
-                    let icc_end = pos - 4 + box_size;
                     let icc_bytes = &bytes[icc_start..icc_end];
 
                     img_debug!(
@@ -322,10 +327,10 @@ const PQ_C3: f32 = 2392.0 / 4096.0 * 32.0;
 /// (0 to 10000 nits).
 #[inline]
 fn pq_eotf(e: f32) -> f32 {
-    let e = e.max(0.0);
+    let e = e.clamp(0.0, 1.0);
     let ep = e.powf(1.0 / PQ_M2);
     let num = (ep - PQ_C1).max(0.0);
-    let den = PQ_C2 - PQ_C3 * ep;
+    let den = (PQ_C2 - PQ_C3 * ep).max(1e-6);
     let y = (num / den).powf(1.0 / PQ_M1);
     // 10000 nits peak by definition.
     y * 10000.0
@@ -353,7 +358,7 @@ fn hlg_eotf(e: f32, peak_nits: f32) -> f32 {
 // sRGB OETF (linear → non-linear, [0,1] → [0,1]).
 #[inline]
 fn srgb_oetf(v: f32) -> f32 {
-    // let v = v.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
     if v <= 0.0031308 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
 }
 
@@ -476,6 +481,9 @@ fn p3_to_bt709_linear(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
 /// resulting ratio — this preserves hue better than per-channel tone mapping.
 #[inline]
 fn bt2390_eetf(e: f32, src_peak_pq: f32, dst_peak_pq: f32) -> f32 {
+    if src_peak_pq <= 1e-6 {
+        return 0.0;
+    }
     // Normalize input to [0, src_peak_pq] -> [0, 1].
     let e1 = (e / src_peak_pq).clamp(0.0, 1.0);
     let max_lum = dst_peak_pq / src_peak_pq;
@@ -567,6 +575,8 @@ struct TonemapParams {
 
 impl TonemapParams {
     fn new(cicp: Cicp, sdr_peak_nits: f32) -> Self {
+        let sdr_peak_nits =
+            if sdr_peak_nits.is_finite() && sdr_peak_nits > 1.0 { sdr_peak_nits } else { 100.0 };
         let use_pq = cicp.transfer_characteristics == 16;
         let use_hlg = cicp.transfer_characteristics == 18;
         // Source peak. PQ is absolute with a 10000 nit ceiling; assume the
@@ -596,7 +606,8 @@ fn to_rgba16_flat(img: &DynamicImage) -> (u32, u32, Vec<u16>) {
     match img {
         DynamicImage::ImageRgb16(buf) => {
             let (w, h) = (buf.width(), buf.height());
-            let mut out = Vec::with_capacity((w * h * 4) as usize);
+            let cap = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+            let mut out = Vec::with_capacity(cap);
             for p in buf.pixels() {
                 out.push(p[0]);
                 out.push(p[1]);
@@ -756,9 +767,9 @@ pub fn process_hdr_to_sdr(img: &DynamicImage, cicp: Cicp, sdr_peak_nits: f32) ->
     let params = TonemapParams::new(cicp, sdr_peak_nits);
     let (width, height, raw_rgba_u16) = to_rgba16_flat(img);
 
-    let pixel_count = (width as usize) * (height as usize);
-    let mut out: Vec<u8> = vec![0u8; pixel_count * 4];
-    let w = width as usize;
+    let pixel_count = (width as usize).saturating_mul(height as usize);
+    let mut out: Vec<u8> = vec![0u8; pixel_count.saturating_mul(4)];
+    let w = (width as usize).max(1);
     raw_rgba_u16.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).enumerate().for_each(
         |(i, (src, dst))| {
             let (r, g, b, a) = tonemap_px(src, params);
@@ -767,7 +778,7 @@ pub fn process_hdr_to_sdr(img: &DynamicImage, cicp: Cicp, sdr_peak_nits: f32) ->
             dst[0] = q(r);
             dst[1] = q(g);
             dst[2] = q(b);
-            dst[3] = (a * 255.0).round() as u8;
+            dst[3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
         },
     );
 
@@ -795,8 +806,8 @@ pub fn process_hdr_to_rgb10a2(
     let params = TonemapParams::new(cicp, sdr_peak_nits);
     let (width, height, raw_rgba_u16) = to_rgba16_flat(img);
 
-    let mut out: Vec<u32> = vec![0u32; (width as usize) * (height as usize)];
-    let w = width as usize;
+    let mut out: Vec<u32> = vec![0u32; (width as usize).saturating_mul(height as usize)];
+    let w = (width as usize).max(1);
     raw_rgba_u16.par_chunks_exact(4).zip(out.par_iter_mut()).enumerate().for_each(
         |(i, (src, dst))| {
             let (r, g, b, a) = tonemap_px(src, params);
@@ -804,7 +815,8 @@ pub fn process_hdr_to_rgb10a2(
             // curve is steep in the shadows, so dither still earns its keep.
             let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
             let q = |v: f32| (v * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
-            *dst = (((a * 3.0).round() as u32) << 30) | (q(b) << 20) | (q(g) << 10) | q(r);
+            let qa = (a * 3.0).round().clamp(0.0, 3.0) as u32;
+            *dst = (qa << 30) | (q(b) << 20) | (q(g) << 10) | q(r);
         },
     );
 
@@ -903,13 +915,14 @@ pub fn convert_sdr_to_srgb_rgb10a2(img: &DynamicImage, cicp: Cicp) -> (u32, u32,
     }
     let (width, height, raw) = to_rgba16_flat(img);
 
-    let mut out: Vec<u32> = vec![0u32; (width as usize) * (height as usize)];
-    let w = width as usize;
+    let mut out: Vec<u32> = vec![0u32; (width as usize).saturating_mul(height as usize)];
+    let w = (width as usize).max(1);
     raw.par_chunks_exact(4).zip(out.par_iter_mut()).enumerate().for_each(|(i, (src, dst))| {
         let (r, g, b, a) = sdr_px(src, params);
         let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
         let q = |v: f32| (v * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
-        *dst = (((a * 3.0).round() as u32) << 30) | (q(b) << 20) | (q(g) << 10) | q(r);
+        let qa = (a * 3.0).round().clamp(0.0, 3.0) as u32;
+        *dst = (qa << 30) | (q(b) << 20) | (q(g) << 10) | q(r);
     });
 
     (width, height, out)
@@ -924,7 +937,8 @@ pub fn convert_sdr_to_srgb_rgba16(img: &DynamicImage, cicp: Cicp) -> (u32, u32, 
     }
     let (width, height, raw) = to_rgba16_flat(img);
 
-    let mut out: Vec<u16> = vec![0u16; (width as usize) * (height as usize) * 4];
+    let mut out: Vec<u16> =
+        vec![0u16; (width as usize).saturating_mul(height as usize).saturating_mul(4)];
     raw.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).for_each(|(src, dst)| {
         let (r, g, b, a) = sdr_px(src, params);
         // 65536 codes is far below the visible threshold, so no dither here.
@@ -944,9 +958,9 @@ pub fn convert_sdr_to_srgb8(img: &DynamicImage, cicp: Cicp) -> RgbaImage {
     let params = SdrParams::new(cicp);
     let (width, height, raw) = to_rgba16_flat(img);
 
-    let pixel_count = (width as usize) * (height as usize);
-    let mut out: Vec<u8> = vec![0u8; pixel_count * 4];
-    let w = width as usize;
+    let pixel_count = (width as usize).saturating_mul(height as usize);
+    let mut out: Vec<u8> = vec![0u8; pixel_count.saturating_mul(4)];
+    let w = (width as usize).max(1);
     raw.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).enumerate().for_each(
         |(i, (src, dst))| {
             let (r, g, b, a) = sdr_px(src, params);
@@ -955,7 +969,7 @@ pub fn convert_sdr_to_srgb8(img: &DynamicImage, cicp: Cicp) -> RgbaImage {
             dst[0] = q(r);
             dst[1] = q(g);
             dst[2] = q(b);
-            dst[3] = (a * 255.0).round() as u8;
+            dst[3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
         },
     );
 
@@ -969,13 +983,13 @@ pub fn convert_sdr_to_srgb8(img: &DynamicImage, cicp: Cicp) -> RgbaImage {
 /// at all); otherwise use `convert_sdr_to_srgb_rgb10a2`.
 pub fn requantize_srgb16_to_rgb10a2(img: &DynamicImage) -> (u32, u32, Vec<u32>) {
     let (width, height, raw) = to_rgba16_flat(img);
-    let w = width as usize;
-    let mut out: Vec<u32> = vec![0u32; w * (height as usize)];
+    let w = (width as usize).max(1);
+    let mut out: Vec<u32> = vec![0u32; (width as usize).saturating_mul(height as usize)];
 
     raw.par_chunks_exact(4).zip(out.par_iter_mut()).enumerate().for_each(|(i, (src, dst))| {
         let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
         let q = |v: u16| ((v as f32 / 65535.0) * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
-        let a = (src[3] as f32 / 65535.0 * 3.0).round() as u32;
+        let a = (src[3] as f32 / 65535.0 * 3.0).round().clamp(0.0, 3.0) as u32;
         *dst = (a << 30) | (q(src[2]) << 20) | (q(src[1]) << 10) | q(src[0]);
     });
 
@@ -1004,7 +1018,8 @@ pub fn process_hdr_to_rgba16(
     let params = TonemapParams::new(cicp, sdr_peak_nits);
     let (width, height, raw_rgba_u16) = to_rgba16_flat(img);
 
-    let mut out: Vec<u16> = vec![0u16; (width as usize) * (height as usize) * 4];
+    let mut out: Vec<u16> =
+        vec![0u16; (width as usize).saturating_mul(height as usize).saturating_mul(4)];
 
     raw_rgba_u16.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).for_each(|(src, dst)| {
         let (r, g, b, a) = tonemap_px(src, params);
