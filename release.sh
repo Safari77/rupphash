@@ -12,3 +12,6 @@ cargo fmt --check && \
 # Eventually:
 # RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 # cargo clippy --all-targets --all-features -- -D warnings
+
+# vetting if feeling lazy:
+# cargo vet regenerate exemptions
