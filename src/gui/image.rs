@@ -2573,11 +2573,9 @@ fn compute_histogram_from_colorimage(
     } = palette_config;
     let (src_w, src_h) = (img.size[0] as u32, img.size[1] as u32);
     let (dst_w, dst_h) = (128u32, 128u32);
+    let total_pixels = (src_w as usize).saturating_mul(src_h as usize);
 
-    // Guard against zero-dimension images (e.g. a corrupt decode): the sampling
-    // step below divides by the pixel count and the fallbacks index into the
-    // pixel buffer, both of which would panic on an empty image.
-    if src_w == 0 || src_h == 0 {
+    if src_w == 0 || src_h == 0 || img.pixels.len() < total_pixels {
         let k = dominant_colors.clamp(1, 25);
         return HistPalette {
             hist_l: [0; 256],
@@ -2587,17 +2585,9 @@ fn compute_histogram_from_colorimage(
             blur: blur_backdrop(&[egui::Color32::TRANSPARENT], 1, 1),
         };
     }
-    // Detect low-color images (1-bit, indexed, etc.) by sampling the pixels
-    // for unique RGB values. If there are fewer unique colors than requested,
-    // we return them directly and skip k-means entirely.
-    //
-    // This only works when the pixels are original (not Lanczos-resampled),
-    // because resampling creates intermediate colors at edges. When the image
-    // was pre-resized (e.g. exceeding MAX_TEXTURE_SIDE), we skip this check
-    // and let k-means handle it.
+
     let k = dominant_colors.clamp(1, 25);
     let low_color_palette: Option<Vec<(egui::Color32, f32)>> = if !pre_resized {
-        let total_pixels = (src_w as usize) * (src_h as usize);
         let sample_count = total_pixels.min(4096);
         let step = (total_pixels / sample_count).max(1);
         let mut counts: std::collections::HashMap<(u8, u8, u8), u32> =
@@ -2610,8 +2600,6 @@ fn compute_histogram_from_colorimage(
             idx += step;
         }
         if counts.len() <= k && !counts.is_empty() {
-            // Re-count with the full sample to get accurate pixel distribution
-            // (the first pass may have stopped early once unique count exceeded k)
             counts.clear();
             idx = 0;
             while idx < total_pixels {
@@ -2644,7 +2632,6 @@ fn compute_histogram_from_colorimage(
     let mut thumb: Vec<egui::Color32> = Vec::with_capacity((dst_w * dst_h) as usize);
     let pixel_type = PixelType::U8x4;
 
-    // 1. High-quality downsample using fast_image_resize
     let resized_successfully =
         FastImage::from_vec_u8(src_w, src_h, img.as_raw().to_vec(), pixel_type).ok().and_then(
             |src_image| {
@@ -2659,10 +2646,6 @@ fn compute_histogram_from_colorimage(
         );
 
     if let Some(dst_image) = resized_successfully {
-        // 2. Convert smoothed pixels to Oklab. Resampling premultiplied data is
-        // correct — that is what keeps edge pixels from bleeding — but the
-        // result is still premultiplied and has to be undone before it means
-        // anything as a colour.
         for chunk in dst_image.buffer().as_chunks::<4>().0 {
             thumb.push(egui::Color32::from_rgba_premultiplied(
                 chunk[0], chunk[1], chunk[2], chunk[3],
@@ -2672,7 +2655,6 @@ fn compute_histogram_from_colorimage(
             }
         }
     } else {
-        // Fallback: Original nearest-neighbor logic if the high-quality resize fails
         let src_w_usize = src_w as usize;
         let src_h_usize = src_h as usize;
         let dst_w_usize = dst_w as usize;
@@ -2683,6 +2665,7 @@ fn compute_histogram_from_colorimage(
             for dx in 0..dst_w_usize {
                 let sx = (dx * src_w_usize) / dst_w_usize;
                 let px = img.pixels[sy * src_w_usize + sx];
+                thumb.push(px);
                 if let Some(ok) = oklab_from_premultiplied(&px.to_array()) {
                     oklab_pixels.push(ok);
                 }
@@ -2692,7 +2675,6 @@ fn compute_histogram_from_colorimage(
 
     let (hist_l, hist_a, hist_b) = build_histograms(&oklab_pixels);
 
-    // Use pre-computed palette for low-color images, otherwise run k-means
     let palette = low_color_palette
         .unwrap_or_else(|| kmeans_palette(&oklab_pixels, dominant_colors, sat_bias, pal_sort));
 
@@ -3138,10 +3120,9 @@ fn compute_histogram_from_dynamic_image(
     let (src_w, src_h) = rgba.dimensions();
     let (dst_w, dst_h) = (128u32, 128u32);
     let pixel_type = PixelType::U8x4;
+    let total_pixels = (src_w as usize).saturating_mul(src_h as usize);
 
-    // Guard against zero-dimension images (e.g. a corrupt decode): the sampling
-    // step below divides by the pixel count, which would panic on an empty image.
-    if src_w == 0 || src_h == 0 {
+    if src_w == 0 || src_h == 0 || rgba.as_raw().len() < total_pixels.saturating_mul(4) {
         let k = dominant_colors.clamp(1, 25);
         return HistPalette {
             hist_l: [0; 256],
@@ -3152,11 +3133,8 @@ fn compute_histogram_from_dynamic_image(
         };
     }
 
-    // Detect low-color images before Lanczos downsampling destroys the information.
-    // This path always receives original (non-resized) pixels.
     let k = dominant_colors.clamp(1, 25);
     let raw_pixels = rgba.as_raw();
-    let total_pixels = (src_w as usize) * (src_h as usize);
     let sample_count = total_pixels.min(4096);
     let step = (total_pixels / sample_count).max(1);
     let mut unique_rgb: std::collections::HashMap<(u8, u8, u8), u32> =
@@ -3164,44 +3142,44 @@ fn compute_histogram_from_dynamic_image(
     let mut idx = 0;
     while idx < total_pixels && unique_rgb.len() <= k {
         let base = idx * 4;
-        *unique_rgb
-            .entry((raw_pixels[base], raw_pixels[base + 1], raw_pixels[base + 2]))
-            .or_insert(0) += 1;
-        idx += step;
-    }
-
-    // Build the low-color palette now while raw_pixels is still valid
-    // (rgba.into_raw() below will consume it)
-    let low_color_palette: Option<Vec<(egui::Color32, f32)>> = if unique_rgb.len() <= k {
-        // Re-count with the full sample to get accurate pixel distribution
-        // (the first pass may have stopped early once unique count exceeded k)
-        unique_rgb.clear();
-        let mut full_idx = 0;
-        while full_idx < total_pixels {
-            let base = full_idx * 4;
+        if raw_pixels[base + 3] > 0 {
             *unique_rgb
                 .entry((raw_pixels[base], raw_pixels[base + 1], raw_pixels[base + 2]))
                 .or_insert(0) += 1;
-            full_idx += step;
         }
-        let total_sampled: u32 = unique_rgb.values().sum();
-        let mut colors: Vec<(Oklab, egui::Color32, f32)> = unique_rgb
-            .iter()
-            .map(|(&(r, g, b), &count)| {
-                let lr = srgb_to_linear(r as f32 / 255.0);
-                let lg = srgb_to_linear(g as f32 / 255.0);
-                let lb = srgb_to_linear(b as f32 / 255.0);
-                let ok = linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb });
-                (ok, egui::Color32::from_rgb(r, g, b), count as f32 / total_sampled as f32)
-            })
-            .collect();
-        colors.sort_by(|a, b| a.0.l.partial_cmp(&b.0.l).unwrap_or(std::cmp::Ordering::Equal));
-        Some(colors.into_iter().map(|(_, c, w)| (c, w)).collect())
-    } else {
-        None
-    };
+        idx += step;
+    }
 
-    // 1. High-quality downsample using fast_image_resize (matches ColorImage path)
+    let low_color_palette: Option<Vec<(egui::Color32, f32)>> =
+        if unique_rgb.len() <= k && !unique_rgb.is_empty() {
+            unique_rgb.clear();
+            let mut full_idx = 0;
+            while full_idx < total_pixels {
+                let base = full_idx * 4;
+                if raw_pixels[base + 3] > 0 {
+                    *unique_rgb
+                        .entry((raw_pixels[base], raw_pixels[base + 1], raw_pixels[base + 2]))
+                        .or_insert(0) += 1;
+                }
+                full_idx += step;
+            }
+            let total_sampled: u32 = unique_rgb.values().sum::<u32>().max(1);
+            let mut colors: Vec<(Oklab, egui::Color32, f32)> = unique_rgb
+                .iter()
+                .map(|(&(r, g, b), &count)| {
+                    let lr = srgb_to_linear(r as f32 / 255.0);
+                    let lg = srgb_to_linear(g as f32 / 255.0);
+                    let lb = srgb_to_linear(b as f32 / 255.0);
+                    let ok = linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb });
+                    (ok, egui::Color32::from_rgb(r, g, b), count as f32 / total_sampled as f32)
+                })
+                .collect();
+            colors.sort_by(|a, b| a.0.l.partial_cmp(&b.0.l).unwrap_or(std::cmp::Ordering::Equal));
+            Some(colors.into_iter().map(|(_, c, w)| (c, w)).collect())
+        } else {
+            None
+        };
+
     let resized_successfully = FastImage::from_vec_u8(src_w, src_h, rgba.into_raw(), pixel_type)
         .ok()
         .and_then(|src_image| {
@@ -3215,37 +3193,33 @@ fn compute_histogram_from_dynamic_image(
         });
 
     let mut thumb: Vec<egui::Color32> = Vec::with_capacity((dst_w * dst_h) as usize);
+    let mut oklab_pixels: Vec<Oklab> = Vec::with_capacity((dst_w * dst_h) as usize);
 
-    let oklab_pixels: Vec<Oklab> = if let Some(dst_image) = resized_successfully {
-        dst_image
-            .buffer()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|chunk| {
-                thumb.push(egui::Color32::from_rgba_unmultiplied(
-                    chunk[0], chunk[1], chunk[2], chunk[3],
-                ));
+    if let Some(dst_image) = resized_successfully {
+        for chunk in dst_image.buffer().as_chunks::<4>().0 {
+            thumb.push(egui::Color32::from_rgba_unmultiplied(
+                chunk[0], chunk[1], chunk[2], chunk[3],
+            ));
+            if chunk[3] > 0 {
                 let lr = srgb_to_linear(chunk[0] as f32 / 255.0);
                 let lg = srgb_to_linear(chunk[1] as f32 / 255.0);
                 let lb = srgb_to_linear(chunk[2] as f32 / 255.0);
-                linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb })
-            })
-            .collect()
+                oklab_pixels.push(linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb }));
+            }
+        }
     } else {
         let thumb_img =
             img.resize_exact(dst_w, dst_h, image::imageops::FilterType::Lanczos3).to_rgba8();
-        thumb_img
-            .pixels()
-            .map(|p| {
-                thumb.push(egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]));
+        for p in thumb_img.pixels() {
+            thumb.push(egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]));
+            if p[3] > 0 {
                 let lr = srgb_to_linear(p[0] as f32 / 255.0);
                 let lg = srgb_to_linear(p[1] as f32 / 255.0);
                 let lb = srgb_to_linear(p[2] as f32 / 255.0);
-                linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb })
-            })
-            .collect()
-    };
+                oklab_pixels.push(linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb }));
+            }
+        }
+    }
 
     let (hist_l, hist_a, hist_b) = build_histograms(&oklab_pixels);
 
