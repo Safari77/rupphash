@@ -55,14 +55,11 @@ pub fn extract_number_from_string(s: &str) -> Option<f64> {
     // Extract first continuous sequence of digits/dots (with optional leading '-')
     let mut num_str = String::new();
     let mut found_digit = false;
-
     for c in s.chars() {
         if c.is_ascii_digit() {
             num_str.push(c);
             found_digit = true;
-        } else if c == '.' && !num_str.contains('.') {
-            num_str.push(c);
-        } else if c == '-' && num_str.is_empty() {
+        } else if (c == '.' && !num_str.contains('.')) || (c == '-' && num_str.is_empty()) {
             num_str.push(c);
         } else if found_digit {
             // Stop at first non-numeric char after finding numbers (e.g. "24mm" -> stop at m)

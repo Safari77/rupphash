@@ -365,7 +365,7 @@ mod tests {
         // 2. Define a "Cluster" of 5 similar images
         // We use u64 here for simplicity, but the logic holds for [u8; 32] too
         let target = 0xABCD_1234_5678_90EF;
-        let cluster_values = vec![
+        let cluster_values = [
             target,
             target ^ 1,      // Dist 1
             target ^ 2,      // Dist 1
