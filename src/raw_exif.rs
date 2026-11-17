@@ -21,7 +21,7 @@
 // - exif_extract::parse_gps_coordinate() handles kamadak-exif's format
 
 use geo::Point;
-use rsraw::RawImage;
+use rsraw::{FullRawInfo, RawImage};
 
 use crate::{
     exif_types::{
@@ -33,18 +33,46 @@ use crate::{
     image_features::ImageFeatures,
 };
 
-/// Check whether LibRaw parsed valid GPS EXIF metadata from the RAW container.
+/// Check whether the LibRaw GPS header flag is set and both decoded coordinates
+/// are non-zero (`>= 0.0001`).
+///
+/// Note: Requiring *both* `lat.abs() >= 0.0001` and `lon.abs() >= 0.0001` is
+/// intentional because some cameras write uninitialized or bogus GPS headers
+/// with one or both axes set to 0.0 when no fix was acquired.
 #[inline]
-pub fn raw_has_gps(raw: &RawImage) -> bool {
-    if raw.as_ref().other.parsed_gps.gpsparsed as u8 == 0 {
-        return false;
+fn raw_gps_coords(raw: &RawImage, info: &FullRawInfo) -> Option<(f64, f64)> {
+    if raw.as_ref().other.parsed_gps.gpsparsed == 0 {
+        return None;
     }
 
-    let info = raw.full_info();
     let lat = dms_to_decimal(&info.gps.latitude);
     let lon = dms_to_decimal(&info.gps.longitude);
 
-    lat.abs() >= 0.0001 && lon.abs() >= 0.0001
+    // Intentional: reject when either lat or lon is near 0.0 because some cameras
+    // emit invalid GPS tags with 0 on one axis when GPS lock is missing.
+    if lat.abs() >= 0.0001 && lon.abs() >= 0.0001 && gps_is_valid(lat, lon) {
+        Some((lat, lon))
+    } else {
+        None
+    }
+}
+
+/// Check whether LibRaw parsed valid GPS EXIF metadata from the RAW container.
+///
+/// Note: Both `lat.abs() >= 0.0001` and `lon.abs() >= 0.0001` are required
+/// because some cameras generate invalid GPS metadata with 0.0 on one or both
+/// axes when no satellite fix is available.
+#[inline]
+pub fn raw_has_gps(raw: &RawImage) -> bool {
+    if raw.as_ref().other.parsed_gps.gpsparsed == 0 {
+        return false;
+    }
+
+    let gps = &raw.as_ref().other.parsed_gps;
+    let lat = dms_to_decimal(&gps.latitude);
+    let lon = dms_to_decimal(&gps.longitude);
+
+    lat.abs() >= 0.0001 && lon.abs() >= 0.0001 && gps_is_valid(lat, lon)
 }
 
 /// Extract ImageFeatures from an rsraw RawImage.
@@ -58,74 +86,7 @@ pub fn raw_has_gps(raw: &RawImage) -> bool {
 pub fn build_features_from_raw_image(raw: &RawImage) -> ImageFeatures {
     let info = raw.full_info();
     let mut features = ImageFeatures::new(info.width, info.height);
-
-    // Camera info
-    if !info.make.is_empty() {
-        features.insert_tag(TAG_MAKE, ExifValue::String(info.make.clone()));
-    }
-    if !info.model.is_empty() {
-        features.insert_tag(TAG_MODEL, ExifValue::String(info.model.clone()));
-    }
-    if !info.software.is_empty() {
-        features.insert_tag(TAG_SOFTWARE, ExifValue::String(info.software.trim().to_string()));
-    }
-    if !info.artist.is_empty() {
-        features.insert_tag(TAG_ARTIST, ExifValue::String(info.artist.clone()));
-    }
-
-    // Exposure settings
-    if info.iso_speed > 0 {
-        features.insert_tag(TAG_ISO, ExifValue::Long(info.iso_speed));
-    }
-    if info.shutter > 0.0 {
-        features.insert_tag(TAG_EXPOSURE_TIME, ExifValue::Float(info.shutter.into()));
-    }
-    if info.aperture > 0.0 {
-        features.insert_tag(TAG_FNUMBER, ExifValue::Float(info.aperture.into()));
-    }
-    if info.focal_len > 0.0 {
-        features.insert_tag(TAG_FOCAL_LENGTH, ExifValue::Float(info.focal_len.into()));
-    }
-
-    // Lens info
-    if !info.lens_info.lens_make.is_empty() {
-        features.insert_tag(TAG_LENS_MAKE, ExifValue::String(info.lens_info.lens_make.clone()));
-    }
-    if !info.lens_info.lens_name.is_empty() {
-        features.insert_tag(
-            TAG_LENS_MODEL,
-            ExifValue::String(info.lens_info.lens_name.trim().to_string()),
-        );
-    }
-    if info.lens_info.focal_length_in_35mm_format > 0 {
-        features.insert_tag(
-            TAG_FOCAL_LENGTH_35MM,
-            ExifValue::Short(info.lens_info.focal_length_in_35mm_format),
-        );
-    }
-
-    // GPS info
-    let has_gps = raw_has_gps(raw);
-    let lat = dms_to_decimal(&info.gps.latitude);
-    let lon = dms_to_decimal(&info.gps.longitude);
-    let has_valid_gps = has_gps && gps_is_valid(lat, lon);
-
-    if has_valid_gps {
-        features.insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(lat));
-        features.insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(lon));
-    }
-
-    // Altitude — only alongside a usable position, and only if finite.
-    if has_valid_gps && info.gps.altitude.is_finite() && info.gps.altitude.abs() > 0.0001 {
-        features.insert_tag(TAG_GPS_ALTITUDE, ExifValue::Float(info.gps.altitude.into()));
-    }
-
-    // Timestamp
-    if let Some(ref dt) = info.datetime {
-        let timestamp = dt.timestamp();
-        features.insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(timestamp));
-    }
-
+    populate_features_from_raw_info(&mut features, raw, &info, true);
     features
 }
 
@@ -157,10 +118,10 @@ fn gps_is_valid(lat: f64, lon: f64) -> bool {
 pub fn dms_to_decimal(dms: &[f32; 3]) -> f64 {
     // Recover the hemisphere sign from any component (rsraw signs all three),
     // then sum the magnitudes so minutes/seconds add instead of subtracting.
-    let sign = if dms[0] < 0.0 || dms[1] < 0.0 || dms[2] < 0.0 { -1.0 } else { 1.0 };
-    let degrees = dms[0].abs() as f64;
-    let minutes = dms[1].abs() as f64;
-    let seconds = dms[2].abs() as f64;
+    let sign = if dms.iter().any(|&c| c < 0.0) { -1.0 } else { 1.0 };
+    let degrees = f64::from(dms[0].abs());
+    let minutes = f64::from(dms[1].abs());
+    let seconds = f64::from(dms[2].abs());
 
     sign * (degrees + minutes / 60.0 + seconds / 3600.0)
 }
@@ -170,14 +131,16 @@ pub fn dms_to_decimal(dms: &[f32; 3]) -> f64 {
 ///
 /// Thread Safety: Only reads from RawImage.
 pub fn get_gps_point_from_raw(raw: &RawImage) -> Option<Point<f64>> {
-    if !raw_has_gps(raw) {
+    if raw.as_ref().other.parsed_gps.gpsparsed == 0 {
         return None;
     }
-    let info = raw.full_info();
-    let lat = dms_to_decimal(&info.gps.latitude);
-    let lon = dms_to_decimal(&info.gps.longitude);
+    let gps = &raw.as_ref().other.parsed_gps;
+    let lat = dms_to_decimal(&gps.latitude);
+    let lon = dms_to_decimal(&gps.longitude);
 
-    if gps_is_valid(lat, lon) {
+    // Both lat and lon must be >= 0.0001 in magnitude because some cameras
+    // write 0.0 on one or both axes when GPS data is invalid/uninitialized.
+    if lat.abs() >= 0.0001 && lon.abs() >= 0.0001 && gps_is_valid(lat, lon) {
         Some(Point::new(lon, lat)) // geo uses (x, y) = (lon, lat)
     } else {
         None
@@ -189,7 +152,7 @@ pub fn get_gps_point_from_raw(raw: &RawImage) -> Option<Point<f64>> {
 ///
 /// Thread Safety: Only reads from RawImage.
 pub fn get_timestamp_from_raw(raw: &RawImage) -> Option<i64> {
-    raw.full_info().datetime.as_ref().map(|dt| dt.timestamp())
+    raw.full_info().datetime.as_ref().map(chrono::DateTime::timestamp)
 }
 
 /// Map LibRaw's `sizes.flip` orientation code to a standard EXIF Orientation
@@ -201,7 +164,8 @@ pub fn get_timestamp_from_raw(raw: &RawImage) -> Option<i64> {
 /// e.g. flip 5 (rotate 90 CCW) is EXIF 8 (Rotate 270 CW). A handful of old
 /// cameras store the angle (90/180/270) directly, which we also accept. -1
 /// (LibRaw's "take from RAW" default / unknown) and anything unexpected map to 1.
-fn libraw_flip_to_exif_orientation(flip: i32) -> u8 {
+#[inline]
+const fn libraw_flip_to_exif_orientation(flip: i32) -> u8 {
     match flip {
         0 => 1,
         1 => 2,
@@ -226,6 +190,7 @@ fn libraw_flip_to_exif_orientation(flip: i32) -> u8 {
 /// stored in the sensor's native orientation and must be rotated by the viewer.
 ///
 /// Thread Safety: Only reads from RawImage.
+#[inline]
 pub fn get_orientation_from_raw(raw: &RawImage) -> u8 {
     libraw_flip_to_exif_orientation(raw.as_ref().sizes.flip)
 }
@@ -245,80 +210,78 @@ pub fn get_orientation_from_raw(raw: &RawImage) -> u8 {
 /// Thread Safety: Mutates features, but RawImage is only read.
 pub fn merge_raw_info_into_features(features: &mut ImageFeatures, raw: &RawImage) {
     let info = raw.full_info();
+    populate_features_from_raw_info(features, raw, &info, false);
+}
 
-    // Camera info - only if not already present
-    if !features.has_tag(TAG_MAKE) && !info.make.is_empty() {
-        features.insert_tag(TAG_MAKE, ExifValue::String(info.make.clone()));
+fn populate_features_from_raw_info(
+    features: &mut ImageFeatures,
+    raw: &RawImage,
+    info: &FullRawInfo,
+    overwrite: bool,
+) {
+    let mut insert_if_needed = |tag: u16, make_val: &dyn Fn() -> ExifValue| {
+        if overwrite || !features.has_tag(tag) {
+            features.insert_tag(tag, make_val());
+        }
+    };
+
+    // Camera info
+    if !info.make.is_empty() {
+        insert_if_needed(TAG_MAKE, &|| ExifValue::String(info.make.clone()));
     }
-    if !features.has_tag(TAG_MODEL) && !info.model.is_empty() {
-        features.insert_tag(TAG_MODEL, ExifValue::String(info.model.clone()));
+    if !info.model.is_empty() {
+        insert_if_needed(TAG_MODEL, &|| ExifValue::String(info.model.clone()));
     }
-    if !features.has_tag(TAG_SOFTWARE) && !info.software.is_empty() {
-        features.insert_tag(TAG_SOFTWARE, ExifValue::String(info.software.trim().to_string()));
+    let software = info.software.trim();
+    if !software.is_empty() {
+        insert_if_needed(TAG_SOFTWARE, &|| ExifValue::String(software.to_string()));
     }
-    if !features.has_tag(TAG_ARTIST) && !info.artist.is_empty() {
-        features.insert_tag(TAG_ARTIST, ExifValue::String(info.artist.clone()));
+    if !info.artist.is_empty() {
+        insert_if_needed(TAG_ARTIST, &|| ExifValue::String(info.artist.clone()));
     }
 
     // Exposure settings
-    if !features.has_tag(TAG_ISO) && info.iso_speed > 0 {
-        features.insert_tag(TAG_ISO, ExifValue::Long(info.iso_speed));
+    if info.iso_speed > 0 {
+        insert_if_needed(TAG_ISO, &|| ExifValue::Long(info.iso_speed));
     }
-    if !features.has_tag(TAG_EXPOSURE_TIME) && info.shutter > 0.0 {
-        features.insert_tag(TAG_EXPOSURE_TIME, ExifValue::Float(info.shutter.into()));
+    if info.shutter > 0.0 {
+        insert_if_needed(TAG_EXPOSURE_TIME, &|| ExifValue::Float(f64::from(info.shutter)));
     }
-    if !features.has_tag(TAG_FNUMBER) && info.aperture > 0.0 {
-        features.insert_tag(TAG_FNUMBER, ExifValue::Float(info.aperture.into()));
+    if info.aperture > 0.0 {
+        insert_if_needed(TAG_FNUMBER, &|| ExifValue::Float(f64::from(info.aperture)));
     }
-    if !features.has_tag(TAG_FOCAL_LENGTH) && info.focal_len > 0.0 {
-        features.insert_tag(TAG_FOCAL_LENGTH, ExifValue::Float(info.focal_len.into()));
+    if info.focal_len > 0.0 {
+        insert_if_needed(TAG_FOCAL_LENGTH, &|| ExifValue::Float(f64::from(info.focal_len)));
     }
 
     // Lens info
-    if !features.has_tag(TAG_LENS_MAKE) && !info.lens_info.lens_make.is_empty() {
-        features.insert_tag(TAG_LENS_MAKE, ExifValue::String(info.lens_info.lens_make.clone()));
+    if !info.lens_info.lens_make.is_empty() {
+        insert_if_needed(TAG_LENS_MAKE, &|| ExifValue::String(info.lens_info.lens_make.clone()));
     }
-    if !features.has_tag(TAG_LENS_MODEL) && !info.lens_info.lens_name.is_empty() {
-        features.insert_tag(
-            TAG_LENS_MODEL,
-            ExifValue::String(info.lens_info.lens_name.trim().to_string()),
-        );
+    let lens_name = info.lens_info.lens_name.trim();
+    if !lens_name.is_empty() {
+        insert_if_needed(TAG_LENS_MODEL, &|| ExifValue::String(lens_name.to_string()));
     }
-    if !features.has_tag(TAG_FOCAL_LENGTH_35MM) && info.lens_info.focal_length_in_35mm_format > 0 {
-        features.insert_tag(
-            TAG_FOCAL_LENGTH_35MM,
-            ExifValue::Short(info.lens_info.focal_length_in_35mm_format),
-        );
+    if info.lens_info.focal_length_in_35mm_format > 0 {
+        insert_if_needed(TAG_FOCAL_LENGTH_35MM, &|| {
+            ExifValue::Short(info.lens_info.focal_length_in_35mm_format)
+        });
     }
 
     // GPS info
-    let has_gps = raw_has_gps(raw);
-    let lat = dms_to_decimal(&info.gps.latitude);
-    let lon = dms_to_decimal(&info.gps.longitude);
-    let has_valid_gps = has_gps && gps_is_valid(lat, lon);
+    if let Some((lat, lon)) = raw_gps_coords(raw, info) {
+        insert_if_needed(TAG_GPS_LATITUDE, &|| ExifValue::Float(lat));
+        insert_if_needed(TAG_GPS_LONGITUDE, &|| ExifValue::Float(lon));
 
-    if has_valid_gps {
-        if !features.has_tag(TAG_GPS_LATITUDE) {
-            features.insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(lat));
+        // Altitude — only alongside a usable position, and only if finite.
+        if info.gps.altitude.is_finite() && info.gps.altitude.abs() > 0.0001 {
+            insert_if_needed(TAG_GPS_ALTITUDE, &|| ExifValue::Float(f64::from(info.gps.altitude)));
         }
-        if !features.has_tag(TAG_GPS_LONGITUDE) {
-            features.insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(lon));
-        }
-    }
-
-    if has_valid_gps
-        && !features.has_tag(TAG_GPS_ALTITUDE)
-        && info.gps.altitude.is_finite()
-        && info.gps.altitude.abs() > 0.0001
-    {
-        features.insert_tag(TAG_GPS_ALTITUDE, ExifValue::Float(info.gps.altitude.into()));
     }
 
     // Timestamp
-    if !features.has_tag(TAG_DERIVED_TIMESTAMP)
-        && let Some(ref dt) = info.datetime
-    {
-        features.insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(dt.timestamp()));
+    if let Some(ref dt) = info.datetime {
+        insert_if_needed(TAG_DERIVED_TIMESTAMP, &|| ExifValue::Long64(dt.timestamp()));
     }
 }
 

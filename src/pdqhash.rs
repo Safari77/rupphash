@@ -35,10 +35,27 @@ const DCT_FREQ_OFFSET: usize = 1;
 // a box blur down to 64x64 anyway, visually equivalent.
 const RESIZE_ALG: ResizeAlg = ResizeAlg::Convolution(FilterType::Box);
 
+struct PdqScratch {
+    resizer: fr::Resizer,
+    luma_buf: Vec<f32>,
+    tmp_buf: Vec<f32>,
+}
+
+impl PdqScratch {
+    fn new() -> Self {
+        let cap = (DOWNSAMPLE_DIMS as usize) * (DOWNSAMPLE_DIMS as usize);
+        Self {
+            resizer: fr::Resizer::new(),
+            luma_buf: Vec::with_capacity(cap),
+            tmp_buf: Vec::with_capacity(cap),
+        }
+    }
+}
+
 thread_local! {
-    // Resizer holds internal scratch buffers; reusing it across images avoids
-    // re-allocating them for every file scanned.
-    static RESIZER: RefCell<fr::Resizer> = RefCell::new(fr::Resizer::new());
+    // Reusing resizer and float filter buffers across images avoids
+    // re-allocating ~2 MB of scratch memory for every file scanned.
+    static SCRATCH: RefCell<PdqScratch> = RefCell::new(PdqScratch::new());
 }
 
 // The DCT matrix only depends on constants
@@ -131,8 +148,8 @@ fn apply_sign(v: f32, r: usize, c: usize, neg_rows: bool, neg_cols: bool) -> f32
     // DCT_FREQ_OFFSET = 1 the DC term is dropped, so the parity is inverted
     // relative to the index; getting this wrong complements the hash of every
     // variant built from an odd number of mirrors.
-    let flip_r = neg_rows && (r + DCT_FREQ_OFFSET) % 2 == 1;
-    let flip_c = neg_cols && (c + DCT_FREQ_OFFSET) % 2 == 1;
+    let flip_r = neg_rows && !(r + DCT_FREQ_OFFSET).is_multiple_of(2);
+    let flip_c = neg_cols && !(c + DCT_FREQ_OFFSET).is_multiple_of(2);
     if flip_r ^ flip_c { -v } else { v }
 }
 
@@ -155,8 +172,9 @@ fn transpose_bit_rows(rows: &[u16; DCT_OUTPUT_W_H]) -> [u16; DCT_OUTPUT_W_H] {
 fn pack_bit_rows(rows: &[u16; DCT_OUTPUT_W_H]) -> [u8; HASH_LENGTH] {
     let mut hash = [0u8; HASH_LENGTH];
     for (r, &row) in rows.iter().enumerate() {
-        hash[HASH_LENGTH - 2 * r - 1] = (row & 0xFF) as u8;
-        hash[HASH_LENGTH - 2 * r - 2] = (row >> 8) as u8;
+        let [lo, hi] = row.to_le_bytes();
+        hash[HASH_LENGTH - 2 * r - 1] = lo;
+        hash[HASH_LENGTH - 2 * r - 2] = hi;
     }
     hash
 }
@@ -213,7 +231,7 @@ fn resize_luma_fast(img: &image::GrayImage, w: u32, h: u32) -> Option<image::Gra
     let mut dst_view = Image::new(w, h, fr::PixelType::U8);
 
     let options = ResizeOptions::new().resize_alg(RESIZE_ALG);
-    RESIZER.with(|r| r.borrow_mut().resize(&src_view, &mut dst_view, &options)).ok()?;
+    SCRATCH.with(|s| s.borrow_mut().resizer.resize(&src_view, &mut dst_view, &options)).ok()?;
 
     // Convert back to image::GrayImage
     image::GrayImage::from_raw(w, h, dst_view.into_vec())
@@ -238,24 +256,34 @@ fn calculate_target_dimensions(w: u32, h: u32, max_dim: u32) -> (u32, u32) {
 fn generate_pdq_from_luma(img: &image::GrayImage) -> (PdqFeatures, f32) {
     let num_cols = img.width() as usize;
     let num_rows = img.height() as usize;
-
-    // Convert u8 pixels to f32 for processing (straight over the raw buffer,
-    // which skips the per-pixel Luma wrapper)
-    let mut luma_buffer: Vec<f32> = img.as_raw().iter().map(|&p| p as f32).collect();
-
     let window_size_along_rows = num_cols.div_ceil(JAROSZ_WINDOW_DIVISOR);
     let window_size_along_cols = num_rows.div_ceil(JAROSZ_WINDOW_DIVISOR);
 
-    jarosz_filter_float(
-        &mut luma_buffer,
-        num_rows,
-        num_cols,
-        window_size_along_rows,
-        window_size_along_cols,
-        PDQ_NUM_JAROSZ_XY_PASSES,
-    );
+    let buffer64x64 = SCRATCH.with(|s| {
+        let mut scratch = s.borrow_mut();
+        let PdqScratch { luma_buf, tmp_buf, .. } = &mut *scratch;
 
-    let buffer64x64 = decimate_float::<BUFFER_W_H, BUFFER_W_H>(&luma_buffer, num_rows, num_cols);
+        // Reuse thread-local float buffers across images instead of allocating
+        // two new Vec<f32> on every call.
+        luma_buf.clear();
+        luma_buf.extend(img.as_raw().iter().map(|&p| f32::from(p)));
+
+        tmp_buf.clear();
+        tmp_buf.resize(luma_buf.len(), 0.0);
+
+        jarosz_filter_float(
+            luma_buf,
+            tmp_buf,
+            num_rows,
+            num_cols,
+            window_size_along_rows,
+            window_size_along_cols,
+            PDQ_NUM_JAROSZ_XY_PASSES,
+        );
+
+        decimate_float::<BUFFER_W_H, BUFFER_W_H>(luma_buf, num_rows, num_cols)
+    });
+
     let quality = pdq_image_domain_quality_metric(&buffer64x64);
     let features = PdqFeatures::new(&buffer64x64);
     (features, quality)
@@ -269,7 +297,8 @@ fn to_luma601(img: &image::DynamicImage) -> image::GrayImage {
     #[inline(always)]
     fn luma601(px: &[u8]) -> u8 {
         // (299r + 587g + 114b + 500) / 1000, rounded, integer only
-        ((299 * px[0] as u32 + 587 * px[1] as u32 + 114 * px[2] as u32 + 500) / 1000) as u8
+        ((299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2]) + 500) / 1000)
+            as u8
     }
 
     let (w, h) = (img.width(), img.height());
@@ -292,8 +321,9 @@ fn compute_dct_matrix() -> [[f32; BUFFER_W_H]; DCT_OUTPUT_W_H] {
 
     for (i, row) in matrix.iter_mut().enumerate() {
         // Rows (Frequency)
-        let freq = (i + DCT_FREQ_OFFSET) as f32;
-        let normalization = if freq == 0.0 { inv_sqrt_cols } else { inv_sqrt_cols * sqrt_2 };
+        let freq_idx = i + DCT_FREQ_OFFSET;
+        let freq = freq_idx as f32;
+        let normalization = if freq_idx == 0 { inv_sqrt_cols } else { inv_sqrt_cols * sqrt_2 };
         for (j, cell) in row.iter_mut().enumerate() {
             // Cols (Space)
             let angle = (PI * freq * (2.0 * (j as f32) + 1.0)) / (2.0 * (num_cols as f32));
@@ -314,8 +344,8 @@ fn dct64_to_16(input: &[[f32; BUFFER_W_H]; BUFFER_W_H]) -> [f32; DCT_OUTPUT_MATR
     for (i, inter_row) in intermediate.iter_mut().enumerate() {
         for (k, in_row) in input.iter().enumerate() {
             let coeff = dct_mat[i][k];
-            for j in 0..BUFFER_W_H {
-                inter_row[j] += coeff * in_row[j];
+            for (inter_val, &in_val) in inter_row.iter_mut().zip(in_row.iter()) {
+                *inter_val += coeff * in_val;
             }
         }
     }
@@ -323,11 +353,11 @@ fn dct64_to_16(input: &[[f32; BUFFER_W_H]; BUFFER_W_H]) -> [f32; DCT_OUTPUT_MATR
     let mut output = [0.0; DCT_OUTPUT_MATRIX_SIZE];
 
     // Pass 2: Columns (Using same matrix, effectively Transposed * Matrix)
-    for i in 0..DCT_OUTPUT_W_H {
-        for j in 0..DCT_OUTPUT_W_H {
+    for (i, inter_row) in intermediate.iter().enumerate() {
+        for (j, dct_row) in dct_mat.iter().enumerate() {
             let mut sum = 0.0;
-            for k in 0..BUFFER_W_H {
-                sum += intermediate[i][k] * dct_mat[j][k];
+            for (&inter_val, &dct_val) in inter_row.iter().zip(dct_row.iter()) {
+                sum += inter_val * dct_val;
             }
             output[i * DCT_OUTPUT_W_H + j] = sum;
         }
@@ -409,6 +439,7 @@ fn box_along_cols_float(input: &[f32], output: &mut [f32], rows: usize, cols: us
 
 fn jarosz_filter_float(
     buf: &mut [f32],
+    tmp: &mut [f32],
     rows: usize,
     cols: usize,
     w_rows: usize,
@@ -417,11 +448,10 @@ fn jarosz_filter_float(
 ) {
     // The column pass walks with a stride instead of transposing the whole
     // buffer twice per repetition; same arithmetic, four fewer full-image
-    // copies per rep.
-    let mut tmp = vec![0.0; buf.len()];
+    // copies per rep, and `tmp` is provided by the caller's thread-local scratch.
     for _ in 0..nreps {
-        box_along_rows_float(buf, &mut tmp, rows, cols, w_rows);
-        box_along_cols_float(&tmp, buf, rows, cols, w_cols);
+        box_along_rows_float(buf, tmp, rows, cols, w_rows);
+        box_along_cols_float(tmp, buf, rows, cols, w_cols);
     }
 }
 
@@ -455,8 +485,7 @@ fn pdq_image_domain_quality_metric<const R: usize, const C: usize>(buf: &[[f32; 
     let sum: f32 =
         vertical.chain(horizontal).map(|(a, b)| (((a - b) * 100.0) / 255.0).abs().trunc()).sum();
 
-    let q = sum / 90.0;
-    if q > 1.0 { 1.0 } else { q }
+    (sum / 90.0).min(1.0)
 }
 
 // --- CORRECTNESS TESTS ---
@@ -683,9 +712,9 @@ mod benchmarks {
         let avg_time = duration / iterations_feats;
 
         println!("\n=== Benchmark Results ===");
-        println!("generate_pdq_features ({} iterations):", iterations_feats);
-        println!("  Total time: {:?}", duration);
-        println!("  Avg time:   {:?}", avg_time);
+        println!("generate_pdq_features ({iterations_feats} iterations):");
+        println!("  Total time: {duration:?}");
+        println!("  Avg time:   {avg_time:?}");
 
         // ---------------------------------------------------------
         // Benchmark 2: generate_dihedral_hashes
@@ -701,9 +730,9 @@ mod benchmarks {
         let duration = start.elapsed();
         let avg_time = duration / iterations_dihed;
 
-        println!("generate_dihedral_hashes ({} iterations):", iterations_dihed);
-        println!("  Total time: {:?}", duration);
-        println!("  Avg time:   {:?}", avg_time);
+        println!("generate_dihedral_hashes ({iterations_dihed} iterations):");
+        println!("  Total time: {duration:?}");
+        println!("  Avg time:   {avg_time:?}");
         println!("=========================\n");
     }
 }

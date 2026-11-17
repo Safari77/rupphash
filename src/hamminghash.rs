@@ -54,20 +54,13 @@ impl HammingHash for [u8; 32] {
 
     #[inline(always)]
     fn hamming_distance(&self, other: &Self) -> u32 {
-        let a0 = u64::from_ne_bytes(self[0..8].try_into().unwrap());
-        let a1 = u64::from_ne_bytes(self[8..16].try_into().unwrap());
-        let a2 = u64::from_ne_bytes(self[16..24].try_into().unwrap());
-        let a3 = u64::from_ne_bytes(self[24..32].try_into().unwrap());
-
-        let b0 = u64::from_ne_bytes(other[0..8].try_into().unwrap());
-        let b1 = u64::from_ne_bytes(other[8..16].try_into().unwrap());
-        let b2 = u64::from_ne_bytes(other[16..24].try_into().unwrap());
-        let b3 = u64::from_ne_bytes(other[24..32].try_into().unwrap());
-
-        (a0 ^ b0).count_ones()
-            + (a1 ^ b1).count_ones()
-            + (a2 ^ b2).count_ones()
-            + (a3 ^ b3).count_ones()
+        let (a_chunks, _) = self.as_chunks::<8>();
+        let (b_chunks, _) = other.as_chunks::<8>();
+        a_chunks
+            .iter()
+            .zip(b_chunks.iter())
+            .map(|(&a, &b)| (u64::from_ne_bytes(a) ^ u64::from_ne_bytes(b)).count_ones())
+            .sum()
     }
 
     fn bit_width_per_chunk() -> usize {
@@ -102,17 +95,14 @@ impl<H: HammingHash> MIHIndex<H> {
     pub fn new(hashes: Vec<H>) -> Self {
         let num_buckets = H::NUM_CHUNKS * H::NUM_BUCKETS;
         let mut offsets = vec![0u32; num_buckets + 1];
-        let mut values = Vec::<DenseId>::new();
 
         // Count phase
-        for (i, h) in hashes.iter().enumerate() {
-            let dense = DenseId(i as u32);
+        for h in &hashes {
             for k in 0..H::NUM_CHUNKS {
                 let bucket = h.get_chunk(k) as usize;
                 let flat = k * H::NUM_BUCKETS + bucket;
                 offsets[flat + 1] += 1;
             }
-            let _ = dense; // silence warnings if unused in some builds
         }
 
         // Prefix sum
@@ -120,7 +110,8 @@ impl<H: HammingHash> MIHIndex<H> {
             offsets[i] += offsets[i - 1];
         }
 
-        values.resize(offsets.last().copied().unwrap() as usize, DenseId(0));
+        let total_entries = offsets.last().copied().unwrap_or(0) as usize;
+        let mut values = vec![DenseId(0); total_entries];
 
         // Fill phase
         let mut cursor = offsets.clone();
@@ -214,48 +205,40 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
     let adjacency: Vec<Vec<u32>> = (0..n)
         .into_par_iter()
         .map_init(
-            || (SparseBitSet::new(n), Vec::new()),
-            |(visited, results), i| {
+            || SparseBitSet::new(n),
+            |visited, i| {
                 visited.clear();
-                results.clear();
-
+                let mut results = Vec::new();
                 let query_hash = index.hash(DenseId(i as u32));
 
                 for k in 0..H::NUM_CHUNKS {
                     let q_chunk = query_hash.get_chunk(k);
 
-                    let check_bucket =
-                        |val: u16, visited: &mut SparseBitSet, results: &mut Vec<u32>| {
-                            let bucket = index.bucket(k, val);
+                    let mut check_bucket = |val: u16| {
+                        for &dense in index.bucket(k, val) {
+                            let dense_idx = dense.index();
 
-                            for dense in bucket {
-                                let dense_idx = dense.index();
-
-                                if dense_idx == i {
-                                    continue;
-                                }
-
-                                if visited.set(dense_idx) {
-                                    continue;
-                                }
-
-                                let cand_hash = index.hash(*dense);
-                                if query_hash.hamming_distance(cand_hash) <= max_dist {
-                                    results.push(dense_idx as u32);
-                                }
+                            if dense_idx == i || visited.set(dense_idx) {
+                                continue;
                             }
-                        };
 
-                    check_bucket(q_chunk, visited, results);
+                            let cand_hash = index.hash(dense);
+                            if query_hash.hamming_distance(cand_hash) <= max_dist {
+                                results.push(dense_idx as u32);
+                            }
+                        }
+                    };
+
+                    check_bucket(q_chunk);
 
                     if chunk_tolerance >= 1 {
                         for bit in 0..bits_per_chunk {
-                            check_bucket(q_chunk ^ (1 << bit), visited, results);
+                            check_bucket(q_chunk ^ (1 << bit));
                         }
                     }
                 }
 
-                results.clone()
+                results
             },
         )
         .collect();
@@ -264,15 +247,15 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
     let mut visited = vec![false; n];
     let mut groups = Vec::new();
 
-    for i in 0..n {
-        if visited[i] || adjacency[i].is_empty() {
+    for (i, neighbors) in adjacency.iter().enumerate() {
+        if visited[i] || neighbors.is_empty() {
             continue;
         }
 
         let mut group = vec![i as u32];
         visited[i] = true;
 
-        for &neighbor in &adjacency[i] {
+        for &neighbor in neighbors {
             let idx = neighbor as usize;
             if !visited[idx] {
                 visited[idx] = true;
@@ -316,7 +299,7 @@ mod tests {
             // Query using find_groups (wrapper around the internal query logic)
             // We use distance 12, which is high for pHash but valid for testing limits.
             let groups = find_groups(&index, 12);
-            println!("Querying distance 12 (u64)... Found: {:?}", groups);
+            println!("Querying distance 12 (u64)... Found: {groups:?}");
 
             // Expecting 1 group containing [0, 1] (order may vary)
             assert!(!groups.is_empty(), "Failed to find any groups for u64");
@@ -339,7 +322,7 @@ mod tests {
             let index = MIHIndex::new(hashes);
 
             let groups = find_groups(&index, 30);
-            println!("Querying distance 30 (PDQ)... Found: {:?}", groups);
+            println!("Querying distance 30 (PDQ)... Found: {groups:?}");
 
             assert!(!groups.is_empty(), "Failed to find any groups for PDQ");
             let group = &groups[0];
@@ -355,12 +338,12 @@ mod tests {
     #[ignore = "slow test"]
     fn test_1_million_images_performance() {
         let n = 1_000_000;
-        println!("\n--- PERFORMANCE TEST: {} Images (Generic u64) ---", n);
+        println!("\n--- PERFORMANCE TEST: {n} Images (Generic u64) ---");
 
         let mut rng = rand::rng();
 
         // 1. Generate Data
-        println!("Generating {} random hashes...", n);
+        println!("Generating {n} random hashes...");
         let mut hashes: Vec<u64> = (0..n).map(|_| rng.random()).collect();
 
         // 2. Define a "Cluster" of 5 similar images
@@ -383,7 +366,7 @@ mod tests {
             }
         }
 
-        println!("Injecting similar hashes at random indices: {:?}", injected_indices);
+        println!("Injecting similar hashes at random indices: {injected_indices:?}");
         for (i, &idx) in injected_indices.iter().enumerate() {
             hashes[idx] = cluster_values[i];
         }
@@ -392,21 +375,17 @@ mod tests {
         let start_index = Instant::now();
         let index = MIHIndex::new(hashes.clone()); // Cloning just to simulate real usage
         let duration_index = start_index.elapsed();
-        println!("Building Index took: {:.2?}", duration_index);
+        println!("Building Index took: {duration_index:.2?}");
 
         // 5. Run Grouping (Parallel)
         let max_dist = 5;
-        println!(
-            "Grouping (max_dist={}) with {} threads...",
-            max_dist,
-            rayon::current_num_threads()
-        );
+        println!("Grouping (max_dist={max_dist}) with {} threads...", rayon::current_num_threads());
 
         let start_group = Instant::now();
         let groups = find_groups(&index, max_dist);
         let duration_group = start_group.elapsed();
 
-        println!("Grouping took:        {:.2?}", duration_group);
+        println!("Grouping took:        {duration_group:.2?}");
         println!("Total Time (Compute): {:.2?}", duration_index + duration_group);
 
         // 6. Verify Results
@@ -419,14 +398,13 @@ mod tests {
         assert!(found_group.is_some(), "The injected images were not found in any group!");
 
         let g = found_group.unwrap();
-        println!("Found Target Group Size: {} (Indices: {:?})", g.len(), g);
+        println!("Found Target Group Size: {} (Indices: {g:?})", g.len());
 
         // Verify that ALL injected indices are present in this group
         for &expected_idx in &injected_indices {
             assert!(
                 g.contains(&(expected_idx as u32)),
-                "Group missing injected index {}",
-                expected_idx
+                "Group missing injected index {expected_idx}"
             );
         }
     }
@@ -480,8 +458,7 @@ mod tests {
             }
 
             println!(
-                "Transform: {:<25} | Best Match Index: {} | Hamming Distance: {}",
-                name, best_idx, min_dist
+                "Transform: {name:<25} | Best Match Index: {best_idx} | Hamming Distance: {min_dist}"
             );
 
             // Pixel-domain rotation causes resampling artifacts that can flip bits.
@@ -490,10 +467,7 @@ mod tests {
 
             assert!(
                 min_dist <= tolerance,
-                "FAIL: Transform '{}' resulted in distance {} (expected <= {})",
-                name,
-                min_dist,
-                tolerance
+                "FAIL: Transform '{name}' resulted in distance {min_dist} (expected <= {tolerance})"
             );
         }
 

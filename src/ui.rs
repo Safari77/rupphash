@@ -1,7 +1,8 @@
-use std::time::Duration; // Added for directory scanning
 use std::{
     fs,
     io::{self, Stdout},
+    path::PathBuf,
+    time::Duration,
 };
 
 use crossterm::{
@@ -21,6 +22,27 @@ use crate::{
         AppState, InputIntent, format_path_depth, get_bit_identical_counts, get_hardlink_groups,
     },
 };
+
+/// RAII guard to ensure raw mode and alternate screen are always restored on exit or panic.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        if let Err(e) = execute!(io::stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
 
 pub struct TuiApp {
     state: AppState,
@@ -59,15 +81,9 @@ impl TuiApp {
     }
 
     pub fn run(&mut self) -> io::Result<()> {
-        enable_raw_mode()?;
+        let _guard = TerminalGuard::enter()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-
-        let res = self.run_loop(&mut stdout);
-
-        disable_raw_mode()?;
-        execute!(stdout, LeaveAlternateScreen)?;
-        res
+        self.run_loop(&mut stdout)
     }
 
     fn run_loop(&mut self, terminal: &mut Stdout) -> io::Result<()> {
@@ -94,11 +110,15 @@ impl TuiApp {
             self.list_state.select(None);
             return;
         }
-        let mut abs_idx = 0;
-        for i in 0..self.state.current_group_idx {
-            abs_idx += 1 + self.state.groups[i].len();
-        }
-        abs_idx += 1 + self.state.current_file_idx;
+        let abs_idx: usize = self
+            .state
+            .groups
+            .iter()
+            .take(self.state.current_group_idx)
+            .map(|g| 1 + g.len())
+            .sum::<usize>()
+            + 1
+            + self.state.current_file_idx;
         self.list_state.select(Some(abs_idx));
     }
 
@@ -117,13 +137,17 @@ impl TuiApp {
                     self.move_buffer.clear();
                 },
                 KeyCode::Enter => {
-                    let path = std::path::PathBuf::from(&self.move_buffer);
+                    let path = PathBuf::from(&self.move_buffer);
                     if path.is_dir() {
                         self.state.move_target = Some(path);
                         self.show_move_input = false;
                         self.state.handle_input(InputIntent::MoveMarked);
                     } else {
-                        // Flash error or set error state
+                        self.show_move_input = false;
+                        self.state.set_status(
+                            format!("Move target is not a directory: {}", self.move_buffer),
+                            true,
+                        );
                     }
                 },
                 KeyCode::Backspace => {
@@ -134,14 +158,14 @@ impl TuiApp {
                 },
                 KeyCode::Tab => {
                     // Similar Directory-Only Completion Logic as GUI
-                    let path_buf = std::path::PathBuf::from(&self.move_buffer);
+                    let path_buf = PathBuf::from(&self.move_buffer);
                     let (parent, prefix) = if self.move_buffer.ends_with(std::path::MAIN_SEPARATOR)
                     {
-                        (Some(path_buf.as_path()), "".to_string())
+                        (Some(path_buf.as_path()), String::new())
                     } else {
                         (
                             path_buf.parent(),
-                            path_buf.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                            path_buf.file_name().unwrap_or_default().to_string_lossy().into_owned(),
                         )
                     };
 
@@ -163,7 +187,7 @@ impl TuiApp {
                                     if let Ok(ft) = entry.file_type()
                                         && ft.is_dir()
                                     {
-                                        let name = entry.path().to_string_lossy().to_string();
+                                        let name = entry.path().to_string_lossy().into_owned();
                                         // Basic prefix check
                                         if name.starts_with(&self.move_buffer)
                                             || entry
@@ -179,8 +203,9 @@ impl TuiApp {
                             }
                         }
                         if !self.move_completion_candidates.is_empty() {
-                            self.move_buffer =
-                                self.move_completion_candidates[self.move_completion_index].clone();
+                            self.move_buffer.clone_from(
+                                &self.move_completion_candidates[self.move_completion_index],
+                            );
                             self.move_completion_index = (self.move_completion_index + 1)
                                 % self.move_completion_candidates.len();
                         }
@@ -200,8 +225,8 @@ impl TuiApp {
                     self.completion_candidates.clear();
                 },
                 KeyCode::Enter => {
-                    self.state.handle_input(InputIntent::SubmitRename(self.rename_buffer.clone()));
-                    self.rename_buffer.clear();
+                    let submitted = std::mem::take(&mut self.rename_buffer);
+                    self.state.handle_input(InputIntent::SubmitRename(submitted));
                     self.completion_candidates.clear();
                 },
                 KeyCode::Backspace => {
@@ -211,11 +236,10 @@ impl TuiApp {
                     self.rename_buffer.push(c);
                 },
                 KeyCode::Tab => {
-                    let parent = if let Some(state) = &self.state.renaming {
-                        state.original_path.parent().map(|p| p.to_path_buf())
-                    } else {
-                        None
-                    };
+                    let parent =
+                        self.state.renaming.as_ref().and_then(|s| {
+                            s.original_path.parent().map(std::path::Path::to_path_buf)
+                        });
 
                     if let Some(parent_dir) = parent {
                         // Calculate previous index to check if input matches what we last auto-completed
@@ -235,10 +259,9 @@ impl TuiApp {
                             self.completion_candidates.clear();
                             self.completion_index = 0;
                             if let Ok(entries) = fs::read_dir(&parent_dir) {
-                                let prefix = self.rename_buffer.clone();
                                 for entry in entries.flatten() {
-                                    let name = entry.file_name().to_string_lossy().to_string();
-                                    if name.starts_with(&prefix) {
+                                    let name = entry.file_name().to_string_lossy().into_owned();
+                                    if name.starts_with(&self.rename_buffer) {
                                         self.completion_candidates.push(name);
                                     }
                                 }
@@ -248,8 +271,8 @@ impl TuiApp {
 
                         // Apply the next completion
                         if !self.completion_candidates.is_empty() {
-                            self.rename_buffer =
-                                self.completion_candidates[self.completion_index].clone();
+                            self.rename_buffer
+                                .clone_from(&self.completion_candidates[self.completion_index]);
                             self.completion_index =
                                 (self.completion_index + 1) % self.completion_candidates.len();
                         }
@@ -263,11 +286,9 @@ impl TuiApp {
         // 3. Delete Confirmation
         if self.state.show_confirmation {
             match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.state.handle_input(InputIntent::ConfirmDelete)
-                },
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.state.handle_input(InputIntent::Cancel)
+                KeyCode::Char('y' | 'Y') => self.state.handle_input(InputIntent::ConfirmDelete),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    self.state.handle_input(InputIntent::Cancel);
                 },
                 _ => {},
             }
@@ -277,11 +298,11 @@ impl TuiApp {
         // 4. Move Confirmation
         if self.state.show_move_confirmation {
             match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.state.handle_input(InputIntent::ConfirmMoveMarked)
+                KeyCode::Char('y' | 'Y') => {
+                    self.state.handle_input(InputIntent::ConfirmMoveMarked);
                 },
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.state.handle_input(InputIntent::Cancel)
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    self.state.handle_input(InputIntent::Cancel);
                 },
                 _ => {},
             }
@@ -291,11 +312,11 @@ impl TuiApp {
         // 5. Delete Immediate Confirmation
         if self.state.show_delete_immediate_confirmation {
             match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.state.handle_input(InputIntent::ConfirmDeleteImmediate)
+                KeyCode::Char('y' | 'Y') => {
+                    self.state.handle_input(InputIntent::ConfirmDeleteImmediate);
                 },
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.state.handle_input(InputIntent::Cancel)
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    self.state.handle_input(InputIntent::Cancel);
                 },
                 _ => {},
             }
@@ -306,10 +327,10 @@ impl TuiApp {
         if self.state.show_sort_selection {
             match code {
                 KeyCode::Char('1') => {
-                    self.state.handle_input(InputIntent::ChangeSortOrder("name".to_string()))
+                    self.state.handle_input(InputIntent::ChangeSortOrder("name".to_string()));
                 },
                 KeyCode::Char('2') => {
-                    self.state.handle_input(InputIntent::ChangeSortOrder("name-desc".to_string()))
+                    self.state.handle_input(InputIntent::ChangeSortOrder("name-desc".to_string()));
                 },
                 KeyCode::Char('3') => self
                     .state
@@ -318,25 +339,28 @@ impl TuiApp {
                     .state
                     .handle_input(InputIntent::ChangeSortOrder("name-natural-desc".to_string())),
                 KeyCode::Char('5') => {
-                    self.state.handle_input(InputIntent::ChangeSortOrder("date".to_string()))
+                    self.state.handle_input(InputIntent::ChangeSortOrder("date".to_string()));
                 },
                 KeyCode::Char('6') => {
-                    self.state.handle_input(InputIntent::ChangeSortOrder("date-desc".to_string()))
+                    self.state.handle_input(InputIntent::ChangeSortOrder("date-desc".to_string()));
                 },
                 KeyCode::Char('7') => {
-                    self.state.handle_input(InputIntent::ChangeSortOrder("size".to_string()))
+                    self.state.handle_input(InputIntent::ChangeSortOrder("size".to_string()));
                 },
                 KeyCode::Char('8') => {
-                    self.state.handle_input(InputIntent::ChangeSortOrder("size-desc".to_string()))
+                    self.state.handle_input(InputIntent::ChangeSortOrder("size-desc".to_string()));
                 },
                 KeyCode::Char('9') => {
-                    self.state.handle_input(InputIntent::ChangeSortOrder("random".to_string()))
+                    self.state.handle_input(InputIntent::ChangeSortOrder("random".to_string()));
                 },
-                KeyCode::Esc | KeyCode::Char('n') => self.state.handle_input(InputIntent::Cancel),
+                KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                    self.state.handle_input(InputIntent::Cancel);
+                },
                 _ => {},
             }
             return;
         }
+
         if self.state.show_search {
             match code {
                 KeyCode::Esc => {
@@ -344,8 +368,8 @@ impl TuiApp {
                     self.search_buffer.clear();
                 },
                 KeyCode::Enter => {
-                    self.state.handle_input(InputIntent::SubmitSearch(self.search_buffer.clone()));
-                    self.search_buffer.clear();
+                    let query = std::mem::take(&mut self.search_buffer);
+                    self.state.handle_input(InputIntent::SubmitSearch(query));
                 },
                 KeyCode::Backspace => {
                     self.search_buffer.pop();
@@ -399,7 +423,7 @@ impl TuiApp {
                 // Pre-fill buffer with current filename
                 if let Some(path) = self.state.get_current_image_path() {
                     self.rename_buffer =
-                        path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        path.file_name().unwrap_or_default().to_string_lossy().into_owned();
                 }
                 // Clear any old completion state
                 self.completion_candidates.clear();
@@ -409,8 +433,8 @@ impl TuiApp {
             KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(InputIntent::StartSearch)
             },
-            KeyCode::F(3) | KeyCode::Char('n') => {
-                // 'n' for next is common tui convention
+            KeyCode::F(3) | KeyCode::Char('n' | 'N') => {
+                // 'n' for next, 'N' or Shift+F3 for previous
                 if modifiers.contains(KeyModifiers::SHIFT) || code == KeyCode::Char('N') {
                     Some(InputIntent::PrevSearchResult)
                 } else {
@@ -439,7 +463,7 @@ impl TuiApp {
 
         let main_layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(vec![
+            .constraints([
                 Constraint::Min(0),
                 Constraint::Length(1), // Status Bar
             ])
@@ -450,13 +474,12 @@ impl TuiApp {
         // --- Status Bar ---
         let status_widget = if let Some((msg, is_error)) = &self.state.status_message {
             let color = if *is_error { Color::Red } else { Color::Green };
-            Paragraph::new(Span::styled(msg, Style::default().fg(color)))
+            Paragraph::new(Span::styled(msg.as_str(), Style::default().fg(color)))
         } else {
             let mode = if self.state.use_trash { "Trash" } else { "Perm" };
             let time_mode = if self.state.show_relative_times { "Rel" } else { "Abs" };
             Paragraph::new(Span::raw(format!(
-                "Mode: {} | Time: {} | [Space]: Mark | [d]: Delete | [m]: Move | [r]: Rename | [s]: Sort | [q]: Quit",
-                mode, time_mode
+                "Mode: {mode} | Time: {time_mode} | [Space]: Mark | [d]: Delete | [m]: Move | [r]: Rename | [s]: Sort | [q]: Quit"
             )))
         };
 
@@ -494,7 +517,7 @@ impl TuiApp {
                 let is_marked = self.state.marked_for_deletion.contains(&file.path);
                 let is_selected =
                     g_idx == self.state.current_group_idx && f_idx == self.state.current_file_idx;
-                let is_bit_identical = *counts.get(&file.content_hash).unwrap_or(&0) > 1;
+                let is_bit_identical = counts.get(&file.content_hash).copied().unwrap_or(0) > 1;
                 let is_hardlinked = hardlink_groups.contains_key(&file.unique_file_id);
 
                 let style = if is_selected {
@@ -509,7 +532,7 @@ impl TuiApp {
                     Style::default()
                 };
 
-                let marker = if is_marked { "*" } else { " " };
+                let marker = if is_marked { "* " } else { "  " };
                 let marker_style = if is_marked {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                 } else {
@@ -521,31 +544,36 @@ impl TuiApp {
                 let size_kb = file.size / 1024;
 
                 let time_str = if self.state.show_relative_times {
-                    let ts = Timestamp::from_second(file.modified.timestamp())
-                        .unwrap()
-                        .checked_add(jiff::SignedDuration::from_nanos(
-                            file.modified.timestamp_subsec_nanos() as i64,
-                        ))
-                        .unwrap();
-                    format_relative_time(ts)
+                    Timestamp::from_second(file.modified.timestamp())
+                        .ok()
+                        .and_then(|ts| {
+                            ts.checked_add(jiff::SignedDuration::from_nanos(i64::from(
+                                file.modified.timestamp_subsec_nanos(),
+                            )))
+                            .ok()
+                        })
+                        .map_or_else(
+                            || file.modified.format("%Y-%m-%d %H:%M:%S").to_string(),
+                            format_relative_time,
+                        )
                 } else {
                     file.modified.format("%Y-%m-%d %H:%M:%S").to_string()
                 };
 
                 let res_str = if let Some((w, h)) = file.resolution {
-                    format!("{}x{}", w, h)
+                    format!("{w}x{h}")
                 } else {
                     "???x???".to_string()
                 };
 
                 let line1 = Line::from(vec![
-                    Span::styled(format!("{} ", marker), marker_style),
+                    Span::styled(marker, marker_style),
                     Span::styled(path_display, style.add_modifier(Modifier::BOLD)),
                 ]);
 
                 let line2 = Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(format!("{} | {} KB | {}", time_str, size_kb, res_str), style),
+                    Span::styled(format!("{time_str} | {size_kb} KB | {res_str}"), style),
                 ]);
 
                 list_items.push(ListItem::new(vec![line1, line2]));
@@ -564,8 +592,7 @@ impl TuiApp {
         if self.state.show_confirmation {
             let action = if self.state.use_trash { "trash" } else { "delete" };
             let text = format!(
-                "Are you sure you want to {} {} files?\n\n(y) Yes / (n) No",
-                action,
+                "Are you sure you want to {action} {} files?\n\n(y) Yes / (n) No",
                 self.state.marked_for_deletion.len()
             );
             render_popup(frame, "Confirm Deletion", &text, 60, 20, Color::Red);
@@ -577,7 +604,7 @@ impl TuiApp {
                 .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
                 .unwrap_or_default();
             let action = if self.state.use_trash { "trash" } else { "delete" };
-            let text = format!("{} current file?\n{}\n\n(y) Yes / (n) No", action, name);
+            let text = format!("{action} current file?\n{name}\n\n(y) Yes / (n) No");
             render_popup(frame, "Confirm Delete", &text, 60, 20, Color::Red);
         }
 
@@ -586,24 +613,19 @@ impl TuiApp {
                 .state
                 .move_target
                 .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or("???".into());
+                .map_or_else(|| "???".to_string(), |p| p.display().to_string());
             // Metadata read from the kept-open destination dirfd: mtime + fs
             // type. Same info as the GUI confirm dialog.
             let info = if let Some(d) = self.state.move_dest_info.as_ref() {
-                let modified = d
-                    .mtime_timestamp()
-                    .map(format_relative_time)
-                    .unwrap_or_else(|| "?".to_string());
-                format!("\nDest modified: {}\nFilesystem: {}", modified, d.fs_type)
+                let modified =
+                    d.mtime_timestamp().map_or_else(|| "?".to_string(), format_relative_time);
+                format!("\nDest modified: {modified}\nFilesystem: {}", d.fs_type)
             } else {
                 String::new()
             };
             let text = format!(
-                "Move {} files to:\n{}{}\n\n(y) Yes / (n) No",
+                "Move {} files to:\n{target}{info}\n\n(y) Yes / (n) No",
                 self.state.marked_for_deletion.len(),
-                target,
-                info
             );
             render_popup(frame, "Confirm Move", &text, 60, 25, Color::Cyan);
         }
@@ -620,7 +642,7 @@ impl TuiApp {
                 .title("Rename File")
                 .borders(Borders::ALL)
                 .style(Style::default().bg(Color::Blue).fg(Color::White));
-            let paragraph = Paragraph::new(self.rename_buffer.clone()).block(block);
+            let paragraph = Paragraph::new(self.rename_buffer.as_str()).block(block);
             let area = centered_rect(60, 10, area);
             frame.render_widget(Clear, area);
             frame.render_widget(paragraph, area);
@@ -636,7 +658,7 @@ impl TuiApp {
                 .title("Find (Regex)")
                 .borders(Borders::ALL)
                 .style(Style::default().bg(Color::Blue).fg(Color::White));
-            let paragraph = Paragraph::new(self.search_buffer.clone()).block(block);
+            let paragraph = Paragraph::new(self.search_buffer.as_str()).block(block);
             let area = centered_rect(60, 10, frame.area());
             frame.render_widget(Clear, area);
             frame.render_widget(paragraph, area);
@@ -667,7 +689,7 @@ fn render_popup(
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(vec![
+        .constraints([
             Constraint::Percentage((100 - percent_y) / 2),
             Constraint::Percentage(percent_y),
             Constraint::Percentage((100 - percent_y) / 2),
@@ -675,7 +697,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(r);
     Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(vec![
+        .constraints([
             Constraint::Percentage((100 - percent_x) / 2),
             Constraint::Percentage(percent_x),
             Constraint::Percentage((100 - percent_x) / 2),

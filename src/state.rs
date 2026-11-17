@@ -77,34 +77,24 @@ pub struct FileTransform {
     pub flip_vertical: bool,   // Up-down flip
 }
 
-impl FileTransform {}
-
 // --- Shared Helpers ---
 
 /// Formats a path to show only the last `depth + 1` components.
 pub fn format_path_depth(path: &Path, depth: usize) -> String {
-    let components: Vec<_> = path.components().collect();
-    if components.is_empty() {
-        return "".to_string();
+    let total = path.components().count();
+    if total == 0 {
+        return String::new();
     }
 
-    let take = depth + 1;
-    let len = components.len();
-
-    let start = len.saturating_sub(take);
-
-    let mut out = PathBuf::new();
-    for c in &components[start..] {
-        out.push(c);
-    }
-
-    out.to_string_lossy().to_string()
+    let skip = total.saturating_sub(depth + 1);
+    let out: PathBuf = path.components().skip(skip).collect();
+    out.to_string_lossy().into_owned()
 }
 
 /// Returns a map of content_hash -> count for a group of files.
 /// Used to detect and highlight bit-identical files in UIs.
 pub fn get_bit_identical_counts(group: &[FileMetadata]) -> HashMap<[u8; 32], usize> {
-    let mut counts = HashMap::new();
+    let mut counts = HashMap::with_capacity(group.len());
     for f in group {
         *counts.entry(f.content_hash).or_insert(0) += 1;
     }
@@ -112,7 +102,7 @@ pub fn get_bit_identical_counts(group: &[FileMetadata]) -> HashMap<[u8; 32], usi
 }
 
 pub fn get_content_subgroups(group: &[FileMetadata]) -> HashMap<[u8; 32], usize> {
-    let mut counts = HashMap::new();
+    let mut counts = HashMap::with_capacity(group.len());
     for f in group {
         if let Some(ph) = f.pixel_hash {
             *counts.entry(ph).or_insert(0) += 1;
@@ -124,14 +114,12 @@ pub fn get_content_subgroups(group: &[FileMetadata]) -> HashMap<[u8; 32], usize>
 
     // Assign IDs in order of appearance in the list to keep UI stable
     for f in group {
-        if let Some(ph) = f.pixel_hash {
-            // Only assign an ID if this hash appears more than once (is a duplicate)
-            if *counts.get(&ph).unwrap_or(&0) > 1
-                && let std::collections::hash_map::Entry::Vacant(e) = ids.entry(ph)
-            {
-                e.insert(next_id);
-                next_id += 1;
-            }
+        if let Some(ph) = f.pixel_hash
+            && counts.get(&ph).copied().unwrap_or(0) > 1
+            && let std::collections::hash_map::Entry::Vacant(e) = ids.entry(ph)
+        {
+            e.insert(next_id);
+            next_id += 1;
         }
     }
     ids
@@ -144,7 +132,7 @@ pub struct AppState {
     pub group_infos: Vec<GroupInfo>,
     pub current_group_idx: usize,
     pub current_file_idx: usize,
-    pub marked_for_deletion: Vec<PathBuf>,
+    pub marked_for_deletion: HashSet<PathBuf>,
     pub renaming: Option<RenameState>,
     pub show_relative_times: bool,
     pub use_trash: bool,
@@ -202,13 +190,13 @@ impl AppState {
         group_by: String,
         ext_priorities: HashMap<String, usize>,
     ) -> Self {
-        let count = groups.iter().map(|g| g.len()).sum();
+        let count = groups.iter().map(Vec::len).sum();
         Self {
             groups,
             group_infos,
             current_group_idx: 0,
             current_file_idx: 0,
-            marked_for_deletion: Vec::new(),
+            marked_for_deletion: HashSet::new(),
             renaming: None,
             show_relative_times,
             use_trash,
@@ -262,7 +250,7 @@ impl AppState {
             match intent {
                 InputIntent::ChangeSortOrder(sort) => {
                     self.show_sort_selection = false;
-                    self.perform_sort(sort);
+                    self.perform_sort(&sort);
                 },
                 InputIntent::Cancel | InputIntent::Quit => {
                     self.show_sort_selection = false;
@@ -336,7 +324,7 @@ impl AppState {
 
         if self.renaming.is_some() {
             match intent {
-                InputIntent::SubmitRename(new_name) => self.perform_rename(new_name),
+                InputIntent::SubmitRename(new_name) => self.perform_rename(&new_name),
                 InputIntent::Cancel => self.renaming = None,
                 _ => {},
             }
@@ -395,24 +383,24 @@ impl AppState {
             },
             InputIntent::ConfirmDeleteImmediate => {},
             InputIntent::MoveMarked => {
-                if self.move_target.is_none() {
+                let Some(ref target) = self.move_target else {
                     self.set_status("No move target set (use --move-marked)".to_string(), true);
-                } else if self.marked_for_deletion.is_empty() {
+                    return;
+                };
+                if self.marked_for_deletion.is_empty() {
                     self.set_status("No files marked.".to_string(), false);
                 } else {
                     // Open the destination directory now (before the dialog) so
                     // the same fd survives confirm + move, closing the TOCTOU
                     // window between display and the actual rename/copy.
-                    let target = self.move_target.clone().unwrap();
-                    match fileops::DestinationDir::open(&target) {
+                    match fileops::DestinationDir::open(target) {
                         Ok(dest) => {
                             self.move_dest_info = Some(dest);
                             self.show_move_confirmation = true;
                         },
                         Err(e) => {
                             self.error_popup = Some(format!(
-                                "Could not open move target {:?}:\n{}\n\n(Press any key to dismiss)",
-                                target, e
+                                "Could not open move target {target:?}:\n{e}\n\n(Press any key to dismiss)"
                             ));
                         },
                     }
@@ -478,17 +466,15 @@ impl AppState {
                     let transform = self.file_transforms.entry(file.unique_file_id).or_default();
                     transform.rotation = (transform.rotation + 1) % 4;
                 }
-                self.manual_rotation = (self.manual_rotation + 1) % 4;
-
                 // Also update legacy manual_rotation for compatibility
                 self.manual_rotation = (self.manual_rotation + 1) % 4;
             },
             InputIntent::ToggleLut => {
                 if self.has_lut {
                     self.lut_enabled = !self.lut_enabled;
-                    let lut_name = self.lut_names.get(self.lut_index).cloned().unwrap_or_default();
+                    let lut_name = self.lut_names.get(self.lut_index).map_or("", String::as_str);
                     let status = if self.lut_enabled {
-                        format!("3D LUT: ON [{}]", lut_name)
+                        format!("3D LUT: ON [{lut_name}]")
                     } else {
                         "3D LUT: OFF".to_string()
                     };
@@ -501,11 +487,11 @@ impl AppState {
                 let count = self.lut_names.len();
                 if self.has_lut && count > 0 {
                     self.lut_index = (self.lut_index + 1) % count;
-                    let lut_name = self.lut_names.get(self.lut_index).cloned().unwrap_or_default();
+                    let lut_name = self.lut_names.get(self.lut_index).map_or("", String::as_str);
                     let status = if self.lut_enabled {
-                        format!("3D LUT: [{}] ({}/{})", lut_name, self.lut_index + 1, count)
+                        format!("3D LUT: [{lut_name}] ({}/{count})", self.lut_index + 1)
                     } else {
-                        format!("3D LUT Selected: [{}] (OFF, press '3' to enable)", lut_name)
+                        format!("3D LUT Selected: [{lut_name}] (OFF, press '3' to enable)")
                     };
                     self.set_status(status, false);
                 } else {
@@ -540,10 +526,10 @@ impl AppState {
                 self.show_sort_selection = true;
             },
             InputIntent::NextGroupByDist => {
-                if self.groups.is_empty() {
+                let Some(curr_info) = self.group_infos.get(self.current_group_idx) else {
                     return;
-                }
-                let current_dist = self.group_infos[self.current_group_idx].max_dist;
+                };
+                let current_dist = curr_info.max_dist;
 
                 // Find next group index with strictly greater max_dist
                 if let Some(new_idx) = self
@@ -567,10 +553,10 @@ impl AppState {
                 }
             },
             InputIntent::PreviousGroupByDist => {
-                if self.groups.is_empty() {
+                let Some(curr_info) = self.group_infos.get(self.current_group_idx) else {
                     return;
-                }
-                let current_dist = self.group_infos[self.current_group_idx].max_dist;
+                };
+                let current_dist = curr_info.max_dist;
 
                 // Find the last group preceding current one that has strictly smaller max_dist
                 if let Some(new_idx) = self
@@ -596,7 +582,7 @@ impl AppState {
                 self.show_search = true;
             },
             InputIntent::SubmitSearch(query) => {
-                self.perform_search(query);
+                self.perform_search(&query);
             },
             InputIntent::CancelSearch => {
                 self.show_search = false;
@@ -638,15 +624,10 @@ impl AppState {
     }
 
     pub fn get_current_image_path(&self) -> Option<&PathBuf> {
-        if self.groups.is_empty() {
-            return None;
-        }
-        let group = &self.groups[self.current_group_idx];
-        if self.current_file_idx < group.len() {
-            Some(&group[self.current_file_idx].path)
-        } else {
-            None
-        }
+        self.groups
+            .get(self.current_group_idx)
+            .and_then(|group| group.get(self.current_file_idx))
+            .map(|f| &f.path)
     }
 
     /// Get the transform state for the current file (or default if none set)
@@ -659,73 +640,72 @@ impl AppState {
         FileTransform::default()
     }
 
-    fn perform_rename(&mut self, new_name: String) {
+    fn perform_rename(&mut self, new_name: &str) {
         if let Some(rename_state) = self.renaming.take() {
-            let parent = rename_state.original_path.parent().unwrap_or(std::path::Path::new("."));
-            let new_path = parent.join(&new_name);
+            let parent = rename_state.original_path.parent().unwrap_or_else(|| Path::new("."));
+            let new_path = parent.join(new_name);
 
             if new_path.exists() {
                 self.error_popup =
-                    Some(format!("Error: Destination already exists:\n{:?}", new_path));
+                    Some(format!("Error: Destination already exists:\n{new_path:?}"));
                 return;
             }
 
             match fs::rename(&rename_state.original_path, &new_path) {
-                Ok(_) => {
+                Ok(()) => {
+                    // Keep marked_for_deletion in sync if the renamed file was marked
+                    if self.marked_for_deletion.remove(&rename_state.original_path) {
+                        self.marked_for_deletion.insert(new_path.clone());
+                    }
                     if let Some(group) = self.groups.get_mut(rename_state.group_idx)
                         && let Some(file) = group.get_mut(rename_state.file_idx)
                     {
                         file.path = new_path;
-                        self.set_status(format!("Renamed to '{}'", new_name), false);
+                        self.set_status(format!("Renamed to '{new_name}'"), false);
                     }
                     self.selection_changed = true;
                 },
                 Err(e) => {
-                    self.error_popup = Some(format!("Failed to rename:\n{}", e));
+                    self.error_popup = Some(format!("Failed to rename:\n{e}"));
                 },
             }
         }
     }
 
-    fn perform_sort(&mut self, sort_order: String) {
+    fn perform_sort(&mut self, sort_order: &str) {
         // Capture current file path to preserve selection
         let current_path = self.get_current_image_path().cloned();
 
         for group in &mut self.groups {
-            sort_files(group, &sort_order);
+            sort_files(group, sort_order);
         }
 
         // Restore selection
         if let Some(path) = current_path {
             if let Some(group) = self.groups.get(self.current_group_idx) {
-                if let Some(new_idx) = group.iter().position(|f| f.path == path) {
-                    self.current_file_idx = new_idx;
-                } else {
-                    // Fallback if file not found (unlikely unless list changed concurrently)
-                    self.current_file_idx = 0;
-                }
+                self.current_file_idx = group.iter().position(|f| f.path == path).unwrap_or(0);
             }
         } else {
             self.current_file_idx = 0;
         }
 
-        self.set_status(format!("Sorted by: {}", sort_order), false);
+        self.set_status(format!("Sorted by: {sort_order}"), false);
         self.selection_changed = true;
     }
 
     pub fn next_item(&mut self) {
-        if self.groups.is_empty() {
+        let Some(group) = self.groups.get(self.current_group_idx) else {
             return;
-        }
+        };
         self.manual_rotation = 0; // Reset rotation
-        let group_len = self.groups[self.current_group_idx].len();
-        if self.current_file_idx + 1 < group_len {
+        if self.current_file_idx + 1 < group.len() {
             self.current_file_idx += 1;
         } else if self.current_group_idx + 1 < self.groups.len() {
             self.current_group_idx += 1;
             self.current_file_idx = 0;
         }
     }
+
     fn prev_item(&mut self) {
         if self.groups.is_empty() {
             return;
@@ -735,9 +715,10 @@ impl AppState {
             self.current_file_idx -= 1;
         } else if self.current_group_idx > 0 {
             self.current_group_idx -= 1;
-            self.current_file_idx = self.groups[self.current_group_idx].len() - 1;
+            self.current_file_idx = self.groups[self.current_group_idx].len().saturating_sub(1);
         }
     }
+
     fn next_group(&mut self) {
         if self.groups.is_empty() {
             return;
@@ -746,6 +727,7 @@ impl AppState {
         self.current_group_idx = (self.current_group_idx + 1) % self.groups.len();
         self.current_file_idx = 0;
     }
+
     fn prev_group(&mut self) {
         if self.groups.is_empty() {
             return;
@@ -758,6 +740,7 @@ impl AppState {
         }
         self.current_file_idx = 0;
     }
+
     fn go_home(&mut self) {
         if !self.groups.is_empty() {
             self.current_group_idx = 0;
@@ -765,13 +748,12 @@ impl AppState {
             self.manual_rotation = 0;
         }
     }
+
     fn go_end(&mut self) {
-        if !self.groups.is_empty() {
+        if let Some(g) = self.groups.last() {
             self.current_group_idx = self.groups.len() - 1;
             self.manual_rotation = 0;
-            if let Some(g) = self.groups.last() {
-                self.current_file_idx = g.len().saturating_sub(1);
-            }
+            self.current_file_idx = g.len().saturating_sub(1);
         }
     }
 
@@ -780,15 +762,14 @@ impl AppState {
             return;
         }
         self.manual_rotation = 0;
-        let mut current_abs = 0;
-        for i in 0..self.current_group_idx {
-            current_abs += 1 + self.groups[i].len();
-        }
-        current_abs += 1 + self.current_file_idx;
+        let current_abs: usize =
+            self.groups.iter().take(self.current_group_idx).map(|g| 1 + g.len()).sum::<usize>()
+                + 1
+                + self.current_file_idx;
         let total_rows: usize = self.groups.iter().map(|g| 1 + g.len()).sum();
         let scroll_amount = view_size.max(1);
         let target_abs = if down {
-            current_abs.saturating_add(scroll_amount).min(total_rows - 1)
+            current_abs.saturating_add(scroll_amount).min(total_rows.saturating_sub(1))
         } else {
             current_abs.saturating_sub(scroll_amount)
         };
@@ -819,12 +800,10 @@ impl AppState {
     }
 
     fn toggle_delete(&mut self) {
-        if let Some(path) = self.get_current_image_path().cloned() {
-            if self.marked_for_deletion.contains(&path) {
-                self.marked_for_deletion.retain(|p| p != &path);
-            } else {
-                self.marked_for_deletion.push(path);
-            }
+        if let Some(path) = self.get_current_image_path().cloned()
+            && !self.marked_for_deletion.remove(&path)
+        {
+            self.marked_for_deletion.insert(path);
         }
     }
 
@@ -834,7 +813,7 @@ impl AppState {
         }
         let mut success_count = 0;
         let mut failed_paths = HashSet::new();
-        let deleted_paths = self.marked_for_deletion.clone();
+        let deleted_paths: HashSet<PathBuf> = std::mem::take(&mut self.marked_for_deletion);
         let mut error_details = Vec::new();
 
         for path in &deleted_paths {
@@ -844,22 +823,19 @@ impl AppState {
                 fs::remove_file(path).map_err(|e| e.to_string())
             };
             match res {
-                Ok(_) => {
+                Ok(()) => {
                     success_count += 1;
                     let action = if self.use_trash { "TRASHED " } else { "DELETED " };
-                    eprintln!("[DELETE] {}{}", action, path.display());
+                    eprintln!("[DELETE] {action}{}", path.display());
                 },
                 Err(e) => {
-                    error_details.push(format!(
-                        "• {:?}: {}",
-                        path.file_name().unwrap_or_default(),
-                        e
-                    ));
+                    error_details
+                        .push(format!("• {:?}: {e}", path.file_name().unwrap_or_default(),));
                     failed_paths.insert(path.clone());
                 },
             }
         }
-        self.marked_for_deletion.retain(|p| failed_paths.contains(p));
+        self.marked_for_deletion = failed_paths.clone();
         if success_count > 0 {
             for group in &mut self.groups {
                 group
@@ -879,22 +855,12 @@ impl AppState {
                     i += 1;
                 }
             }
-            if self.groups.is_empty() {
-                self.current_group_idx = 0;
-                self.current_file_idx = 0;
-            } else {
-                if self.current_group_idx >= self.groups.len() {
-                    self.current_group_idx = self.groups.len() - 1;
-                }
-                if self.current_file_idx >= self.groups[self.current_group_idx].len() {
-                    self.current_file_idx = self.groups[self.current_group_idx].len() - 1;
-                }
-            }
+            self.clamp_selection();
             self.selection_changed = true;
         }
         if failed_paths.is_empty() {
             let action = if self.use_trash { "trashed" } else { "permanently deleted" };
-            self.set_status(format!("Successfully {} {} files.", action, success_count), false);
+            self.set_status(format!("Successfully {action} {success_count} files."), false);
         } else {
             let mut full_msg = format!("Failed to delete {} files:\n\n", failed_paths.len());
             full_msg.push_str(&error_details.into_iter().take(5).collect::<Vec<_>>().join("\n"));
@@ -918,50 +884,57 @@ impl AppState {
         };
 
         match res {
-            Ok(_) => {
-                let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            Ok(()) => {
+                let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
                 let action_log = if self.use_trash { "TRASHED " } else { "DELETED " };
-                eprintln!("[DELETE] {}{}", action_log, path.display());
+                eprintln!("[DELETE] {action_log}{}", path.display());
 
-                // Remove from current group
-                if let Some(group) = self.groups.get_mut(self.current_group_idx) {
+                let g_idx = self.current_group_idx;
+
+                // Remove from current group and update or remove group_infos
+                if let Some(group) = self.groups.get_mut(g_idx) {
                     group.retain(|f| f.path != path);
-                }
-
-                // Clean up empty groups
-                if self.groups.get(self.current_group_idx).map(|g| g.is_empty()).unwrap_or(false) {
-                    self.groups.remove(self.current_group_idx);
-                    self.group_infos.remove(self.current_group_idx);
-                }
-
-                // Adjust indices
-                if self.groups.is_empty() {
-                    self.current_group_idx = 0;
-                    self.current_file_idx = 0;
-                } else {
-                    if self.current_group_idx >= self.groups.len() {
-                        self.current_group_idx = self.groups.len() - 1;
-                    }
-                    if self.current_file_idx >= self.groups[self.current_group_idx].len() {
-                        self.current_file_idx =
-                            self.groups[self.current_group_idx].len().saturating_sub(1);
+                    if group.is_empty() {
+                        self.groups.remove(g_idx);
+                        if g_idx < self.group_infos.len() {
+                            self.group_infos.remove(g_idx);
+                        }
+                    } else if let Some(info) = self.group_infos.get_mut(g_idx) {
+                        *info = analyze_group(group, &self.group_by, &self.ext_priorities);
                     }
                 }
 
-                // Also remove from marked list if it was there
-                self.marked_for_deletion.retain(|p| p != &path);
+                self.clamp_selection();
+
+                // Also remove from marked set if it was there
+                self.marked_for_deletion.remove(&path);
 
                 let action = if self.use_trash { "Trashed" } else { "Deleted" };
-                self.set_status(format!("{}: {}", action, filename), false);
+                self.set_status(format!("{action}: {filename}"), false);
                 self.selection_changed = true;
             },
             Err(e) => {
-                self.error_popup = Some(format!("Failed to delete:\n{}", e));
+                self.error_popup = Some(format!("Failed to delete:\n{e}"));
             },
         }
     }
 
-    fn perform_search(&mut self, query: String) {
+    fn clamp_selection(&mut self) {
+        if self.groups.is_empty() {
+            self.current_group_idx = 0;
+            self.current_file_idx = 0;
+        } else {
+            if self.current_group_idx >= self.groups.len() {
+                self.current_group_idx = self.groups.len() - 1;
+            }
+            let group_len = self.groups[self.current_group_idx].len();
+            if self.current_file_idx >= group_len {
+                self.current_file_idx = group_len.saturating_sub(1);
+            }
+        }
+    }
+
+    fn perform_search(&mut self, query: &str) {
         // Note: EXIF-aware search with caching is handled by GuiApp::perform_search_with_cache
         // This is a simple filename-only fallback
         self.search_results.clear();
@@ -970,10 +943,10 @@ impl AppState {
             return;
         }
 
-        let re = match RegexBuilder::new(&query).case_insensitive(true).build() {
+        let re = match RegexBuilder::new(query).case_insensitive(true).build() {
             Ok(r) => r,
             Err(e) => {
-                self.error_popup = Some(format!("Invalid Regex:\n{}", e));
+                self.error_popup = Some(format!("Invalid Regex:\n{e}"));
                 return;
             },
         };
@@ -988,24 +961,19 @@ impl AppState {
             }
         }
 
-        if !self.search_results.is_empty() {
+        if let Some((g, f, match_source)) = self.search_results.first().cloned() {
             self.show_search = false;
             self.current_search_match = 0;
-            let (g, f, ref match_source) = self.search_results[0];
             self.current_group_idx = g;
             self.current_file_idx = f;
             self.selection_changed = true;
+            let count = self.search_results.len();
             self.set_status(
-                format!(
-                    "Found {} matches. Match 1/{} in [{}]. (F3/Shift+F3 to nav)",
-                    self.search_results.len(),
-                    self.search_results.len(),
-                    match_source
-                ),
+                format!("Found {count} matches. Match 1/{count} in [{match_source}]. (F3/Shift+F3 to nav)"),
                 false,
             );
         } else {
-            self.error_popup = Some(format!("No matches found for:\n'{}'", query));
+            self.error_popup = Some(format!("No matches found for:\n'{query}'"));
         }
     }
 
@@ -1028,10 +996,9 @@ impl AppState {
         self.selection_changed = true;
         self.set_status(
             format!(
-                "Match {}/{} in [{}]",
+                "Match {}/{} in [{match_source}]",
                 self.current_search_match + 1,
                 self.search_results.len(),
-                match_source
             ),
             false,
         );
@@ -1047,14 +1014,14 @@ impl AppState {
         };
         let target_dir = dest.path.clone();
 
-        let paths_to_move = if self.marked_for_deletion.is_empty() {
+        let paths_to_move: Vec<PathBuf> = if self.marked_for_deletion.is_empty() {
             if let Some(p) = self.get_current_image_path() {
                 vec![p.clone()]
             } else {
                 return; // Should be handled by InputIntent check, but safety check here
             }
         } else {
-            self.marked_for_deletion.clone()
+            self.marked_for_deletion.iter().cloned().collect()
         };
 
         if paths_to_move.is_empty() {
@@ -1078,7 +1045,7 @@ impl AppState {
                 },
                 Err(e) => {
                     // e is a standard std::io::Error with a descriptive message
-                    error_details.push(format!("• {:?}: {}", filename, e));
+                    error_details.push(format!("• {filename:?}: {e}"));
                     moved_failed.push((result.source.clone(), result.destination, e.to_string()));
                     failed_paths.insert(result.source);
                 },
@@ -1091,7 +1058,7 @@ impl AppState {
         // source dir once, then enumerate moved/failed files with full paths.
         {
             let mut src_dirs: Vec<PathBuf> =
-                paths_to_move.iter().filter_map(|p| p.parent().map(|p| p.to_path_buf())).collect();
+                paths_to_move.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
             src_dirs.sort();
             src_dirs.dedup();
 
@@ -1112,15 +1079,17 @@ impl AppState {
                 eprintln!("[MOVE]   OK   {}  ->  {}", src.display(), dst.display());
             }
             for (src, dst, err) in &moved_failed {
-                eprintln!("[MOVE]   FAIL {}  ->  {}  ({})", src.display(), dst.display(), err);
+                eprintln!("[MOVE]   FAIL {}  ->  {}  ({err})", src.display(), dst.display());
             }
         }
 
         if success_count > 0 {
-            // Remove moved files from groups
+            let paths_to_move_set: HashSet<PathBuf> = paths_to_move.into_iter().collect();
+            // Remove moved files from groups in O(1) per file
             for group in &mut self.groups {
-                group
-                    .retain(|f| !paths_to_move.contains(&f.path) || failed_paths.contains(&f.path));
+                group.retain(|f| {
+                    !paths_to_move_set.contains(&f.path) || failed_paths.contains(&f.path)
+                });
             }
 
             // Clean up empty groups
@@ -1139,24 +1108,12 @@ impl AppState {
                 }
             }
 
-            // Adjust indices
-            if self.groups.is_empty() {
-                self.current_group_idx = 0;
-                self.current_file_idx = 0;
-            } else {
-                if self.current_group_idx >= self.groups.len() {
-                    self.current_group_idx = self.groups.len() - 1;
-                }
-                if self.current_file_idx >= self.groups[self.current_group_idx].len() {
-                    self.current_file_idx =
-                        self.groups[self.current_group_idx].len().saturating_sub(1);
-                }
-            }
+            self.clamp_selection();
             self.selection_changed = true;
         }
 
         if failed_paths.is_empty() {
-            self.set_status(format!("Moved {} files to {:?}", success_count, target_dir), false);
+            self.set_status(format!("Moved {success_count} files to {target_dir:?}"), false);
         } else {
             let mut full_msg = format!("Failed to move {} files:\n\n", failed_paths.len());
             full_msg.push_str(&error_details.into_iter().take(5).collect::<Vec<_>>().join("\n"));
@@ -1164,7 +1121,7 @@ impl AppState {
                 full_msg.push_str("\n...and others.");
             }
             if success_count > 0 {
-                full_msg.push_str(&format!("\n\n({} files moved successfully)", success_count));
+                full_msg.push_str(&format!("\n\n({success_count} files moved successfully)"));
             }
             full_msg.push_str("\n\n(Press any key to dismiss)");
             self.error_popup = Some(full_msg);
@@ -1172,9 +1129,9 @@ impl AppState {
     }
 }
 
-/// Returns a map of (dev, ino) -> Vec<&FileMetadata> for files that are hardlinked
+/// Returns a map of (dev, ino) -> Vec<usize> for files that are hardlinked
 pub fn get_hardlink_groups(group: &[FileMetadata]) -> HashMap<u128, Vec<usize>> {
-    let mut groups: HashMap<u128, Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<u128, Vec<usize>> = HashMap::with_capacity(group.len());
 
     for (idx, f) in group.iter().enumerate() {
         groups.entry(f.unique_file_id).or_default().push(idx);

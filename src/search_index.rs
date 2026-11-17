@@ -1,9 +1,13 @@
 // In-memory search index using RoaringBitmap for O(1) tag-based queries.
 // Built on application startup by iterating the feature database.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
+};
 
 use roaring::RoaringBitmap;
+use siphasher::sip::SipHasher13;
 
 use crate::{
     exif_types::{ExifValue, tag_id_to_name},
@@ -42,7 +46,7 @@ pub fn extract_number_from_string(s: &str) -> Option<f64> {
         let after = after.trim();
 
         if let (Ok(num), Ok(denom)) = (before.parse::<f64>(), after.parse::<f64>())
-            && denom != 0.0
+            && denom.abs() > f64::EPSILON
         {
             let val = num / denom;
             if val.is_finite() {
@@ -129,6 +133,7 @@ impl SearchCriterion {
 
 /// Scalar numeric comparison, matching the semantics of the binary-search paths
 /// in `search_numeric`. Used by the linear fallback when the index is not sorted.
+#[inline]
 fn numeric_value_matches(op: SearchOp, v: f64, value: f64, epsilon: f64) -> bool {
     match op {
         SearchOp::Equals => (v - value).abs() <= epsilon,
@@ -184,11 +189,12 @@ impl SearchIndex {
     /// re-inserting the same id (the freed slot is reused by the next insert).
     pub fn remove(&mut self, unique_file_id: u128) {
         if let Some(file_idx) = self.id_to_index.remove(&unique_file_id) {
-            // Remove from string/exact index
+            // Remove from string/exact index and prune empty bitmaps
             for tag_map in self.exact_index.values_mut() {
-                for bitmap in tag_map.values_mut() {
+                tag_map.retain(|_, bitmap| {
                     bitmap.remove(file_idx);
-                }
+                    !bitmap.is_empty()
+                });
             }
             for list in self.numeric_index.values_mut() {
                 list.retain(|&(_, idx)| idx != file_idx);
@@ -286,63 +292,51 @@ impl SearchIndex {
         let file_idx = self.get_or_create_index(unique_file_id);
         self.is_finalized = false;
 
-        for (tag_id, value) in &features.tags {
-            self.indexed_tags.insert(*tag_id);
+        for (&tag_id, value) in &features.tags {
+            self.indexed_tags.insert(tag_id);
 
             match value {
                 ExifValue::String(s) => {
                     // Index for exact/contains match (case-insensitive)
-                    let normalized = s.to_lowercase();
-                    let hash = Self::hash_string(&normalized);
-
-                    // Store in string table for later retrieval
-                    self.string_table.entry(hash).or_insert_with(|| normalized.clone());
-
-                    // Add to exact index
-                    self.exact_index
-                        .entry(*tag_id)
-                        .or_default()
-                        .entry(hash)
-                        .or_default()
-                        .insert(file_idx);
+                    self.insert_string(tag_id, s, file_idx);
 
                     // Also try to extract a numeric value for range queries
                     // This handles cases like "ISO 100", "24mm", "f/2.8", "1/250s", etc.
                     if let Some(num) = extract_number_from_string(s) {
-                        self.insert_numeric(*tag_id, num, file_idx);
+                        self.insert_numeric(tag_id, num, file_idx);
                     }
                 },
 
                 ExifValue::Short(v) => {
-                    self.insert_numeric(*tag_id, *v as f64, file_idx);
+                    self.insert_numeric(tag_id, f64::from(*v), file_idx);
                     // Also index as string for contains search
-                    self.insert_string(*tag_id, &v.to_string(), file_idx);
+                    self.insert_string(tag_id, &v.to_string(), file_idx);
                 },
 
                 ExifValue::Long(v) => {
-                    self.insert_numeric(*tag_id, *v as f64, file_idx);
-                    self.insert_string(*tag_id, &v.to_string(), file_idx);
+                    self.insert_numeric(tag_id, f64::from(*v), file_idx);
+                    self.insert_string(tag_id, &v.to_string(), file_idx);
                 },
 
                 ExifValue::Signed(v) => {
-                    self.insert_numeric(*tag_id, *v as f64, file_idx);
-                    self.insert_string(*tag_id, &v.to_string(), file_idx);
+                    self.insert_numeric(tag_id, f64::from(*v), file_idx);
+                    self.insert_string(tag_id, &v.to_string(), file_idx);
                 },
 
                 ExifValue::Long64(v) => {
-                    self.insert_numeric(*tag_id, *v as f64, file_idx);
-                    self.insert_string(*tag_id, &v.to_string(), file_idx);
+                    self.insert_numeric(tag_id, *v as f64, file_idx);
+                    self.insert_string(tag_id, &v.to_string(), file_idx);
                 },
 
                 ExifValue::Float(v) => {
-                    self.insert_numeric(*tag_id, *v, file_idx);
+                    self.insert_numeric(tag_id, *v, file_idx);
                     // Format float for string search
-                    self.insert_string(*tag_id, &format!("{:.2}", v), file_idx);
+                    self.insert_string(tag_id, &format!("{v:.2}"), file_idx);
                 },
 
                 ExifValue::Byte(v) => {
-                    self.insert_numeric(*tag_id, *v as f64, file_idx);
-                    self.insert_string(*tag_id, &v.to_string(), file_idx);
+                    self.insert_numeric(tag_id, f64::from(*v), file_idx);
+                    self.insert_string(tag_id, &v.to_string(), file_idx);
                 },
 
                 _ => {
@@ -356,7 +350,7 @@ impl SearchIndex {
     fn insert_string(&mut self, tag_id: u16, value: &str, file_idx: u32) {
         let normalized = value.to_lowercase();
         let hash = Self::hash_string(&normalized);
-        self.string_table.entry(hash).or_insert_with(|| normalized.clone());
+        self.string_table.entry(hash).or_insert(normalized);
         self.exact_index.entry(tag_id).or_default().entry(hash).or_default().insert(file_idx);
     }
 
@@ -365,17 +359,15 @@ impl SearchIndex {
         if !value.is_finite() {
             return;
         }
-        let list = self.numeric_index.entry(tag_id).or_default();
-        list.push((value, file_idx));
+        self.numeric_index.entry(tag_id).or_default().push((value, file_idx));
     }
 
-    /// Hash a string for the exact index
+    /// Hash a string for the exact index using SipHasher13
+    #[inline]
     fn hash_string(s: &str) -> u64 {
-        let hash = blake3::hash(s.as_bytes());
-        let bytes = hash.as_bytes();
-        u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ])
+        let mut hasher = SipHasher13::new();
+        s.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Finalize the index after bulk insertion.
@@ -406,11 +398,10 @@ impl SearchIndex {
         eprintln!("\nIndexed tags:");
         for tag_id in &self.indexed_tags {
             let name = tag_id_to_name(*tag_id).unwrap_or("Unknown");
-            let exact_count = self.exact_index.get(tag_id).map(|m| m.len()).unwrap_or(0);
-            let numeric_count = self.numeric_index.get(tag_id).map(|v| v.len()).unwrap_or(0);
+            let exact_count = self.exact_index.get(tag_id).map_or(0, HashMap::len);
+            let numeric_count = self.numeric_index.get(tag_id).map_or(0, Vec::len);
             eprintln!(
-                "  0x{:04X} {}: {} string values, {} numeric entries",
-                tag_id, name, exact_count, numeric_count
+                "  0x{tag_id:04X} {name}: {exact_count} string values, {numeric_count} numeric entries"
             );
         }
 
@@ -423,11 +414,11 @@ impl SearchIndex {
             if self.indexed_tags.contains(tag_id) {
                 let name = tag_id_to_name(*tag_id).unwrap_or("Unknown");
                 let values = self.get_tag_values(*tag_id);
-                eprintln!("\n  {} sample values: {:?}", name, &values[..values.len().min(5)]);
+                eprintln!("\n  {name} sample values: {:?}", &values[..values.len().min(5)]);
 
                 if let Some(list) = self.numeric_index.get(tag_id) {
-                    let sample: Vec<_> = list.iter().take(5).map(|(v, _)| *v).collect();
-                    eprintln!("    numeric samples: {:?}", sample);
+                    let sample: Vec<_> = list.iter().take(5).map(|&(v, _)| v).collect();
+                    eprintln!("    numeric samples: {sample:?}");
                 }
             }
         }
@@ -501,11 +492,11 @@ impl SearchIndex {
         // mutated since the last finalize(), fall back to a correct linear scan so
         // callers can never get silently-wrong results.
         if !self.is_finalized {
-            for &(v, idx) in list {
-                if numeric_value_matches(op, v, value, epsilon) {
-                    result.insert(idx);
-                }
-            }
+            result.extend(
+                list.iter()
+                    .filter(|&&(v, _)| numeric_value_matches(op, v, value, epsilon))
+                    .map(|&(_, idx)| idx),
+            );
             return result;
         }
 
@@ -513,30 +504,24 @@ impl SearchIndex {
             SearchOp::Equals => {
                 // Find start of potential equality range
                 let start = list.partition_point(|&(v, _)| v < value - epsilon);
-                for &(v, idx) in &list[start..] {
-                    if v > value + epsilon {
-                        break;
-                    }
-                    result.insert(idx);
-                }
+                result.extend(
+                    list[start..]
+                        .iter()
+                        .take_while(|&&(v, _)| v <= value + epsilon)
+                        .map(|&(_, idx)| idx),
+                );
             },
             SearchOp::LessThan => {
                 let end = list.partition_point(|&(v, _)| v < value);
-                for &(_, idx) in &list[..end] {
-                    result.insert(idx);
-                }
+                result.extend(list[..end].iter().map(|&(_, idx)| idx));
             },
             SearchOp::LessOrEqual => {
                 let end = list.partition_point(|&(v, _)| v <= value + epsilon);
-                for &(_, idx) in &list[..end] {
-                    result.insert(idx);
-                }
+                result.extend(list[..end].iter().map(|&(_, idx)| idx));
             },
             SearchOp::GreaterThan => {
                 let start = list.partition_point(|&(v, _)| v <= value);
-                for &(_, idx) in &list[start..] {
-                    result.insert(idx);
-                }
+                result.extend(list[start..].iter().map(|&(_, idx)| idx));
             },
             SearchOp::GreaterOrEqual => {
                 // partition_point needs the predicate true for the prefix and
@@ -544,9 +529,7 @@ impl SearchIndex {
                 // `v < value - epsilon` (true for values below the cutoff); the
                 // returned index is the first entry with v >= value - epsilon.
                 let start = list.partition_point(|&(v, _)| v < value - epsilon);
-                for &(_, idx) in &list[start..] {
-                    result.insert(idx);
-                }
+                result.extend(list[start..].iter().map(|&(_, idx)| idx));
             },
             _ => {},
         }
@@ -568,21 +551,18 @@ impl SearchIndex {
         // See search_numeric: binary search requires a finalized (sorted) list,
         // otherwise fall back to a correct linear scan.
         if !self.is_finalized {
-            for &(v, idx) in list {
-                if v >= min - epsilon && v <= max + epsilon {
-                    result.insert(idx);
-                }
-            }
+            result.extend(
+                list.iter()
+                    .filter(|&&(v, _)| v >= min - epsilon && v <= max + epsilon)
+                    .map(|&(_, idx)| idx),
+            );
             return result;
         }
 
         let start = list.partition_point(|&(v, _)| v < min - epsilon);
-        for &(v, idx) in &list[start..] {
-            if v > max + epsilon {
-                break;
-            }
-            result.insert(idx);
-        }
+        result.extend(
+            list[start..].iter().take_while(|&&(v, _)| v <= max + epsilon).map(|&(_, idx)| idx),
+        );
         result
     }
 
@@ -628,28 +608,23 @@ impl SearchIndex {
 
     /// Execute multiple criteria with AND logic
     pub fn search_and(&self, criteria: &[SearchCriterion]) -> RoaringBitmap {
-        let enabled: Vec<_> = criteria.iter().filter(|c| c.enabled).collect();
-
-        if enabled.is_empty() {
+        let mut enabled = criteria.iter().filter(|c| c.enabled);
+        let Some(first) = enabled.next() else {
             return RoaringBitmap::new();
-        }
+        };
 
-        let mut result = self.search_criterion(enabled[0]);
-        for criterion in &enabled[1..] {
-            result &= self.search_criterion(criterion);
-        }
-        result
+        enabled.fold(self.search_criterion(first), |mut acc, criterion| {
+            acc &= self.search_criterion(criterion);
+            acc
+        })
     }
 
     /// Execute multiple criteria with OR logic
     pub fn search_or(&self, criteria: &[SearchCriterion]) -> RoaringBitmap {
-        let mut result = RoaringBitmap::new();
-        for criterion in criteria {
-            if criterion.enabled {
-                result |= self.search_criterion(criterion);
-            }
-        }
-        result
+        criteria.iter().filter(|c| c.enabled).fold(RoaringBitmap::new(), |mut acc, criterion| {
+            acc |= self.search_criterion(criterion);
+            acc
+        })
     }
 
     /// Get all unique values for a string tag (for autocomplete)
@@ -675,7 +650,7 @@ impl SearchIndex {
             .values()
             .map(|m| m.values().map(|b| b.len() as usize).sum::<usize>())
             .sum();
-        let total_numeric_entries: usize = self.numeric_index.values().map(|v| v.len()).sum();
+        let total_numeric_entries: usize = self.numeric_index.values().map(Vec::len).sum();
 
         IndexStats {
             file_count: self.len(),
@@ -689,12 +664,8 @@ impl SearchIndex {
     /// Get a bitmap of all live file indices (slots freed by remove() excluded)
     pub fn all_files(&self) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
-        for i in 0..self.file_count {
-            result.insert(i);
-        }
-        for idx in self.free_slots.iter() {
-            result.remove(idx);
-        }
+        result.insert_range(0..self.file_count);
+        result -= &self.free_slots;
         result
     }
 }
@@ -737,20 +708,12 @@ impl std::fmt::Display for IndexStats {
 ///
 /// Returns Result with Vec of criteria (for AND logic) or error message
 pub fn parse_search_query(query: &str) -> Result<Vec<SearchCriterion>, String> {
-    let mut criteria = Vec::new();
-
-    // Split on whitespace or semicolons for multiple criteria
-    for part in query.split(|c: char| c.is_whitespace() || c == ';') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-
-        {
-            let c = parse_single_criterion(part)?;
-            criteria.push(c)
-        }
-    }
+    let criteria: Vec<SearchCriterion> = query
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(parse_single_criterion)
+        .collect::<Result<Vec<_>, _>>()?;
 
     if criteria.is_empty() {
         return Err("No valid search criteria provided".to_string());
@@ -781,13 +744,10 @@ fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
 
     // Try to resolve tag ID, with support for aliases
     let tag_id = resolve_tag_name(tag_name)
-        .ok_or_else(|| format!("Unknown tag: '{}'. Use Make, Model, ISO, FocalLength, Country, SunAzimuth, SunAltitude, etc.", tag_name))?;
+        .ok_or_else(|| format!("Unknown tag: '{tag_name}'. Use Make, Model, ISO, FocalLength, Country, SunAzimuth, SunAltitude, etc."))?;
 
     if parts.len() == 1 {
-        return Err(format!(
-            "Missing value for tag '{}'. Use format: {}:value",
-            tag_name, tag_name
-        ));
+        return Err(format!("Missing value for tag '{tag_name}'. Use format: {tag_name}:value"));
     }
 
     if parts.len() == 2 {
@@ -799,8 +759,8 @@ fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
         // string-search fallback below to avoid returning zero results.
         if is_numeric_tag(tag_id) {
             // Use extract_number_from_string to handle ranges like "f/2.8-f/11"
-            if let Some(range) = parse_range_value(value) {
-                return Ok(SearchCriterion::with_range(tag_id, range.0, range.1));
+            if let Some((min, max)) = parse_range_value(value) {
+                return Ok(SearchCriterion::with_range(tag_id, min, max));
             }
 
             // Try to parse as number first using the robust extractor.
@@ -827,7 +787,7 @@ fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
         "<=" | "le" | "lte" => SearchOp::LessOrEqual,
         ">" | "gt" => SearchOp::GreaterThan,
         ">=" | "ge" | "gte" => SearchOp::GreaterOrEqual,
-        _ => return Err(format!("Unknown operator: '{}'. Use =, ~, <, >, <=, >=, regex", op_str)),
+        _ => return Err(format!("Unknown operator: '{op_str}'. Use =, ~, <, >, <=, >=, regex")),
     };
 
     // Clean the value for numeric operators (or Equals on numeric tags) if possible
@@ -839,11 +799,7 @@ fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
             | SearchOp::GreaterOrEqual
     ) || (op == SearchOp::Equals && is_numeric_tag(tag_id))
     {
-        if let Some(num) = extract_number_from_string(value) {
-            num.to_string()
-        } else {
-            value.to_string()
-        }
+        extract_number_from_string(value).map_or_else(|| value.to_string(), |num| num.to_string())
     } else {
         value.to_string()
     };
