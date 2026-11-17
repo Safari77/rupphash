@@ -2,23 +2,20 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::Path,
-    str::FromStr,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::UNIX_EPOCH,
 };
 
 use bytemuck::cast_slice;
 use chrono::{DateTime, Utc};
-use codes_iso_3166::{part_1::CountryCode, part_2::SubdivisionCode};
-use crossbeam_channel::{Sender, unbounded};
+use crossbeam_channel::{Sender, bounded};
 use geo::Point;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, Rgba};
 use jpeg_decoder::Decoder as Tier2Decoder;
 use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
-use num_integer::gcd;
 use rayon::prelude::*;
 use sysinfo::System;
 use walkdir::WalkDir;
@@ -30,7 +27,9 @@ use crate::{
         AppContext, CachedCoefficients, DbUpdate, EnrichmentResult, HashValue, compute_meta_key,
         create_feature_update,
     },
-    exif_extract::extract_gps_lat_lon,
+    exif_extract::{
+        derive_location, extract_gps_lat_lon, format_dms_from_decimal, format_exif_value,
+    },
     exif_types::{
         ExifValue, TAG_DERIVED_PDQ_QUALITY, TAG_DERIVED_TIMESTAMP, TAG_GPS_LATITUDE,
         TAG_GPS_LONGITUDE, TAG_ORIENTATION,
@@ -38,7 +37,7 @@ use crate::{
     fileops,
     fileops::get_file_key,
     hamminghash::{HammingHash, MIHIndex, SparseBitSet},
-    helper_exif::{get_altitude, get_date_str, get_exif_timestamp, parse_gps_coordinate},
+    helper_exif::{get_altitude, get_date_str, get_exif_timestamp},
     image_features::ImageFeatures,
     position, raw_exif,
     raw_exif::dms_to_decimal,
@@ -47,6 +46,15 @@ use crate::{
 pub const RAW_EXTS: &[&str] = &[
     "nef", "dng", "cr2", "cr3", "arw", "orf", "rw2", "raf", "kdc", "dcr", "pef", "x3f", "srf",
     "3fr",
+];
+
+const IMAGE_EXTS: &[&str] = &[
+    "dds", "exr", "ff", "hdr", "ico", "pnm", "qoi", "gif", "jpg", "jpeg", "png", "webp", "bmp",
+    "tiff", "tif", "avif", "heic", "heif", "tga", "pbm", // hayro-jpeg2000
+    "jp2", "j2k", // image-extras
+    "xbm", "xpm", "ora", "otb", "pcx", "sgi", "wbmp",
+    // hayro pdf, jxl - update also load_image_fast fast path
+    "jxl", "pdf",
 ];
 
 trait BufReadSeek: std::io::BufRead + std::io::Seek {}
@@ -63,8 +71,8 @@ macro_rules! img_debug {
 const BUDGET_PER_THREAD_BYTES: u64 = 1_500 * 1024 * 1024;
 // Create an empty lock to hold our calculated thread count and byte limit.
 static SMART_LIMITS: OnceLock<(usize, u64)> = OnceLock::new();
-// Cache parsed country boundaries once at module scope.
-static BOUNDARIES: OnceLock<Option<country_boundaries::CountryBoundaries>> = OnceLock::new();
+// Cache the constrained Rayon thread pool so scans reuse threads instead of spawning per call.
+static SMART_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 
 /// Calculates the safe number of threads and initializes the per-thread memory limit.
 /// Uses OnceLock so the heavy computation only runs on the first call.
@@ -152,19 +160,16 @@ pub fn read_exif_data(path: &Path, preloaded_bytes: Option<&[u8]>) -> Option<exi
 /// Orientation tag must NOT be applied again by the viewer, or the image gets
 /// rotated twice.
 pub(crate) fn orientation_baked_into_pixels(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
-        Some("heic") | Some("heif")
-    )
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("heic") || e.eq_ignore_ascii_case("heif"))
 }
 
-pub fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
-    // HEIC/HEIF pixels come out of libheif already upright; report neutral 1.
+fn orientation_from_exif(path: &Path, exif_data: &exif::Exif) -> u8 {
     if orientation_baked_into_pixels(path) {
         return 1;
     }
-    if let Some(exif_data) = read_exif_data(path, preloaded_bytes)
-        && let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+    if let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         && let Some(v @ 1..=8) = field.value.get_uint(0)
     {
         return v as u8;
@@ -174,14 +179,16 @@ pub fn get_orientation(path: &Path, preloaded_bytes: Option<&[u8]>) -> u8 {
 
 pub fn has_gps_time(path: &Path) -> bool {
     if let Some(exif) = read_exif_data(path, None) {
-        return crate::helper_exif::get_date_str(&exif, true).is_some();
+        return get_date_str(&exif, true).is_some();
     }
     false
 }
 
 /// Check if a tag name is a derived value (not a real EXIF tag)
 fn is_derived_tag(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(), "derivedcountry" | "country" | "derivedsunposition")
+    name.eq_ignore_ascii_case("derivedcountry")
+        || name.eq_ignore_ascii_case("country")
+        || name.eq_ignore_ascii_case("derivedsunposition")
 }
 
 /// Get multiple EXIF tags as a vector of (tag_name, value) pairs.
@@ -229,7 +236,7 @@ fn get_exif_tags_from_kamadak(
     decimal_coords: bool,
     use_gps_utc: bool,
 ) -> Vec<(String, String)> {
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(tag_names.len());
 
     // Pre-extract GPS coordinates if needed for derived values
     let needs_gps = tag_names.iter().any(|t| is_derived_tag(t));
@@ -237,17 +244,12 @@ fn get_exif_tags_from_kamadak(
 
     // Pre-extract Data for Sun Position if needed
     let needs_sun = tag_names.iter().any(|t| t.eq_ignore_ascii_case("DerivedSunPosition"));
-    let sun_inputs = if needs_sun && gps_coords.is_some() {
-        let alt = get_altitude(exif_data);
-        Some(alt)
-    } else {
-        None
-    };
+    let sun_alt_m = if needs_sun && gps_coords.is_some() { get_altitude(exif_data) } else { None };
 
     for tag_name in tag_names {
         // Check for derived tags first
         if let Some(derived_entries) =
-            get_derived_value(tag_name, gps_coords, &sun_inputs, exif_data, use_gps_utc)
+            get_derived_value(tag_name, gps_coords, sun_alt_m, exif_data, use_gps_utc)
         {
             results.extend(derived_entries);
         } else if let Some((tag, in_value)) = parse_exif_tag_name(tag_name)
@@ -269,7 +271,7 @@ fn get_exif_tags_from_rsraw(
     decimal_coords: bool,
 ) -> Vec<(String, String)> {
     let info = raw.full_info();
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(tag_names.len());
     let has_gps = raw_exif::raw_has_gps(raw);
 
     eprintln!(
@@ -278,44 +280,16 @@ fn get_exif_tags_from_rsraw(
     );
 
     for tag_name in tag_names {
-        let value = match tag_name.to_lowercase().as_str() {
-            "make" => {
-                if !info.make.is_empty() {
-                    Some(info.make.clone())
-                } else {
-                    None
-                }
-            },
-            "model" => {
-                if !info.model.is_empty() {
-                    Some(info.model.clone())
-                } else {
-                    None
-                }
-            },
-            "software" => {
-                if !info.software.is_empty() {
-                    Some(info.software.trim().to_string())
-                } else {
-                    None
-                }
-            },
-            "artist" => {
-                if !info.artist.is_empty() {
-                    Some(info.artist.clone())
-                } else {
-                    None
-                }
-            },
+        let value = match tag_name.to_ascii_lowercase().as_str() {
+            "make" => (!info.make.is_empty()).then(|| info.make.clone()),
+            "model" => (!info.model.is_empty()).then(|| info.model.clone()),
+            "software" => (!info.software.is_empty()).then(|| info.software.trim().to_string()),
+            "artist" => (!info.artist.is_empty()).then(|| info.artist.clone()),
             "iso" | "isospeedratings" | "photographicsensitivity" => {
-                if info.iso_speed > 0 {
-                    Some(format!("ISO {}", info.iso_speed))
-                } else {
-                    None
-                }
+                (info.iso_speed > 0).then(|| format!("ISO {}", info.iso_speed))
             },
             "exposuretime" | "exposure" => {
-                if info.shutter > 0.0 {
+                if info.shutter > 0.0 && info.shutter.is_finite() {
                     if info.shutter >= 1.0 {
                         Some(format!("{:.1}s", info.shutter))
                     } else {
@@ -325,40 +299,19 @@ fn get_exif_tags_from_rsraw(
                     None
                 }
             },
-            "fnumber" | "aperture" => {
-                if info.aperture > 0.0 {
-                    Some(format!("f/{:.1}", info.aperture))
-                } else {
-                    None
-                }
-            },
-            "focallength" => {
-                if info.focal_len > 0.0 {
-                    Some(format!("{:.0}mm", info.focal_len))
-                } else {
-                    None
-                }
-            },
+            "fnumber" | "aperture" => (info.aperture > 0.0 && info.aperture.is_finite())
+                .then(|| format!("f/{:.1}", info.aperture)),
+            "focallength" => (info.focal_len > 0.0 && info.focal_len.is_finite())
+                .then(|| format!("{:.0}mm", info.focal_len)),
             "focallengthin35mmfilm" | "focallength35mm" => {
-                if info.lens_info.focal_length_in_35mm_format > 0 {
-                    Some(format!("{}mm (35mm equiv)", info.lens_info.focal_length_in_35mm_format))
-                } else {
-                    None
-                }
+                (info.lens_info.focal_length_in_35mm_format > 0).then(|| {
+                    format!("{}mm (35mm equiv)", info.lens_info.focal_length_in_35mm_format)
+                })
             },
-            "lensmodel" | "lens" => {
-                if !info.lens_info.lens_name.is_empty() {
-                    Some(info.lens_info.lens_name.trim().to_string())
-                } else {
-                    None
-                }
-            },
+            "lensmodel" | "lens" => (!info.lens_info.lens_name.is_empty())
+                .then(|| info.lens_info.lens_name.trim().to_string()),
             "lensmake" => {
-                if !info.lens_info.lens_make.is_empty() {
-                    Some(info.lens_info.lens_make.clone())
-                } else {
-                    None
-                }
+                (!info.lens_info.lens_make.is_empty()).then(|| info.lens_info.lens_make.clone())
             },
             "datetime" | "datetimeoriginal" => {
                 info.datetime.as_ref().map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -366,10 +319,14 @@ fn get_exif_tags_from_rsraw(
             "gpslatitude" => {
                 if has_gps {
                     let lat = dms_to_decimal(&info.gps.latitude);
-                    if decimal_coords {
-                        Some(format!("{:.6}°", lat))
+                    if lat.is_finite() {
+                        if decimal_coords {
+                            Some(format!("{lat:.6}°"))
+                        } else {
+                            Some(format_dms_from_decimal(lat, true))
+                        }
                     } else {
-                        Some(format_dms_from_decimal(lat, true))
+                        None
                     }
                 } else {
                     None
@@ -378,10 +335,14 @@ fn get_exif_tags_from_rsraw(
             "gpslongitude" => {
                 if has_gps {
                     let lon = dms_to_decimal(&info.gps.longitude);
-                    if decimal_coords {
-                        Some(format!("{:.6}°", lon))
+                    if lon.is_finite() {
+                        if decimal_coords {
+                            Some(format!("{lon:.6}°"))
+                        } else {
+                            Some(format_dms_from_decimal(lon, false))
+                        }
                     } else {
-                        Some(format_dms_from_decimal(lon, false))
+                        None
                     }
                 } else {
                     None
@@ -395,10 +356,17 @@ fn get_exif_tags_from_rsraw(
                 }
             },
             "derivedcountry" | "country" => {
-                let lat = dms_to_decimal(&info.gps.latitude);
-                let lon = dms_to_decimal(&info.gps.longitude);
-                if lat.abs() > 0.0001 || lon.abs() > 0.0001 {
-                    derive_country(lat, lon)
+                if has_gps {
+                    let lat = dms_to_decimal(&info.gps.latitude);
+                    let lon = dms_to_decimal(&info.gps.longitude);
+                    if lat.is_finite()
+                        && lon.is_finite()
+                        && (lat.abs() > 0.0001 || lon.abs() > 0.0001)
+                    {
+                        derive_location(lat, lon)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -422,86 +390,54 @@ fn get_exif_tags_from_rsraw(
     results
 }
 
-/// Format decimal degrees as DMS string with hemisphere and carry-over handling (helper for rsraw GPS display)
-fn format_dms_from_decimal(decimal_deg: f64, is_latitude: bool) -> String {
-    let abs_deg = decimal_deg.abs();
-    let mut d = abs_deg.floor() as i32;
-    let m_float = (abs_deg - d as f64) * 60.0;
-    let mut m = m_float.floor() as i32;
-    let s = (m_float - m as f64) * 60.0;
-
-    let mut s_rounded = (s * 10.0).round() / 10.0;
-    if s_rounded >= 60.0 {
-        s_rounded = 0.0;
-        m += 1;
-        if m >= 60 {
-            m = 0;
-            d += 1;
-        }
-    }
-
-    let hemi = if is_latitude {
-        if decimal_deg >= 0.0 { "N" } else { "S" }
-    } else {
-        if decimal_deg >= 0.0 { "E" } else { "W" }
-    };
-
-    format!("{}° {}' {:.1}\" {}", d, m, s_rounded, hemi)
-}
-
 /// Get derived values based on tag name and available data
 /// Returns a vector because one derived tag (like SunPosition) might expand into multiple display lines
 fn get_derived_value(
     tag_name: &str,
     gps_coords: Option<(f64, f64)>,
-    sun_inputs: &Option<Option<f64>>,
+    sun_alt_m: Option<f64>,
     exif_data: &exif::Exif,
     use_gps_utc: bool,
 ) -> Option<Vec<(String, String)>> {
-    match tag_name.to_lowercase().as_str() {
-        "country" | "derivedcountry" => {
-            let (lat, lon) = gps_coords?;
-            let val = derive_country(lat, lon)?;
-            Some(vec![("Country".to_string(), val)])
-        },
-        "derivedsunposition" => {
-            let (lat, lon) = gps_coords?;
-            let alt_m = sun_inputs.as_ref()?.unwrap_or(0.0);
-            // Determine which time to use
-            let mut date_str = None;
-            let mut final_use_utc = false;
+    if tag_name.eq_ignore_ascii_case("country") || tag_name.eq_ignore_ascii_case("derivedcountry") {
+        let (lat, lon) = gps_coords?;
+        let val = derive_location(lat, lon)?;
+        Some(vec![("Country".to_string(), val)])
+    } else if tag_name.eq_ignore_ascii_case("derivedsunposition") {
+        let (lat, lon) = gps_coords?;
+        let alt_m = sun_alt_m.unwrap_or(0.0);
+        // Determine which time to use
+        let mut date_str = None;
+        let mut final_use_utc = false;
 
-            if use_gps_utc {
-                // Try GPS first
-                if let Some(d) = get_date_str(exif_data, true) {
-                    date_str = Some(d);
-                    final_use_utc = true; // Success, we are using UTC
-                }
+        if use_gps_utc {
+            // Try GPS first
+            if let Some(d) = get_date_str(exif_data, true) {
+                date_str = Some(d);
+                final_use_utc = true; // Success, we are using UTC
             }
+        }
 
-            // Fallback (or default) to Local time
-            if date_str.is_none() {
-                date_str = get_date_str(exif_data, false);
-                // final_use_utc remains false
-            }
+        // Fallback (or default) to Local time
+        if date_str.is_none() {
+            date_str = get_date_str(exif_data, false);
+            // final_use_utc remains false
+        }
 
-            if let Some(d) = date_str {
-                if let Ok((elev, az, tz)) =
-                    position::sun_alt_and_azimuth(&d, lat, lon, Some(alt_m), final_use_utc)
-                {
-                    // Split into two lines as requested
-                    Some(vec![
-                        ("Sun Position".to_string(), crate::position::format_sun_pos(elev, az)),
-                        ("TZ at GPS pos".to_string(), tz),
-                    ])
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        },
-        _ => None,
+        if let Some(d) = date_str
+            && let Ok((elev, az, tz)) =
+                position::sun_alt_and_azimuth(&d, lat, lon, Some(alt_m), final_use_utc)
+        {
+            // Split into two lines as requested
+            Some(vec![
+                ("Sun Position".to_string(), crate::position::format_sun_pos(elev, az)),
+                ("TZ at GPS pos".to_string(), tz),
+            ])
+        } else {
+            None
+        }
+    } else {
+        None
     }
 }
 
@@ -516,6 +452,18 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
     }
     let has_alpha = handle.has_alpha_channel();
     let channels = if has_alpha { 4usize } else { 3usize };
+
+    let bytes_per_pixel = if bit_depth > 8 { channels * 2 } else { channels } as u64;
+    let est_bytes = (handle.width() as u64)
+        .saturating_mul(handle.height() as u64)
+        .saturating_mul(bytes_per_pixel);
+    if est_bytes > get_image_memory_limit() {
+        return Err(format!(
+            "HEIC: Dimensions {}x{} exceed memory limit",
+            handle.width(),
+            handle.height()
+        ));
+    }
 
     let chroma = match (bit_depth > 8, has_alpha) {
         (true, true) => RgbChroma::HdrRgbaLe,
@@ -532,6 +480,8 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
 
     let width = plane.width as usize;
     let height = plane.height as usize;
+    let width_u32 = u32::try_from(width).map_err(|_| "HEIC: Width exceeds u32".to_string())?;
+    let height_u32 = u32::try_from(height).map_err(|_| "HEIC: Height exceeds u32".to_string())?;
     let stride = plane.stride;
     let data = plane.data;
 
@@ -602,11 +552,11 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
         }
 
         if has_alpha {
-            let buf = ImageBuffer::<Rgba<u16>, _>::from_raw(width as u32, height as u32, out)
+            let buf = ImageBuffer::<Rgba<u16>, _>::from_raw(width_u32, height_u32, out)
                 .ok_or_else(|| "Failed to construct ImageRgba16 buffer".to_string())?;
             Ok(DynamicImage::ImageRgba16(buf))
         } else {
-            let buf = ImageBuffer::<Rgb<u16>, _>::from_raw(width as u32, height as u32, out)
+            let buf = ImageBuffer::<Rgb<u16>, _>::from_raw(width_u32, height_u32, out)
                 .ok_or_else(|| "Failed to construct ImageRgb16 buffer".to_string())?;
             Ok(DynamicImage::ImageRgb16(buf))
         }
@@ -633,11 +583,11 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
         };
 
         if has_alpha {
-            let buf = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, out)
+            let buf = ImageBuffer::<Rgba<u8>, _>::from_raw(width_u32, height_u32, out)
                 .ok_or_else(|| "Failed to construct ImageRgba8 buffer".to_string())?;
             Ok(DynamicImage::ImageRgba8(buf))
         } else {
-            let buf = ImageBuffer::<Rgb<u8>, _>::from_raw(width as u32, height as u32, out)
+            let buf = ImageBuffer::<Rgb<u8>, _>::from_raw(width_u32, height_u32, out)
                 .ok_or_else(|| "Failed to construct ImageRgb8 buffer".to_string())?;
             Ok(DynamicImage::ImageRgb8(buf))
         }
@@ -645,15 +595,16 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
 }
 
 pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage, String> {
-    let ext =
-        path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
 
     img_debug!("[load_image_fast] ext={} bytes={}", ext, bytes.len());
 
     // Explicitly reject RAWs here so they are handled by the RAW-specific logic
-    if crate::scanner::RAW_EXTS.contains(&ext.as_str()) {
+    if RAW_EXTS.iter().any(|&r| ext.eq_ignore_ascii_case(r)) {
         return Err("RAW formats handled elsewhere".to_string());
     }
+
+    let mem_limit = get_image_memory_limit();
 
     // Helper closure to construct DynamicImage from decoded 8-bit buffers without duplication
     let build_8bit_image =
@@ -689,22 +640,42 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
             }
         };
 
-    match ext.as_str() {
-        "jpg" | "jpeg" => {
-            // TIER 1: Zune-JPEG
-            let mut zune = ZuneDecoder::new(std::io::Cursor::new(bytes));
+    if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+        // TIER 1: Zune-JPEG
+        let mut zune = ZuneDecoder::new(std::io::Cursor::new(bytes));
+        if zune.decode_headers().is_ok()
+            && let Some(info) = zune.info()
+        {
+            let est_bytes =
+                (info.width as u64).saturating_mul(info.height as u64).saturating_mul(4);
+            if est_bytes > mem_limit {
+                return Err(format!(
+                    "JPEG dimensions {}x{} exceed memory limit",
+                    info.width, info.height
+                ));
+            }
             if let Ok(pixels) = zune.decode()
-                && let Some(info) = zune.info()
                 && let Some(img) =
                     build_8bit_image(info.width as u32, info.height as u32, pixels, "Zune-JPEG")
             {
                 return Ok(img);
             }
+        }
 
-            // TIER 2: jpeg-decoder (Fallback)
-            let mut decoder = Tier2Decoder::new(std::io::Cursor::new(bytes));
+        // TIER 2: jpeg-decoder (Fallback)
+        let mut decoder = Tier2Decoder::new(std::io::Cursor::new(bytes));
+        if decoder.read_info().is_ok()
+            && let Some(info) = decoder.info()
+        {
+            let est_bytes =
+                (info.width as u64).saturating_mul(info.height as u64).saturating_mul(4);
+            if est_bytes > mem_limit {
+                return Err(format!(
+                    "JPEG dimensions {}x{} exceed memory limit",
+                    info.width, info.height
+                ));
+            }
             if let Ok(pixels) = decoder.decode()
-                && let Some(info) = decoder.info()
                 && let Some(img) = build_8bit_image(
                     info.width as u32,
                     info.height as u32,
@@ -714,174 +685,172 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
             {
                 return Ok(img);
             }
-        },
+        }
+    } else if ext.eq_ignore_ascii_case("jxl") {
+        use std::io::Cursor;
 
-        "jxl" => {
-            use std::io::Cursor;
+        use image::ImageDecoder;
+        use jxl_oxide::integration::JxlDecoder;
 
-            use image::ImageDecoder;
-            use jxl_oxide::integration::JxlDecoder;
+        img_debug!("[jxl] attempting decode");
 
-            img_debug!("[jxl] attempting decode");
+        let decoder = JxlDecoder::new(Cursor::new(bytes)).map_err(|e| {
+            img_debug!("[jxl] decoder init failed: {:?}", e);
+            format!("JXL decoder init failed: {:?}", e)
+        })?;
 
-            let decoder = JxlDecoder::new(Cursor::new(bytes)).map_err(|e| {
-                img_debug!("[jxl] decoder init failed: {:?}", e);
-                format!("JXL decoder init failed: {:?}", e)
-            })?;
+        let (w, h) = decoder.dimensions();
+        img_debug!("[jxl] dimensions: {}x{}", w, h);
 
-            let (_w, _h) = decoder.dimensions();
-            img_debug!("[jxl] dimensions: {}x{}", _w, _h);
+        if decoder.total_bytes() > mem_limit {
+            return Err(format!("JXL dimensions {}x{} exceed memory limit", w, h));
+        }
 
-            return DynamicImage::from_decoder(decoder).map_err(|e| {
-                img_debug!("[jxl] decode failed: {:?}", e);
-                format!("JXL decode failed: {:?}", e)
-            });
-        },
+        return DynamicImage::from_decoder(decoder).map_err(|e| {
+            img_debug!("[jxl] decode failed: {:?}", e);
+            format!("JXL decode failed: {:?}", e)
+        });
+    } else if ext.eq_ignore_ascii_case("pdf") {
+        img_debug!("[pdf] attempting hayro decode");
 
-        "pdf" => {
-            img_debug!("[pdf] attempting hayro decode");
+        let pdf_data = std::sync::Arc::new(bytes.to_vec());
+        let pdf = hayro::hayro_syntax::Pdf::new(pdf_data).map_err(|e| {
+            img_debug!("[pdf] parse failed: {:?}", e);
+            format!("PDF parse failed: {:?}", e)
+        })?;
 
-            let pdf_data = std::sync::Arc::new(bytes.to_vec());
-            let pdf = hayro::hayro_syntax::Pdf::new(pdf_data).map_err(|e| {
-                img_debug!("[pdf] parse failed: {:?}", e);
-                format!("PDF parse failed: {:?}", e)
-            })?;
-
-            let pages = pdf.pages();
-            if let Some(first_page) = pages.first() {
-                let interpreter_settings = hayro::hayro_interpret::InterpreterSettings::default();
-                let cache = hayro::RenderCache::new();
-
-                let render_settings = hayro::RenderSettings::default();
-                let pixmap_settings = hayro::PixmapSettings {
-                    x_scale: 2.0,
-                    y_scale: 2.0,
-                    bg_color: hayro::vello_cpu::color::palette::css::WHITE,
-                };
-
-                // Render the page to a pixmap
-                let pixmap = hayro::render(
-                    first_page,
-                    &cache,
-                    &interpreter_settings,
-                    &render_settings,
-                    &pixmap_settings,
-                );
-
-                let width = pixmap.width() as u32;
-                let height = pixmap.height() as u32;
-                let pixel_slice = pixmap.data();
-                let raw_bytes: Vec<u8> = bytemuck::cast_slice(pixel_slice).to_vec();
-
-                if let Some(rgba_image) = image::RgbaImage::from_raw(width, height, raw_bytes) {
-                    img_debug!("[pdf] zero-copy decode successful");
-                    return Ok(image::DynamicImage::ImageRgba8(rgba_image));
-                }
+        let pages = pdf.pages();
+        if let Some(first_page) = pages.first() {
+            let (page_w, page_h) = first_page.render_dimensions();
+            let est_w = (page_w as f64 * 2.0).ceil().max(0.0) as u64;
+            let est_h = (page_h as f64 * 2.0).ceil().max(0.0) as u64;
+            if est_w.saturating_mul(est_h).saturating_mul(4) > mem_limit {
+                return Err(format!("PDF page dimensions {}x{} exceed memory limit", est_w, est_h));
             }
 
-            img_debug!("[pdf] document has no pages or render failed");
-            return Err("PDF document has no pages or render failed".to_string());
-        },
+            let interpreter_settings = hayro::hayro_interpret::InterpreterSettings::default();
+            let cache = hayro::RenderCache::new();
 
-        "tif" | "tiff" => {
-            use std::io::Cursor;
+            let render_settings = hayro::RenderSettings::default();
+            let pixmap_settings = hayro::PixmapSettings {
+                x_scale: 2.0,
+                y_scale: 2.0,
+                bg_color: hayro::vello_cpu::color::palette::css::WHITE,
+            };
 
-            eprintln!(
-                "[DEBUG-TIFF] Attempting image crate wrapper for {:?}",
-                path.file_name().unwrap_or_default()
+            // Render the page to a pixmap
+            let pixmap = hayro::render(
+                first_page,
+                &cache,
+                &interpreter_settings,
+                &render_settings,
+                &pixmap_settings,
             );
 
-            let mem_limit = get_image_memory_limit();
+            let width = pixmap.width() as u32;
+            let height = pixmap.height() as u32;
+            let pixel_slice = pixmap.data();
+            let raw_bytes: Vec<u8> = bytemuck::cast_slice(pixel_slice).to_vec();
 
-            match image::codecs::tiff::TiffDecoder::new(Cursor::new(bytes)) {
-                Ok(decoder) => {
-                    use image::ImageDecoder;
-                    let total_bytes = decoder.total_bytes();
-                    if total_bytes <= mem_limit {
-                        if decoder.color_type() == image::ColorType::Rgb8 {
-                            let (w, h) = decoder.dimensions();
-                            if let Ok(buf_len) = usize::try_from(total_bytes) {
-                                let mut buffer = vec![0u8; buf_len];
-                                if decoder.read_image(&mut buffer).is_ok()
-                                    && let Some(buf) =
-                                        image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(
-                                            w, h, buffer,
-                                        )
-                                {
-                                    return Ok(image::DynamicImage::ImageRgb8(buf));
-                                }
-                            }
-                        } else if let Ok(img) = image::DynamicImage::from_decoder(decoder) {
-                            return Ok(img);
-                        }
-                    }
-                },
-                Err(e) => {
-                    eprintln!(
-                        "[DEBUG-TIFF] Wrapper failed: {}. Falling back to native tiff crate...",
-                        e
-                    );
-
-                    // 2. NATIVE TIFF BYPASS: Handles JPEG-compressed YCbCr
-                    if let Ok(mut native_decoder) = tiff::decoder::Decoder::new(Cursor::new(bytes))
-                    {
-                        let is_ycbcr =
-                            matches!(native_decoder.colortype(), Ok(tiff::ColorType::YCbCr(_)));
-
-                        if let Ok((w, h)) = native_decoder.dimensions()
-                            && let Some(wh) = (w as usize).checked_mul(h as usize)
-                            && (wh.saturating_mul(4) as u64) <= mem_limit
-                            && let Ok(tiff::decoder::DecodingResult::U8(mut data)) =
-                                native_decoder.read_image()
-                        {
-                            let expected_rgb_len = wh.saturating_mul(3);
-                            let expected_rgba_len = wh.saturating_mul(4);
-
-                            if data.len() == expected_rgb_len {
-                                if is_ycbcr {
-                                    eprintln!(
-                                        "[DEBUG-TIFF] Converting raw YCbCr bytes to RGB in-place..."
-                                    );
-                                    for chunk in data.as_chunks_mut::<3>().0 {
-                                        let y = chunk[0] as f32;
-                                        let cb = chunk[1] as f32 - 128.0;
-                                        let cr = chunk[2] as f32 - 128.0;
-
-                                        chunk[0] = (y + 1.402 * cr).clamp(0.0, 255.0) as u8;
-                                        chunk[1] = (y - 0.344136 * cb - 0.714136 * cr)
-                                            .clamp(0.0, 255.0)
-                                            as u8;
-                                        chunk[2] = (y + 1.772 * cb).clamp(0.0, 255.0) as u8;
-                                    }
-                                }
-
-                                if let Some(buf) =
-                                    image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, data)
-                                {
-                                    eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGB8");
-                                    return Ok(image::DynamicImage::ImageRgb8(buf));
-                                }
-                            } else if data.len() == expected_rgba_len
-                                && let Some(buf) =
-                                    image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, data)
-                            {
-                                eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGBA8");
-                                return Ok(image::DynamicImage::ImageRgba8(buf));
-                            }
-                        }
-                    } else {
-                        eprintln!("[DEBUG-TIFF] Native tiff decoder also rejected the file.");
-                    }
-                },
+            if let Some(rgba_image) = image::RgbaImage::from_raw(width, height, raw_bytes) {
+                img_debug!("[pdf] decode successful");
+                return Ok(image::DynamicImage::ImageRgba8(rgba_image));
             }
-        },
+        }
 
-        "heic" | "heif" => return decode_heic(bytes),
+        img_debug!("[pdf] document has no pages or render failed");
+        return Err("PDF document has no pages or render failed".to_string());
+    } else if ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff") {
+        use std::io::Cursor;
 
-        _ => {},
+        eprintln!(
+            "[DEBUG-TIFF] Attempting image crate wrapper for {:?}",
+            path.file_name().unwrap_or_default()
+        );
+
+        match image::codecs::tiff::TiffDecoder::new(Cursor::new(bytes)) {
+            Ok(decoder) => {
+                use image::ImageDecoder;
+                let total_bytes = decoder.total_bytes();
+                if total_bytes > mem_limit {
+                    return Err(format!("TIFF size {} bytes exceeds memory limit", total_bytes));
+                }
+                if decoder.color_type() == image::ColorType::Rgb8 {
+                    let (w, h) = decoder.dimensions();
+                    if let Ok(buf_len) = usize::try_from(total_bytes) {
+                        let mut buffer = vec![0u8; buf_len];
+                        if decoder.read_image(&mut buffer).is_ok()
+                            && let Some(buf) =
+                                image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, buffer)
+                        {
+                            return Ok(image::DynamicImage::ImageRgb8(buf));
+                        }
+                    }
+                } else if let Ok(img) = image::DynamicImage::from_decoder(decoder) {
+                    return Ok(img);
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "[DEBUG-TIFF] Wrapper failed: {}. Falling back to native tiff crate...",
+                    e
+                );
+
+                // 2. NATIVE TIFF BYPASS: Handles JPEG-compressed YCbCr
+                if let Ok(mut native_decoder) = tiff::decoder::Decoder::new(Cursor::new(bytes)) {
+                    let is_ycbcr =
+                        matches!(native_decoder.colortype(), Ok(tiff::ColorType::YCbCr(_)));
+
+                    if let Ok((w, h)) = native_decoder.dimensions()
+                        && let Some(wh) = (w as usize).checked_mul(h as usize)
+                        && (wh.saturating_mul(4) as u64) <= mem_limit
+                        && let Ok(tiff::decoder::DecodingResult::U8(mut data)) =
+                            native_decoder.read_image()
+                    {
+                        let expected_rgb_len = wh.saturating_mul(3);
+                        let expected_rgba_len = wh.saturating_mul(4);
+
+                        if data.len() == expected_rgb_len {
+                            if is_ycbcr {
+                                eprintln!(
+                                    "[DEBUG-TIFF] Converting raw YCbCr bytes to RGB in-place..."
+                                );
+                                for chunk in data.as_chunks_mut::<3>().0 {
+                                    let y = chunk[0] as f32;
+                                    let cb = chunk[1] as f32 - 128.0;
+                                    let cr = chunk[2] as f32 - 128.0;
+
+                                    chunk[0] = (y + 1.402 * cr).clamp(0.0, 255.0) as u8;
+                                    chunk[1] =
+                                        (y - 0.344136 * cb - 0.714136 * cr).clamp(0.0, 255.0) as u8;
+                                    chunk[2] = (y + 1.772 * cb).clamp(0.0, 255.0) as u8;
+                                }
+                            }
+
+                            if let Some(buf) =
+                                image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, data)
+                            {
+                                eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGB8");
+                                return Ok(image::DynamicImage::ImageRgb8(buf));
+                            }
+                        } else if data.len() == expected_rgba_len
+                            && let Some(buf) =
+                                image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(w, h, data)
+                        {
+                            eprintln!("[DEBUG-TIFF] Native bypass SUCCESS: RGBA8");
+                            return Ok(image::DynamicImage::ImageRgba8(buf));
+                        }
+                    }
+                } else {
+                    eprintln!("[DEBUG-TIFF] Native tiff decoder also rejected the file.");
+                }
+            },
+        }
+    } else if ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif") {
+        return decode_heic(bytes);
     }
 
-    // This handles AVIF, WebP, PCX etc (image-extras) and corrupted files.
+    // This handles AVIF, WebP, PCX etc (image-extras) and corrupted/misnamed files.
     eprintln!("[DEBUG-LOAD] {:?} -> Fallback (image crate)", path.file_name().unwrap_or_default());
 
     // Chain with_guessed_format(). If it fails (IO error), fallback to a fresh reader.
@@ -896,67 +865,16 @@ pub fn load_image_fast(path: &Path, bytes: &[u8]) -> Result<image::DynamicImage,
     }
 
     let mut custom_limits = image::Limits::default();
-    custom_limits.max_alloc = Some(get_image_memory_limit());
+    custom_limits.max_alloc = Some(mem_limit);
     reader.limits(custom_limits);
 
     reader.decode().map_err(|e| e.to_string())
 }
 
-/// Derive country name from GPS coordinates using country-boundaries
-fn derive_country(lat: f64, lon: f64) -> Option<String> {
-    use country_boundaries::{BOUNDARIES_ODBL_360X180, CountryBoundaries, LatLon};
-
-    // Lazily load boundaries instance once at module scope
-    let boundaries = BOUNDARIES
-        .get_or_init(|| CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).ok())
-        .as_ref()?;
-
-    // Get the position
-    let pos = LatLon::new(lat, lon).ok()?;
-
-    // Get country IDs for this position
-    let ids = boundaries.ids(pos);
-
-    if ids.is_empty() {
-        return None;
-    }
-
-    // Find subdivision (like "US-FL") and country code (like "US")
-    let subdivision_id = ids.iter().find(|id| id.contains('-')).map(|s| s.as_ref());
-    let country_id = ids.iter().find(|id| id.len() == 2).map(|s| s.as_ref());
-
-    // Build the location string
-    format_location(country_id, subdivision_id)
-}
-
-/// Format location string from country and subdivision codes
-fn format_location(country_code: Option<&str>, subdivision_code: Option<&str>) -> Option<String> {
-    // 1. Get subdivision name (e.g., "US-FL" -> "Florida")
-    let subdivision_name = subdivision_code.and_then(|code| {
-        // The crate expects underscores (US_FL) not hyphens (US-FL)
-        let formatted_code = code.replace('-', "_");
-        SubdivisionCode::from_str(&formatted_code).ok().map(|s| s.name().to_string())
-    });
-
-    // 2. Get country name (e.g., "FI" -> "Finland")
-    let country_name = country_code
-        .and_then(|code| CountryCode::from_str(code).ok().map(|c| c.short_name().to_string()));
-
-    match (country_name, subdivision_name) {
-        (Some(country), Some(subdivision)) => Some(format!("{}, {}", subdivision, country)),
-        (Some(country), None) => Some(country),
-        (None, Some(subdivision)) => Some(subdivision),
-        (None, None) => {
-            // Fallback: return the raw code if we have one
-            country_code.or(subdivision_code).map(|s| s.to_string())
-        },
-    }
-}
-
 /// Parse a tag name string into an exif::Tag and exif::In
 fn parse_exif_tag_name(name: &str) -> Option<(exif::Tag, exif::In)> {
     // Common EXIF tags - add more as needed
-    let tag = match name.to_lowercase().as_str() {
+    let tag = match name.to_ascii_lowercase().as_str() {
         "make" => exif::Tag::Make,
         "model" => exif::Tag::Model,
         "orientation" => exif::Tag::Orientation,
@@ -1049,158 +967,6 @@ pub fn get_supported_exif_tags() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Format seconds as human-readable time with up to three-decimal accuracy,
-/// trimming trailing zeros: 1.22 -> "1.22s", 1.20 -> "1.2s", 2.00 -> "2s",
-/// 0.023 -> "0.023s"; sub-millisecond times switch to ms: 0.0001 -> "0.1ms"
-fn format_seconds(secs: f64) -> String {
-    if secs < 0.001 {
-        let s = format!("{:.3}", secs * 1000.0);
-        let s = s.trim_end_matches('0').trim_end_matches('.');
-        format!("{}ms", s)
-    } else {
-        let s = format!("{:.3}", secs);
-        let s = s.trim_end_matches('0').trim_end_matches('.');
-        format!("{}s", s)
-    }
-}
-
-/// Format an EXIF value for display
-fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) -> String {
-    match tag {
-        exif::Tag::GPSLatitude | exif::Tag::GPSLongitude => {
-            if decimal_coords {
-                // Parse rational D/M/S to decimal degrees
-                if let Some(val) = parse_gps_coordinate(value) {
-                    return format!("{:.6}", val);
-                }
-            }
-            // Fallback to default Minutes/Seconds display
-            clean_exif_string(&value.display_as(tag).to_string())
-        },
-        exif::Tag::ExposureTime => {
-            // ExposureTime is stored as Rational; check that first because
-            // Value::get_uint() returns None for Rational values.
-            if let exif::Value::Rational(rats) = value
-                && !rats.is_empty()
-                && rats[0].num > 0
-                && rats[0].denom > 0
-            {
-                let g = gcd(rats[0].num, rats[0].denom);
-                let (n, d) = (rats[0].num / g, rats[0].denom / g);
-                if d == 1 {
-                    // Whole seconds, e.g. "2s"
-                    return format_seconds(n as f64);
-                }
-                // Exact reduced fraction plus human-readable time, always
-                let secs = n as f64 / d as f64;
-                return format!("{}/{}s ({})", n, d, format_seconds(secs));
-            }
-            // Integer-typed fallback (some writers store plain integers)
-            if let Some(r) = value.get_uint(0) {
-                return format!("{}s", r);
-            }
-            clean_exif_string(&value.display_as(tag).to_string())
-        },
-        exif::Tag::ExposureBiasValue => {
-            // ExposureBias is stored as SRational; widen to i64 first so that
-            // negating i32::MIN (-2147483648) never overflows or panics in gcd().
-            if let exif::Value::SRational(rats) = value
-                && !rats.is_empty()
-                && rats[0].denom != 0
-            {
-                let (mut n, mut d) = (rats[0].num as i64, rats[0].denom as i64);
-                if d < 0 {
-                    // Normalize sign into the numerator safely in i64
-                    n = -n;
-                    d = -d;
-                }
-                let g = gcd(n, d);
-                let (n, d) = (n / g, d / g);
-                return if n == 0 {
-                    "0 EV".to_string()
-                } else if d == 1 {
-                    format!("{:+} EV", n)
-                } else {
-                    format!("{:+}/{} EV", n, d)
-                };
-            }
-            clean_exif_string(&value.display_as(tag).to_string())
-        },
-        exif::Tag::FNumber => {
-            if let exif::Value::Rational(rats) = value
-                && !rats.is_empty()
-                && rats[0].denom > 0
-            {
-                return format!("f/{:.1}", rats[0].num as f64 / rats[0].denom as f64);
-            }
-            clean_exif_string(&value.display_as(tag).to_string())
-        },
-        exif::Tag::FocalLength => {
-            if let exif::Value::Rational(rats) = value
-                && !rats.is_empty()
-                && rats[0].denom > 0
-            {
-                return format!("{}mm", rats[0].num as f64 / rats[0].denom as f64);
-            }
-            clean_exif_string(&value.display_as(tag).to_string())
-        },
-        exif::Tag::PhotographicSensitivity => {
-            if let Some(iso) = value.get_uint(0) {
-                format!("ISO {}", iso)
-            } else {
-                clean_exif_string(&value.display_as(tag).to_string())
-            }
-        },
-        exif::Tag::FocalLengthIn35mmFilm => {
-            if let Some(fl) = value.get_uint(0) {
-                format!("{}mm (35mm equiv)", fl)
-            } else {
-                clean_exif_string(&value.display_as(tag).to_string())
-            }
-        },
-        _ => {
-            // Default: use the library's display formatting, then clean it
-            clean_exif_string(&value.display_as(tag).to_string())
-        },
-    }
-}
-
-/// Clean up EXIF string values that may contain garbage or repeated empty entries
-fn clean_exif_string(s: &str) -> String {
-    // Remove surrounding quotes, brackets, and null bytes if present
-    let s = s.trim().trim_matches(|c: char| c == '"' || c == '[' || c == ']' || c == '\0');
-
-    // If the string contains comma-separated values (common in some EXIF fields),
-    // clean individual items, discard empty/garbage entries, and preserve valid values
-    if s.contains(',') || s.contains("\", \"") {
-        // Split by comma, strip surrounding quotes and nulls from each part, and filter out empties
-        let mut parts: Vec<String> = s
-            .split(',')
-            .map(|p| {
-                p.trim()
-                    .trim_matches(|c: char| c == '"' || c == '\'' || c == '\0')
-                    .trim()
-                    .to_string()
-            })
-            .filter(|p| !p.is_empty())
-            .collect();
-
-        // Deduplicate consecutive identical entries often produced by buggy EXIF encoders
-        parts.dedup();
-
-        if !parts.is_empty() {
-            return parts.join(", ");
-        }
-    }
-
-    // Remove any trailing garbage (null bytes represented as empty quotes, etc.)
-    let cleaned = s.trim_matches(|c: char| {
-        c == '"' || c == '\'' || c == ',' || c.is_whitespace() || c == '\0'
-    });
-
-    cleaned.to_string()
-}
-
 fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
     // 1. Handle RAW images
     if is_raw_ext(path) {
@@ -1221,8 +987,7 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
 
     // 2. Handle HEIC/HEIF and TIFF specifically
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        let ext = ext.to_lowercase();
-        if ext == "heic" || ext == "heif" {
+        if ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif") {
             let data_cow;
             let ctx = match bytes {
                 Some(b) => HeifContext::read_from_bytes(b).ok()?,
@@ -1241,7 +1006,7 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
         }
 
         // 2.5 Handle TIFF specifically to bypass ImageReader color space limits
-        if ext == "tif" || ext == "tiff" {
+        if ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff") {
             let reader_obj: Box<dyn BufReadSeek> = match bytes {
                 Some(b) => Box::new(std::io::Cursor::new(b)),
                 None => Box::new(std::io::BufReader::new(fs::File::open(path).ok()?)),
@@ -1272,24 +1037,30 @@ fn get_resolution(path: &Path, bytes: Option<&[u8]>) -> Option<(u32, u32)> {
     None
 }
 
-/// Helper to run a closure inside a constrained Rayon thread pool without panicking
+/// Helper to run a closure inside the cached constrained Rayon thread pool without panicking
 /// if OS thread creation fails (falls back to running on the current/global pool).
 fn run_in_smart_pool<OP, R>(op: OP) -> R
 where
     OP: FnOnce() -> R + Send,
     R: Send,
 {
-    let safe_threads = get_safe_thread_count();
-    match rayon::ThreadPoolBuilder::new().num_threads(safe_threads).build() {
-        Ok(pool) => pool.install(op),
-        Err(e) => {
-            eprintln!("[WARN] Failed to build custom thread pool ({}), using fallback", e);
-            op()
-        },
+    let pool = SMART_POOL.get_or_init(|| {
+        let safe_threads = get_safe_thread_count();
+        match rayon::ThreadPoolBuilder::new().num_threads(safe_threads).build() {
+            Ok(pool) => Some(pool),
+            Err(e) => {
+                eprintln!("[WARN] Failed to build custom thread pool ({}), using fallback", e);
+                None
+            },
+        }
+    });
+    match pool {
+        Some(pool) => pool.install(op),
+        None => op(),
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanConfig {
     pub paths: Vec<String>,
     pub rehash: bool,
@@ -1391,7 +1162,7 @@ pub fn scan_and_group(
     }
 
     let hash_start = Instant::now();
-    let (tx, rx) = unbounded();
+    let (tx, rx) = bounded(4096);
     let db_handle = ctx.start_db_writer(rx);
     let processed_count = AtomicUsize::new(0);
 
@@ -1412,7 +1183,8 @@ pub fn scan_and_group(
                 let mtime = metadata.modified().ok().unwrap_or(UNIX_EPOCH);
                 let mtime_utc: DateTime<Utc> = DateTime::from(mtime);
                 let mtime_ns =
-                    mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+                    u64::try_from(mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos())
+                        .unwrap_or(u64::MAX);
                 let unique_file_id = fileops::get_file_key(path)?;
 
                 let meta_key = compute_meta_key(&ctx_ref.meta_key, mtime_ns, size, unique_file_id);
@@ -1485,161 +1257,143 @@ pub fn scan_and_group(
                     if !metadata_hit {
                         eprintln!("[CACHE-MISS] New file: {:?}", path.display());
                     }
-                    let bytes = fs::read(path).ok();
-
-                    if let Some(ref b) = bytes {
-                        let is_raw = is_raw_ext(path);
-                        let mut parsed_raw = None;
-                        let mut exif_data = None;
-
-                        if !pdq_cached {
-                            // Only parse EXIF / RAW metadata if PDQ features were NOT already cached
-                            parsed_raw =
-                                if is_raw { rsraw::RawImage::open(b).ok() } else { None };
-                            exif_data = read_exif_data(path, Some(b));
-
-                            if let Some(ref exif) = exif_data {
-                                if let Some((lat, lon)) = extract_gps_lat_lon(exif) {
-                                    gps_pos = Some(Point::new(lon, lat));
-                                }
-                                if let Some(field) =
-                                    exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-                                    && let Some(v @ 1..=8) = field.value.get_uint(0)
-                                {
-                                    orientation = v as u8;
-                                }
-                                if orientation_baked_into_pixels(path) {
-                                    orientation = 1;
-                                }
-                                exif_timestamp = get_exif_timestamp(exif);
-                            } else if is_raw
-                                && let Some(ref raw) = parsed_raw
-                            {
-                                if let Some(point) = raw_exif::get_gps_point_from_raw(raw) {
-                                    gps_pos = Some(point);
-                                }
-                                exif_timestamp = raw_exif::get_timestamp_from_raw(raw);
-                                orientation = raw_exif::get_orientation_from_raw(raw);
-                            }
-                        } else if is_raw {
-                            parsed_raw = rsraw::RawImage::open(b).ok();
-                        }
-
-                        if !metadata_hit {
-                            let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
-                            ck = *ch.as_bytes();
-                            new_meta = Some((meta_key, ck));
-                        }
-
-                        let mut img_for_hashing: Option<image::DynamicImage> = None;
-
-                        if is_raw {
-                            if resolution.is_none()
-                                && let Some(ref raw) = parsed_raw
-                            {
-                                resolution = Some((raw.width(), raw.height()));
-                            }
-
-                            if let Some(mut raw) = parsed_raw
-                                && let Ok(thumbs) = raw.extract_thumbs()
-                                && let Some(thumb) = thumbs // Find largest JPEG thumbnail
-                                    .into_iter()
-                                    .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
-                                    .max_by_key(|t| (t.width as u64) * (t.height as u64))
-                            {
-                                img_for_hashing =
-                                    load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data).ok();
-                            }
-                            if resolution.is_none() {
-                                resolution = get_resolution(path, Some(b));
-                            }
-                        } else {
-                            img_for_hashing = load_image_fast(path, b).ok();
-                        }
-
-                        if let Some(img) = &img_for_hashing {
-                            if resolution.is_none() {
-                                resolution = Some(img.dimensions());
-                            }
-
-                            if config.calc_pixel_hash && pixel_hash.is_none() {
-                                // Calculate Pixel Hash of 16bit RGBA (Content Identical Check)
-                                let rgba16 = img.to_rgba16();
-                                let raw_u16 = rgba16.as_raw();
-                                let raw_bytes: &[u8] = cast_slice(raw_u16);
-                                let ph = *blake3::hash(raw_bytes).as_bytes();
-                                eprintln!(
-                                    "[DEBUG-PIXEL_HASH 16BIT] {:?} : {}",
-                                    path.file_name().unwrap_or_default(),
-                                    hex::encode(ph)
-                                );
-                                pixel_hash = Some(ph);
-                                new_pixel = Some((ck, ph));
-                            }
-
-                            if !pdq_cached
-                                && let Some((features, quality)) =
-                                    crate::pdqhash::generate_pdq_features(img)
-                            {
-                                let hash = features.to_hash();
-                                pdqhash = Some(hash);
-
-                                let quality_100 =
-                                    (quality * 100.0).round().clamp(0.0, 100.0) as u16;
-                                pdq_quality = Some(quality_100);
-
-                                let cached_coeffs = CachedCoefficients {
-                                    coefficients: features.coefficients.to_vec(),
-                                };
-                                pdq_features = Some(Arc::new(features));
-
-                                let (w, h) = resolution.unwrap_or((0, 0));
-                                let mut img_features = if let Some(ref exif) = exif_data {
-                                    crate::exif_extract::build_image_features(
-                                        w, h, exif, true, false,
-                                    )
-                                } else {
-                                    ImageFeatures::new(w, h)
-                                };
-
-                                if orientation_baked_into_pixels(path) {
-                                    img_features.insert_tag(TAG_ORIENTATION, ExifValue::Short(1));
-                                } else if orientation != 1 {
-                                    img_features.insert_tag(
-                                        TAG_ORIENTATION,
-                                        ExifValue::Short(orientation as u16),
-                                    );
-                                }
-
-                                if let Some(pos) = gps_pos {
-                                    img_features
-                                        .insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y()));
-                                    img_features
-                                        .insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(pos.x()));
-                                }
-
-                                if let Some(ts) = exif_timestamp {
-                                    img_features
-                                        .insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(ts));
-                                }
-
-                                img_features.insert_tag(
-                                    TAG_DERIVED_PDQ_QUALITY,
-                                    ExifValue::Short(quality_100),
-                                );
-
-                                if new_hash.is_none() {
-                                    new_hash = Some((ck, HashValue::PdqHash(hash)));
-                                }
-                                new_features = Some((ck, img_features));
-                                new_coeffs = Some((ck, cached_coeffs));
-                            }
-                        } else if resolution.is_none() {
-                            resolution = get_resolution(path, Some(b));
-                        }
-                    } else if !metadata_hit {
+                    let Some(ref b) = fs::read(path).ok() else {
                         eprintln!("[ERROR] Failed to read file, skipping: {:?}", path.display());
                         return None;
+                    };
+
+                    let is_raw = is_raw_ext(path);
+                    let mut parsed_raw = None;
+                    let mut exif_data = None;
+
+                    if !pdq_cached {
+                        // Only parse EXIF / RAW metadata if PDQ features were NOT already cached
+                        parsed_raw = if is_raw { rsraw::RawImage::open(b).ok() } else { None };
+                        exif_data = read_exif_data(path, Some(b));
+
+                        if let Some(ref exif) = exif_data {
+                            if let Some((lat, lon)) = extract_gps_lat_lon(exif) {
+                                gps_pos = Some(Point::new(lon, lat));
+                            }
+                            orientation = orientation_from_exif(path, exif);
+                            exif_timestamp = get_exif_timestamp(exif);
+                        } else if is_raw
+                            && let Some(ref raw) = parsed_raw
+                        {
+                            if let Some(point) = raw_exif::get_gps_point_from_raw(raw) {
+                                gps_pos = Some(point);
+                            }
+                            exif_timestamp = raw_exif::get_timestamp_from_raw(raw);
+                            orientation = raw_exif::get_orientation_from_raw(raw);
+                        }
+                    } else if is_raw {
+                        parsed_raw = rsraw::RawImage::open(b).ok();
+                    }
+
+                    if !metadata_hit {
+                        let ch = blake3::keyed_hash(&ctx_ref.content_key, b);
+                        ck = *ch.as_bytes();
+                        new_meta = Some((meta_key, ck));
+                    }
+
+                    let mut img_for_hashing: Option<image::DynamicImage> = None;
+
+                    if is_raw {
+                        if resolution.is_none()
+                            && let Some(ref raw) = parsed_raw
+                        {
+                            resolution = Some((raw.width(), raw.height()));
+                        }
+
+                        if let Some(mut raw) = parsed_raw
+                            && let Ok(thumbs) = raw.extract_thumbs()
+                            && let Some(thumb) = thumbs // Find largest JPEG thumbnail
+                                .into_iter()
+                                .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
+                                .max_by_key(|t| (t.width as u64) * (t.height as u64))
+                        {
+                            img_for_hashing =
+                                load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data).ok();
+                        }
+                    } else {
+                        img_for_hashing = load_image_fast(path, b).ok();
+                    }
+
+                    if let Some(img) = &img_for_hashing {
+                        if resolution.is_none() {
+                            resolution = Some(img.dimensions());
+                        }
+
+                        if config.calc_pixel_hash && pixel_hash.is_none() {
+                            // Calculate Pixel Hash of 16bit RGBA (Content Identical Check)
+                            let rgba16 = img.to_rgba16();
+                            let raw_u16 = rgba16.as_raw();
+                            let raw_bytes: &[u8] = cast_slice(raw_u16);
+                            let ph = *blake3::hash(raw_bytes).as_bytes();
+                            eprintln!(
+                                "[DEBUG-PIXEL_HASH 16BIT] {:?} : {}",
+                                path.file_name().unwrap_or_default(),
+                                hex::encode(ph)
+                            );
+                            pixel_hash = Some(ph);
+                            new_pixel = Some((ck, ph));
+                        }
+
+                        if !pdq_cached
+                            && let Some((features, quality)) =
+                                crate::pdqhash::generate_pdq_features(img)
+                        {
+                            let hash = features.to_hash();
+                            pdqhash = Some(hash);
+
+                            let quality_100 = (quality * 100.0).round().clamp(0.0, 100.0) as u16;
+                            pdq_quality = Some(quality_100);
+
+                            let cached_coeffs =
+                                CachedCoefficients { coefficients: features.coefficients.to_vec() };
+                            pdq_features = Some(Arc::new(features));
+
+                            let (w, h) = resolution.unwrap_or((0, 0));
+                            let mut img_features = if let Some(ref exif) = exif_data {
+                                crate::exif_extract::build_image_features(w, h, exif, true, false)
+                            } else {
+                                ImageFeatures::new(w, h)
+                            };
+
+                            if orientation_baked_into_pixels(path) {
+                                img_features.insert_tag(TAG_ORIENTATION, ExifValue::Short(1));
+                            } else if orientation != 1 {
+                                img_features.insert_tag(
+                                    TAG_ORIENTATION,
+                                    ExifValue::Short(orientation as u16),
+                                );
+                            }
+
+                            if let Some(pos) = gps_pos {
+                                img_features
+                                    .insert_tag(TAG_GPS_LATITUDE, ExifValue::Float(pos.y()));
+                                img_features
+                                    .insert_tag(TAG_GPS_LONGITUDE, ExifValue::Float(pos.x()));
+                            }
+
+                            if let Some(ts) = exif_timestamp {
+                                img_features
+                                    .insert_tag(TAG_DERIVED_TIMESTAMP, ExifValue::Long64(ts));
+                            }
+
+                            img_features.insert_tag(
+                                TAG_DERIVED_PDQ_QUALITY,
+                                ExifValue::Short(quality_100),
+                            );
+
+                            if new_hash.is_none() {
+                                new_hash = Some((ck, HashValue::PdqHash(hash)));
+                            }
+                            new_features = Some((ck, img_features));
+                            new_coeffs = Some((ck, cached_coeffs));
+                        }
+                    } else if resolution.is_none() && !is_raw {
+                        resolution = get_resolution(path, Some(b));
                     }
                 }
 
@@ -1797,6 +1551,8 @@ where
     H: HammingHash + std::fmt::Debug + Clone + Copy + Default,
     S: GroupingStrategy<H>,
 {
+    assert!(valid_files.len() <= u32::MAX as usize, "too many files for u32 index");
+
     // Clamp similarity instead of panicking if config.similarity > MAX_SIMILARITY_256
     let maxsim = crate::hamminghash::MAX_SIMILARITY_256;
     let effective_similarity = if config.similarity > maxsim {
@@ -1851,6 +1607,7 @@ where
 
                     let count = strategy.generate_variants(file, hash, variants_buf);
                     let variants = &variants_buf[..count];
+                    let is_single_variant = count == 1;
 
                     let base_limit = if low_conf[i] { 0 } else { effective_similarity };
 
@@ -1873,7 +1630,18 @@ where
                                         let dense_id = dense.index();
                                         let cand_idx = dense_to_sparse[dense_id];
 
-                                        if cand_idx <= i || v.set(cand_idx) {
+                                        // Skip self. For cand_idx < i, skip if both sides are symmetric
+                                        // or if cand_idx already expanded its own dihedral variants
+                                        // when it ran as the query; otherwise an asymmetric file with
+                                        // features must still check earlier feature-less files.
+                                        if cand_idx == i
+                                            || (cand_idx < i
+                                                && (is_single_variant
+                                                    || valid_files[cand_idx]
+                                                        .pdq_features
+                                                        .is_some()))
+                                            || v.set(cand_idx)
+                                        {
                                             continue;
                                         }
 
@@ -1882,7 +1650,10 @@ where
                                         if variant.hamming_distance(cand_hash) <= limit
                                             && !m.set(cand_idx)
                                         {
-                                            edges.push((i as u32, cand_idx as u32));
+                                            edges.push((
+                                                i.min(cand_idx) as u32,
+                                                i.max(cand_idx) as u32,
+                                            ));
                                         }
                                     }
                                 };
@@ -1985,7 +1756,7 @@ fn get_ext_priority(path: &Path, ext_priorities: &HashMap<String, usize>) -> usi
     }
     path.extension()
         .and_then(|e| e.to_str())
-        .and_then(|e| ext_priorities.get(&e.to_lowercase()).copied())
+        .and_then(|e| ext_priorities.get(&e.to_ascii_lowercase()).copied())
         .unwrap_or(usize::MAX)
 }
 
@@ -2000,7 +1771,7 @@ pub fn analyze_group(
 
 fn analyze_group_with_features(
     files: &mut Vec<FileMetadata>,
-    features_map: &HashMap<&std::path::PathBuf, &crate::pdqhash::PdqFeatures>,
+    features_map: &HashMap<&Path, &crate::pdqhash::PdqFeatures>,
     sort_order: &str,
     ext_priorities: &HashMap<String, usize>,
 ) -> GroupInfo {
@@ -2029,7 +1800,7 @@ fn analyze_group_with_features(
         files.drain(..).partition(|f| {
             let is_bit_dupe = *bit_counts.get(&f.content_hash).unwrap_or(&0) > 1;
             let is_pixel_dupe =
-                f.pixel_hash.map(|ph| *pixel_counts.get(&ph).unwrap_or(&0) > 1).unwrap_or(false);
+                f.pixel_hash.is_some_and(|ph| *pixel_counts.get(&ph).unwrap_or(&0) > 1);
             is_bit_dupe || is_pixel_dupe
         });
 
@@ -2052,7 +1823,7 @@ fn analyze_group_with_features(
     files.append(&mut unique);
 
     let pivot_features: Option<&crate::pdqhash::PdqFeatures> =
-        files.iter().find_map(|f| features_map.get(&f.path).copied());
+        files.iter().find_map(|f| features_map.get(f.path.as_path()).copied());
 
     let max_d = if let Some(pivot_feats) = pivot_features {
         let pivot_variants = pivot_feats.generate_dihedral_hashes();
@@ -2147,38 +1918,18 @@ fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> V
 
     // Union-Find Merge Logic
     let mut parent: Vec<usize> = (0..groups.len()).collect();
-    fn find(parent: &mut [usize], i: usize) -> usize {
-        let mut root = i;
-        while root != parent[root] {
-            root = parent[root];
-        }
-        let mut curr = i;
-        while curr != root {
-            let next = parent[curr];
-            parent[curr] = root;
-            curr = next;
-        }
-        root
-    }
-    fn union(parent: &mut [usize], i: usize, j: usize) {
-        let root_i = find(parent, i);
-        let root_j = find(parent, j);
-        if root_i != root_j {
-            parent[root_i] = root_j;
-        }
-    }
 
     // Iterate linearly and merge adjacent identical stems
     for w in entries.windows(2) {
         if w[0].0 == w[1].0 && w[0].1 == w[1].1 {
-            union(&mut parent, w[0].2, w[1].2);
+            uf_union(&mut parent, w[0].2, w[1].2);
         }
     }
 
     // Rebuild Groups
     let mut merged_map: HashMap<usize, Vec<u32>> = HashMap::new();
     for (old_idx, group) in groups.into_iter().enumerate() {
-        let root = find(&mut parent, old_idx);
+        let root = uf_find(&mut parent, old_idx);
         merged_map.entry(root).or_default().extend(group);
     }
 
@@ -2202,16 +1953,18 @@ fn process_raw_groups(
         .extensions
         .iter()
         .enumerate()
-        .map(|(i, e)| (e.trim_start_matches('.').to_lowercase(), i))
+        .map(|(i, e)| (e.trim_start_matches('.').to_ascii_lowercase(), i))
         .collect();
 
     // Build read-only lookup map
-    let mut features_map = HashMap::new();
+    let mut features_map: HashMap<&Path, &crate::pdqhash::PdqFeatures> = HashMap::new();
     for vf in valid_files {
         if let Some(feats) = &vf.pdq_features {
-            features_map.insert(&vf.path, &**feats);
+            features_map.insert(vf.path.as_path(), &**feats);
         }
     }
+
+    let group_by = config.group_by.to_ascii_lowercase();
 
     // Process groups in parallel using Rayon
     let results: Vec<(Vec<FileMetadata>, GroupInfo)> = raw_groups
@@ -2225,7 +1978,7 @@ fn process_raw_groups(
             let info = analyze_group_with_features(
                 &mut group_data,
                 &features_map,
-                &config.group_by.to_lowercase(),
+                &group_by,
                 &ext_priorities,
             );
             (group_data, info)
@@ -2322,7 +2075,7 @@ pub fn sort_files(files: &mut [FileMetadata], sort_order: &str) {
     }
 }
 
-/// Sort directories by the given sort order (same options as files)
+/// Sort directories by the given sort order (same options as files; directory size falls back to natural name)
 pub fn sort_directories(dirs: &mut [std::path::PathBuf], sort_order: &str) {
     use rand::seq::SliceRandom;
     match sort_order {
@@ -2381,28 +2134,14 @@ pub fn sort_directories(dirs: &mut [std::path::PathBuf], sort_order: &str) {
 pub fn is_raw_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| RAW_EXTS.contains(&e.to_lowercase().as_str()))
-        .unwrap_or(false)
+        .is_some_and(|ext| RAW_EXTS.iter().any(|&r| ext.eq_ignore_ascii_case(r)))
 }
 
 pub fn is_image_ext(path: &Path) -> bool {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .map(|ext| {
-            let e = ext.to_lowercase();
-            matches!(
-                e.as_str(),
-                "dds"|"exr"|"ff"|"hdr"|"ico"|"pnm"|"qoi"|"gif"|"jpg"|"jpeg"|"png"|"webp"
-            |"bmp"|"tiff"|"tif"|"avif"|"heic"|"heif"|"tga"|"pbm"
-            // hayro-jpeg2000
-            |"jp2"|"j2k"
-            // image-extras
-            |"xbm"|"xpm"|"ora"|"otb"|"pcx"|"sgi"|"wbmp"
-            // hayro pdf, jxl - update also load_and_process_image_from_bytes fast path
-            |"jxl"|"pdf"
-            ) || RAW_EXTS.contains(&e.as_str())
-        })
-        .unwrap_or(false)
+    path.extension().and_then(|s| s.to_str()).is_some_and(|ext| {
+        IMAGE_EXTS.iter().any(|&e| ext.eq_ignore_ascii_case(e))
+            || RAW_EXTS.iter().any(|&r| ext.eq_ignore_ascii_case(r))
+    })
 }
 
 pub fn scan_for_view(
@@ -2454,13 +2193,10 @@ pub fn scan_for_view(
     // 2. Parallel Processing with Streaming inside constrained pool
     let chunk_size = 100;
     let processed_count = AtomicUsize::new(0);
-
-    let chunks: Vec<Vec<std::path::PathBuf>> =
-        raw_paths.chunks(chunk_size).map(|c| c.to_vec()).collect();
-    let mut all_files = Vec::new();
+    let mut all_files = Vec::with_capacity(total_files);
 
     run_in_smart_pool(|| {
-        for chunk in chunks {
+        for chunk in raw_paths.chunks(chunk_size) {
             let batch_results: Vec<FileMetadata> = chunk
                 .par_iter()
                 .filter_map(|path| {
@@ -2477,13 +2213,14 @@ pub fn scan_for_view(
 
                     let mut gps_pos = None;
                     let mut exif_timestamp = None;
+                    let mut orientation = 1;
                     if let Some(exif) = read_exif_data(path, None) {
                         if let Some((lat, lon)) = extract_gps_lat_lon(&exif) {
                             gps_pos = Some(Point::new(lon, lat));
                         }
                         exif_timestamp = get_exif_timestamp(&exif);
+                        orientation = orientation_from_exif(path, &exif);
                     }
-                    let orientation = get_orientation(path, None);
                     img_debug!(
                         "[DEBUG-SCAN] scan_for_view get_orientation={} for {:?}",
                         orientation,
@@ -2510,8 +2247,10 @@ pub fn scan_for_view(
                 .collect();
 
             if !batch_results.is_empty() {
-                if let Some(tx) = &batch_tx {
-                    let _ = tx.send(batch_results.clone());
+                if let Some(tx) = &batch_tx
+                    && tx.send(batch_results.clone()).is_err()
+                {
+                    break;
                 }
                 all_files.extend(batch_results);
             }
@@ -2576,6 +2315,9 @@ pub fn spawn_background_flatten_scan(
     file_count
 }
 
+/// Input tuple `(path, unique_file_id, resolution, orientation)` for background enrichment.
+pub type EnrichmentInput = (std::path::PathBuf, u128, Option<(u32, u32)>, u8);
+
 /// Spawn a background thread to enrich files with content_hash and GPS data.
 /// This function handles:
 /// - Computing blake3 content_hash (parallel with rayon)
@@ -2585,7 +2327,7 @@ pub fn spawn_background_flatten_scan(
 ///
 /// The GUI can then use unique_file_id for O(1) lookup to update FileMetadata.
 pub fn spawn_background_enrichment(
-    files_to_enrich: Vec<(std::path::PathBuf, u128, Option<(u32, u32)>, u8)>, /* (path, unique_file_id, resolution, orientation) */
+    files_to_enrich: Vec<EnrichmentInput>,
     content_key: [u8; 32],
     meta_key_secret: [u8; 32],
     db_tx: Option<Sender<DbUpdate>>,
@@ -2596,162 +2338,185 @@ pub fn spawn_background_enrichment(
     }
 
     std::thread::spawn(move || {
-        // Process files in parallel using rayon
-        // Thread Safety: Each file is processed independently, no shared mutable state
-        // between iterations. The db_tx and result_tx channels are thread-safe.
-        files_to_enrich.par_iter().for_each(|(path, unique_file_id, resolution, _orientation)| {
-            if let Ok(data) = std::fs::read(path) {
-                // Compute content_hash
-                let mut hasher = blake3::Hasher::new_keyed(&content_key);
-                hasher.update(&data);
-                let content_hash = *hasher.finalize().as_bytes();
+        let cancelled = AtomicBool::new(false);
 
-                // Read EXIF data once for GPS, orientation, and timestamp
-                let exif_data = read_exif_data(path, Some(&data));
-
-                // Determine if this is a RAW file for potential rsraw fallback
-                let is_raw = is_raw_ext(path);
-
-                // Open rsraw once if this is a RAW file (used for fallback or merging extra metadata)
-                let raw_image = if is_raw {
-                    rsraw::RawImage::open(&data).ok()
-                } else {
-                    None
-                };
-
-                // Read GPS from EXIF, with rsraw fallback for RAW files
-                let gps_pos = exif_data
-                    .as_ref()
-                    .and_then(extract_gps_lat_lon)
-                    .map(|(lat, lon)| Point::new(lon, lat))
-                    .or_else(|| raw_image.as_ref().and_then(raw_exif::get_gps_point_from_raw));
-
-                // Read orientation from EXIF (fresh, not from stale passed-in value).
-                // kamadak-exif can't parse some RAW containers (e.g. CR3/CRX); when it
-                // returns the neutral 1 for a RAW we have a handle to, fall back to
-                // LibRaw's value via rsraw so orientation-based search is correct.
-                let orientation = {
-                    let from_exif = get_orientation(path, Some(&data));
-                    if from_exif != 1 {
-                        from_exif
-                    } else {
-                        raw_image.as_ref().map(raw_exif::get_orientation_from_raw).unwrap_or(1)
+        // Process files in parallel inside the constrained smart pool
+        run_in_smart_pool(|| {
+            files_to_enrich.par_iter().for_each(
+                |(path, unique_file_id, resolution, _orientation)| {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return;
                     }
-                };
+                    if let Ok(data) = std::fs::read(path) {
+                        // Compute content_hash
+                        let mut hasher = blake3::Hasher::new_keyed(&content_key);
+                        hasher.update(&data);
+                        let content_hash = *hasher.finalize().as_bytes();
 
-                // Read EXIF timestamp, with rsraw fallback
-                let exif_timestamp = exif_data
-                    .as_ref()
-                    .and_then(get_exif_timestamp)
-                    .or_else(|| raw_image.as_ref().and_then(raw_exif::get_timestamp_from_raw));
+                        // Read EXIF data once for GPS, orientation, and timestamp
+                        let exif_data = read_exif_data(path, Some(&data));
 
-                // --- 1. BUILD FEATURES (Unified Path) ---
-                // We build the features object now so it can be used for BOTH the database
-                // and the immediate GUI update (fixing the race condition).
-                let (w, h) = resolution.unwrap_or((0, 0));
+                        // Determine if this is a RAW file for potential rsraw fallback
+                        let is_raw = is_raw_ext(path);
 
-                // Initialize: Use rich EXIF data if available, or blank slate
-                // For RAW files where kamadak-exif failed, use rsraw data
-                let mut features = if let Some(exif) = exif_data.as_ref() {
-                    // 'true' here enables enrichment (Country, Sun Position, etc.)
-                    crate::exif_extract::build_image_features(w, h, exif, true, false)
-                } else if let Some(ref raw) = raw_image {
-                    // kamadak-exif failed, but we have rsraw data
-                    raw_exif::build_features_from_raw_image(raw)
-                } else {
-                    crate::image_features::ImageFeatures::new(w, h)
-                };
+                        // Open rsraw once if this is a RAW file (used for fallback or merging extra metadata)
+                        let raw_image =
+                            if is_raw { rsraw::RawImage::open(&data).ok() } else { None };
 
-                // If we have kamadak-exif data and this is a RAW file, also merge rsraw data
-                // (rsraw might have data that kamadak-exif missed, like lens info)
-                if exif_data.is_some() && is_raw
-                    && let Some(ref raw) = raw_image {
-                        raw_exif::merge_raw_info_into_features(&mut features, raw);
+                        // Read GPS from EXIF, with rsraw fallback for RAW files
+                        let gps_pos = exif_data
+                            .as_ref()
+                            .and_then(extract_gps_lat_lon)
+                            .map(|(lat, lon)| Point::new(lon, lat))
+                            .or_else(|| {
+                                raw_image.as_ref().and_then(raw_exif::get_gps_point_from_raw)
+                            });
+
+                        // Read orientation from already-parsed EXIF (not from stale passed-in value).
+                        // kamadak-exif can't parse some RAW containers (e.g. CR3/CRX); when it
+                        // returns the neutral 1 for a RAW we have a handle to, fall back to
+                        // LibRaw's value via rsraw so orientation-based search is correct.
+                        let orientation = {
+                            let from_exif = exif_data
+                                .as_ref()
+                                .map(|e| orientation_from_exif(path, e))
+                                .unwrap_or(1);
+                            if from_exif != 1 {
+                                from_exif
+                            } else {
+                                raw_image
+                                    .as_ref()
+                                    .map(raw_exif::get_orientation_from_raw)
+                                    .unwrap_or(1)
+                            }
+                        };
+
+                        // Read EXIF timestamp, with rsraw fallback
+                        let exif_timestamp = exif_data
+                            .as_ref()
+                            .and_then(get_exif_timestamp)
+                            .or_else(|| raw_image.as_ref().and_then(raw_exif::get_timestamp_from_raw));
+
+                        // --- 1. BUILD FEATURES (Unified Path) ---
+                        // We build the features object now so it can be used for BOTH the database
+                        // and the immediate GUI update (fixing the race condition).
+                        let (w, h) = resolution.unwrap_or((0, 0));
+
+                        // Initialize: Use rich EXIF data if available, or blank slate
+                        // For RAW files where kamadak-exif failed, use rsraw data
+                        let mut features = if let Some(exif) = exif_data.as_ref() {
+                            // 'true' here enables enrichment (Country, Sun Position, etc.)
+                            crate::exif_extract::build_image_features(w, h, exif, true, false)
+                        } else if let Some(ref raw) = raw_image {
+                            // kamadak-exif failed, but we have rsraw data
+                            raw_exif::build_features_from_raw_image(raw)
+                        } else {
+                            crate::image_features::ImageFeatures::new(w, h)
+                        };
+
+                        // If we have kamadak-exif data and this is a RAW file, also merge rsraw data
+                        // (rsraw might have data that kamadak-exif missed, like lens info)
+                        if exif_data.is_some()
+                            && is_raw
+                            && let Some(ref raw) = raw_image
+                        {
+                            raw_exif::merge_raw_info_into_features(&mut features, raw);
+                        }
+
+                        if false {
+                            eprintln!(
+                                "[DEBUG-ENRICH]   Final features for '{}': tag_count={}, has_make={}, has_model={}, has_iso={}",
+                                path.file_name().unwrap_or_default().to_string_lossy(),
+                                features.tag_count(),
+                                features.has_tag(crate::exif_types::TAG_MAKE),
+                                features.has_tag(crate::exif_types::TAG_MODEL),
+                                features.has_tag(crate::exif_types::TAG_ISO)
+                            );
+                        }
+
+                        // Enforce critical tags (Orientation, GPS) to ensure consistency
+                        // (These might be redundant if build_image_features ran, but safe to ensure)
+                        // For HEIC/HEIF the decoder bakes orientation into the pixels, so overwrite
+                        // the EXIF Orientation tag copied by build_image_features with a neutral 1.
+                        if orientation_baked_into_pixels(path) {
+                            features.insert_tag(
+                                crate::exif_types::TAG_ORIENTATION,
+                                crate::exif_types::ExifValue::Short(1),
+                            );
+                        } else if orientation != 1 {
+                            features.insert_tag(
+                                crate::exif_types::TAG_ORIENTATION,
+                                crate::exif_types::ExifValue::Short(orientation as u16),
+                            );
+                        }
+
+                        if let Some(pos) = gps_pos {
+                            features.insert_tag(
+                                crate::exif_types::TAG_GPS_LATITUDE,
+                                crate::exif_types::ExifValue::Float(pos.y()),
+                            );
+                            features.insert_tag(
+                                crate::exif_types::TAG_GPS_LONGITUDE,
+                                crate::exif_types::ExifValue::Float(pos.x()),
+                            );
+
+                            // Fallback: If build_image_features didn't derive country (or if we had no EXIF object), try manually
+                            if !features.has_tag(crate::exif_types::TAG_DERIVED_COUNTRY)
+                                && let Some(country) =
+                                    crate::exif_extract::derive_country(pos.y(), pos.x())
+                            {
+                                features.insert_tag(
+                                    crate::exif_types::TAG_DERIVED_COUNTRY,
+                                    crate::exif_types::ExifValue::String(country),
+                                );
+                            }
+                        }
+
+                        // Ensure derived timestamp is indexed (critical for range search)
+                        if let Some(ts) = exif_timestamp {
+                            features.insert_tag(
+                                crate::exif_types::TAG_DERIVED_TIMESTAMP,
+                                crate::exif_types::ExifValue::Long64(ts),
+                            );
+                        }
+
+                        // --- 2. SEND TO DATABASE ---
+                        // We clone 'features' because the DB update takes ownership
+                        if let Some(ref tx) = db_tx
+                            && let Some(update) = create_feature_update(
+                                &meta_key_secret,
+                                path,
+                                *unique_file_id,
+                                content_hash,
+                                features.clone(),
+                            )
+                        {
+                            let _ = tx.send(update);
+                        }
+
+                        // --- 3. SEND TO GUI ---
+                        // We pass 'features' directly. The GUI uses this to update the search index immediately.
+                        if result_tx
+                            .send(EnrichmentResult {
+                                unique_file_id: *unique_file_id,
+                                content_hash,
+                                gps_pos,
+                                exif_timestamp,
+                                features: Some(features),
+                            })
+                            .is_err()
+                        {
+                            cancelled.store(true, Ordering::Relaxed);
+                        }
                     }
-
-                if false {
-                    eprintln!("[DEBUG-ENRICH]   Final features for '{}': tag_count={}, has_make={}, has_model={}, has_iso={}",
-                        path.file_name().unwrap_or_default().to_string_lossy(),
-                        features.tag_count(),
-                        features.has_tag(crate::exif_types::TAG_MAKE),
-                        features.has_tag(crate::exif_types::TAG_MODEL),
-                        features.has_tag(crate::exif_types::TAG_ISO));
-                }
-
-                // Enforce critical tags (Orientation, GPS) to ensure consistency
-                // (These might be redundant if build_image_features ran, but safe to ensure)
-                // For HEIC/HEIF the decoder bakes orientation into the pixels, so overwrite
-                // the EXIF Orientation tag copied by build_image_features with a neutral 1.
-                if orientation_baked_into_pixels(path) {
-                    features.insert_tag(
-                        crate::exif_types::TAG_ORIENTATION,
-                        crate::exif_types::ExifValue::Short(1),
-                    );
-                } else if orientation != 1 {
-                    features.insert_tag(
-                        crate::exif_types::TAG_ORIENTATION,
-                        crate::exif_types::ExifValue::Short(orientation as u16),
-                    );
-                }
-
-                if let Some(pos) = gps_pos {
-                    features.insert_tag(
-                        crate::exif_types::TAG_GPS_LATITUDE,
-                        crate::exif_types::ExifValue::Float(pos.y()),
-                    );
-                    features.insert_tag(
-                        crate::exif_types::TAG_GPS_LONGITUDE,
-                        crate::exif_types::ExifValue::Float(pos.x()),
-                    );
-
-                    // Fallback: If build_image_features didn't derive country (or if we had no EXIF object), try manually
-                    if !features.has_tag(crate::exif_types::TAG_DERIVED_COUNTRY)
-                        && let Some(country) = crate::exif_extract::derive_country(pos.y(), pos.x())
-                    {
-                        features.insert_tag(
-                            crate::exif_types::TAG_DERIVED_COUNTRY,
-                            crate::exif_types::ExifValue::String(country),
-                        );
-                    }
-                }
-
-                // Ensure derived timestamp is indexed (critical for range search)
-                if let Some(ts) = exif_timestamp {
-                    features.insert_tag(
-                        crate::exif_types::TAG_DERIVED_TIMESTAMP,
-                        crate::exif_types::ExifValue::Long64(ts),
-                    );
-                }
-
-                // --- 2. SEND TO DATABASE ---
-                // We clone 'features' because the DB update takes ownership
-                if let Some(ref tx) = db_tx
-                    && let Some(update) = create_feature_update(
-                        &meta_key_secret,
-                        path,
-                        *unique_file_id,
-                        content_hash,
-                        features.clone(),
-                    ) {
-                        let _ = tx.send(update);
-                    }
-
-                // --- 3. SEND TO GUI ---
-                // We pass 'features' directly. The GUI uses this to update the search index immediately.
-                let _ = result_tx.send(EnrichmentResult {
-                    unique_file_id: *unique_file_id,
-                    content_hash,
-                    gps_pos,
-                    exif_timestamp,
-                    features: Some(features),
-                });
-            }
+                },
+            );
         });
     });
 }
 
 /// Lightweight file entry for initial fast directory scan
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct DirEntry {
     pub path: std::path::PathBuf,
     pub size: u64,
@@ -2763,7 +2528,8 @@ pub struct DirEntry {
 fn try_make_dir_entry(canonical: std::path::PathBuf, meta: fs::Metadata) -> Option<DirEntry> {
     let unique_file_id = get_file_key(&canonical)?;
     let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-    let mtime_ns = mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let mtime_ns = u64::try_from(mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos())
+        .unwrap_or(u64::MAX);
     Some(DirEntry {
         path: canonical,
         size: meta.len(),
@@ -2826,12 +2592,19 @@ fn process_and_stream_dir_entries(
 
         sort_files(&mut files, &sort_order);
 
-        for chunk in files.chunks(BATCH_SIZE) {
-            processed += chunk.len();
+        let mut iter = files.into_iter();
+        loop {
+            let batch: Vec<FileMetadata> = iter.by_ref().take(BATCH_SIZE).collect();
+            if batch.is_empty() {
+                break;
+            }
+            processed += batch.len();
             if let Some(ref tx) = progress_tx {
                 let _ = tx.send((processed, file_count));
             }
-            let _ = batch_tx.send(chunk.to_vec());
+            if batch_tx.send(batch).is_err() {
+                break;
+            }
         }
     });
 }
@@ -2897,14 +2670,82 @@ pub fn spawn_background_dir_scan(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::pdqhash::PdqFeatures;
+
+    fn make_scanned_file(
+        name: &str,
+        pdqhash: Option<[u8; 32]>,
+        pdq_features: Option<Arc<PdqFeatures>>,
+    ) -> ScannedFile {
+        ScannedFile {
+            path: PathBuf::from(name),
+            size: 100,
+            modified: DateTime::from(UNIX_EPOCH),
+            resolution: Some((100, 100)),
+            content_hash: [0u8; 32],
+            orientation: 1,
+            gps_pos: None,
+            unique_file_id: 1,
+            pdqhash,
+            pdq_features,
+            pdq_quality: Some(100),
+            pixel_hash: None,
+            exif_timestamp: None,
+        }
+    }
 
     #[test]
     fn test_derive_country_florida() {
         // Simulate the GPS coordinates provided
         let lat = 28.68;
         let lon = -81.31;
-        let result = derive_country(lat, lon);
+        let result = derive_location(lat, lon);
         assert_eq!(result, Some("Florida, United States of America (the)".to_string()));
+    }
+
+    #[test]
+    fn test_asymmetric_dihedral_grouping_finds_match() {
+        // Construct coefficients where 90-degree rotation differs from original hash
+        let mut coeffs = [0.0f32; 256];
+        for (idx, c) in coeffs.iter_mut().enumerate() {
+            let row = idx / 16;
+            let col = idx % 16;
+            *c = if row < 8 { (col as f32) + 1.0 } else { -((col as f32) + 1.0) };
+        }
+        let feats = PdqFeatures { coefficients: coeffs };
+        let variants = feats.generate_dihedral_hashes();
+        let rotated_hash = variants[1];
+        assert_ne!(rotated_hash, feats.to_hash());
+
+        // Index 0 has no pdq_features (e.g. legacy/partial record), index 1 has features.
+        // Previously cand_idx <= i skipped (1 -> 0), so they never grouped.
+        let files = vec![
+            make_scanned_file("a.jpg", Some(rotated_hash), None),
+            make_scanned_file("b.jpg", Some(feats.to_hash()), Some(Arc::new(feats))),
+        ];
+        let cfg = ScanConfig {
+            paths: vec![],
+            rehash: false,
+            similarity: 0,
+            group_by: "name".to_string(),
+            extensions: vec![],
+            ignore_same_stem: true,
+            calc_pixel_hash: false,
+        };
+
+        let (groups, _, _) = group_with_pdqhash(&files, &cfg);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn test_ext_checks_case_insensitive() {
+        assert!(is_raw_ext(Path::new("photo.CR3")));
+        assert!(!is_raw_ext(Path::new("photo.JPG")));
+        assert!(is_image_ext(Path::new("photo.JXL")));
+        assert!(!is_image_ext(Path::new("notes.txt")));
     }
 }

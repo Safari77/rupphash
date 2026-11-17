@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, path::Path, str::FromStr};
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use exif::{In, Tag, Value};
+use num_integer::gcd;
 
 use crate::{
     exif_types::{
@@ -435,45 +436,71 @@ fn add_derived_values(
     }
 }
 
-static BOUNDARIES: std::sync::OnceLock<country_boundaries::CountryBoundaries> =
+static BOUNDARIES: std::sync::OnceLock<Option<country_boundaries::CountryBoundaries>> =
     std::sync::OnceLock::new();
+
+fn get_boundaries() -> Option<&'static country_boundaries::CountryBoundaries> {
+    use country_boundaries::{BOUNDARIES_ODBL_360X180, CountryBoundaries};
+
+    BOUNDARIES.get_or_init(|| CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).ok()).as_ref()
+}
 
 /// Derive country name from GPS coordinates
 pub fn derive_country(lat: f64, lon: f64) -> Option<String> {
     use codes_iso_3166::part_1::CountryCode;
-    use country_boundaries::{BOUNDARIES_ODBL_360X180, CountryBoundaries, LatLon};
+    use country_boundaries::LatLon;
 
-    let boundaries = BOUNDARIES.get_or_init(|| {
-        CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180)
-            .expect("Failed to initialize country boundaries")
-    });
+    let boundaries = get_boundaries()?;
     let ids = boundaries.ids(LatLon::new(lat, lon).ok()?);
 
-    ids.first().and_then(|id| {
-        CountryCode::from_str(id.to_string().as_str()).ok().map(|c| c.short_name().to_string())
-    })
+    ids.iter()
+        .find(|id| id.len() == 2)
+        .and_then(|id| CountryCode::from_str(id).ok().map(|c| c.short_name().to_string()))
 }
 
 /// Derive subdivision/state from GPS coordinates
 pub fn derive_subdivision(lat: f64, lon: f64) -> Option<String> {
     use codes_iso_3166::part_2::SubdivisionCode;
-    use country_boundaries::{BOUNDARIES_ODBL_360X180, CountryBoundaries, LatLon};
+    use country_boundaries::LatLon;
 
-    let boundaries = BOUNDARIES.get_or_init(|| {
-        CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180)
-            .expect("Failed to initialize country boundaries")
-    });
+    let boundaries = get_boundaries()?;
     let ids = boundaries.ids(LatLon::new(lat, lon).ok()?);
 
     for id in ids {
-        let id_str = id.to_string();
-        if id_str.len() > 2
-            && let Ok(subdiv) = SubdivisionCode::from_str(&id_str)
-        {
-            return Some(subdiv.name().to_string());
+        if id.contains('-') {
+            // The crate expects underscores (US_FL) not hyphens (US-FL)
+            let formatted = id.replace('-', "_");
+            if let Ok(subdiv) = SubdivisionCode::from_str(&formatted) {
+                return Some(subdiv.name().to_string());
+            }
         }
     }
     None
+}
+
+/// Derive formatted location string (`"Subdivision, Country"` or `"Country"`) from GPS coordinates.
+pub fn derive_location(lat: f64, lon: f64) -> Option<String> {
+    use country_boundaries::LatLon;
+
+    let boundaries = get_boundaries()?;
+    let ids = boundaries.ids(LatLon::new(lat, lon).ok()?);
+    if ids.is_empty() {
+        return None;
+    }
+
+    let country_name = derive_country(lat, lon);
+    let subdivision_name = derive_subdivision(lat, lon);
+
+    match (country_name, subdivision_name) {
+        (Some(country), Some(subdivision)) => Some(format!("{subdivision}, {country}")),
+        (Some(country), None) => Some(country),
+        (None, Some(subdivision)) => Some(subdivision),
+        (None, None) => {
+            let country_id = ids.iter().find(|id| id.len() == 2).map(AsRef::<str>::as_ref);
+            let subdivision_id = ids.iter().find(|id| id.contains('-')).map(AsRef::<str>::as_ref);
+            country_id.or(subdivision_id).map(|s| s.to_string())
+        },
+    }
 }
 
 /// Derive sun position from GPS coordinates and EXIF timestamp
@@ -523,4 +550,214 @@ fn format_dms(decimal_deg: f64) -> String {
 
     let sign = if decimal_deg < 0.0 { "-" } else { "" };
     format!("{}{}° {}' {:.1}\"", sign, d, m, s)
+}
+
+/// Format decimal degrees as DMS string with hemisphere and carry-over handling.
+pub fn format_dms_from_decimal(decimal_deg: f64, is_latitude: bool) -> String {
+    if !decimal_deg.is_finite() {
+        return String::new();
+    }
+
+    let abs_deg = decimal_deg.abs();
+    let mut d = abs_deg.floor() as i64;
+    let m_float = (abs_deg - d as f64) * 60.0;
+    let mut m = m_float.floor() as i64;
+    let s = (m_float - m as f64) * 60.0;
+
+    let mut s_rounded = (s * 10.0).round() / 10.0;
+    if s_rounded >= 60.0 {
+        s_rounded = 0.0;
+        m += 1;
+        if m >= 60 {
+            m = 0;
+            d = d.saturating_add(1);
+        }
+    }
+
+    let hemi = if is_latitude {
+        if decimal_deg >= 0.0 { "N" } else { "S" }
+    } else if decimal_deg >= 0.0 {
+        "E"
+    } else {
+        "W"
+    };
+
+    format!("{d}° {m}' {s_rounded:.1}\" {hemi}")
+}
+
+/// Format seconds as human-readable time with up to three-decimal accuracy,
+/// trimming trailing zeros: 1.22 -> "1.22s", 1.20 -> "1.2s", 2.00 -> "2s",
+/// 0.023 -> "0.023s"; sub-millisecond times switch to ms: 0.0001 -> "0.1ms".
+pub fn format_seconds(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return "0s".to_string();
+    }
+    if secs < 0.001 {
+        let s = format!("{:.3}", secs * 1000.0);
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        format!("{s}ms")
+    } else {
+        let s = format!("{:.3}", secs);
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        format!("{s}s")
+    }
+}
+
+/// Format an EXIF value for display.
+pub fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bool) -> String {
+    match tag {
+        exif::Tag::GPSLatitude | exif::Tag::GPSLongitude => {
+            if decimal_coords {
+                // Parse rational D/M/S to decimal degrees
+                if let Some(val) = parse_gps_coordinate(value) {
+                    return format!("{val:.6}");
+                }
+            }
+            // Fallback to default Minutes/Seconds display
+            clean_exif_string(&value.display_as(tag).to_string())
+        },
+        exif::Tag::ExposureTime => {
+            // ExposureTime is stored as Rational; check that first because
+            // Value::get_uint() returns None for Rational values.
+            if let exif::Value::Rational(rats) = value
+                && !rats.is_empty()
+                && rats[0].num > 0
+                && rats[0].denom > 0
+            {
+                let g = gcd(rats[0].num, rats[0].denom);
+                let (n, d) = (rats[0].num / g, rats[0].denom / g);
+                if d == 1 {
+                    // Whole seconds, e.g. "2s"
+                    return format_seconds(n as f64);
+                }
+                // Exact reduced fraction plus human-readable time, always
+                let secs = n as f64 / d as f64;
+                return format!("{n}/{d}s ({})", format_seconds(secs));
+            }
+            // Integer-typed fallback (some writers store plain integers)
+            if let Some(r) = value.get_uint(0) {
+                return format!("{r}s");
+            }
+            clean_exif_string(&value.display_as(tag).to_string())
+        },
+        exif::Tag::ExposureBiasValue => {
+            // ExposureBias is stored as SRational; widen to i64 first so that
+            // negating i32::MIN (-2147483648) never overflows or panics in gcd().
+            if let exif::Value::SRational(rats) = value
+                && !rats.is_empty()
+                && rats[0].denom != 0
+            {
+                let (mut n, mut d) = (rats[0].num as i64, rats[0].denom as i64);
+                if d < 0 {
+                    // Normalize sign into the numerator safely in i64
+                    n = -n;
+                    d = -d;
+                }
+                let g = gcd(n, d);
+                let (n, d) = (n / g, d / g);
+                return if n == 0 {
+                    "0 EV".to_string()
+                } else if d == 1 {
+                    format!("{n:+} EV")
+                } else {
+                    format!("{n:+}/{d} EV")
+                };
+            }
+            clean_exif_string(&value.display_as(tag).to_string())
+        },
+        exif::Tag::FNumber => {
+            if let exif::Value::Rational(rats) = value
+                && !rats.is_empty()
+                && rats[0].denom > 0
+            {
+                return format!("f/{:.1}", rats[0].num as f64 / rats[0].denom as f64);
+            }
+            clean_exif_string(&value.display_as(tag).to_string())
+        },
+        exif::Tag::FocalLength => {
+            if let exif::Value::Rational(rats) = value
+                && !rats.is_empty()
+                && rats[0].denom > 0
+            {
+                return format!("{}mm", rats[0].num as f64 / rats[0].denom as f64);
+            }
+            clean_exif_string(&value.display_as(tag).to_string())
+        },
+        exif::Tag::PhotographicSensitivity => {
+            if let Some(iso) = value.get_uint(0) {
+                format!("ISO {iso}")
+            } else {
+                clean_exif_string(&value.display_as(tag).to_string())
+            }
+        },
+        exif::Tag::FocalLengthIn35mmFilm => {
+            if let Some(fl) = value.get_uint(0) {
+                format!("{fl}mm (35mm equiv)")
+            } else {
+                clean_exif_string(&value.display_as(tag).to_string())
+            }
+        },
+        _ => {
+            // Default: use the library's display formatting, then clean it
+            clean_exif_string(&value.display_as(tag).to_string())
+        },
+    }
+}
+
+/// Clean up EXIF string values that may contain garbage or repeated empty entries.
+pub fn clean_exif_string(s: &str) -> String {
+    // Remove surrounding quotes, brackets, and null bytes if present
+    let s = s.trim().trim_matches(|c: char| c == '"' || c == '[' || c == ']' || c == '\0');
+
+    // If the string contains comma-separated values (common in some EXIF fields),
+    // clean individual items, discard empty/garbage entries, and preserve valid values
+    if s.contains(',') {
+        let mut parts: Vec<&str> = s
+            .split(',')
+            .map(|p| p.trim().trim_matches(|c: char| c == '"' || c == '\'' || c == '\0').trim())
+            .filter(|p| !p.is_empty())
+            .collect();
+
+        // Deduplicate consecutive identical entries often produced by buggy EXIF encoders
+        parts.dedup();
+
+        if !parts.is_empty() {
+            return parts.join(", ");
+        }
+    }
+
+    // Remove any trailing garbage (null bytes represented as empty quotes, etc.)
+    s.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c.is_whitespace() || c == '\0')
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_country_and_location_florida() {
+        let lat = 28.68;
+        let lon = -81.31;
+        assert_eq!(derive_country(lat, lon), Some("United States of America (the)".to_string()));
+        assert_eq!(derive_subdivision(lat, lon), Some("Florida".to_string()));
+        assert_eq!(
+            derive_location(lat, lon),
+            Some("Florida, United States of America (the)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_dms_from_decimal_handles_carry_and_non_finite() {
+        assert_eq!(format_dms_from_decimal(28.99999, true), "29° 0' 0.0\" N");
+        assert_eq!(format_dms_from_decimal(-81.5, false), "81° 30' 0.0\" W");
+        assert_eq!(format_dms_from_decimal(f64::NAN, true), "");
+        assert_eq!(format_dms_from_decimal(f64::INFINITY, false), "");
+    }
+
+    #[test]
+    fn test_clean_exif_string() {
+        assert_eq!(clean_exif_string("[\"Canon\", \"Canon\", \"\"]"), "Canon");
+        assert_eq!(clean_exif_string("\"Nikon\", \"Z8\""), "Nikon, Z8");
+    }
 }
