@@ -73,8 +73,8 @@ pub fn sort_nearest_neighbor(markers: &mut [GpsMarker]) {
         let mut best_dist = f64::INFINITY;
         let mut best_idx = i + 1;
 
-        for j in i + 1..len {
-            let d2 = dist_sq_approx(current, (markers[j].lat, markers[j].lon));
+        for (j, marker) in markers.iter().enumerate().take(len).skip(i + 1) {
+            let d2 = dist_sq_approx(current, (marker.lat, marker.lon));
             if d2 < best_dist {
                 best_dist = d2;
                 best_idx = j;
@@ -160,6 +160,7 @@ pub fn part1by1(n: u32) -> u64 {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn part1by1_bmi2_safe(n: u32) -> u64 {
+    // SAFETY: `PART1BY1` only selects `part1by1_bmi2_safe` when `is_x86_feature_detected!("bmi2")` is true.
     unsafe { part1by1_bmi2(n) }
 }
 
@@ -486,14 +487,11 @@ impl GpsMapState {
             }
             self.restore_selection(selected_path);
 
-            // Calculate total distance
-            let mut total_dist = 0.0;
-            for i in 0..self.markers.len() - 1 {
-                let p1 = (self.markers[i].lat, self.markers[i].lon);
-                let p2 = (self.markers[i + 1].lat, self.markers[i + 1].lon);
-                let dist = crate::position::distance(p1, p2);
-                total_dist += dist;
-            }
+            let total_dist: f64 = self
+                .markers
+                .windows(2)
+                .map(|w| crate::position::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
+                .sum();
 
             let with_ts = self.markers.iter().filter(|m| m.exif_timestamp.is_some()).count();
             eprintln!(
@@ -531,13 +529,11 @@ impl GpsMapState {
         self.restore_selection(selected_path);
 
         // Calculate and log Total Distance using exact geodesic formula
-        let mut total_dist = 0.0;
-        for i in 0..self.markers.len() - 1 {
-            let p1 = (self.markers[i].lat, self.markers[i].lon);
-            let p2 = (self.markers[i + 1].lat, self.markers[i + 1].lon);
-            let dist = crate::position::distance(p1, p2);
-            total_dist += dist;
-        }
+        let total_dist: f64 = self
+            .markers
+            .windows(2)
+            .map(|w| crate::position::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
+            .sum();
         eprintln!("[GPS] Spatial Sort Complete. Path Length: {}", format_distance(total_dist));
         self.markers_needs_sort = false;
         total_dist

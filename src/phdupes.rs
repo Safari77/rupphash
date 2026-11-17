@@ -458,7 +458,7 @@ impl Cli {
 /// Convert a chrono UTC time to a relative-time string via jiff.
 /// Falls back to absolute formatting when the value is outside jiff's supported timestamp range.
 #[must_use]
-fn relative_time_str(modified: &DateTime<Utc>) -> String {
+pub(crate) fn relative_time_str(modified: &DateTime<Utc>) -> String {
     Timestamp::from_second(modified.timestamp())
         .ok()
         .and_then(|ts| {
@@ -1078,13 +1078,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sort_order,
             args.relative_times,
             args.use_trash,
-            args.move_marked.clone(),
-            args.slideshow,
-            args.slideshow_effect,
             args.raw_thumbnails,
             args.view_flatten,
-            parsed_luts,
-        );
+        )
+        .with_move_target(args.move_marked.clone())
+        .with_slideshow_interval(args.slideshow)
+        .with_slideshow_effect(args.slideshow_effect)
+        .with_luts(parsed_luts);
         if let Err(e) = app.run() {
             eprintln!("GUI Error: {e}");
             std::process::exit(1);
@@ -1164,13 +1164,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scan_config,
             args.relative_times,
             args.use_trash,
-            sort_order,
             ext_priorities,
             args.raw_thumbnails,
-            parsed_luts,
         )
         .with_move_target(args.move_marked.clone())
-        .with_slideshow_effect(args.slideshow_effect);
+        .with_slideshow_effect(args.slideshow_effect)
+        .with_luts(parsed_luts);
 
         if let Err(e) = app.run() {
             eprintln!("GUI Error: {e}");
