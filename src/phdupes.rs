@@ -35,6 +35,7 @@ struct DepInfo {
     source: Option<String>,
 }
 
+mod configs;
 mod db;
 mod exif_extract;
 mod exif_types;

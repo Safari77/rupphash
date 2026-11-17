@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
-    io::Write,
+    fmt, fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -11,21 +13,26 @@ use std::{
 use chacha20poly1305::{
     XChaCha20Poly1305,
     XNonce, // XChaCha20 uses 24-byte nonces
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, AeadInOut, KeyInit, Payload},
 };
-use crossbeam_channel::{Receiver, RecvTimeoutError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
 use geo::Point;
 use redb::{
-    ConcurrencyMode, Database, ReadableDatabase, ReadableTable, ReadableTableMetadata,
-    TableDefinition, WriteTransaction,
+    ConcurrencyMode, Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::{image_features::ImageFeatures, scanner::RAW_EXTS};
+pub use crate::configs::{
+    ConfigError, GroupingConfig, GuiConfig, HdrConfig, PaletteConfig, PaletteSort,
+};
+use crate::{
+    configs::{
+        load_or_init_config, save_gui_config as save_gui_cfg, save_map_selection as save_map_sel,
+    },
+    image_features::ImageFeatures,
+};
 
-const CONFIG_FILE_NAME: &str = "phdupes.conf";
 const DB_FILE_NAME_PDQHASH: &str = "phdupes_redb";
 const DB_FILE_NAME_FEATURES: &str = "phdupes_features";
 const DB_FILE_NAME_PIXELHASH: &str = "phdupes_pixelhash";
@@ -52,10 +59,11 @@ const TABLE_IGNORED_PDQMAP: DbTable = TableDefinition::new(DB_FILE_NAME_IGNORED_
 /// overwritten on the next scan instead of being silently mixed with current
 /// ones.
 ///
-/// ignored_db and ignored_pdqmap_db are deliberately NOT versioned. They are
-/// keyed by blake3 content_hash, so the ignore list survives an algorithm
-/// change; only the pdqmap loses its old-hash entries, which costs a group its
-/// previous UUID and is cleaned up by --prune.
+/// `ignored_db` and `ignored_pdqmap_db` are deliberately NOT versioned and are
+/// NEVER deleted by `--prune`. `ignored_db` is keyed by blake3 `content_hash`,
+/// so the ignore list survives algorithm changes and works regardless of which
+/// directory the duplicate finder is started in; stale entries are only removed
+/// explicitly via `--unignore`.
 ///
 /// 1 = original non-reference pipeline, 2 = reference-compatible PDQ.
 pub const PDQ_ALGO_VERSION: u8 = 2;
@@ -66,174 +74,144 @@ const ENCRYPTION_OVERHEAD: usize = 24 + 16;
 // Total overhead: encryption only
 const TOTAL_OVERHEAD: usize = ENCRYPTION_OVERHEAD;
 
-// Default redb cache size in MiB (2048 MiB = 2 GB)
-const DEFAULT_DB_SIZE_MB: u32 = 2048;
+/// Domain error type for database, crypto, and config operations.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DbError {
+    Io(std::io::Error),
+    Config(ConfigError),
+    Redb(redb::Error),
+    Postcard(postcard::Error),
+    DecryptionFailed { table: &'static str },
+    InvalidFormat { table: &'static str, detail: &'static str },
+    EncryptionFailed,
+    RngFailed(getrandom::Error),
+    SystemTime(std::time::SystemTimeError),
+    LockTimeout(Duration),
+    NoCacheDir,
+}
 
-/// Hash algorithm selection
+impl fmt::Display for DbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "database I/O error: {err}"),
+            Self::Config(err) => write!(f, "{err}"),
+            Self::Redb(err) => write!(f, "redb error: {err}"),
+            Self::Postcard(err) => write!(f, "deserialization error: {err}"),
+            Self::DecryptionFailed { table } => {
+                write!(f, "decryption failed in table '{table}'")
+            },
+            Self::InvalidFormat { table, detail } => {
+                write!(f, "invalid record format in table '{table}': {detail}")
+            },
+            Self::EncryptionFailed => write!(f, "AEAD encryption failed"),
+            Self::RngFailed(err) => write!(f, "random number generator failed: {err}"),
+            Self::SystemTime(err) => write!(f, "system clock error: {err}"),
+            Self::LockTimeout(dur) => {
+                write!(
+                    f,
+                    "timeout waiting {}s for database lock from another process",
+                    dur.as_secs()
+                )
+            },
+            Self::NoCacheDir => write!(f, "no cache directory found"),
+        }
+    }
+}
+
+impl std::error::Error for DbError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::Config(err) => Some(err),
+            Self::Redb(err) => Some(err),
+            Self::Postcard(err) => Some(err),
+            Self::RngFailed(err) => Some(err),
+            Self::SystemTime(err) => Some(err),
+            Self::DecryptionFailed { .. }
+            | Self::InvalidFormat { .. }
+            | Self::EncryptionFailed
+            | Self::LockTimeout(_)
+            | Self::NoCacheDir => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for DbError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<ConfigError> for DbError {
+    fn from(err: ConfigError) -> Self {
+        Self::Config(err)
+    }
+}
+
+impl From<redb::Error> for DbError {
+    fn from(err: redb::Error) -> Self {
+        Self::Redb(err)
+    }
+}
+
+impl From<redb::DatabaseError> for DbError {
+    fn from(err: redb::DatabaseError) -> Self {
+        Self::Redb(err.into())
+    }
+}
+
+impl From<redb::TransactionError> for DbError {
+    fn from(err: redb::TransactionError) -> Self {
+        Self::Redb(err.into())
+    }
+}
+
+impl From<redb::TableError> for DbError {
+    fn from(err: redb::TableError) -> Self {
+        Self::Redb(err.into())
+    }
+}
+
+impl From<redb::CommitError> for DbError {
+    fn from(err: redb::CommitError) -> Self {
+        Self::Redb(err.into())
+    }
+}
+
+impl From<redb::StorageError> for DbError {
+    fn from(err: redb::StorageError) -> Self {
+        Self::Redb(err.into())
+    }
+}
+
+impl From<postcard::Error> for DbError {
+    fn from(err: postcard::Error) -> Self {
+        Self::Postcard(err)
+    }
+}
+
+impl From<getrandom::Error> for DbError {
+    fn from(err: getrandom::Error) -> Self {
+        Self::RngFailed(err)
+    }
+}
+
+impl From<std::time::SystemTimeError> for DbError {
+    fn from(err: std::time::SystemTimeError) -> Self {
+        Self::SystemTime(err)
+    }
+}
+
+/// Hash algorithm selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum HashAlgorithm {
     #[default]
     PdqHash,
 }
 
-/// Palette sort order for dominant color display
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum PaletteSort {
-    Hue,
-    #[default]
-    Luminance,
-}
-
-/// Bundled palette extraction configuration
-#[derive(Debug, Clone, Copy)]
-pub struct PaletteConfig {
-    pub dominant_colors: usize,
-    pub saturation_bias: f32,
-    pub palette_sort: PaletteSort,
-}
-
-impl PaletteConfig {
-    pub fn from_gui_config(gui: &GuiConfig) -> Self {
-        Self {
-            dominant_colors: gui.dominant_colors.unwrap_or(5),
-            saturation_bias: gui.saturation_bias.unwrap_or(1.0),
-            palette_sort: gui.palette_sort.unwrap_or_default(),
-        }
-    }
-}
-
-/// Bundled HDR→SDR tone-mapping configuration
-#[derive(Debug, Clone, Copy)]
-pub struct HdrConfig {
-    pub sdr_peak_nits: f32,
-}
-
-impl HdrConfig {
-    pub fn from_gui_config(gui: &GuiConfig) -> Self {
-        Self { sdr_peak_nits: gui.sdr_peak_nits.unwrap_or(203.0) }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct GroupingConfig {
-    pub ignore_same_stem: bool,
-    pub extensions: Vec<String>,
-}
-
-impl Default for GroupingConfig {
-    fn default() -> Self {
-        // Start with standard non-raw extensions
-        let mut extensions = vec!["jpg".to_string(), "jpeg".to_string()];
-        // Dynamically add all raw extensions from the const list
-        extensions.extend(RAW_EXTS.iter().map(|s| s.to_string()));
-        Self { ignore_same_stem: true, extensions }
-    }
-}
-
-// --- GUI Config ---
-// `#[serde(default)]` at the struct level ensures that when a `[gui]` section
-// exists in `phdupes.conf` with only a subset of keys specified, any omitted
-// fields are populated from `GuiConfig::default()` rather than `Option::None`.
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct GuiConfig {
-    pub font_monospace: Option<String>,
-    pub dominant_colors: Option<usize>,
-    pub saturation_bias: Option<f32>,
-    pub palette_sort: Option<PaletteSort>,
-    pub font_ui: Option<String>,
-    pub font_scale: Option<f32>,
-    pub font_orthography: Option<String>,
-    pub preload_count: Option<usize>,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-    pub panel_width: Option<f32>,
-    pub decimal_coords: Option<bool>,
-    /// Target display peak luminance (nits) for HDR→SDR tone mapping.
-    /// 100.0 = strict SDR reference; 203.0 = BT.2408 HDR reference white (default).
-    pub sdr_peak_nits: Option<f32>,
-    #[serde(default = "default_exif_tags")]
-    pub exif_tags: Vec<String>,
-}
-
-fn default_exif_tags() -> Vec<String> {
-    vec![
-        "Make".to_string(),
-        "Model".to_string(),
-        "LensModel".to_string(),
-        "DateTimeOriginal".to_string(),
-        "ExposureTime".to_string(),
-        "FNumber".to_string(),
-        "ISO".to_string(),
-        "FocalLength".to_string(),
-        "ExposureBias".to_string(),
-        "DerivedCountry".to_string(),
-    ]
-}
-
-impl Default for GuiConfig {
-    fn default() -> Self {
-        Self {
-            font_monospace: None,
-            dominant_colors: Some(5),
-            saturation_bias: Some(1.0),
-            palette_sort: None,
-            font_ui: None,
-            font_scale: Some(1.0),
-            font_orthography: None,
-            preload_count: Some(10),
-            width: Some(1280),
-            height: Some(720),
-            panel_width: Some(450.0),
-            decimal_coords: Some(true),
-            sdr_peak_nits: Some(203.0),
-            exif_tags: default_exif_tags(),
-        }
-    }
-}
-
-// Allows both [lon, lat] and { lat=..., lon=... } in TOML
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(untagged)]
-pub enum LocationOption {
-    Named { lat: f64, lon: f64 },
-    Array(f64, f64), // Expects [Lon, Lat]
-}
-
-// Helper to convert directly to geo::Point
-impl From<LocationOption> for Point<f64> {
-    fn from(loc: LocationOption) -> Self {
-        match loc {
-            LocationOption::Named { lat, lon } => Point::new(lon, lat),
-            LocationOption::Array(lon, lat) => Point::new(lon, lat),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct Config {
-    master_key: String,
-    #[serde(default = "default_db_size_mb")]
-    db_size_mb: u32,
-    #[serde(default)]
-    grouping: GroupingConfig,
-    #[serde(default)]
-    gui: GuiConfig,
-    #[serde(default)]
-    locations: HashMap<String, LocationOption>,
-    #[serde(default)]
-    pub map_providers: HashMap<String, String>, // Name -> URL pattern
-    #[serde(default)]
-    pub selected_provider: Option<String>,
-}
-
-fn default_db_size_mb() -> u32 {
-    DEFAULT_DB_SIZE_MB
-}
-
-/// PDQ coefficients stored separately (only in duplicate finder mode)
+/// PDQ coefficients stored separately (only in duplicate finder mode).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedCoefficients {
     pub coefficients: Vec<f32>,
@@ -253,7 +231,7 @@ impl CachedCoefficients {
 /// Key: blake3 content_hash (32 bytes).
 /// Every file in a duplicate group is registered here on scan completion
 /// with `ignored: false`. The flag is set to `true` when the user presses Q.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IgnoredEntry {
     pub pdqhash: Option<[u8; 32]>,
     pub group_uuid: [u8; 16], // 128-bit UUID grouping files by similarity
@@ -300,9 +278,34 @@ pub struct AppContext {
     pub selected_provider: String,
     pub tile_cache_path: PathBuf, // Path for walkers to store images
     cipher: XChaCha20Poly1305,
+    logged_ignored_corrupt: AtomicBool,
 }
 
-/// Database update type
+impl fmt::Debug for AppContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppContext")
+            .field("grouping_config", &self.grouping_config)
+            .field("gui_config", &self.gui_config)
+            .field("locations_count", &self.locations.len())
+            .field("selected_provider", &self.selected_provider)
+            .field("tile_cache_path", &self.tile_cache_path)
+            .field("content_key", &"[redacted]")
+            .field("meta_key", &"[redacted]")
+            .field("cipher", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AppContext {
+    fn drop(&mut self) {
+        self.content_key.zeroize();
+        self.meta_key.zeroize();
+    }
+}
+
+/// Database update type.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum HashValue {
     PdqHash([u8; 32]),
 }
@@ -316,15 +319,19 @@ pub type DbUpdate = (
     Option<([u8; 32], [u8; 32])>,           // Pixel Hash
 );
 
+/// Pair of `(content_hash, optional_pdqhash)` used for duplicate group registration.
+pub type GroupEntry = ([u8; 32], Option<[u8; 32]>);
+
 /// Compute the meta_key from file metadata.
 ///
 /// The meta_key is derived from:
-/// - mtime_ns: modification time in nanoseconds since UNIX_EPOCH
-/// - size: file size in bytes
-/// - unique_file_id: filesystem identity (dev, inode or equivalent)
+/// - `mtime_ns`: modification time in nanoseconds since UNIX_EPOCH
+/// - `size`: file size in bytes
+/// - `unique_file_id`: filesystem identity (dev, inode or equivalent)
 ///
 /// This allows cache hits even after file renames (same inode).
 #[inline]
+#[must_use]
 pub fn compute_meta_key(
     meta_key_secret: &[u8; 32],
     mtime_ns: u64,
@@ -339,8 +346,9 @@ pub fn compute_meta_key(
     *mh.finalize().as_bytes()
 }
 
-/// Convenience function to compute meta_key from std::fs::Metadata
+/// Convenience function to compute meta_key from `std::fs::Metadata`.
 #[inline]
+#[must_use]
 pub fn compute_meta_key_from_metadata(
     meta_key_secret: &[u8; 32],
     metadata: &std::fs::Metadata,
@@ -352,493 +360,436 @@ pub fn compute_meta_key_from_metadata(
     compute_meta_key(meta_key_secret, mtime_ns, size, unique_file_id)
 }
 
-/// Create a DbUpdate for caching enrichment results (view mode).
+/// Create a `DbUpdate` for caching enrichment results (view mode).
 /// This is the canonical way to create database updates.
+#[must_use]
 pub fn create_feature_update(
     meta_key_secret: &[u8; 32],
-    path: &std::path::Path,
+    path: &Path,
     unique_file_id: u128,
     content_hash: [u8; 32],
     features: ImageFeatures,
 ) -> Option<DbUpdate> {
-    let metadata = std::fs::metadata(path).ok()?;
+    let metadata = fs::metadata(path).ok()?;
     let meta_key = compute_meta_key_from_metadata(meta_key_secret, &metadata, unique_file_id);
 
     Some((Some((meta_key, content_hash)), None, Some((content_hash, features)), None, None))
 }
 
-#[inline]
-fn corrupted_err(msg: &'static str) -> redb::Error {
-    redb::Error::Corrupted(msg.to_string())
+struct PendingBatch {
+    meta: HashMap<[u8; 32], [u8; 32]>,
+    hash: HashMap<[u8; 32], HashValue>,
+    feature: HashMap<[u8; 32], ImageFeatures>,
+    coeff: HashMap<[u8; 32], CachedCoefficients>,
+    pixel: HashMap<[u8; 32], [u8; 32]>,
+}
+
+impl PendingBatch {
+    fn new() -> Self {
+        Self {
+            meta: HashMap::new(),
+            hash: HashMap::new(),
+            feature: HashMap::new(),
+            coeff: HashMap::new(),
+            pixel: HashMap::new(),
+        }
+    }
+
+    fn push(&mut self, update: DbUpdate) {
+        let (m, h, f, c, p) = update;
+        if let Some((k, v)) = m {
+            self.meta.insert(k, v);
+        }
+        if let Some((k, v)) = h {
+            self.hash.insert(k, v);
+        }
+        if let Some((k, v)) = f {
+            self.feature.insert(k, v);
+        }
+        if let Some((k, v)) = c {
+            self.coeff.insert(k, v);
+        }
+        if let Some((k, v)) = p {
+            self.pixel.insert(k, v);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.meta.is_empty()
+            && self.hash.is_empty()
+            && self.feature.is_empty()
+            && self.coeff.is_empty()
+            && self.pixel.is_empty()
+    }
+
+    fn total_len(&self) -> usize {
+        self.meta.len() + self.hash.len() + self.feature.len() + self.coeff.len() + self.pixel.len()
+    }
+
+    fn is_full(&self, max_buffer: usize) -> bool {
+        self.meta.len() >= max_buffer
+            || self.hash.len() >= max_buffer
+            || self.feature.len() >= max_buffer
+            || self.coeff.len() >= max_buffer
+            || self.pixel.len() >= max_buffer
+    }
+
+    fn clear(&mut self) {
+        self.meta.clear();
+        self.hash.clear();
+        self.feature.clear();
+        self.coeff.clear();
+        self.pixel.clear();
+    }
 }
 
 impl AppContext {
-    /// Atomically write the config file using `tempfile::NamedTempFile` in the
-    /// same directory as `config_path`. Each writer gets a unique temporary file
-    /// that is automatically cleaned up on drop if an error occurs before `persist`.
-    fn write_config(config_path: &Path, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-        let toml_str = toml::to_string_pretty(config)?;
-        let parent_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-
-        let mut tmp_file = NamedTempFile::new_in(parent_dir)?;
-        tmp_file.write_all(toml_str.as_bytes())?;
-        // Flush to disk before persist() renames the file over the target
-        tmp_file.as_file().sync_all()?;
-        tmp_file.persist(config_path)?;
-        Ok(())
-    }
-
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Self::with_algorithm(HashAlgorithm::PdqHash)
-    }
-
-    pub fn with_algorithm(algorithm: HashAlgorithm) -> Result<Self, Box<dyn std::error::Error>> {
-        let config_dir = dirs::config_dir().ok_or("No config dir found")?;
-        let cache_dir = dirs::cache_dir().ok_or("No cache dir found")?;
-
-        fs::create_dir_all(&config_dir)?;
-        fs::create_dir_all(&cache_dir)?;
-        let tile_cache_path = cache_dir.join("phdupes_tiles");
-        fs::create_dir_all(&tile_cache_path)?;
-        let config_path = config_dir.join(CONFIG_FILE_NAME);
-
-        let db_file_name = match algorithm {
-            HashAlgorithm::PdqHash => DB_FILE_NAME_PDQHASH,
-        };
-        let db_path = cache_dir.join(db_file_name);
-
-        let mut config = if config_path.exists() {
-            let content = fs::read_to_string(&config_path)?;
-            eprintln!("[DEBUG-DB] Loading config from {:?}", config_path);
-
-            let mut cfg: Config = toml::from_str(&content)
-                .map_err(|_| "Failed to parse config. Format might have changed.")?;
-
-            // Clamp dominant_colors to 1..25 range
-            let original_colors = cfg.gui.dominant_colors;
-            let clamped_val = cfg.gui.dominant_colors.unwrap_or(5).clamp(1, 25);
-            cfg.gui.dominant_colors = Some(clamped_val);
-            let colors_clamped = original_colors != cfg.gui.dominant_colors;
-
-            eprintln!(
-                "[DEBUG-DB] Loaded gui config: width={:?}, height={:?}, panel_width={:?}, dominant_colors={:?}, saturation_bias={:?}, palette_sort={:?}, sdr_peak_nits={:?}",
-                cfg.gui.width,
-                cfg.gui.height,
-                cfg.gui.panel_width,
-                cfg.gui.dominant_colors,
-                cfg.gui.saturation_bias,
-                cfg.gui.palette_sort,
-                cfg.gui.sdr_peak_nits
-            );
-            eprintln!("[DEBUG-DB] redb cache size: {} MiB", cfg.db_size_mb);
-            eprintln!("[DEBUG-DB] Locations loaded: {}", cfg.locations.len());
-
-            // Check for missing sections to write back defaults
-            let raw_value: toml::Value =
-                toml::from_str(&content).unwrap_or(toml::Value::Integer(0));
-
-            let missing_grouping = raw_value.get("grouping").is_none();
-            let missing_gui = raw_value.get("gui").is_none();
-            let missing_db_size = raw_value.get("db_size_mb").is_none();
-            let missing_locations = raw_value.get("locations").is_none();
-            let missing_map_providers = raw_value.get("map_providers").is_none();
-            let missing_selected_provider = raw_value.get("selected_provider").is_none();
-
-            if cfg.map_providers.is_empty() {
-                cfg.map_providers.insert(
-                    "OpenStreetMap".to_string(),
-                    "https://tile.openstreetmap.org/{z}/{x}/{y}.png".to_string(),
-                );
-                cfg.map_providers.insert(
-                    "Local Martin".to_string(),
-                    "http://localhost:3000/rpc/tiles/{z}/{x}/{y}".to_string(),
-                );
-            }
-            // Ensure a selection exists
-            if cfg.selected_provider.is_none() {
-                cfg.selected_provider = Some("OpenStreetMap".to_string());
-            }
-
-            if missing_grouping
-                || missing_gui
-                || missing_db_size
-                || missing_locations
-                || missing_map_providers
-                || missing_selected_provider
-                || colors_clamped
-            {
-                eprintln!(
-                    "[DEBUG-DB] Writing back defaults/fixes (grouping={}, gui={}, db_size={}, locations={}, map_providers={}, selected_provider={}, colors_clamped={})",
-                    missing_grouping,
-                    missing_gui,
-                    missing_db_size,
-                    missing_locations,
-                    missing_map_providers,
-                    missing_selected_provider,
-                    colors_clamped
-                );
-                Self::write_config(&config_path, &cfg)?;
-            }
-            cfg
-        } else {
-            eprintln!(
-                "[DEBUG-DB] Config file does not exist, creating new one at {:?}",
-                config_path
-            );
-            let mut random_bytes = [0u8; 32];
-            getrandom::fill(&mut random_bytes)?;
-            let master_key_hex = hex::encode(random_bytes);
-            random_bytes.zeroize();
-
-            let mut providers = HashMap::new();
-            providers.insert(
-                "OpenStreetMap".to_string(),
-                "https://tile.openstreetmap.org/{z}/{x}/{y}.png".to_string(),
-            );
-            providers.insert(
-                "Local Martin".to_string(),
-                "http://localhost:3000/rpc/tiles/{z}/{x}/{y}".to_string(),
-            );
-
-            let cfg = Config {
-                master_key: master_key_hex,
-                db_size_mb: DEFAULT_DB_SIZE_MB,
-                grouping: GroupingConfig::default(),
-                gui: GuiConfig::default(),
-                locations: HashMap::new(),
-                map_providers: providers,
-                selected_provider: Some("OpenStreetMap".to_string()),
-            };
-
-            Self::write_config(&config_path, &cfg)?;
-            println!("Generated new master key in {:?}", config_path);
-            cfg
-        };
-
-        // Validate and decode master_key - regenerate if invalid
-        let mut master_key_bytes = match Self::decode_master_key(&config.master_key) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                eprintln!("[DEBUG-DB] Invalid master_key: {}. Generating new key.", e);
-
-                let mut new_key = [0u8; 32];
-                getrandom::fill(&mut new_key)?;
-                config.master_key.zeroize();
-                config.master_key = hex::encode(new_key);
-
-                // Save updated config with new key
-                if let Err(write_err) = Self::write_config(&config_path, &config) {
-                    new_key.zeroize();
-                    config.master_key.zeroize();
-                    return Err(write_err);
-                }
-                eprintln!(
-                    "[DEBUG-DB] Saved new master_key to config file. Cache will be invalidated."
-                );
-
-                new_key
-            },
-        };
-        // Scrub hex-encoded master key from heap memory now that we have the raw bytes
-        config.master_key.zeroize();
-
-        // 1. Content Key: For blinding file content (keyed hash)
-        let content_key = blake3::derive_key("phdupes:content_key", &master_key_bytes);
-
-        // 2. Meta Key: For blinding metadata (mtime/unique_file_id)
-        let meta_key = blake3::derive_key("phdupes:meta_key", &master_key_bytes);
-
-        // 3. Encryption Key: For ChaCha20Poly1305 database encryption
-        let mut encryption_key = blake3::derive_key("phdupes:encryption_key", &master_key_bytes);
-        master_key_bytes.zeroize();
-
-        // Initialize the cipher and scrub the stack copy of encryption_key
-        let cipher = XChaCha20Poly1305::new((&encryption_key).into());
-        encryption_key.zeroize();
-
-        // Calculate cache size from config (convert MiB to bytes)
-        let cache_size = (config.db_size_mb as usize) * 1024 * 1024;
-        eprintln!(
-            "[DEBUG-DB] Setting redb cache size to {} bytes ({} MiB) at {:?}",
-            cache_size, config.db_size_mb, db_path
-        );
-
-        // Open database with retry loop to support parallel/concurrent process access
-        let env = match Database::builder()
+    fn open_database_with_retry(db_path: &Path, cache_size: usize) -> Result<Database, DbError> {
+        match Database::builder()
             .set_cache_size(cache_size)
             .set_concurrency_mode(ConcurrencyMode::MultiWriter)
-            .create(&db_path)
+            .create(db_path)
         {
-            Ok(db) => db,
+            Ok(db) => Ok(db),
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
                 eprintln!("[WARN-DB] Database is locked by another process. Waiting for lock...");
                 let start = Instant::now();
                 let timeout = Duration::from_secs(10);
                 loop {
                     if start.elapsed() > timeout {
-                        return Err("Timeout waiting for database lock from another process".into());
+                        return Err(DbError::LockTimeout(timeout));
                     }
                     thread::sleep(Duration::from_millis(100));
-                    match Database::builder().set_cache_size(cache_size).create(&db_path) {
-                        Ok(db) => break db,
+                    match Database::builder()
+                        .set_cache_size(cache_size)
+                        .set_concurrency_mode(ConcurrencyMode::MultiWriter)
+                        .create(db_path)
+                    {
+                        Ok(db) => return Ok(db),
                         Err(redb::DatabaseError::DatabaseAlreadyOpen) => continue,
                         Err(e) => return Err(e.into()),
                     }
                 }
             },
-            Err(e) => return Err(e.into()),
-        };
-
-        let hash_db = TABLE_HASH;
-        let meta_db = TABLE_META;
-        let feature_db = TABLE_FEATURES;
-        let coeff_db = TABLE_COEFFICIENTS;
-        let pixel_db = TABLE_PIXELHASH;
-        let ignored_db = TABLE_IGNORED;
-        let ignored_pdqmap_db = TABLE_IGNORED_PDQMAP;
-
-        // Ensure all tables exist in redb so read transactions never fail with TableDoesNotExist
-        {
-            let write_txn = env.begin_write()?;
-            let _ = write_txn.open_table(hash_db)?;
-            let _ = write_txn.open_table(meta_db)?;
-            let _ = write_txn.open_table(feature_db)?;
-            let _ = write_txn.open_table(coeff_db)?;
-            let _ = write_txn.open_table(pixel_db)?;
-            let _ = write_txn.open_table(ignored_db)?;
-            let _ = write_txn.open_table(ignored_pdqmap_db)?;
-            write_txn.commit()?;
+            Err(e) => Err(e.into()),
         }
+    }
 
-        // Convert the locations into runtime usable Points
-        let locations: HashMap<String, Point<f64>> =
-            config.locations.into_iter().map(|(name, option)| (name, option.into())).collect();
+    fn ensure_tables(env: &Database) -> Result<(), DbError> {
+        let write_txn = env.begin_write()?;
+        let _ = write_txn.open_table(TABLE_HASH)?;
+        let _ = write_txn.open_table(TABLE_META)?;
+        let _ = write_txn.open_table(TABLE_FEATURES)?;
+        let _ = write_txn.open_table(TABLE_COEFFICIENTS)?;
+        let _ = write_txn.open_table(TABLE_PIXELHASH)?;
+        let _ = write_txn.open_table(TABLE_IGNORED)?;
+        let _ = write_txn.open_table(TABLE_IGNORED_PDQMAP)?;
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    fn derive_keys(master_key_bytes: &[u8; 32]) -> ([u8; 32], [u8; 32], XChaCha20Poly1305) {
+        let content_key = blake3::derive_key("phdupes:content_key", master_key_bytes);
+        let meta_key = blake3::derive_key("phdupes:meta_key", master_key_bytes);
+        let encryption_key =
+            Zeroizing::new(blake3::derive_key("phdupes:encryption_key", master_key_bytes));
+        let cipher = XChaCha20Poly1305::new((&*encryption_key).into());
+        (content_key, meta_key, cipher)
+    }
+
+    /// Open context using default config and cache directories.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if configuration loading, master key validation, or
+    /// database initialization fails.
+    pub fn new() -> Result<Self, DbError> {
+        Self::with_algorithm(HashAlgorithm::PdqHash)
+    }
+
+    /// Open context with the selected hash algorithm.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if configuration loading, master key validation,
+    /// directory creation, or database opening fails.
+    pub fn with_algorithm(algorithm: HashAlgorithm) -> Result<Self, DbError> {
+        let cache_dir = dirs::cache_dir().ok_or(DbError::NoCacheDir)?;
+        fs::create_dir_all(&cache_dir)?;
+        let tile_cache_path = cache_dir.join("phdupes_tiles");
+        fs::create_dir_all(&tile_cache_path)?;
+
+        let loaded = load_or_init_config()?;
+        let (content_key, meta_key, cipher) = Self::derive_keys(&loaded.master_key_bytes);
+
+        let db_file_name = match algorithm {
+            HashAlgorithm::PdqHash => DB_FILE_NAME_PDQHASH,
+        };
+        let db_path = cache_dir.join(db_file_name);
+
+        let cache_size = (loaded.db_size_mb as usize).saturating_mul(1024 * 1024);
+        eprintln!(
+            "[DEBUG-DB] Setting redb cache size to {} bytes ({} MiB) at {:?}",
+            cache_size, loaded.db_size_mb, db_path
+        );
+
+        let env = Self::open_database_with_retry(&db_path, cache_size)?;
+        Self::ensure_tables(&env)?;
 
         Ok(Self {
             env: Arc::new(env),
-            hash_db,
-            meta_db,
-            feature_db,
-            coeff_db,
-            pixel_db,
-            ignored_db,
-            ignored_pdqmap_db,
+            hash_db: TABLE_HASH,
+            meta_db: TABLE_META,
+            feature_db: TABLE_FEATURES,
+            coeff_db: TABLE_COEFFICIENTS,
+            pixel_db: TABLE_PIXELHASH,
+            ignored_db: TABLE_IGNORED,
+            ignored_pdqmap_db: TABLE_IGNORED_PDQMAP,
             content_key,
             meta_key,
-            grouping_config: config.grouping,
-            gui_config: config.gui,
-            locations,
-            map_providers: config.map_providers,
-            selected_provider: config
-                .selected_provider
-                .unwrap_or_else(|| "OpenStreetMap".to_string()),
-            tile_cache_path, // Pass the path to the context
+            grouping_config: loaded.grouping,
+            gui_config: loaded.gui,
+            locations: loaded.locations,
+            map_providers: loaded.map_providers,
+            selected_provider: loaded.selected_provider,
+            tile_cache_path,
             cipher,
+            logged_ignored_corrupt: AtomicBool::new(false),
         })
     }
 
-    /// Decode and validate master_key from hex string
-    fn decode_master_key(hex_str: &str) -> Result<[u8; 32], String> {
-        let trimmed = hex_str.trim().trim_start_matches("0x").trim_start_matches("0X");
-        let mut bytes = hex::decode(trimmed).map_err(|e| format!("hex decode failed: {}", e))?;
-        if bytes.len() != 32 {
-            let len = bytes.len();
-            bytes.zeroize();
-            return Err(format!("expected 32 bytes, got {}", len));
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        bytes.zeroize();
+    #[cfg(test)]
+    fn open_for_test(db_path: &Path, master_key: [u8; 32]) -> Result<Self, DbError> {
+        let (content_key, meta_key, cipher) = Self::derive_keys(&master_key);
+        let env = Self::open_database_with_retry(db_path, 16 * 1024 * 1024)?;
+        Self::ensure_tables(&env)?;
 
-        Ok(arr)
+        Ok(Self {
+            env: Arc::new(env),
+            hash_db: TABLE_HASH,
+            meta_db: TABLE_META,
+            feature_db: TABLE_FEATURES,
+            coeff_db: TABLE_COEFFICIENTS,
+            pixel_db: TABLE_PIXELHASH,
+            ignored_db: TABLE_IGNORED,
+            ignored_pdqmap_db: TABLE_IGNORED_PDQMAP,
+            content_key,
+            meta_key,
+            grouping_config: GroupingConfig::default(),
+            gui_config: GuiConfig::default(),
+            locations: HashMap::new(),
+            map_providers: HashMap::new(),
+            selected_provider: String::new(),
+            tile_cache_path: db_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf(),
+            cipher,
+            logged_ignored_corrupt: AtomicBool::new(false),
+        })
     }
 
-    /// Encrypt data using AAD to bind ciphertext to the db_key.
-    /// Storage format: [Nonce (24 bytes) || Ciphertext || Tag (16 bytes)]
-    ///
-    /// We pass `db_key` as AAD (Additional Authenticated Data). The AEAD construction
-    /// ensures that if the AAD doesn't match during decryption, the tag verification fails.
-    /// This prevents swap attacks where values are moved between keys.
-    fn encrypt_value(cipher: &XChaCha20Poly1305, db_key: &[u8], data: &[u8]) -> Vec<u8> {
-        // XChaCha20Poly1305 uses a 24-byte nonce.
+    fn log_ignored_corrupt_once(&self, context: &str) {
+        if !self.logged_ignored_corrupt.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[ERROR-IGNORE] {context}: failed to decrypt or deserialize ignored entry (keeping entry intact)"
+            );
+        }
+    }
+
+    /// Encrypt data using AAD to bind ciphertext to `db_key`, reusing `out`.
+    /// Storage format: `[Nonce (24 bytes) || Ciphertext || Tag (16 bytes)]`.
+    fn encrypt_into(
+        cipher: &XChaCha20Poly1305,
+        db_key: &[u8],
+        data: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), DbError> {
         let mut nonce_bytes = [0u8; 24];
-        getrandom::fill(&mut nonce_bytes).expect("RNG failed");
-        let nonce = XNonce::try_from(&nonce_bytes[..]).expect("nonce is exactly 24 bytes");
+        getrandom::fill(&mut nonce_bytes)?;
+        let nonce = XNonce::from(nonce_bytes);
 
-        // Encrypt with AAD = db_key
-        let ciphertext = match cipher.encrypt(&nonce, Payload { msg: data, aad: db_key }) {
-            Ok(ct) => ct,
-            Err(_) => panic!("Encryption failed - implementation error"),
-        };
+        out.clear();
+        out.reserve(ENCRYPTION_OVERHEAD + data.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(data);
 
-        // Storage format: [Nonce (24) || Ciphertext+Tag]
+        let tag = cipher
+            .encrypt_inout_detached(&nonce, db_key, (&mut out[24..]).into())
+            .map_err(|_| DbError::EncryptionFailed)?;
+        out.extend_from_slice(tag.as_slice());
+        Ok(())
+    }
+
+    /// Encrypt data using AAD to bind ciphertext to `db_key`.
+    /// Storage format: `[Nonce (24 bytes) || Ciphertext || Tag (16 bytes)]`.
+    fn encrypt_value(
+        cipher: &XChaCha20Poly1305,
+        db_key: &[u8],
+        data: &[u8],
+    ) -> Result<Vec<u8>, DbError> {
+        let mut nonce_bytes = [0u8; 24];
+        getrandom::fill(&mut nonce_bytes)?;
+        let nonce = XNonce::from(nonce_bytes);
+
+        let ciphertext = cipher
+            .encrypt(&nonce, Payload { msg: data, aad: db_key })
+            .map_err(|_| DbError::EncryptionFailed)?;
+
         let mut out = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
-        out
+        Ok(out)
     }
 
     /// Decrypt value using AAD.
-    /// Returns None if tag verification fails (e.g., wrong key, tampering) or decryption fails.
+    /// Returns `None` if tag verification fails (e.g., wrong key, tampering) or decryption fails.
     fn decrypt_value(&self, db_key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
-        // Minimum size: nonce (24) + tag (16) = 40 bytes (for empty plaintext)
         if data.len() < TOTAL_OVERHEAD {
             return None;
         }
 
-        let nonce = XNonce::try_from(&data[0..24]).expect("length already verified >= 40 bytes");
+        let nonce = XNonce::try_from(&data[0..24]).ok()?;
         let ciphertext = &data[24..];
 
-        // Decrypt with AAD = db_key
-        // This validates that the ciphertext belongs to this specific db_key
         self.cipher.decrypt(&nonce, Payload { msg: ciphertext, aad: db_key }).ok()
     }
 
     // --- DATABASE ACCESS ---
 
-    /// Get PDQ hash (256-bit) from database
-    pub fn get_pdqhash(&self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, redb::Error> {
+    /// Get PDQ hash (256-bit) from database.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on database read failure or AEAD decryption failure.
+    pub fn get_pdqhash(&self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, DbError> {
         let txn = self.env.begin_read()?;
         let table = txn.open_table(self.hash_db)?;
-        match table.get(content_hash)? {
-            Some(encrypted_guard) => {
-                let encrypted_bytes = encrypted_guard.value();
-                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    // Stored as [PDQ_ALGO_VERSION || 32-byte hash]. A different
-                    // version means the entry came from another PDQ pipeline, so
-                    // report a miss and let the scanner recompute it.
-                    match decrypted.split_first() {
-                        Some((&PDQ_ALGO_VERSION, rest)) if rest.len() == 32 => {
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(rest);
-                            Ok(Some(arr))
-                        },
-                        _ => Ok(None),
-                    }
-                } else {
-                    eprintln!("[ERROR-DB] get_pdqhash Corrupted content_hash={:x?}", content_hash);
-                    Err(corrupted_err("get_pdqhash decryption failed"))
-                }
+        let Some(encrypted_guard) = table.get(content_hash)? else {
+            return Ok(None);
+        };
+
+        let Some(decrypted) = self.decrypt_value(content_hash, encrypted_guard.value()) else {
+            eprintln!("[ERROR-DB] get_pdqhash Corrupted content_hash={:x?}", content_hash);
+            return Err(DbError::DecryptionFailed { table: "pdqhash" });
+        };
+
+        // Stored as [PDQ_ALGO_VERSION || 32-byte hash]. A different version
+        // means the entry came from another PDQ pipeline, so report a miss.
+        match decrypted.split_first() {
+            Some((&PDQ_ALGO_VERSION, rest)) if rest.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(rest);
+                Ok(Some(arr))
             },
-            None => Ok(None),
+            _ => Ok(None),
         }
     }
 
-    /// Get cached features from database
-    pub fn get_features(
-        &self,
-        content_hash: &[u8; 32],
-    ) -> Result<Option<ImageFeatures>, redb::Error> {
+    /// Get cached features from database.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on database read failure, decryption failure, or deserialization failure.
+    pub fn get_features(&self, content_hash: &[u8; 32]) -> Result<Option<ImageFeatures>, DbError> {
         let txn = self.env.begin_read()?;
         let table = txn.open_table(self.feature_db)?;
-        match table.get(content_hash)? {
-            Some(encrypted_guard) => {
-                let encrypted_bytes = encrypted_guard.value();
-                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    ImageFeatures::from_bytes(&decrypted)
-                        .map(Some)
-                        .map_err(|_| corrupted_err("get_features deserialization failed"))
-                } else {
-                    eprintln!("[ERROR] get_features Corrupted ch={:x?}", content_hash);
-                    Err(corrupted_err("get_features decryption failed"))
-                }
-            },
-            None => Ok(None),
-        }
+        let Some(encrypted_guard) = table.get(content_hash)? else {
+            return Ok(None);
+        };
+
+        let Some(decrypted) = self.decrypt_value(content_hash, encrypted_guard.value()) else {
+            eprintln!("[ERROR] get_features Corrupted ch={:x?}", content_hash);
+            return Err(DbError::DecryptionFailed { table: DB_FILE_NAME_FEATURES });
+        };
+
+        Ok(Some(ImageFeatures::from_bytes(&decrypted)?))
     }
 
     /// Get the stored PDQ quality (0-100) for a content hash, if any.
-    /// None means the record predates quality storage, or was written by view
-    /// mode, which never computes a PDQ hash.
+    /// `None` means the record predates quality storage, was written by view mode,
+    /// or could not be read.
+    #[must_use]
     pub fn get_pdq_quality(&self, content_hash: &[u8; 32]) -> Option<u16> {
         self.get_features(content_hash).ok().flatten().and_then(|f| f.pdq_quality())
     }
 
-    /// Get coefficients from the separate coeff_db
-    pub fn get_coefficients(
-        &self,
-        content_hash: &[u8; 32],
-    ) -> Result<Option<Vec<f32>>, redb::Error> {
+    /// Get coefficients from the separate `coeff_db`.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on database read failure, decryption failure, or deserialization failure.
+    pub fn get_coefficients(&self, content_hash: &[u8; 32]) -> Result<Option<Vec<f32>>, DbError> {
         let txn = self.env.begin_read()?;
         let table = txn.open_table(self.coeff_db)?;
-        match table.get(content_hash)? {
-            Some(encrypted_guard) => {
-                let encrypted_bytes = encrypted_guard.value();
-                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    // Stored as [PDQ_ALGO_VERSION || postcard(CachedCoefficients)].
-                    match decrypted.split_first() {
-                        Some((&PDQ_ALGO_VERSION, rest)) => {
-                            if let Ok(cached) = CachedCoefficients::from_bytes(rest) {
-                                Ok(Some(cached.coefficients))
-                            } else {
-                                Err(corrupted_err("get_coefficients deserialization failed"))
-                            }
-                        },
-                        // Older algorithm version: treat as absent, not corrupt.
-                        _ => Ok(None),
-                    }
-                } else {
-                    Err(corrupted_err("get_coefficients decryption failed"))
-                }
-            },
-            None => Ok(None),
-        }
+        let Some(encrypted_guard) = table.get(content_hash)? else {
+            return Ok(None);
+        };
+
+        let Some(decrypted) = self.decrypt_value(content_hash, encrypted_guard.value()) else {
+            return Err(DbError::DecryptionFailed { table: DB_FILE_NAME_COEFFICIENTS });
+        };
+
+        // Stored as [PDQ_ALGO_VERSION || postcard(CachedCoefficients)].
+        let Some((&PDQ_ALGO_VERSION, rest)) = decrypted.split_first() else {
+            // Older algorithm version or empty payload: treat as absent, not corrupt.
+            return Ok(None);
+        };
+
+        let cached = CachedCoefficients::from_bytes(rest)?;
+        Ok(Some(cached.coefficients))
     }
 
     /// Retrieve content hash from metadata key.
-    /// STRICTLY expects [ContentHash (32) || Timestamp (8)].
-    /// Returns ONLY the ContentHash.
-    pub fn get_content_hash(&self, meta_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, redb::Error> {
+    /// Strictly expects `[ContentHash (32) || Timestamp (8)]`.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on database read failure, decryption failure, or length mismatch.
+    pub fn get_content_hash(&self, meta_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, DbError> {
         let txn = self.env.begin_read()?;
         let table = txn.open_table(self.meta_db)?;
-        match table.get(meta_hash)? {
-            Some(encrypted_guard) => {
-                let encrypted = encrypted_guard.value();
-                if let Some(decrypted) = self.decrypt_value(meta_hash, encrypted) {
-                    if decrypted.len() == 40 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&decrypted[0..32]);
-                        Ok(Some(arr))
-                    } else {
-                        // Strict check: if size is wrong, it's corrupted or old format
-                        eprintln!("[ERROR] get_content_hash Corrupted mh={:x?}", meta_hash);
-                        Err(corrupted_err("get_content_hash invalid length"))
-                    }
-                } else {
-                    Err(corrupted_err("get_content_hash decryption failed"))
-                }
-            },
-            None => Ok(None),
+        let Some(encrypted_guard) = table.get(meta_hash)? else {
+            return Ok(None);
+        };
+
+        let Some(decrypted) = self.decrypt_value(meta_hash, encrypted_guard.value()) else {
+            return Err(DbError::DecryptionFailed { table: "file_metadata" });
+        };
+
+        if decrypted.len() != 40 {
+            eprintln!("[ERROR] get_content_hash Corrupted mh={:x?}", meta_hash);
+            return Err(DbError::InvalidFormat {
+                table: "file_metadata",
+                detail: "expected 40 bytes",
+            });
         }
+
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&decrypted[0..32]);
+        Ok(Some(arr))
     }
 
-    pub fn get_pixel_hash(&self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, redb::Error> {
+    /// Retrieve raw pixel hash by `content_hash`.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on database read failure, decryption failure, or length mismatch.
+    pub fn get_pixel_hash(&self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, DbError> {
         let txn = self.env.begin_read()?;
         let table = txn.open_table(self.pixel_db)?;
-        match table.get(content_hash)? {
-            Some(encrypted_guard) => {
-                let encrypted_bytes = encrypted_guard.value();
-                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    let arr: [u8; 32] = decrypted
-                        .try_into()
-                        .map_err(|_| corrupted_err("get_pixel_hash invalid length"))?;
-                    Ok(Some(arr))
-                } else {
-                    Err(corrupted_err("get_pixel_hash decryption failed"))
-                }
-            },
-            None => Ok(None),
-        }
+        let Some(encrypted_guard) = table.get(content_hash)? else {
+            return Ok(None);
+        };
+
+        let Some(decrypted) = self.decrypt_value(content_hash, encrypted_guard.value()) else {
+            return Err(DbError::DecryptionFailed { table: DB_FILE_NAME_PIXELHASH });
+        };
+
+        let arr: [u8; 32] = decrypted.try_into().map_err(|_| DbError::InvalidFormat {
+            table: DB_FILE_NAME_PIXELHASH,
+            detail: "expected 32 bytes",
+        })?;
+        Ok(Some(arr))
     }
 
-    /// Look up cached features from the database.
-    /// Returns Option<ImageFeatures> - all fields accessible via methods.
+    /// Look up cached features from the database in a single read transaction.
+    #[must_use]
     pub fn lookup_cached_features(
         &self,
-        metadata: &std::fs::Metadata,
+        metadata: &fs::Metadata,
         unique_file_id: u128,
     ) -> Option<ImageFeatures> {
-        // CHANGED return type
         let meta_key = compute_meta_key_from_metadata(&self.meta_key, metadata, unique_file_id);
 
         eprintln!(
@@ -848,16 +799,27 @@ impl AppContext {
             hex::encode(&meta_key[..8])
         );
 
-        // Look up content_hash from meta_key
-        if let Ok(Some(content_hash)) = self.get_content_hash(&meta_key) {
+        let txn = self.env.begin_read().ok()?;
+        let meta_table = txn.open_table(self.meta_db).ok()?;
+        let feature_table = txn.open_table(self.feature_db).ok()?;
+
+        if let Ok(Some(encrypted_guard)) = meta_table.get(&meta_key)
+            && let Some(decrypted) = self.decrypt_value(&meta_key, encrypted_guard.value())
+            && decrypted.len() == 40
+        {
+            let mut content_hash = [0u8; 32];
+            content_hash.copy_from_slice(&decrypted[0..32]);
             if content_hash == [0u8; 32] {
                 return None;
             }
 
             eprintln!("[DEBUG-CACHE]   Found content_hash: {:?}", hex::encode(&content_hash[..8]));
 
-            // Look up cached features from content_hash
-            if let Ok(Some(features)) = self.get_features(&content_hash) {
+            if let Ok(Some(features_guard)) = feature_table.get(&content_hash)
+                && let Some(dec_features) =
+                    self.decrypt_value(&content_hash, features_guard.value())
+                && let Ok(features) = ImageFeatures::from_bytes(&dec_features)
+            {
                 eprintln!(
                     "[DEBUG-CACHE]   Found features: resolution={:?}, orientation={}, gps_pos={:#?}, exif_timestamp={:?}",
                     features.resolution(),
@@ -876,7 +838,8 @@ impl AppContext {
     }
 
     /// Batch lookup of cached features for multiple files.
-    /// Returns HashMap mapping unique_file_id to ImageFeatures.
+    /// Returns `HashMap` mapping `unique_file_id` to `ImageFeatures`.
+    #[must_use]
     pub fn lookup_cached_features_batch(
         &self,
         files: &[(u128, u64, u64)], // (unique_file_id, size, mtime_ns)
@@ -920,14 +883,16 @@ impl AppContext {
         results
     }
 
-    /// Prune entries older than `max_age_seconds`.
-    /// 1. Iterates MetaDB: Removes entries where timestamp < cutoff.
-    /// 2. Collects active ContentHashes.
-    /// 3. Sweeps HashDB/FeatureDB: Removes entries not in active set.
-    pub fn prune(
-        &self,
-        max_age_seconds: u64,
-    ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    /// Prune cache entries older than `max_age_seconds`.
+    /// 1. Iterates `meta_db`: removes entries where `timestamp < cutoff`.
+    /// 2. Collects active `content_hash`es.
+    /// 3. Sweeps `hash_db`, `feature_db`, `coeff_db`, `pixel_db`: removes entries not in active set.
+    ///
+    /// Note: `ignored_db` and `ignored_pdqmap_db` are NEVER touched by `prune`.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on system clock, transaction, or table operation failures.
+    pub fn prune(&self, max_age_seconds: u64) -> Result<(usize, usize), DbError> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let cutoff = now.saturating_sub(max_age_seconds);
 
@@ -939,116 +904,86 @@ impl AppContext {
         // 1. Scan MetaDB
         {
             let mut table = txn.open_table(self.meta_db)?;
-            if table.len()? > 0 {
-                let mut keys_to_delete = Vec::new();
-                for item in table.iter()? {
-                    let (key_guard, val_guard) = item?;
-                    let key = key_guard.value();
-                    let val_bytes = val_guard.value();
+            let mut keys_to_delete = Vec::new();
+            for item in table.iter()? {
+                let (key_guard, val_guard) = item?;
+                let key = key_guard.value();
+                let val_bytes = val_guard.value();
 
-                    if let Some(decrypted) = self.decrypt_value(key, val_bytes) {
-                        if decrypted.len() == 40 {
-                            let ts_bytes: [u8; 8] = decrypted[32..40].try_into().unwrap();
-                            let last_seen = u64::from_le_bytes(ts_bytes);
-
-                            if last_seen < cutoff {
-                                keys_to_delete.push(*key);
-                            } else {
-                                let mut ch = [0u8; 32];
-                                ch.copy_from_slice(&decrypted[0..32]);
-                                valid_content_hashes.insert(ch);
-                            }
-                        } else {
-                            keys_to_delete.push(*key);
-                        }
-                    } else {
+                if let Some(decrypted) = self.decrypt_value(key, val_bytes)
+                    && decrypted.len() == 40
+                    && let Ok(ts_bytes) = <[u8; 8]>::try_from(&decrypted[32..40])
+                {
+                    let last_seen = u64::from_le_bytes(ts_bytes);
+                    if last_seen < cutoff {
                         keys_to_delete.push(*key);
+                    } else {
+                        let mut ch = [0u8; 32];
+                        ch.copy_from_slice(&decrypted[0..32]);
+                        valid_content_hashes.insert(ch);
                     }
+                } else {
+                    keys_to_delete.push(*key);
                 }
-                for key in keys_to_delete {
-                    table.remove(&key)?;
-                    meta_remove_count += 1;
-                }
+            }
+            for key in keys_to_delete {
+                table.remove(&key)?;
+                meta_remove_count += 1;
             }
         }
 
         // 2. Sweep HashDB
         {
             let mut table = txn.open_table(self.hash_db)?;
-            if table.len()? > 0 {
-                let mut keys_to_delete = Vec::new();
-                for item in table.iter()? {
-                    let (key_guard, _) = item?;
-                    let k = *key_guard.value();
-                    if !valid_content_hashes.contains(&k) {
-                        keys_to_delete.push(k);
-                    }
+            let mut keys_to_delete = Vec::new();
+            for item in table.iter()? {
+                let (key_guard, _) = item?;
+                let k = *key_guard.value();
+                if !valid_content_hashes.contains(&k) {
+                    keys_to_delete.push(k);
                 }
-                for k in keys_to_delete {
-                    table.remove(&k)?;
-                    hash_remove_count += 1;
-                }
+            }
+            for k in keys_to_delete {
+                table.remove(&k)?;
+                hash_remove_count += 1;
             }
         }
 
         // 3. Sweep FeatureDB
-        {
-            let mut table = txn.open_table(self.feature_db)?;
-            if table.len()? > 0 {
-                let mut keys_to_delete = Vec::new();
-                for item in table.iter()? {
-                    let (key_guard, _) = item?;
-                    let k = *key_guard.value();
-                    if !valid_content_hashes.contains(&k) {
-                        keys_to_delete.push(k);
-                    }
-                }
-                for k in keys_to_delete {
-                    table.remove(&k)?;
-                }
-            }
-        }
+        Self::sweep_orphaned_keys(&txn, self.feature_db, &valid_content_hashes)?;
 
         // 4. Sweep CoeffDB (PDQ coefficients)
-        {
-            let mut table = txn.open_table(self.coeff_db)?;
-            if table.len()? > 0 {
-                let mut keys_to_delete = Vec::new();
-                for item in table.iter()? {
-                    let (key_guard, _) = item?;
-                    let k = *key_guard.value();
-                    if !valid_content_hashes.contains(&k) {
-                        keys_to_delete.push(k);
-                    }
-                }
-                for k in keys_to_delete {
-                    table.remove(&k)?;
-                }
-            }
-        }
+        Self::sweep_orphaned_keys(&txn, self.coeff_db, &valid_content_hashes)?;
 
         // 5. Sweep PixelDB
-        {
-            let mut table = txn.open_table(self.pixel_db)?;
-            if table.len()? > 0 {
-                let mut keys_to_delete = Vec::new();
-                for item in table.iter()? {
-                    let (key_guard, _) = item?;
-                    let k = *key_guard.value();
-                    if !valid_content_hashes.contains(&k) {
-                        keys_to_delete.push(k);
-                    }
-                }
-                for k in keys_to_delete {
-                    table.remove(&k)?;
-                }
-            }
-        }
+        Self::sweep_orphaned_keys(&txn, self.pixel_db, &valid_content_hashes)?;
 
         txn.commit()?;
         Ok((meta_remove_count, hash_remove_count))
     }
 
+    fn sweep_orphaned_keys(
+        txn: &WriteTransaction,
+        table_def: DbTable,
+        valid_content_hashes: &HashSet<[u8; 32]>,
+    ) -> Result<(), DbError> {
+        let mut table = txn.open_table(table_def)?;
+        let mut keys_to_delete = Vec::new();
+        for item in table.iter()? {
+            let (key_guard, _) = item?;
+            let k = *key_guard.value();
+            if !valid_content_hashes.contains(&k) {
+                keys_to_delete.push(k);
+            }
+        }
+        for k in keys_to_delete {
+            table.remove(&k)?;
+        }
+        Ok(())
+    }
+
+    /// Spawn the background writer thread that coalesces and batches cache writes.
+    #[must_use]
     pub fn start_db_writer(&self, rx: Receiver<DbUpdate>) -> thread::JoinHandle<()> {
         let env = self.env.clone();
         let meta_db = self.meta_db;
@@ -1058,12 +993,11 @@ impl AppContext {
         let pixel_db = self.pixel_db;
         let cipher = self.cipher.clone();
 
-        thread::spawn(move || {
-            let mut meta_updates = Vec::new();
-            let mut hash_updates = Vec::new();
-            let mut feature_updates = Vec::new();
-            let mut coeff_updates = Vec::new();
-            let mut pixel_updates = Vec::new();
+        let builder = thread::Builder::new().name("db-writer".to_string());
+        let run = move || {
+            let mut batch = PendingBatch::new();
+            let mut plain_buf = Vec::with_capacity(512);
+            let mut enc_buf = Vec::with_capacity(512);
 
             let mut last_flush = Instant::now();
             let flush_interval = Duration::from_secs(1);
@@ -1077,29 +1011,37 @@ impl AppContext {
             let mut last_write_failed = false;
 
             loop {
-                let msg = rx.recv_timeout(Duration::from_millis(100));
-                match msg {
-                    Ok((m, h, f, c, p)) => {
-                        if let Some(up) = m {
-                            meta_updates.push(up);
+                let was_empty = batch.is_empty();
+                let mut disconnected = false;
+
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(update) => {
+                        if was_empty {
+                            // Start batch window from the first item after an idle period
+                            last_flush = Instant::now();
                         }
-                        if let Some(up) = h {
-                            hash_updates.push(up);
-                        }
-                        if let Some(up) = f {
-                            feature_updates.push(up);
-                        }
-                        if let Some(up) = c {
-                            coeff_updates.push(up);
-                        }
-                        if let Some(up) = p {
-                            pixel_updates.push(up);
+                        batch.push(update);
+
+                        // Drain already-queued updates up to max_buffer to maximize batching
+                        while !batch.is_full(max_buffer) {
+                            match rx.try_recv() {
+                                Ok(more) => batch.push(more),
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    disconnected = true;
+                                    break;
+                                },
+                            }
                         }
                     },
+                    Err(RecvTimeoutError::Timeout) => {},
                     Err(RecvTimeoutError::Disconnected) => {
-                        // Channel closed: attempt a final flush. Retry a few times
-                        // because losing the last batch loses cache entries that
-                        // would otherwise have to be recomputed on the next run.
+                        disconnected = true;
+                    },
+                }
+
+                if disconnected {
+                    if !batch.is_empty() {
                         let mut attempts = 0;
                         loop {
                             match Self::write_batch(
@@ -1110,28 +1052,21 @@ impl AppContext {
                                 feature_db,
                                 coeff_db,
                                 pixel_db,
-                                &meta_updates,
-                                &hash_updates,
-                                &feature_updates,
-                                &coeff_updates,
-                                &pixel_updates,
+                                &batch,
+                                &mut plain_buf,
+                                &mut enc_buf,
                             ) {
                                 Ok(()) => break,
                                 Err(e) => {
                                     attempts += 1;
                                     eprintln!(
-                                        "[ERROR-DB] Final write_batch failed (attempt {}): {:?}",
+                                        "[ERROR-DB] Final write_batch failed (attempt {}): {}",
                                         attempts, e
                                     );
                                     if attempts >= 3 {
-                                        let lost = meta_updates.len()
-                                            + hash_updates.len()
-                                            + feature_updates.len()
-                                            + coeff_updates.len()
-                                            + pixel_updates.len();
                                         eprintln!(
                                             "[ERROR-DB] Giving up on final flush; {} cache updates lost",
-                                            lost
+                                            batch.total_len()
                                         );
                                         break;
                                     }
@@ -1139,26 +1074,14 @@ impl AppContext {
                                 },
                             }
                         }
-                        break;
-                    },
-                    _ => {},
+                    }
+                    break;
                 }
 
-                let any_pending = !meta_updates.is_empty()
-                    || !hash_updates.is_empty()
-                    || !feature_updates.is_empty()
-                    || !coeff_updates.is_empty()
-                    || !pixel_updates.is_empty();
-                let buffer_full = meta_updates.len() >= max_buffer
-                    || hash_updates.len() >= max_buffer
-                    || feature_updates.len() >= max_buffer
-                    || coeff_updates.len() >= max_buffer
-                    || pixel_updates.len() >= max_buffer;
+                let any_pending = !batch.is_empty();
+                let buffer_full = batch.is_full(max_buffer);
                 let time_elapsed = last_flush.elapsed() >= flush_interval;
 
-                // After a failure, suppress the buffer-full trigger so we retry at
-                // most once per flush_interval instead of spinning on a
-                // persistently-failing write (the buffers stay >= max_buffer).
                 let should_flush =
                     any_pending && (time_elapsed || (buffer_full && !last_write_failed));
 
@@ -1171,51 +1094,40 @@ impl AppContext {
                         feature_db,
                         coeff_db,
                         pixel_db,
-                        &meta_updates,
-                        &hash_updates,
-                        &feature_updates,
-                        &coeff_updates,
-                        &pixel_updates,
+                        &batch,
+                        &mut plain_buf,
+                        &mut enc_buf,
                     ) {
                         Ok(()) => {
-                            meta_updates.clear();
-                            hash_updates.clear();
-                            feature_updates.clear();
-                            coeff_updates.clear();
-                            pixel_updates.clear();
+                            batch.clear();
                             last_write_failed = false;
                         },
                         Err(e) => {
-                            eprintln!("[ERROR-DB] write_batch failed: {:?} (will retry)", e);
+                            eprintln!("[ERROR-DB] write_batch failed: {} (will retry)", e);
                             last_write_failed = true;
 
-                            // Bound memory: if the backlog grows past the hard cap
-                            // while writes keep failing, drop it. The dropped
-                            // entries are a cache and are recomputed on next scan.
-                            let buffered = meta_updates.len()
-                                + hash_updates.len()
-                                + feature_updates.len()
-                                + coeff_updates.len()
-                                + pixel_updates.len();
+                            let buffered = batch.total_len();
                             if buffered > hard_cap {
                                 eprintln!(
                                     "[ERROR-DB] Dropping {} buffered cache updates after repeated write failures",
                                     buffered
                                 );
-                                meta_updates.clear();
-                                hash_updates.clear();
-                                feature_updates.clear();
-                                coeff_updates.clear();
-                                pixel_updates.clear();
+                                batch.clear();
                             }
                         },
                     }
                     last_flush = Instant::now();
                 }
             }
+        };
+
+        builder.spawn(run).unwrap_or_else(|e| {
+            eprintln!("[WARN-DB] Failed to spawn named db-writer thread ({}); falling back", e);
+            thread::spawn(|| {})
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_batch(
         cipher: &XChaCha20Poly1305,
         env: &Database,
@@ -1224,78 +1136,93 @@ impl AppContext {
         feature_db: DbTable,
         coeff_db: DbTable,
         pixel_db: DbTable,
-        meta_updates: &Vec<([u8; 32], [u8; 32])>,
-        hash_updates: &Vec<([u8; 32], HashValue)>,
-        feature_updates: &Vec<([u8; 32], ImageFeatures)>,
-        coeff_updates: &Vec<([u8; 32], CachedCoefficients)>,
-        pixel_updates: &Vec<([u8; 32], [u8; 32])>,
-    ) -> Result<(), redb::Error> {
+        batch: &PendingBatch,
+        plain_buf: &mut Vec<u8>,
+        enc_buf: &mut Vec<u8>,
+    ) -> Result<(), DbError> {
         let txn = env.begin_write()?;
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let now_bytes = now.to_le_bytes();
 
-        // 1. Meta Updates: Append Timestamp (8 bytes) to ContentHash (32 bytes)
-        if !meta_updates.is_empty() {
+        // 1. Meta Updates: [ContentHash (32) || Timestamp (8)]
+        if !batch.meta.is_empty() {
             let mut table = txn.open_table(meta_db)?;
-            for (key, val) in meta_updates {
-                let mut data = Vec::with_capacity(32 + 8);
-                data.extend_from_slice(val); // Content Hash
-                data.extend_from_slice(&now_bytes); // Timestamp
+            for (key, val) in &batch.meta {
+                plain_buf.clear();
+                plain_buf.extend_from_slice(val);
+                plain_buf.extend_from_slice(&now_bytes);
 
-                let encrypted = Self::encrypt_value(cipher, key, &data);
-                table.insert(key, encrypted.as_slice())?;
+                Self::encrypt_into(cipher, key, plain_buf, enc_buf)?;
+                table.insert(key, enc_buf.as_slice())?;
             }
         }
 
-        // 2. Hash Updates: prefix the algorithm version (1 byte) to the hash
-        if !hash_updates.is_empty() {
+        // 2. Hash Updates: [PDQ_ALGO_VERSION (1) || pdqhash (32)]
+        if !batch.hash.is_empty() {
             let mut table = txn.open_table(hash_db)?;
-            for (key, val) in hash_updates {
+            for (key, val) in &batch.hash {
                 match val {
                     HashValue::PdqHash(pdqhash) => {
-                        let mut data = Vec::with_capacity(1 + 32);
-                        data.push(PDQ_ALGO_VERSION);
-                        data.extend_from_slice(pdqhash);
+                        plain_buf.clear();
+                        plain_buf.push(PDQ_ALGO_VERSION);
+                        plain_buf.extend_from_slice(pdqhash);
 
-                        let encrypted = Self::encrypt_value(cipher, key, &data);
-                        table.insert(key, encrypted.as_slice())?;
+                        Self::encrypt_into(cipher, key, plain_buf, enc_buf)?;
+                        table.insert(key, enc_buf.as_slice())?;
                     },
                 }
             }
         }
 
         // 3. Feature Updates
-        if !feature_updates.is_empty() {
+        if !batch.feature.is_empty() {
             let mut table = txn.open_table(feature_db)?;
-            for (key, features) in feature_updates {
-                let bytes = features.to_bytes().expect("ImageFeatures serialization failed");
-                let encrypted = Self::encrypt_value(cipher, key, &bytes);
-                table.insert(key, encrypted.as_slice())?;
+            for (key, features) in &batch.feature {
+                match features.to_bytes() {
+                    Ok(bytes) => {
+                        Self::encrypt_into(cipher, key, &bytes, enc_buf)?;
+                        table.insert(key, enc_buf.as_slice())?;
+                    },
+                    Err(e) => {
+                        eprintln!(
+                            "[ERROR-DB] Skipping ImageFeatures entry due to serialization error: {}",
+                            e
+                        );
+                    },
+                }
             }
         }
 
-        // 4. Coefficient Updates (PDQ coefficients - duplicate finder mode only)
-        //    Prefixed with the algorithm version, same as the hashes.
-        if !coeff_updates.is_empty() {
+        // 4. Coefficient Updates: [PDQ_ALGO_VERSION (1) || postcard(CachedCoefficients)]
+        if !batch.coeff.is_empty() {
             let mut table = txn.open_table(coeff_db)?;
-            for (key, coeffs) in coeff_updates {
-                let bytes = coeffs.to_bytes().expect("CachedCoefficients serialization failed");
-                let mut data = Vec::with_capacity(1 + bytes.len());
-                data.push(PDQ_ALGO_VERSION);
-                data.extend_from_slice(&bytes);
+            for (key, coeffs) in &batch.coeff {
+                match coeffs.to_bytes() {
+                    Ok(bytes) => {
+                        plain_buf.clear();
+                        plain_buf.push(PDQ_ALGO_VERSION);
+                        plain_buf.extend_from_slice(&bytes);
 
-                let encrypted = Self::encrypt_value(cipher, key, &data);
-                table.insert(key, encrypted.as_slice())?;
+                        Self::encrypt_into(cipher, key, plain_buf, enc_buf)?;
+                        table.insert(key, enc_buf.as_slice())?;
+                    },
+                    Err(e) => {
+                        eprintln!(
+                            "[ERROR-DB] Skipping CachedCoefficients entry due to serialization error: {}",
+                            e
+                        );
+                    },
+                }
             }
         }
 
         // 5. Pixel Updates
-        if !pixel_updates.is_empty() {
+        if !batch.pixel.is_empty() {
             let mut table = txn.open_table(pixel_db)?;
-            for (key, val) in pixel_updates {
-                let encrypted = Self::encrypt_value(cipher, key, val);
-                table.insert(key, encrypted.as_slice())?;
+            for (key, val) in &batch.pixel {
+                Self::encrypt_into(cipher, key, val, enc_buf)?;
+                table.insert(key, enc_buf.as_slice())?;
             }
         }
 
@@ -1304,29 +1231,45 @@ impl AppContext {
     }
 
     /// Iterate all features in the database for building search index.
-    /// Calls the provided callback for each (content_hash, ImageFeatures) pair.
+    /// Calls `callback` for each `(content_hash, ImageFeatures)` pair.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on database read/table failures.
     #[allow(dead_code)]
-    pub fn iterate_all_features<F>(&self, mut callback: F) -> Result<usize, redb::Error>
+    pub fn iterate_all_features<F>(&self, mut callback: F) -> Result<usize, DbError>
     where
         F: FnMut(&[u8; 32], &ImageFeatures),
     {
         let txn = self.env.begin_read()?;
         let table = txn.open_table(self.feature_db)?;
         let mut count = 0;
+        let mut corrupt_count = 0usize;
 
-        if table.len()? > 0 {
-            for result in table.iter()? {
-                let (key_guard, encrypted_guard) = result?;
-                let content_hash = *key_guard.value();
-                let encrypted = encrypted_guard.value();
+        for result in table.iter()? {
+            let (key_guard, encrypted_guard) = result?;
+            let content_hash = *key_guard.value();
+            let encrypted = encrypted_guard.value();
 
-                if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
-                    && let Ok(features) = ImageFeatures::from_bytes(&decrypted)
-                {
+            let Some(decrypted) = self.decrypt_value(&content_hash, encrypted) else {
+                corrupt_count += 1;
+                continue;
+            };
+            match ImageFeatures::from_bytes(&decrypted) {
+                Ok(features) => {
                     callback(&content_hash, &features);
                     count += 1;
-                }
+                },
+                Err(_) => {
+                    corrupt_count += 1;
+                },
             }
+        }
+
+        if corrupt_count > 0 {
+            eprintln!(
+                "[ERROR-DB] iterate_all_features skipped {} corrupted or undecryptable entries",
+                corrupt_count
+            );
         }
 
         Ok(count)
@@ -1334,18 +1277,28 @@ impl AppContext {
 
     // --- Ignored Files Database ---
 
-    /// Check if a file has been explicitly ignored (ignored flag == true).
+    /// Check if a file has been explicitly ignored (`ignored == true`).
+    #[must_use]
     pub fn is_ignored(&self, content_hash: &[u8; 32]) -> bool {
-        let Ok(txn) = self.env.begin_read() else { return false };
-        let Ok(table) = txn.open_table(self.ignored_db) else { return false };
+        let Ok(txn) = self.env.begin_read() else {
+            return false;
+        };
+        let Ok(table) = txn.open_table(self.ignored_db) else {
+            return false;
+        };
         match table.get(content_hash) {
             Ok(Some(encrypted_guard)) => {
-                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_guard.value())
-                    && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
-                {
-                    entry.ignored
-                } else {
-                    false
+                let Some(decrypted) = self.decrypt_value(content_hash, encrypted_guard.value())
+                else {
+                    self.log_ignored_corrupt_once("is_ignored");
+                    return false;
+                };
+                match IgnoredEntry::from_bytes(&decrypted) {
+                    Ok(entry) => entry.ignored,
+                    Err(_) => {
+                        self.log_ignored_corrupt_once("is_ignored");
+                        false
+                    },
                 }
             },
             _ => false,
@@ -1353,78 +1306,98 @@ impl AppContext {
     }
 
     /// Get the group UUID for a file (works for both ignored and registered-only files).
+    #[must_use]
     pub fn get_group_uuid(&self, content_hash: &[u8; 32]) -> Option<[u8; 16]> {
         let txn = self.env.begin_read().ok()?;
         let table = txn.open_table(self.ignored_db).ok()?;
         let encrypted_guard = table.get(content_hash).ok()??;
-        let decrypted = self.decrypt_value(content_hash, encrypted_guard.value())?;
-        let entry = IgnoredEntry::from_bytes(&decrypted).ok()?;
-        Some(entry.group_uuid)
+        let Some(decrypted) = self.decrypt_value(content_hash, encrypted_guard.value()) else {
+            self.log_ignored_corrupt_once("get_group_uuid");
+            return None;
+        };
+        match IgnoredEntry::from_bytes(&decrypted) {
+            Ok(entry) => Some(entry.group_uuid),
+            Err(_) => {
+                self.log_ignored_corrupt_once("get_group_uuid");
+                None
+            },
+        }
     }
 
     /// Look up an existing UUID for a group within `txn`.
     /// First checks `ignored_pdqmap_db` by `pdqhash`, then falls back to checking
-    /// `ignored_db` by `content_hash` so groups without a PDQ hash (e.g., exact
-    /// content/pixel matches where `pdqhash` is `None`) also preserve their UUID.
+    /// `ignored_db` by `content_hash` so groups without a PDQ hash also preserve their UUID.
     fn find_uuid_in_txn(
         &self,
         txn: &WriteTransaction,
-        group: &[([u8; 32], Option<[u8; 32]>)],
-    ) -> Option<[u8; 16]> {
-        if let Ok(pdqmap_table) = txn.open_table(self.ignored_pdqmap_db) {
+        group: &[GroupEntry],
+    ) -> Result<Option<[u8; 16]>, DbError> {
+        {
+            let pdqmap_table = txn.open_table(self.ignored_pdqmap_db)?;
             for (_, pdqhash_opt) in group {
                 if let Some(pdqhash) = pdqhash_opt
-                    && let Ok(Some(encrypted_guard)) = pdqmap_table.get(pdqhash)
-                    && let Some(decrypted) = self.decrypt_value(pdqhash, encrypted_guard.value())
-                    && decrypted.len() == 16
+                    && let Some(encrypted_guard) = pdqmap_table.get(pdqhash)?
                 {
-                    let mut uuid = [0u8; 16];
-                    uuid.copy_from_slice(&decrypted);
-                    return Some(uuid);
+                    if let Some(decrypted) = self.decrypt_value(pdqhash, encrypted_guard.value())
+                        && decrypted.len() == 16
+                    {
+                        let mut uuid = [0u8; 16];
+                        uuid.copy_from_slice(&decrypted);
+                        return Ok(Some(uuid));
+                    }
+                    self.log_ignored_corrupt_once("find_uuid_in_txn (pdqmap)");
                 }
             }
         }
 
         // Fallback: check if any file in the group already has an entry in ignored_db
-        if let Ok(ignored_table) = txn.open_table(self.ignored_db) {
+        {
+            let ignored_table = txn.open_table(self.ignored_db)?;
             for (content_hash, _) in group {
-                if let Ok(Some(encrypted_guard)) = ignored_table.get(content_hash)
-                    && let Some(decrypted) =
+                if let Some(encrypted_guard) = ignored_table.get(content_hash)? {
+                    if let Some(decrypted) =
                         self.decrypt_value(content_hash, encrypted_guard.value())
-                    && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
-                {
-                    return Some(entry.group_uuid);
+                        && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                    {
+                        return Ok(Some(entry.group_uuid));
+                    }
+                    self.log_ignored_corrupt_once("find_uuid_in_txn (ignored_db)");
                 }
             }
         }
 
-        None
+        Ok(None)
     }
 
-    /// Store pdqhash → UUID mappings for all pdqhashes in a group.
+    /// Store `pdqhash -> UUID` mappings for all `pdqhash`es in a group, skipping any
+    /// protected hashes belonging to untouched entries with a different UUID.
     fn store_pdqmap_entries(
         cipher: &XChaCha20Poly1305,
         txn: &WriteTransaction,
         pdqmap_db: DbTable,
         pdqhashes: &[Option<[u8; 32]>],
+        protected_pdqhashes: &HashSet<[u8; 32]>,
         uuid: &[u8; 16],
-    ) -> Result<(), redb::Error> {
+    ) -> Result<(), DbError> {
         let mut table = txn.open_table(pdqmap_db)?;
         for pdqhash in pdqhashes.iter().flatten() {
-            let encrypted = Self::encrypt_value(cipher, pdqhash, uuid);
+            if protected_pdqhashes.contains(pdqhash) {
+                continue;
+            }
+            let encrypted = Self::encrypt_value(cipher, pdqhash, uuid)?;
             table.insert(pdqhash, encrypted.as_slice())?;
         }
         Ok(())
     }
 
     /// Register all duplicate groups in the database on scan completion.
-    /// Each file gets an IgnoredEntry with `ignored: false`.
-    /// Entries already marked `ignored: true` are NOT overwritten.
-    /// Returns the total number of newly registered entries.
-    pub fn register_duplicate_groups(
-        &self,
-        groups: &[Vec<([u8; 32], Option<[u8; 32]>)>], /* Vec of groups, each (content_hash, pdqhash) */
-    ) -> Result<usize, redb::Error> {
+    /// Each file gets an `IgnoredEntry` with `ignored: false`.
+    /// Entries already marked `ignored: true` (or corrupted/undecryptable entries)
+    /// are NEVER overwritten.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on RNG, serialization, encryption, or transaction errors.
+    pub fn register_duplicate_groups(&self, groups: &[Vec<GroupEntry>]) -> Result<usize, DbError> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut total_registered = 0;
 
@@ -1435,34 +1408,47 @@ impl AppContext {
                 continue;
             }
 
-            // Use the write transaction as a reader; it sees the same snapshot.
-            let all_pdqhashes: Vec<Option<[u8; 32]>> = group.iter().map(|(_, pdq)| *pdq).collect();
-            let uuid = self.find_uuid_in_txn(&txn, group).unwrap_or_else(|| {
-                let mut uuid = [0u8; 16];
-                getrandom::fill(&mut uuid).expect("RNG failed");
-                uuid
-            });
+            let uuid = match self.find_uuid_in_txn(&txn, group)? {
+                Some(existing_uuid) => existing_uuid,
+                None => {
+                    let mut fresh = [0u8; 16];
+                    getrandom::fill(&mut fresh)?;
+                    fresh
+                },
+            };
+
+            let mut protected_pdqhashes = HashSet::new();
 
             {
                 let mut ignored_table = txn.open_table(self.ignored_db)?;
                 for (content_hash, pdqhash) in group {
-                    // Don't overwrite entries that are already ignored=true
-                    let already_ignored =
-                        if let Ok(Some(existing_guard)) = ignored_table.get(content_hash) {
-                            if let Some(decrypted) =
-                                self.decrypt_value(content_hash, existing_guard.value())
-                                && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
-                            {
-                                entry.ignored
-                            } else {
-                                false
+                    // Never overwrite entries already marked ignored=true OR entries that
+                    // fail decryption/deserialization (e.g. if opened with another key).
+                    if let Some(existing_guard) = ignored_table.get(content_hash)? {
+                        let Some(decrypted) =
+                            self.decrypt_value(content_hash, existing_guard.value())
+                        else {
+                            self.log_ignored_corrupt_once("register_duplicate_groups");
+                            if let Some(pdq) = pdqhash {
+                                protected_pdqhashes.insert(*pdq);
                             }
-                        } else {
-                            false
+                            continue;
                         };
-
-                    if already_ignored {
-                        continue;
+                        let Ok(existing_entry) = IgnoredEntry::from_bytes(&decrypted) else {
+                            self.log_ignored_corrupt_once("register_duplicate_groups");
+                            if let Some(pdq) = pdqhash {
+                                protected_pdqhashes.insert(*pdq);
+                            }
+                            continue;
+                        };
+                        if existing_entry.ignored {
+                            if existing_entry.group_uuid != uuid
+                                && let Some(existing_pdq) = existing_entry.pdqhash
+                            {
+                                protected_pdqhashes.insert(existing_pdq);
+                            }
+                            continue;
+                        }
                     }
 
                     let entry = IgnoredEntry {
@@ -1471,19 +1457,20 @@ impl AppContext {
                         timestamp: now,
                         ignored: false,
                     };
-                    let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
-                    let encrypted = Self::encrypt_value(&self.cipher, content_hash, &bytes);
+                    let bytes = entry.to_bytes()?;
+                    let encrypted = Self::encrypt_value(&self.cipher, content_hash, &bytes)?;
                     ignored_table.insert(content_hash, encrypted.as_slice())?;
                     total_registered += 1;
                 }
             }
 
-            // Store pdqmap entries for cross-session UUID stability
+            let all_pdqhashes: Vec<Option<[u8; 32]>> = group.iter().map(|(_, pdq)| *pdq).collect();
             Self::store_pdqmap_entries(
                 &self.cipher,
                 &txn,
                 self.ignored_pdqmap_db,
                 &all_pdqhashes,
+                &protected_pdqhashes,
                 &uuid,
             )?;
         }
@@ -1499,11 +1486,13 @@ impl AppContext {
 
     /// Import ignored entries (into both `ignored_db` and `ignored_pdqmap_db`)
     /// parsed from `--show-ignored` output.
-    /// Returns `(imported_entries_count, imported_pdqmap_count)`.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on serialization, encryption, or transaction failures.
     pub fn import_ignored_entries(
         &self,
         entries: &[([u8; 32], IgnoredEntry)],
-    ) -> Result<(usize, usize), redb::Error> {
+    ) -> Result<(usize, usize), DbError> {
         let txn = self.env.begin_write()?;
         let mut entry_count = 0;
         let mut pdqmap_count = 0;
@@ -1513,8 +1502,8 @@ impl AppContext {
             let mut pdqmap_table = txn.open_table(self.ignored_pdqmap_db)?;
 
             for (content_hash, entry) in entries {
-                let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
-                let encrypted = Self::encrypt_value(&self.cipher, content_hash, &bytes);
+                let bytes = entry.to_bytes()?;
+                let encrypted = Self::encrypt_value(&self.cipher, content_hash, &bytes)?;
                 ignored_table.insert(content_hash, encrypted.as_slice())?;
                 entry_count += 1;
 
@@ -1522,7 +1511,7 @@ impl AppContext {
                     && entry.group_uuid != [0u8; 16]
                 {
                     let encrypted_uuid =
-                        Self::encrypt_value(&self.cipher, pdqhash, &entry.group_uuid);
+                        Self::encrypt_value(&self.cipher, pdqhash, &entry.group_uuid)?;
                     pdqmap_table.insert(pdqhash, encrypted_uuid.as_slice())?;
                     pdqmap_count += 1;
                 }
@@ -1537,9 +1526,12 @@ impl AppContext {
         Ok((entry_count, pdqmap_count))
     }
 
-    /// Set the ignored flag to true for the given content hashes.
-    /// Returns the number of entries flipped from false to true.
-    pub fn set_files_ignored(&self, content_hashes: &[[u8; 32]]) -> Result<usize, redb::Error> {
+    /// Set the ignored flag to `true` for the given content hashes.
+    /// Returns the number of entries flipped from `false` to `true`.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on serialization, encryption, or transaction failures.
+    pub fn set_files_ignored(&self, content_hashes: &[[u8; 32]]) -> Result<usize, DbError> {
         let txn = self.env.begin_write()?;
         let mut count = 0;
 
@@ -1547,22 +1539,28 @@ impl AppContext {
             let mut table = txn.open_table(self.ignored_db)?;
             for ch in content_hashes {
                 let existing_bytes = table.get(ch)?.map(|guard| guard.value().to_vec());
-                if let Some(encrypted) = existing_bytes {
-                    if let Some(decrypted) = self.decrypt_value(ch, &encrypted)
-                        && let Ok(mut entry) = IgnoredEntry::from_bytes(&decrypted)
-                        && !entry.ignored
-                    {
-                        entry.ignored = true;
-                        let bytes = entry.to_bytes().expect("IgnoredEntry serialization failed");
-                        let new_encrypted = Self::encrypt_value(&self.cipher, ch, &bytes);
-                        table.insert(ch, new_encrypted.as_slice())?;
-                        count += 1;
-                    }
-                } else {
+                let Some(encrypted) = existing_bytes else {
                     eprintln!(
                         "[WARN-IGNORE] set_files_ignored: no entry for blake3={}, skipping",
                         hex::encode(ch)
                     );
+                    continue;
+                };
+
+                let Some(decrypted) = self.decrypt_value(ch, &encrypted) else {
+                    self.log_ignored_corrupt_once("set_files_ignored");
+                    continue;
+                };
+                let Ok(mut entry) = IgnoredEntry::from_bytes(&decrypted) else {
+                    self.log_ignored_corrupt_once("set_files_ignored");
+                    continue;
+                };
+                if !entry.ignored {
+                    entry.ignored = true;
+                    let bytes = entry.to_bytes()?;
+                    let new_encrypted = Self::encrypt_value(&self.cipher, ch, &bytes)?;
+                    table.insert(ch, new_encrypted.as_slice())?;
+                    count += 1;
                 }
             }
         }
@@ -1571,71 +1569,89 @@ impl AppContext {
         Ok(count)
     }
 
-    /// Get an ignored entry by content_hash (returns any entry, regardless of flag).
-    pub fn get_ignored(
-        &self,
-        content_hash: &[u8; 32],
-    ) -> Result<Option<IgnoredEntry>, redb::Error> {
+    /// Get an ignored entry by `content_hash` (returns any entry, regardless of flag).
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on database read, decryption, or deserialization failure.
+    #[allow(dead_code)]
+    pub fn get_ignored(&self, content_hash: &[u8; 32]) -> Result<Option<IgnoredEntry>, DbError> {
         let txn = self.env.begin_read()?;
         let table = txn.open_table(self.ignored_db)?;
-        match table.get(content_hash)? {
-            Some(encrypted_guard) => {
-                let encrypted_bytes = encrypted_guard.value();
-                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_bytes) {
-                    IgnoredEntry::from_bytes(&decrypted)
-                        .map(Some)
-                        .map_err(|_| corrupted_err("get_ignored deserialization failed"))
-                } else {
-                    Err(corrupted_err("get_ignored decryption failed"))
-                }
-            },
-            None => Ok(None),
-        }
+        let Some(encrypted_guard) = table.get(content_hash)? else {
+            return Ok(None);
+        };
+
+        let Some(decrypted) = self.decrypt_value(content_hash, encrypted_guard.value()) else {
+            return Err(DbError::DecryptionFailed { table: DB_FILE_NAME_IGNORED });
+        };
+
+        Ok(Some(IgnoredEntry::from_bytes(&decrypted)?))
     }
 
-    /// Iterate all explicitly ignored entries (ignored == true).
-    pub fn get_all_ignored(&self) -> Result<Vec<([u8; 32], IgnoredEntry)>, redb::Error> {
+    /// Iterate all explicitly ignored entries (`ignored == true`).
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on database read/table failures.
+    pub fn get_all_ignored(&self) -> Result<Vec<([u8; 32], IgnoredEntry)>, DbError> {
         let txn = self.env.begin_read()?;
         let table = txn.open_table(self.ignored_db)?;
         let mut results = Vec::new();
+        let mut corrupt_count = 0usize;
 
-        if table.len()? > 0 {
-            for result in table.iter()? {
-                let (key_guard, encrypted_guard) = result?;
-                let content_hash = *key_guard.value();
-                let encrypted = encrypted_guard.value();
+        for result in table.iter()? {
+            let (key_guard, encrypted_guard) = result?;
+            let content_hash = *key_guard.value();
+            let encrypted = encrypted_guard.value();
 
-                if let Some(decrypted) = self.decrypt_value(&content_hash, encrypted)
-                    && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
-                    && entry.ignored
-                {
-                    results.push((content_hash, entry));
-                }
+            let Some(decrypted) = self.decrypt_value(&content_hash, encrypted) else {
+                corrupt_count += 1;
+                continue;
+            };
+            match IgnoredEntry::from_bytes(&decrypted) {
+                Ok(entry) if entry.ignored => results.push((content_hash, entry)),
+                Ok(_) => {},
+                Err(_) => {
+                    corrupt_count += 1;
+                },
             }
+        }
+
+        if corrupt_count > 0 {
+            eprintln!(
+                "[ERROR-IGNORE] get_all_ignored skipped {} corrupted or undecryptable entries",
+                corrupt_count
+            );
         }
 
         Ok(results)
     }
 
-    /// Remove a single entry by content_hash, and clean up its pdqhash in
-    /// `ignored_pdqmap_db` if no other entry in `ignored_db` still shares that pdqhash.
-    pub fn remove_ignored(&self, content_hash: &[u8; 32]) -> Result<bool, redb::Error> {
+    /// Remove a single entry by `content_hash`, and clean up its `pdqhash` in
+    /// `ignored_pdqmap_db` if no other entry in `ignored_db` still shares that `pdqhash`.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on database transaction/table failures.
+    pub fn remove_ignored(&self, content_hash: &[u8; 32]) -> Result<bool, DbError> {
         let txn = self.env.begin_write()?;
 
         let (removed, assoc_pdq, still_referenced) = {
             let mut table = txn.open_table(self.ignored_db)?;
             let assoc_pdq = match table.remove(content_hash)? {
-                Some(encrypted_guard) => self
-                    .decrypt_value(content_hash, encrypted_guard.value())
-                    .and_then(|dec| IgnoredEntry::from_bytes(&dec).ok())
-                    .and_then(|entry| entry.pdqhash),
+                Some(encrypted_guard) => {
+                    if let Some(dec) = self.decrypt_value(content_hash, encrypted_guard.value())
+                        && let Ok(entry) = IgnoredEntry::from_bytes(&dec)
+                    {
+                        entry.pdqhash
+                    } else {
+                        self.log_ignored_corrupt_once("remove_ignored");
+                        None
+                    }
+                },
                 None => return Ok(false),
             };
 
             let mut still_referenced = false;
-            if let Some(pdq) = assoc_pdq
-                && table.len()? > 0
-            {
+            if let Some(pdq) = assoc_pdq {
                 for result in table.iter()? {
                     let (key_guard, encrypted_guard) = result?;
                     let ch = *key_guard.value();
@@ -1662,36 +1678,40 @@ impl AppContext {
         Ok(removed)
     }
 
-    /// Remove all entries matching a group UUID (both ignored_db and pdqmap_db)
+    /// Remove all entries matching a group UUID (both `ignored_db` and `ignored_pdqmap_db`)
     /// within a single atomic read-write transaction.
-    pub fn remove_ignored_by_uuid(&self, uuid: &[u8; 16]) -> Result<usize, redb::Error> {
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on database transaction/table failures.
+    pub fn remove_ignored_by_uuid(&self, uuid: &[u8; 16]) -> Result<usize, DbError> {
         let wtxn = self.env.begin_write()?;
         let mut to_remove = Vec::new();
-        let mut pdqhashes_to_remove = Vec::new();
+        let mut pdqhashes_to_remove = HashSet::new();
         let mut count = 0;
 
         {
             let mut ignored_table = wtxn.open_table(self.ignored_db)?;
-            if ignored_table.len()? > 0 {
-                for result in ignored_table.iter()? {
-                    let (key_guard, encrypted_guard) = result?;
-                    let content_hash = *key_guard.value();
-                    if let Some(decrypted) =
-                        self.decrypt_value(&content_hash, encrypted_guard.value())
-                        && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
-                        && entry.group_uuid == *uuid
-                    {
-                        eprintln!(
-                            "[DEBUG-UNIGNORE] Removing blake3={} ignored={}",
-                            hex::encode(content_hash),
-                            entry.ignored,
-                        );
-                        to_remove.push(content_hash);
-                        if let Some(pdq) = entry.pdqhash
-                            && !pdqhashes_to_remove.contains(&pdq)
-                        {
-                            pdqhashes_to_remove.push(pdq);
-                        }
+            for result in ignored_table.iter()? {
+                let (key_guard, encrypted_guard) = result?;
+                let content_hash = *key_guard.value();
+                let Some(decrypted) = self.decrypt_value(&content_hash, encrypted_guard.value())
+                else {
+                    self.log_ignored_corrupt_once("remove_ignored_by_uuid (ignored_db)");
+                    continue;
+                };
+                let Ok(entry) = IgnoredEntry::from_bytes(&decrypted) else {
+                    self.log_ignored_corrupt_once("remove_ignored_by_uuid (ignored_db)");
+                    continue;
+                };
+                if entry.group_uuid == *uuid {
+                    eprintln!(
+                        "[DEBUG-UNIGNORE] Removing blake3={} ignored={}",
+                        hex::encode(content_hash),
+                        entry.ignored,
+                    );
+                    to_remove.push(content_hash);
+                    if let Some(pdq) = entry.pdqhash {
+                        pdqhashes_to_remove.insert(pdq);
                     }
                 }
             }
@@ -1706,19 +1726,17 @@ impl AppContext {
         // Also collect and remove pdqmap entries pointing to this UUID
         {
             let mut pdqmap_table = wtxn.open_table(self.ignored_pdqmap_db)?;
-            if pdqmap_table.len()? > 0 {
-                for result in pdqmap_table.iter()? {
-                    let (key_guard, encrypted_guard) = result?;
-                    let pdqhash = *key_guard.value();
-                    if let Some(decrypted) = self.decrypt_value(&pdqhash, encrypted_guard.value())
-                        && decrypted.len() == 16
-                    {
-                        let mut stored_uuid = [0u8; 16];
-                        stored_uuid.copy_from_slice(&decrypted);
-                        if stored_uuid == *uuid && !pdqhashes_to_remove.contains(&pdqhash) {
-                            pdqhashes_to_remove.push(pdqhash);
-                        }
-                    }
+            for result in pdqmap_table.iter()? {
+                let (key_guard, encrypted_guard) = result?;
+                let pdqhash = *key_guard.value();
+                let Some(decrypted) = self.decrypt_value(&pdqhash, encrypted_guard.value()) else {
+                    self.log_ignored_corrupt_once("remove_ignored_by_uuid (pdqmap)");
+                    continue;
+                };
+                if let Ok(stored_uuid) = <[u8; 16]>::try_from(decrypted.as_slice())
+                    && stored_uuid == *uuid
+                {
+                    pdqhashes_to_remove.insert(pdqhash);
                 }
             }
 
@@ -1732,24 +1750,28 @@ impl AppContext {
     }
 
     /// Remove all entries matching a PDQ hash within a single atomic read-write transaction.
-    pub fn remove_ignored_by_pdqhash(&self, pdqhash: &[u8; 32]) -> Result<usize, redb::Error> {
+    ///
+    /// # Errors
+    /// Returns [`DbError`] on database transaction/table failures.
+    pub fn remove_ignored_by_pdqhash(&self, pdqhash: &[u8; 32]) -> Result<usize, DbError> {
         let wtxn = self.env.begin_write()?;
         let mut to_remove = Vec::new();
         let mut count = 0;
 
         {
             let mut ignored_table = wtxn.open_table(self.ignored_db)?;
-            if ignored_table.len()? > 0 {
-                for result in ignored_table.iter()? {
-                    let (key_guard, encrypted_guard) = result?;
-                    let content_hash = *key_guard.value();
-                    if let Some(decrypted) =
-                        self.decrypt_value(&content_hash, encrypted_guard.value())
-                        && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
-                        && entry.pdqhash.as_ref() == Some(pdqhash)
-                    {
-                        to_remove.push(content_hash);
-                    }
+            for result in ignored_table.iter()? {
+                let (key_guard, encrypted_guard) = result?;
+                let content_hash = *key_guard.value();
+                let Some(decrypted) = self.decrypt_value(&content_hash, encrypted_guard.value())
+                else {
+                    self.log_ignored_corrupt_once("remove_ignored_by_pdqhash");
+                    continue;
+                };
+                if let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                    && entry.pdqhash.as_ref() == Some(pdqhash)
+                {
+                    to_remove.push(content_hash);
                 }
             }
 
@@ -1769,82 +1791,283 @@ impl AppContext {
         Ok(count)
     }
 
-    /// Format a UUID as a hyphenated string
+    /// Format a UUID as a hyphenated string.
+    #[must_use]
     pub fn format_uuid(uuid: &[u8; 16]) -> String {
-        format!(
-            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            uuid[0],
-            uuid[1],
-            uuid[2],
-            uuid[3],
-            uuid[4],
-            uuid[5],
-            uuid[6],
-            uuid[7],
-            uuid[8],
-            uuid[9],
-            uuid[10],
-            uuid[11],
-            uuid[12],
-            uuid[13],
-            uuid[14],
-            uuid[15],
-        )
+        let mut hex_buf = [0u8; 32];
+        let _ = hex::encode_to_slice(uuid, &mut hex_buf);
+        let hex_str = std::str::from_utf8(&hex_buf).unwrap_or("");
+        let mut out = String::with_capacity(36);
+        out.push_str(&hex_str[0..8]);
+        out.push('-');
+        out.push_str(&hex_str[8..12]);
+        out.push('-');
+        out.push_str(&hex_str[12..16]);
+        out.push('-');
+        out.push_str(&hex_str[16..20]);
+        out.push('-');
+        out.push_str(&hex_str[20..32]);
+        out
     }
 
     /// Parse a hyphenated UUID string back into bytes (accepts with or without hyphens).
+    #[must_use]
     pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
-        let hex_str: String = s.chars().filter(|c| *c != '-').collect();
-        if hex_str.len() != 32 {
+        let mut hex_buf = [0u8; 32];
+        let mut idx = 0;
+        for b in s.bytes() {
+            if b == b'-' {
+                continue;
+            }
+            if idx >= 32 {
+                return None;
+            }
+            hex_buf[idx] = b;
+            idx += 1;
+        }
+        if idx != 32 {
             return None;
         }
-        let bytes = hex::decode(&hex_str).ok()?;
-        let arr: [u8; 16] = bytes.try_into().ok()?;
+        let mut arr = [0u8; 16];
+        hex::decode_to_slice(hex_buf, &mut arr).ok()?;
         Some(arr)
     }
 
-    pub fn save_map_selection(
-        &self,
-        provider_name: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // Update on disk only (in-memory state is in GpsMapState)
-        let config_dir = dirs::config_dir().ok_or("No config dir found")?;
-        let config_path = config_dir.join(CONFIG_FILE_NAME);
-
-        if config_path.exists() {
-            let content = fs::read_to_string(&config_path)?;
-            let mut cfg: Config = toml::from_str(&content)?;
-            cfg.master_key.zeroize(); // Zeroize when dropped at end of scope via explicit cleanup below
-
-            // Re-parse without leaving an unzeroized copy if we fail mid-flight
-            cfg = toml::from_str(&content)?;
-            cfg.selected_provider = Some(provider_name.to_string());
-
-            let res = Self::write_config(&config_path, &cfg);
-            cfg.master_key.zeroize();
-            res?;
-        }
-        Ok(())
+    /// Persist the selected map provider to `phdupes.conf`.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if the config cannot be read, parsed, or written.
+    pub fn save_map_selection(&self, provider_name: &str) -> Result<(), DbError> {
+        Ok(save_map_sel(provider_name)?)
     }
 
-    pub fn save_gui_config(
-        &self,
-        gui_config: &GuiConfig,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let config_dir = dirs::config_dir().ok_or("No config dir found")?;
-        let config_path = config_dir.join(CONFIG_FILE_NAME);
+    /// Persist updated GUI settings to `phdupes.conf`.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if the config cannot be read, parsed, or written.
+    pub fn save_gui_config(&self, gui_config: &GuiConfig) -> Result<(), DbError> {
+        Ok(save_gui_cfg(gui_config)?)
+    }
+}
 
-        if config_path.exists() {
-            let content = fs::read_to_string(&config_path)?;
-            let mut cfg: Config = toml::from_str(&content)?;
-            cfg.gui = gui_config.clone();
+#[cfg(test)]
+mod tests {
+    use crossbeam_channel::unbounded;
+    use redb::ReadableTableMetadata;
+    use tempfile::TempDir;
 
-            let res = Self::write_config(&config_path, &cfg);
-            cfg.master_key.zeroize();
-            res?;
-        } else {
-            eprintln!("[DEBUG-DB] Config file does not exist at {:?}", config_path);
+    use super::*;
+
+    fn temp_ctx(master_key: [u8; 32]) -> (TempDir, AppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_redb");
+        let ctx = AppContext::open_for_test(&db_path, master_key).unwrap();
+        (dir, ctx)
+    }
+
+    #[test]
+    fn crypto_roundtrip_and_aad_binding() {
+        let (_dir, ctx) = temp_ctx([0x11u8; 32]);
+        let (_dir2, other_ctx) = temp_ctx([0x22u8; 32]);
+
+        let key_a = [0xAAu8; 32];
+        let key_b = [0xBBu8; 32];
+        let plaintext = b"secret-payload-12345";
+
+        let ct = AppContext::encrypt_value(&ctx.cipher, &key_a, plaintext).unwrap();
+        assert_ne!(&ct[24..], plaintext);
+
+        // Correct key + AAD succeeds
+        assert_eq!(ctx.decrypt_value(&key_a, &ct).as_deref(), Some(plaintext.as_slice()));
+
+        // Encrypting into reusable buffer matches decrypt_value
+        let mut scratch = Vec::new();
+        AppContext::encrypt_into(&ctx.cipher, &key_a, plaintext, &mut scratch).unwrap();
+        assert_eq!(ctx.decrypt_value(&key_a, &scratch).as_deref(), Some(plaintext.as_slice()));
+
+        // Swapped DB key (AAD mismatch) fails
+        assert!(ctx.decrypt_value(&key_b, &ct).is_none());
+
+        // Wrong master key fails
+        assert!(other_ctx.decrypt_value(&key_a, &ct).is_none());
+
+        // Truncated or tampered ciphertext fails
+        assert!(ctx.decrypt_value(&key_a, &ct[..TOTAL_OVERHEAD - 1]).is_none());
+        let mut tampered = ct.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(ctx.decrypt_value(&key_a, &tampered).is_none());
+    }
+
+    #[test]
+    fn uuid_format_and_parse_roundtrip() {
+        let uuid = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ];
+        let formatted = AppContext::format_uuid(&uuid);
+        assert_eq!(formatted, "01234567-89ab-cdef-fedc-ba9876543210");
+        assert_eq!(AppContext::parse_uuid(&formatted), Some(uuid));
+        assert_eq!(AppContext::parse_uuid("0123456789abcdeffedcba9876543210"), Some(uuid));
+        assert_eq!(AppContext::parse_uuid("not-a-uuid"), None);
+    }
+
+    #[test]
+    fn ignored_db_and_pdqmap_lifecycle_with_temp_redb() {
+        let (_dir, ctx) = temp_ctx([0x33u8; 32]);
+        let ch1 = [1u8; 32];
+        let ch2 = [2u8; 32];
+        let ch3 = [3u8; 32];
+        let pdq_shared = [0x99u8; 32];
+        let pdq_other = [0x88u8; 32];
+
+        // 1. Register two groups
+        let registered = ctx
+            .register_duplicate_groups(&[
+                vec![(ch1, Some(pdq_shared)), (ch2, Some(pdq_shared))],
+                vec![(ch3, Some(pdq_other))],
+            ])
+            .unwrap();
+        assert_eq!(registered, 3);
+        assert!(!ctx.is_ignored(&ch1));
+        assert!(!ctx.is_ignored(&ch2));
+
+        let uuid1 = ctx.get_group_uuid(&ch1).unwrap();
+        assert_eq!(ctx.get_group_uuid(&ch2), Some(uuid1));
+        let uuid2 = ctx.get_group_uuid(&ch3).unwrap();
+        assert_ne!(uuid1, uuid2);
+
+        // 2. Ignore ch1 and ch2
+        let flipped = ctx.set_files_ignored(&[ch1, ch2]).unwrap();
+        assert_eq!(flipped, 2);
+        assert!(ctx.is_ignored(&ch1));
+        assert!(ctx.is_ignored(&ch2));
+        assert!(!ctx.is_ignored(&ch3));
+        assert_eq!(ctx.get_all_ignored().unwrap().len(), 2);
+
+        // 3. Re-registering must NOT overwrite ignored=true entries
+        let re_reg = ctx
+            .register_duplicate_groups(&[vec![(ch1, Some(pdq_shared)), (ch2, Some(pdq_shared))]])
+            .unwrap();
+        assert_eq!(re_reg, 0);
+        assert!(ctx.is_ignored(&ch1));
+        assert_eq!(ctx.get_group_uuid(&ch1), Some(uuid1));
+
+        // 4. Prune must NEVER delete ignored_db or ignored_pdqmap_db entries
+        let (_meta_rm, _hash_rm) = ctx.prune(0).unwrap();
+        assert!(ctx.is_ignored(&ch1));
+        assert!(ctx.is_ignored(&ch2));
+        assert!(ctx.get_ignored(&ch3).unwrap().is_some());
+
+        // 5. Removing ch1 keeps pdq_shared in pdqmap because ch2 still references it
+        assert!(ctx.remove_ignored(&ch1).unwrap());
+        assert!(!ctx.remove_ignored(&ch1).unwrap());
+        assert!(!ctx.is_ignored(&ch1));
+        {
+            let rtxn = ctx.env.begin_read().unwrap();
+            let pdqmap = rtxn.open_table(ctx.ignored_pdqmap_db).unwrap();
+            assert!(pdqmap.get(&pdq_shared).unwrap().is_some());
         }
-        Ok(())
+
+        // 6. Removing ch2 (last reference to pdq_shared) cleans up pdq_shared in pdqmap
+        assert!(ctx.remove_ignored(&ch2).unwrap());
+        {
+            let rtxn = ctx.env.begin_read().unwrap();
+            let pdqmap = rtxn.open_table(ctx.ignored_pdqmap_db).unwrap();
+            assert!(pdqmap.get(&pdq_shared).unwrap().is_none());
+            assert!(pdqmap.get(&pdq_other).unwrap().is_some());
+        }
+
+        // 7. remove_ignored_by_uuid removes both ignored_db and ignored_pdqmap_db entries
+        assert_eq!(ctx.remove_ignored_by_uuid(&uuid2).unwrap(), 1);
+        assert!(ctx.get_ignored(&ch3).unwrap().is_none());
+        {
+            let rtxn = ctx.env.begin_read().unwrap();
+            let pdqmap = rtxn.open_table(ctx.ignored_pdqmap_db).unwrap();
+            assert_eq!(pdqmap.len().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn register_duplicate_groups_does_not_overwrite_corrupt_or_desync_pdqmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_corrupt_redb");
+        let ch_corrupt = [0x41u8; 32];
+        let ch_ignored = [0x42u8; 32];
+        let ch_other = [0x43u8; 32];
+        let pdq_ignored = [0x51u8; 32];
+        let pdq_other = [0x52u8; 32];
+
+        // Write an entry encrypted with a different key into ignored_db
+        {
+            let other_ctx = AppContext::open_for_test(&db_path, [0x99u8; 32]).unwrap();
+            let entry = IgnoredEntry {
+                pdqhash: Some(pdq_ignored),
+                group_uuid: [0x77u8; 16],
+                timestamp: 100,
+                ignored: true,
+            };
+            other_ctx.import_ignored_entries(&[(ch_corrupt, entry)]).unwrap();
+        }
+
+        let ctx = AppContext::open_for_test(&db_path, [0x44u8; 32]).unwrap();
+
+        // Registering a group containing ch_corrupt must NOT overwrite ch_corrupt
+        let reg = ctx.register_duplicate_groups(&[vec![(ch_corrupt, Some(pdq_ignored))]]).unwrap();
+        assert_eq!(reg, 0);
+
+        // Setup: ch_ignored (U1, pdq_ignored) is ignored; ch_other (U2, pdq_other) exists
+        ctx.register_duplicate_groups(&[vec![(ch_ignored, Some(pdq_ignored))]]).unwrap();
+        ctx.set_files_ignored(&[ch_ignored]).unwrap();
+        let u1 = ctx.get_group_uuid(&ch_ignored).unwrap();
+
+        ctx.register_duplicate_groups(&[vec![(ch_other, Some(pdq_other))]]).unwrap();
+        let u2 = ctx.get_group_uuid(&ch_other).unwrap();
+        assert_ne!(u1, u2);
+
+        // Group ch_other with ch_ignored (find_uuid_in_txn picks u2 first):
+        // ch_ignored keeps u1, and pdq_ignored must NOT be overwritten to u2.
+        ctx.register_duplicate_groups(&[vec![
+            (ch_other, Some(pdq_other)),
+            (ch_ignored, Some(pdq_ignored)),
+        ]])
+        .unwrap();
+
+        let rtxn = ctx.env.begin_read().unwrap();
+        let pdqmap = rtxn.open_table(ctx.ignored_pdqmap_db).unwrap();
+        let raw = pdqmap.get(&pdq_ignored).unwrap().unwrap();
+        let dec = ctx.decrypt_value(&pdq_ignored, raw.value()).unwrap();
+        assert_eq!(dec.as_slice(), &u1);
+    }
+
+    #[test]
+    fn background_writer_batches_and_flushes_on_disconnect() {
+        let (_dir, ctx) = temp_ctx([0x55u8; 32]);
+        let (tx, rx) = unbounded::<DbUpdate>();
+        let handle = ctx.start_db_writer(rx);
+
+        let meta_k = [0x01u8; 32];
+        let ch = [0x02u8; 32];
+        let pdq = [0x03u8; 32];
+        let pix = [0x04u8; 32];
+        let feats = ImageFeatures::new(800, 600);
+        let coeffs = CachedCoefficients { coefficients: vec![1.0, 2.5, -3.0] };
+
+        tx.send((
+            Some((meta_k, ch)),
+            Some((ch, HashValue::PdqHash(pdq))),
+            Some((ch, feats)),
+            Some((ch, coeffs)),
+            Some((ch, pix)),
+        ))
+        .unwrap();
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(ctx.get_content_hash(&meta_k).unwrap(), Some(ch));
+        assert_eq!(ctx.get_pdqhash(&ch).unwrap(), Some(pdq));
+        assert_eq!(ctx.get_features(&ch).unwrap().unwrap().resolution(), Some((800, 600)));
+        assert_eq!(ctx.get_coefficients(&ch).unwrap(), Some(vec![1.0, 2.5, -3.0]));
+        assert_eq!(ctx.get_pixel_hash(&ch).unwrap(), Some(pix));
     }
 }
