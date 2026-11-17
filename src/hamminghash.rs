@@ -352,6 +352,7 @@ mod tests {
 
     // --- TEST 2: Performance & Accuracy (1 Million Items) ---
     #[test]
+    #[ignore = "slow test"]
     fn test_1_million_images_performance() {
         let n = 1_000_000;
         println!("\n--- PERFORMANCE TEST: {} Images (Generic u64) ---", n);

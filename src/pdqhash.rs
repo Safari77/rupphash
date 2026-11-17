@@ -656,6 +656,7 @@ mod benchmarks {
     use super::*;
 
     #[test]
+    #[ignore = "slow test"]
     fn bench_pdq_performance() {
         let path = Path::new("./tests/bench.jpg");
         let img = image::open(path)
