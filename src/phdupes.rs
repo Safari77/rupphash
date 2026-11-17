@@ -71,22 +71,23 @@ pub struct FileMetadata {
 
 /// Render a stored PDQ quality for CLI output, flagging values that are below
 /// the fuzzy-matching cutoff.
+#[must_use]
 fn format_pdq_quality(quality: Option<u16>) -> String {
     match quality {
-        Some(q) if q < crate::scanner::PDQ_MIN_QUALITY => format!("{} (low)", q),
+        Some(q) if q < crate::scanner::PDQ_MIN_QUALITY => format!("{q} (low)"),
         Some(q) => q.to_string(),
         None => "n/a".to_string(),
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupStatus {
     AllIdentical,
     SomeIdentical,
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupInfo {
     pub max_dist: u32,
     pub status: GroupStatus,
@@ -114,18 +115,39 @@ unsafe extern "C" {
     fn aom_codec_version_str() -> *const c_char;
 }
 
+/// Converts a static NUL-terminated C string pointer into an owned `String`,
+/// returning `"unknown"` if the pointer is null.
+///
+/// # Safety
+/// If `ptr` is non-null, it must point to a valid NUL-terminated C string that
+/// remains valid for the duration of this call.
+unsafe fn cstr_or_unknown(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return "unknown".to_string();
+    }
+    // SAFETY: Caller guarantees `ptr` is a valid, NUL-terminated C string when non-null.
+    unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+}
+
+#[must_use]
 fn get_runtime_library_versions() -> String {
-    let dav1d_v = unsafe { CStr::from_ptr(dav1d_version()).to_string_lossy().into_owned() };
+    // SAFETY: `dav1d_version`, `heif_get_version`, and `aom_codec_version_str` are
+    // thread-safe C library functions that take no arguments and return a pointer
+    // to a static, NUL-terminated version string (or null).
+    let (dav1d_v, heif_v, aom_v) = unsafe {
+        (
+            cstr_or_unknown(dav1d_version()),
+            cstr_or_unknown(heif_get_version()),
+            cstr_or_unknown(aom_codec_version_str()),
+        )
+    };
 
-    let heif_v = unsafe { CStr::from_ptr(heif_get_version()).to_string_lossy().into_owned() };
-
-    let aom_v = unsafe { CStr::from_ptr(aom_codec_version_str()).to_string_lossy().into_owned() };
-
-    format!("dav1d: {}, libheif: {}, aom: {}", dav1d_v, heif_v, aom_v)
+    format!("dav1d: {dav1d_v}, libheif: {heif_v}, aom: {aom_v}")
 }
 
 // --------------------------------
 // --- Helper: Relative Time ---
+#[must_use]
 pub fn format_relative_time(ts: Timestamp) -> String {
     let now = Timestamp::now();
     let zoned_ts = ts.to_zoned(jiff::tz::TimeZone::UTC);
@@ -136,7 +158,7 @@ pub fn format_relative_time(ts: Timestamp) -> String {
         if total_secs < 0.001 {
             return "0s".to_string();
         }
-        return format!("{:.3}s", total_secs);
+        return format!("{total_secs:.3}s");
     }
 
     let span = raw_span
@@ -158,25 +180,25 @@ pub fn format_relative_time(ts: Timestamp) -> String {
     let s = span.get_seconds().abs();
 
     if y > 0 {
-        parts.push(format!("{}y", y));
+        parts.push(format!("{y}y"));
     }
     if mo > 0 {
-        parts.push(format!("{}mo", mo));
+        parts.push(format!("{mo}mo"));
     }
     if w > 0 {
-        parts.push(format!("{}w", w));
+        parts.push(format!("{w}w"));
     }
     if d > 0 {
-        parts.push(format!("{}d", d));
+        parts.push(format!("{d}d"));
     }
     if h > 0 {
-        parts.push(format!("{}h", h));
+        parts.push(format!("{h}h"));
     }
     if m > 0 {
-        parts.push(format!("{}m", m));
+        parts.push(format!("{m}m"));
     }
     if s > 0 {
-        parts.push(format!("{}s", s));
+        parts.push(format!("{s}s"));
     }
 
     if parts.is_empty() {
@@ -186,13 +208,65 @@ pub fn format_relative_time(ts: Timestamp) -> String {
 }
 
 // --- Analysis Logic ---
+#[must_use]
 pub fn analyze_group(
     files: &mut Vec<FileMetadata>,
     group_by: &str,
     ext_priorities: &HashMap<String, usize>,
 ) -> GroupInfo {
-    // Delegate to scanner's analyze_group with
+    // Delegate to scanner's analyze_group
     scanner::analyze_group(files, group_by, ext_priorities)
+}
+
+/// Build a normalized extension-to-priority lookup map (stripping leading dots and lowercasing).
+#[must_use]
+fn build_ext_priorities(extensions: &[String]) -> HashMap<String, usize> {
+    extensions
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.trim_start_matches('.').to_ascii_lowercase(), i))
+        .collect()
+}
+
+/// Filter out ignored files from duplicate groups, re-analyze modified groups,
+/// drop groups with fewer than 2 remaining files, and register the surviving groups.
+fn filter_and_register_groups(
+    ctx: &AppContext,
+    groups: &mut Vec<Vec<FileMetadata>>,
+    infos: &mut Vec<GroupInfo>,
+    sort_order: &str,
+    ext_priorities: &HashMap<String, usize>,
+) {
+    let mut i = 0;
+    while i < groups.len() {
+        let before = groups[i].len();
+        groups[i].retain(|f| f.content_hash == [0u8; 32] || !ctx.is_ignored(&f.content_hash));
+        if groups[i].len() < 2 {
+            groups.remove(i);
+            if i < infos.len() {
+                infos.remove(i);
+            }
+        } else {
+            if groups[i].len() != before && i < infos.len() {
+                infos[i] = analyze_group(&mut groups[i], sort_order, ext_priorities);
+            }
+            i += 1;
+        }
+    }
+
+    let group_data: Vec<Vec<_>> = groups
+        .iter()
+        .map(|g| {
+            g.iter()
+                .filter(|f| f.content_hash != [0u8; 32])
+                .map(|f| (f.content_hash, f.pdqhash))
+                .collect()
+        })
+        .collect();
+
+    if let Err(e) = ctx.register_duplicate_groups(&group_data) {
+        eprintln!("[ERROR-IGNORE] Failed to register groups: {e:?}");
+    }
 }
 
 // --- CLI Definition ---
@@ -303,8 +377,7 @@ impl Cli {
         let similarity = self.get_similarity();
         if similarity > max_similarity {
             return Err(format!(
-                "Similarity must be 0-{} for PDQ hash. Got {}.",
-                max_similarity, similarity
+                "Similarity must be 0-{max_similarity} for PDQ hash. Got {similarity}."
             ));
         }
 
@@ -335,17 +408,21 @@ impl Cli {
             return Err("Cannot use both --use-tui and --use-gui".to_string());
         }
 
+        if self.use_tui && (self.slideshow.is_some() || !self.slideshow_effect.is_empty()) {
+            return Err("Cannot use --slideshow or --slideshow-effect with --use-tui".to_string());
+        }
+
         if let Some(ref dir) = self.move_marked {
             if !dir.exists() {
-                return Err(format!("Move target directory does not exist: {:?}", dir));
+                return Err(format!("Move target directory does not exist: {dir:?}"));
             }
             if !dir.is_dir() {
-                return Err(format!("Move target is not a directory: {:?}", dir));
+                return Err(format!("Move target is not a directory: {dir:?}"));
             }
         }
 
         if let Some(secs) = self.slideshow
-            && secs <= 0.0
+            && (!secs.is_finite() || secs <= 0.0)
         {
             return Err("Slideshow interval must be positive".to_string());
         }
@@ -354,6 +431,7 @@ impl Cli {
     }
 
     /// Check if we're in view mode (explicit or implied)
+    #[must_use]
     fn is_view_mode(&self) -> bool {
         self.view
             || self.view_flatten
@@ -363,11 +441,13 @@ impl Cli {
     }
 
     /// Get the hash algorithm based on CLI flags
+    #[must_use]
     fn hash_algorithm(&self) -> HashAlgorithm {
         HashAlgorithm::PdqHash
     }
 
     /// Get similarity threshold with algorithm-specific defaults
+    #[must_use]
     fn get_similarity(&self) -> u32 {
         self.similarity.unwrap_or(40)
     }
@@ -377,33 +457,44 @@ impl Cli {
 
 /// Convert a chrono UTC time to a relative-time string via jiff.
 /// Falls back to absolute formatting when the value is outside jiff's supported timestamp range.
+#[must_use]
 fn relative_time_str(modified: &DateTime<Utc>) -> String {
     Timestamp::from_second(modified.timestamp())
         .ok()
         .and_then(|ts| {
-            ts.checked_add(jiff::SignedDuration::from_nanos(
-                modified.timestamp_subsec_nanos() as i64
-            ))
+            ts.checked_add(jiff::SignedDuration::from_nanos(i64::from(
+                modified.timestamp_subsec_nanos(),
+            )))
             .ok()
         })
         .map(format_relative_time)
         .unwrap_or_else(|| modified.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
+#[must_use]
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
-        return format!("{} B", bytes);
+        return format!("{bytes} B");
     }
     let kb = bytes as f64 / 1024.0;
     if kb < 1024.0 {
-        return format!("{:.1} KB", kb);
+        return format!("{kb:.1} KB");
     }
     let mb = kb / 1024.0;
     if mb < 1024.0 {
-        return format!("{:.1} MB", mb);
+        return format!("{mb:.1} MB");
     }
     let gb = mb / 1024.0;
-    format!("{:.2} GB", gb)
+    format!("{gb:.2} GB")
+}
+
+/// Format an ignored-entry Unix epoch timestamp as UTC string, or raw integer if out of range.
+#[must_use]
+fn format_ignored_timestamp(timestamp: u64) -> String {
+    i64::try_from(timestamp)
+        .ok()
+        .and_then(|secs| chrono::DateTime::<Utc>::from_timestamp(secs, 0))
+        .map_or_else(|| timestamp.to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
 }
 
 /// Parse the text output produced by `--show-ignored` into `(content_hash, IgnoredEntry)` tuples.
@@ -469,18 +560,27 @@ fn parse_show_ignored_output(input: &str) -> Result<Vec<([u8; 32], db::IgnoredEn
             let timestamp = if let Ok(secs) = ts_str.parse::<u64>() {
                 secs
             } else {
-                chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S UTC")
-                    .map(|ndt| ndt.and_utc().timestamp() as u64)
+                let ndt = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S UTC")
                     .map_err(|e| {
                         format!("Line {}: invalid timestamp '{}': {}", line_num + 1, ts_str, e)
-                    })?
+                    })?;
+                u64::try_from(ndt.and_utc().timestamp()).map_err(|_| {
+                    format!(
+                        "Line {}: timestamp '{}' cannot be before Unix epoch",
+                        line_num + 1,
+                        ts_str
+                    )
+                })?
             };
 
             entries.push((
                 content_hash,
                 db::IgnoredEntry { pdqhash, group_uuid, timestamp, ignored: true },
             ));
+            continue;
         }
+
+        return Err(format!("Line {}: unrecognized line '{}'", line_num + 1, line));
     }
 
     Ok(entries)
@@ -507,13 +607,13 @@ fn run_interactive_cli_delete(
         println!("\n========================================================");
         match info.status {
             GroupStatus::AllIdentical => {
-                println!("Group {} - {}Bit-identical{}", g_idx + 1, green, reset)
+                println!("Group {} - {}Bit-identical{}", g_idx + 1, green, reset);
             },
             GroupStatus::SomeIdentical => {
-                println!("Group {} - {}Some files Bit-identical{}", g_idx + 1, green, reset)
+                println!("Group {} - {}Some files Bit-identical{}", g_idx + 1, green, reset);
             },
             GroupStatus::None => {
-                println!("Group {}/{} (Max Dist: {})", g_idx + 1, groups.len(), info.max_dist)
+                println!("Group {}/{} (Max Dist: {})", g_idx + 1, groups.len(), info.max_dist);
             },
         }
         println!("========================================================");
@@ -526,10 +626,8 @@ fn run_interactive_cli_delete(
             } else {
                 file.modified.format("%Y-%m-%d %H:%M:%S").to_string()
             };
-            let res_str = file
-                .resolution
-                .map(|(w, h)| format!("{}x{}", w, h))
-                .unwrap_or("???x???".to_string());
+            let res_str =
+                file.resolution.map_or_else(|| "???x???".to_string(), |(w, h)| format!("{w}x{h}"));
             let is_identical = *counts.get(&file.content_hash).unwrap_or(&0) > 1;
             let (color_start, color_end, marker) =
                 if is_identical { (green, reset, "*") } else { ("", "", " ") };
@@ -548,47 +646,63 @@ fn run_interactive_cli_delete(
         }
 
         let action_verb = if use_trash { "TRASH" } else { "PERMANENTLY delete" };
-        print!("\nEnter numbers to {} (e.g. '1 3'), or ENTER to skip: ", action_verb);
+        print!("\nEnter numbers to {action_verb} (e.g. '1 3'), or ENTER to skip: ");
         stdout.flush().ok();
 
         input_buf.clear();
-        if stdin.read_line(&mut input_buf).is_ok() {
-            let line = input_buf.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut indices: Vec<usize> = line
-                .split_whitespace()
-                .filter_map(|s| s.parse::<usize>().ok())
-                .filter(|&idx| idx >= 1 && idx <= group.len())
-                .map(|idx| idx - 1)
-                .collect();
-            // Deduplicate the input
-            indices.sort_unstable();
-            indices.dedup();
-
-            if indices.is_empty() {
-                println!("No valid selections.");
-                continue;
-            }
-
-            for &idx in &indices {
-                let file = &group[idx];
-                print!(
-                    "{} {:?} ... ",
-                    if use_trash { "Trashing" } else { "Deleting" },
-                    file.path.file_name().unwrap_or_default()
-                );
-                let res = if use_trash {
-                    trash::delete(&file.path).map_err(|e| io::Error::other(e.to_string()))
-                } else {
-                    fs::remove_file(&file.path)
-                };
-                match res {
-                    Ok(_) => println!("OK"),
-                    Err(e) => println!("FAILED ({})", e),
+        match stdin.read_line(&mut input_buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let line = input_buf.trim();
+                if line.is_empty() {
+                    continue;
                 }
-            }
+                let mut indices = Vec::new();
+                let mut invalid_token = None;
+                for token in line.split_whitespace() {
+                    match token.parse::<usize>() {
+                        Ok(idx) if (1..=group.len()).contains(&idx) => indices.push(idx - 1),
+                        _ => {
+                            invalid_token = Some(token);
+                            break;
+                        },
+                    }
+                }
+                if let Some(bad) = invalid_token {
+                    println!(
+                        "Invalid selection '{bad}' (expected 1..={}). Skipping group.",
+                        group.len()
+                    );
+                    continue;
+                }
+                // Deduplicate the input
+                indices.sort_unstable();
+                indices.dedup();
+
+                if indices.is_empty() {
+                    println!("No valid selections.");
+                    continue;
+                }
+
+                for &idx in &indices {
+                    let file = &group[idx];
+                    print!(
+                        "{} {:?} ... ",
+                        if use_trash { "Trashing" } else { "Deleting" },
+                        file.path.file_name().unwrap_or_default()
+                    );
+                    stdout.flush().ok();
+                    let res = if use_trash {
+                        trash::delete(&file.path).map_err(|e| io::Error::other(e.to_string()))
+                    } else {
+                        fs::remove_file(&file.path)
+                    };
+                    match res {
+                        Ok(()) => println!("OK"),
+                        Err(e) => println!("FAILED ({e})"),
+                    }
+                }
+            },
         }
     }
     println!("\nDone.");
@@ -613,6 +727,9 @@ mod windows_security {
     const HEAP_ENABLE_TERMINATION_ON_CORRUPTION: u32 = 1;
 
     pub fn enable_heap_termination() {
+        // SAFETY: `GetProcessHeap` retrieves the handle to the default heap of the
+        // calling process, and `HeapSetInformation` with class
+        // `HEAP_ENABLE_TERMINATION_ON_CORRUPTION` requires a null buffer and 0 length.
         unsafe {
             // Enables the terminate-on-corruption feature. If the heap manager detects an error in
             // any heap used by the process, it calls the Windows Error Reporting service and
@@ -627,8 +744,7 @@ mod windows_security {
             if result == 0 {
                 let err = std::io::Error::last_os_error();
                 eprintln!(
-                    "SECURITY WARNING: Failed to enable Heap Termination on Corruption. Error: {}",
-                    err
+                    "SECURITY WARNING: Failed to enable Heap Termination on Corruption. Error: {err}"
                 );
             }
         }
@@ -651,7 +767,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{:<25} Description", "Tag Name");
         println!("{}", "-".repeat(70));
         for (name, desc) in scanner::get_supported_exif_tags() {
-            println!("{:<25} {}", name, desc);
+            println!("{name:<25} {desc}");
         }
         println!("\nExample configuration in phdupes.conf:");
         println!("[gui]");
@@ -665,27 +781,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Built from Git commit: {}", env!("APP_GIT_HASH"));
         println!("Loaded Libs: {}\n", get_runtime_library_versions());
         const DEP_INFO_RAW: &str = include_str!(env!("DEPS_INFO_PATH"));
-        let deps: Vec<DepInfo> = serde_json::from_str(DEP_INFO_RAW).unwrap();
+        let deps: Vec<DepInfo> = serde_json::from_str(DEP_INFO_RAW)?;
 
         println!("Found {} dependencies.", deps.len());
         for dep in deps {
             println!("- {} v{}", dep.name, dep.version);
             if let Some(sum) = dep.checksum {
-                println!("    Checksum: {}", sum);
+                println!("    Checksum: {sum}");
             }
             if let Some(src) = dep.source {
-                println!("    Source:   {}", src);
+                println!("    Source:   {src}");
             }
         }
         return Ok(());
     }
 
     if let Err(e) = args.validate() {
-        eprintln!("Error: {}", e);
+        eprintln!("Error: {e}");
         std::process::exit(1);
     }
 
-    let sort_order = args.sort.to_lowercase();
+    let sort_order = if args.shuffle { "random".to_string() } else { args.sort.to_lowercase() };
     let is_view_mode = args.is_view_mode();
     let hash_algorithm = args.hash_algorithm();
 
@@ -693,15 +809,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(seconds) = args.prune {
         let ctx = AppContext::with_algorithm(hash_algorithm)?;
 
-        println!("Pruning entries older than {} seconds from PDQ hash database...", seconds);
+        println!("Pruning entries older than {seconds} seconds from PDQ hash database...");
 
         match ctx.prune(seconds) {
             Ok((meta_count, hash_count)) => {
                 println!("Success.");
-                println!("  - Removed {} expired file entries.", meta_count);
-                println!("  - Removed {} orphaned hash entries.", hash_count);
+                println!("  - Removed {meta_count} expired file entries.");
+                println!("  - Removed {hash_count} orphaned hash entries.");
             },
-            Err(e) => eprintln!("Pruning failed: {}", e),
+            Err(e) => {
+                eprintln!("Pruning failed: {e}");
+                std::process::exit(1);
+            },
         }
         // Exit immediately after pruning
         return Ok(());
@@ -732,16 +851,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     for (uuid, group_entries) in &by_uuid {
                         let uuid_str = AppContext::format_uuid(uuid);
-                        println!("Group UUID: {}", uuid_str);
+                        println!("Group UUID: {uuid_str}");
                         for (ch, entry) in group_entries {
-                            let pdq_str = entry
-                                .pdqhash
-                                .map(hex::encode)
-                                .unwrap_or_else(|| "none".to_string());
-                            let ts_str =
-                                chrono::DateTime::<Utc>::from_timestamp(entry.timestamp as i64, 0)
-                                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                                    .unwrap_or_else(|| format!("{}", entry.timestamp));
+                            let pdq_str =
+                                entry.pdqhash.map_or_else(|| "none".to_string(), hex::encode);
+                            let ts_str = format_ignored_timestamp(entry.timestamp);
                             let q_str = format_pdq_quality(ctx.get_pdq_quality(ch));
                             println!(
                                 "  blake3: {}  pdqhash: {}  quality: {}  added: {}",
@@ -755,12 +869,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     for (ch, entry) in &no_group {
-                        let pdq_str =
-                            entry.pdqhash.map(hex::encode).unwrap_or_else(|| "none".to_string());
-                        let ts_str =
-                            chrono::DateTime::<Utc>::from_timestamp(entry.timestamp as i64, 0)
-                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                                .unwrap_or_else(|| format!("{}", entry.timestamp));
+                        let pdq_str = entry.pdqhash.map_or_else(|| "none".to_string(), hex::encode);
+                        let ts_str = format_ignored_timestamp(entry.timestamp);
                         let q_str = format_pdq_quality(ctx.get_pdq_quality(ch));
                         println!(
                             "blake3: {}  pdqhash: {}  quality: {}  added: {}  (no group)",
@@ -772,7 +882,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             },
-            Err(e) => eprintln!("Failed to read ignored list: {}", e),
+            Err(e) => {
+                eprintln!("Failed to read ignored list: {e}");
+                std::process::exit(1);
+            },
         }
         return Ok(());
     }
@@ -791,7 +904,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let entries = match parse_show_ignored_output(&content) {
             Ok(parsed) => parsed,
             Err(e) => {
-                eprintln!("Failed to parse ignored list: {}", e);
+                eprintln!("Failed to parse ignored list: {e}");
                 std::process::exit(1);
             },
         };
@@ -805,12 +918,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match ctx.import_ignored_entries(&entries) {
             Ok((entry_count, pdqmap_count)) => {
                 println!(
-                    "Imported {} ignored entries and {} PDQ map entries into redb.",
-                    entry_count, pdqmap_count
+                    "Imported {entry_count} ignored entries and {pdqmap_count} PDQ map entries into redb."
                 );
             },
             Err(e) => {
-                eprintln!("Failed to import ignored entries: {}", e);
+                eprintln!("Failed to import ignored entries: {e}");
                 std::process::exit(1);
             },
         }
@@ -820,9 +932,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- UNIGNORE ---
     if !args.unignore.is_empty() {
         let ctx = AppContext::with_algorithm(hash_algorithm)?;
+        let mut had_error = false;
 
         for value in &args.unignore {
-            eprintln!("[DEBUG-UNIGNORE] Processing: {}", value);
+            eprintln!("[DEBUG-UNIGNORE] Processing: {value}");
 
             // Try 1: Parse as UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx or 32 hex chars)
             if let Some(uuid) = AppContext::parse_uuid(value) {
@@ -840,7 +953,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             AppContext::format_uuid(&uuid)
                         );
                     },
-                    Err(e) => eprintln!("Failed to unignore by UUID: {}", e),
+                    Err(e) => {
+                        eprintln!("Failed to unignore by UUID: {e}");
+                        had_error = true;
+                    },
                 }
                 continue;
             }
@@ -854,13 +970,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("[DEBUG-UNIGNORE] Parsed as PDQ hash: {}", hex::encode(pdqhash));
                 match ctx.remove_ignored_by_pdqhash(&pdqhash) {
                     Ok(count) => {
-                        println!("Removed {} ignored entries matching PDQ hash {}", count, value);
-                        eprintln!(
-                            "[DEBUG-UNIGNORE] Removed {} entries for pdqhash {}",
-                            count, value
-                        );
+                        println!("Removed {count} ignored entries matching PDQ hash {value}");
+                        eprintln!("[DEBUG-UNIGNORE] Removed {count} entries for pdqhash {value}");
                     },
-                    Err(e) => eprintln!("Failed to unignore by PDQ hash: {}", e),
+                    Err(e) => {
+                        eprintln!("Failed to unignore by PDQ hash: {e}");
+                        had_error = true;
+                    },
                 }
                 continue;
             }
@@ -868,7 +984,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Try 3: Treat as filename — compute keyed blake3 and look up
             let file_path = std::path::Path::new(value);
             if file_path.exists() {
-                eprintln!("[DEBUG-UNIGNORE] Treating as filename: {}", value);
+                eprintln!("[DEBUG-UNIGNORE] Treating as filename: {value}");
                 match fs::read(file_path) {
                     Ok(data) => {
                         let content_hash = *blake3::keyed_hash(&ctx.content_key, &data).as_bytes();
@@ -895,19 +1011,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     hex::encode(content_hash)
                                 );
                             },
-                            Err(e) => eprintln!("Failed to unignore: {}", e),
+                            Err(e) => {
+                                eprintln!("Failed to unignore: {e}");
+                                had_error = true;
+                            },
                         }
                     },
-                    Err(e) => eprintln!("Failed to read file {}: {}", value, e),
+                    Err(e) => {
+                        eprintln!("Failed to read file {value}: {e}");
+                        had_error = true;
+                    },
                 }
             } else {
                 eprintln!(
-                    "'{}' is not a valid UUID, PDQ hash (64 hex chars), or existing filename.",
-                    value
+                    "'{value}' is not a valid UUID, PDQ hash (64 hex chars), or existing filename."
                 );
+                had_error = true;
             }
         }
 
+        if had_error {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
@@ -927,7 +1052,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     parsed_luts.push(lut);
                 },
                 Err(e) => {
-                    eprintln!("Error reading 3D LUT file {:?}: {}", lut_path, e);
+                    eprintln!("Error reading 3D LUT file {lut_path:?}: {e}");
                 },
             }
         }
@@ -961,8 +1086,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             parsed_luts,
         );
         if let Err(e) = app.run() {
-            eprintln!("GUI Error: {}", e);
+            eprintln!("GUI Error: {e}");
+            std::process::exit(1);
         }
+        return Ok(());
+    }
+
+    // View mode with TUI (--view / --view-flatten / --shuffle with --use-tui)
+    if is_view_mode {
+        let ctx = AppContext::with_algorithm(hash_algorithm)?;
+        let (final_groups, final_infos) = if args.view_flatten {
+            let (batch_tx, batch_rx) = crossbeam_channel::unbounded::<Vec<FileMetadata>>();
+            let _ = scanner::spawn_background_flatten_scan(
+                &args.paths,
+                sort_order.clone(),
+                &ctx,
+                batch_tx,
+                None,
+            );
+            let mut all_files: Vec<FileMetadata> = batch_rx.into_iter().flatten().collect();
+            scanner::sort_files(&mut all_files, &sort_order);
+            if all_files.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                (vec![all_files], vec![GroupInfo { max_dist: 0, status: GroupStatus::None }])
+            }
+        } else {
+            let (groups, infos, _subdirs) =
+                scanner::scan_for_view(&args.paths, &sort_order, None, None);
+            (groups, infos)
+        };
+
+        let mut state = state::AppState::new(
+            final_groups,
+            final_infos,
+            args.relative_times,
+            args.use_trash,
+            sort_order,
+            HashMap::new(),
+        );
+        state.view_mode = true;
+        state.view_mode_flatten = args.view_flatten;
+        state.move_target = args.move_marked.clone();
+
+        println!("Launching TUI...");
+        let mut app = ui::TuiApp::new(state);
+        app.run()?;
         return Ok(());
     }
 
@@ -985,17 +1154,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let ext_priorities = build_ext_priorities(&ctx.grouping_config.extensions);
+
     // For GUI mode (duplicate detection), let the GUI handle scanning with progress display
     if use_gui {
-        let ext_priorities: HashMap<String, usize> = ctx
-            .grouping_config
-            .extensions
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (e.to_lowercase(), i))
-            .collect();
-
-        println!("Launching GUI with PDQ hash algorithm (similarity: {})...", similarity);
+        println!("Launching GUI with PDQ hash algorithm (similarity: {similarity})...");
         let app = gui::GuiApp::new(
             ctx,
             scan_config,
@@ -1010,24 +1173,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_slideshow_effect(args.slideshow_effect);
 
         if let Err(e) = app.run() {
-            eprintln!("GUI Error: {}", e);
+            eprintln!("GUI Error: {e}");
+            std::process::exit(1);
         }
         return Ok(());
     }
 
-    // For non-GUI modes, scan first then display results
-    let (final_groups, final_infos) = scanner::scan_and_group(&scan_config, &ctx, None);
+    // For non-GUI modes, scan first then filter ignored files and register duplicate groups
+    let (mut final_groups, mut final_infos) = scanner::scan_and_group(&scan_config, &ctx, None);
+    filter_and_register_groups(
+        &ctx,
+        &mut final_groups,
+        &mut final_infos,
+        &sort_order,
+        &ext_priorities,
+    );
     println!("Found {} duplicate groups using PDQ hash.", final_groups.len());
 
     if args.use_tui {
-        let ext_priorities: HashMap<String, usize> = ctx
-            .grouping_config
-            .extensions
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (e.to_lowercase(), i))
-            .collect();
-
         let mut state = state::AppState::new(
             final_groups,
             final_infos,
@@ -1050,7 +1213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let info = &final_infos[i];
             match info.status {
                 GroupStatus::AllIdentical => {
-                    println!("\n--- Group {} - {}Bit-identical{} ---", i + 1, green, reset)
+                    println!("\n--- Group {} - {}Bit-identical{} ---", i + 1, green, reset);
                 },
                 GroupStatus::SomeIdentical => {
                     println!(
@@ -1058,10 +1221,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         i + 1,
                         green,
                         reset
-                    )
+                    );
                 },
                 GroupStatus::None => {
-                    println!("\n--- Group {} (Max Dist: {}) ---", i + 1, info.max_dist)
+                    println!("\n--- Group {} (Max Dist: {}) ---", i + 1, info.max_dist);
                 },
             }
 
@@ -1074,7 +1237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     file.modified.format("%Y-%m-%d %H:%M:%S.%f").to_string()
                 };
                 let res_str =
-                    file.resolution.map(|(w, h)| format!("{}x{}", w, h)).unwrap_or("?".to_string());
+                    file.resolution.map_or_else(|| "?".to_string(), |(w, h)| format!("{w}x{h}"));
                 let is_identical = *counts.get(&file.content_hash).unwrap_or(&0) > 1;
                 let (color_start, color_end, marker) =
                     if is_identical { (green, reset, "*") } else { ("", "", " ") };
@@ -1092,4 +1255,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(1024), "1.0 KB");
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn test_format_pdq_quality() {
+        assert_eq!(format_pdq_quality(None), "n/a");
+        assert_eq!(format_pdq_quality(Some(10)), "10 (low)");
+        assert_eq!(format_pdq_quality(Some(crate::scanner::PDQ_MIN_QUALITY)), "50");
+        assert_eq!(format_pdq_quality(Some(100)), "100");
+    }
+
+    #[test]
+    fn test_build_ext_priorities_strips_leading_dots_and_lowercases() {
+        let exts = vec![".JPG".to_string(), "cr3".to_string(), "..Png".to_string()];
+        let map = build_ext_priorities(&exts);
+        assert_eq!(map.get("jpg"), Some(&0));
+        assert_eq!(map.get("cr3"), Some(&1));
+        assert_eq!(map.get("png"), Some(&2));
+    }
+
+    #[test]
+    fn test_parse_show_ignored_output_valid_and_invalid() {
+        let valid_input = "\
+Ignored files (2 entries):
+
+Group UUID: 01020304-0506-0708-090a-0b0c0d0e0f10
+  blake3: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  pdqhash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  quality: 90  added: 2025-01-15 12:30:00 UTC
+
+blake3: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  pdqhash: none  quality: n/a  added: 1700000000  (no group)
+";
+        let parsed = parse_show_ignored_output(valid_input).expect("should parse valid input");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, [0xAA; 32]);
+        assert_eq!(parsed[0].1.pdqhash, Some([0xBB; 32]));
+        assert_eq!(parsed[0].1.group_uuid, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        assert!(parsed[0].1.ignored);
+
+        assert_eq!(parsed[1].0, [0xCC; 32]);
+        assert_eq!(parsed[1].1.pdqhash, None);
+        assert_eq!(parsed[1].1.group_uuid, [0u8; 16]);
+        assert_eq!(parsed[1].1.timestamp, 1_700_000_000);
+
+        // Pre-epoch date must be rejected instead of wrapping to u64::MAX
+        let pre_epoch_input = "\
+blake3: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  pdqhash: none  quality: n/a  added: 1969-12-31 23:59:59 UTC  (no group)
+";
+        assert!(parse_show_ignored_output(pre_epoch_input).is_err());
+
+        // Unrecognized non-empty lines must be rejected
+        assert!(parse_show_ignored_output("random garbage line").is_err());
+    }
+
+    #[test]
+    fn test_cli_validate() {
+        let base = Cli::try_parse_from(["phdupes", "."]).expect("should parse");
+        assert!(base.validate().is_ok());
+
+        let bad_sim =
+            Cli::try_parse_from(["phdupes", "--similarity", "300", "."]).expect("should parse");
+        assert!(bad_sim.validate().is_err());
+
+        let bad_sort =
+            Cli::try_parse_from(["phdupes", "--sort", "invalid", "."]).expect("should parse");
+        assert!(bad_sort.validate().is_err());
+
+        let both_ui =
+            Cli::try_parse_from(["phdupes", "--use-tui", "--use-gui", "."]).expect("should parse");
+        assert!(both_ui.validate().is_err());
+
+        let tui_slideshow = Cli::try_parse_from(["phdupes", "--use-tui", "--slideshow", "3", "."])
+            .expect("should parse");
+        assert!(tui_slideshow.validate().is_err());
+
+        let nan_slideshow =
+            Cli::try_parse_from(["phdupes", "--slideshow", "NaN", "."]).expect("should parse");
+        assert!(nan_slideshow.validate().is_err());
+
+        let inf_slideshow =
+            Cli::try_parse_from(["phdupes", "--slideshow", "inf", "."]).expect("should parse");
+        assert!(inf_slideshow.validate().is_err());
+    }
 }
