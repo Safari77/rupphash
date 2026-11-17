@@ -118,10 +118,9 @@ pub struct GuiApp {
     // Set of paths currently being processed by the worker to avoid dupes
     pub(super) raw_loading: HashSet<std::path::PathBuf>,
     // Channel to send paths to the worker
-    pub(super) image_preload_tx: Sender<(std::path::PathBuf, usize, usize)>,
+    pub(super) image_preload_tx: Sender<super::image::ImageLoadRequest>,
     // Channel to receive decoded images from the worker.
-    pub(super) image_preload_rx:
-        Receiver<((std::path::PathBuf, usize, usize), super::image::ImageLoadResult)>,
+    pub(super) image_preload_rx: Receiver<super::image::ImageLoadResponse>,
     pub(super) scan_batch_rx: Option<Receiver<Vec<FileMetadata>>>,
 
     // --- 10-bit GPU image path ---
@@ -2252,11 +2251,12 @@ impl eframe::App for GuiApp {
                                 &path,
                                 g_idx,
                                 f_idx,
-                                actual_resolution.0,
-                                actual_resolution.1,
-                                orientation,
-                                content_hash,
-                                exif_timestamp,
+                                super::image::LoadedFileMeta {
+                                    resolution: actual_resolution,
+                                    orientation,
+                                    content_hash,
+                                    exif_timestamp,
+                                },
                             );
 
                             // Store precomputed histogram+palette in the cache
@@ -2299,11 +2299,12 @@ impl eframe::App for GuiApp {
                                 &path,
                                 g_idx,
                                 f_idx,
-                                resolution.0,
-                                resolution.1,
-                                orientation,
-                                content_hash,
-                                exif_timestamp,
+                                super::image::LoadedFileMeta {
+                                    resolution,
+                                    orientation,
+                                    content_hash,
+                                    exif_timestamp,
+                                },
                             );
 
                             if let Some(hp) = hist_palette {
@@ -2354,11 +2355,12 @@ impl eframe::App for GuiApp {
                                 &path,
                                 g_idx,
                                 f_idx,
-                                resolution.0,
-                                resolution.1,
-                                orientation,
-                                content_hash,
-                                exif_timestamp,
+                                super::image::LoadedFileMeta {
+                                    resolution,
+                                    orientation,
+                                    content_hash,
+                                    exif_timestamp,
+                                },
                             );
 
                             // Upload all frames as textures

@@ -16,7 +16,6 @@ use eframe::egui;
 use egui_wgpu::wgpu;
 use fast_image_resize::{PixelType, ResizeOptions, Resizer, images::Image as FastImage};
 use half::f16;
-use image::GenericImageView;
 use oklab::{LinearRgb, Oklab, linear_srgb_to_oklab, oklab_to_linear_srgb};
 
 use super::app::GuiApp;
@@ -670,8 +669,6 @@ fn log_changed(slot: &std::sync::Mutex<String>, msg: String) {
 /// `egui_wgpu::Renderer::callback_resources`.
 struct GpuImagePipeline {
     pipeline: wgpu::RenderPipeline,
-    /// Whether the device was created with TEXTURE_FORMAT_16BIT_NORM.
-    rgba16_supported: bool,
     /// Layout of group 1 (the per-image texture view).
     texture_layout: wgpu::BindGroupLayout,
     /// 3D LUT
@@ -886,7 +883,6 @@ pub(super) fn init_gpu_image_pipeline(rs: &egui_wgpu::RenderState) -> bool {
 
     rs.renderer.write().callback_resources.insert(GpuImagePipeline {
         pipeline,
-        rgba16_supported,
         texture_layout,
         lut_layout,
         uniform_buffer,
@@ -1118,6 +1114,9 @@ fn deep_to_colorimage(pixels: &DeepPixels, width: u32, height: u32) -> egui::Col
     }
 }
 
+pub(super) type ImageLoadRequest = (PathBuf, usize, usize);
+pub(super) type ImageLoadResponse = (ImageLoadRequest, ImageLoadResult);
+
 pub(super) fn spawn_image_loader_pool(
     use_thumbnails: bool,
     content_key: [u8; 32],
@@ -1125,8 +1124,8 @@ pub(super) fn spawn_image_loader_pool(
     hdr_config: crate::db::HdrConfig,
     histogram_enabled: Arc<AtomicBool>,
     deep_caps: Arc<DeepColorCaps>,
-) -> (Sender<(PathBuf, usize, usize)>, Receiver<((PathBuf, usize, usize), ImageLoadResult)>) {
-    let (tx, rx) = unbounded::<(PathBuf, usize, usize)>();
+) -> (Sender<ImageLoadRequest>, Receiver<ImageLoadResponse>) {
+    let (tx, rx) = unbounded::<ImageLoadRequest>();
     let (result_tx, result_rx) = unbounded();
 
     let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
@@ -1303,6 +1302,8 @@ fn dynamic_image_to_egui(img: image::DynamicImage) -> egui::ColorImage {
     }
 }
 
+type ProcessedImageWithHash = (DecodedImage, (u32, u32), u8, [u8; 32], Option<i64>);
+
 fn load_and_process_image_with_hash(
     path: &Path,
     use_thumbnails: bool,
@@ -1310,7 +1311,7 @@ fn load_and_process_image_with_hash(
     hdr_config: crate::db::HdrConfig,
     caps: &DeepColorCaps,
     prefetched: Option<Vec<u8>>,
-) -> Result<(DecodedImage, (u32, u32), u8, [u8; 32], Option<i64>), String> {
+) -> Result<ProcessedImageWithHash, String> {
     // Read file once for both hashing and image processing — or reuse what the
     // caller already read, which the GIF/WebP animation probe in the worker
     // loop has in hand by the time it gets here.
@@ -1729,11 +1730,10 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
     (frames, durations)
 }
 
+type DecodedAnimation = (Vec<egui::ColorImage>, Vec<Duration>, (u32, u32), u8);
+
 /// Decode all frames from an animated WebP file using the image crate's decoder
-fn decode_animated_webp_frames(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<(Vec<egui::ColorImage>, Vec<Duration>, (u32, u32), u8), String> {
+fn decode_animated_webp_frames(path: &Path, bytes: &[u8]) -> Result<DecodedAnimation, String> {
     use image::{AnimationDecoder, ImageDecoder, codecs::webp::WebPDecoder};
 
     let orientation = crate::exif_extract::get_orientation(path, Some(bytes));
@@ -1767,10 +1767,7 @@ fn decode_animated_webp_frames(
 }
 
 /// Decode all frames from an animated GIF file using the image crate's decoder
-fn decode_animated_gif_frames(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<(Vec<egui::ColorImage>, Vec<Duration>, (u32, u32), u8), String> {
+fn decode_animated_gif_frames(path: &Path, bytes: &[u8]) -> Result<DecodedAnimation, String> {
     use image::{AnimationDecoder, ImageDecoder, codecs::gif::GifDecoder};
 
     let orientation = crate::exif_extract::get_orientation(path, Some(bytes));
@@ -2040,47 +2037,54 @@ fn load_and_process_image_from_bytes(
     Ok(finish_dynamic(dyn_img, dims, orientation, caps, final_cicp, path))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LoadedFileMeta {
+    pub(super) resolution: (u32, u32),
+    pub(super) orientation: u8,
+    pub(super) content_hash: [u8; 32],
+    pub(super) exif_timestamp: Option<i64>,
+}
+
+type UpdatedFileInfo = (u128, Option<geo::Point<f64>>, Option<i64>, bool);
+
 pub(super) fn update_file_metadata(
     app: &mut GuiApp,
     path: &Path,
     g_idx_hint: usize,
     f_idx_hint: usize,
-    w: u32,
-    h: u32,
-    orientation: u8,
-    content_hash: [u8; 32],
-    exif_timestamp: Option<i64>,
+    meta: LoadedFileMeta,
 ) {
+    let LoadedFileMeta { resolution: (w, h), orientation, content_hash, exif_timestamp } = meta;
+
     // Helper to find and update the file in the group list
     // Returns Some((unique_file_id, gps_pos, exif_timestamp, changed)) if file was found
-    let update_file =
-        |file: &mut crate::FileMetadata| -> Option<(u128, Option<geo::Point<f64>>, Option<i64>, bool)> {
-            if file.path == path {
-                let mut changed = false;
-                if file.resolution.is_none() {
-                    file.resolution = Some((w, h));
-                    changed = true;
-                }
-                // Always update orientation from loader - it knows the correct value
-                // (e.g., for RAW full decode it's 1, for RAW thumbnails it's EXIF value)
-                if file.orientation != orientation {
-                    file.orientation = orientation;
-                    changed = true;
-                }
-                // Update exif_timestamp if we have a new value and file doesn't have one
-                if exif_timestamp.is_some() && file.exif_timestamp.is_none() {
-                    file.exif_timestamp = exif_timestamp;
-                    changed = true;
-                }
-                // Return the exif_timestamp to store in database (prefer new value if available)
-                let ts_for_db = exif_timestamp.or(file.exif_timestamp);
-                return Some((file.unique_file_id, file.gps_pos, ts_for_db, changed));
+    let update_file = |file: &mut crate::FileMetadata| -> Option<UpdatedFileInfo> {
+        if file.path == path {
+            let mut changed = false;
+            if file.resolution.is_none() {
+                file.resolution = Some((w, h));
+                changed = true;
             }
-            None
-        };
+            // Always update orientation from loader - it knows the correct value
+            // (e.g., for RAW full decode it's 1, for RAW thumbnails it's EXIF value)
+            if file.orientation != orientation {
+                file.orientation = orientation;
+                changed = true;
+            }
+            // Update exif_timestamp if we have a new value and file doesn't have one
+            if exif_timestamp.is_some() && file.exif_timestamp.is_none() {
+                file.exif_timestamp = exif_timestamp;
+                changed = true;
+            }
+            // Return the exif_timestamp to store in database (prefer new value if available)
+            let ts_for_db = exif_timestamp.or(file.exif_timestamp);
+            return Some((file.unique_file_id, file.gps_pos, ts_for_db, changed));
+        }
+        None
+    };
 
     // Check current file first (fast path)
-    let mut found_info: Option<(u128, Option<geo::Point<f64>>, Option<i64>, bool)> = None;
+    let mut found_info: Option<UpdatedFileInfo> = None;
 
     // 1. FAST PATH: Check the hint provided by the background worker (O(1))
     if let Some(group) = app.state.groups.get_mut(g_idx_hint)
@@ -2814,8 +2818,6 @@ fn kmeans_palette(
     #[derive(Clone, Copy)]
     struct CentroidData {
         l: f32,
-        a: f32,
-        b: f32,
         c: f32,
         h: f32,
         is_dark: bool,
@@ -2825,8 +2827,6 @@ fn kmeans_palette(
     centroid_hues[0] = centroids[0].b.atan2(centroids[0].a);
     let mut new_cd = CentroidData {
         l: centroids[0].l,
-        a: centroids[0].a,
-        b: centroids[0].b,
         c: centroid_chromas[0],
         h: centroid_hues[0],
         is_dark: centroids[0].l < 0.6,
@@ -2874,8 +2874,6 @@ fn kmeans_palette(
         centroid_hues[ki] = centroids[ki].b.atan2(centroids[ki].a);
         new_cd = CentroidData {
             l: centroids[ki].l,
-            a: centroids[ki].a,
-            b: centroids[ki].b,
             c: centroid_chromas[ki],
             h: centroid_hues[ki],
             is_dark: centroids[ki].l < 0.6,
@@ -2917,8 +2915,6 @@ fn kmeans_palette(
             .iter()
             .map(|c| CentroidData {
                 l: c.l,
-                a: c.a,
-                b: c.b,
                 c: (c.a.powi(2) + c.b.powi(2)).sqrt(),
                 h: c.b.atan2(c.a),
                 is_dark: c.l < 0.6,
