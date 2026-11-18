@@ -21,7 +21,6 @@ crossbeam-channel = "0.5"
 crossterm = "0.29"
 dirs = "6"
 fast_image_resize = "6"
-filetime = "0.2"
 file-id = "0.2"
 flate2 = { version = "1.1", features = [
   "rust_backend",
@@ -35,7 +34,7 @@ hex = "0.4"
 image-extras = { git = "https://github.com/Safari77/image-extras", branch = "main" }
 image = { version = "0.25", features = ["avif-native"] }
 tiff = "0.11"
-jiff = { version = "0.2", features = ["serde"] }
+jiff = { version = "1.0", features = ["serde"] }
 jpeg-decoder = "0.3"
 jxl-oxide = { version = "0.12", features = ["moxcms", "image"] }
 exif = { git = "https://github.com/kamadak/exif-rs", rev = "7cb491cd22aa4a586f37c0c0c3ef5c9ae207d337" }

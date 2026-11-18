@@ -150,7 +150,7 @@ fn get_runtime_library_versions() -> String {
 #[must_use]
 pub fn format_relative_time(ts: Timestamp) -> String {
     let now = Timestamp::now();
-    let zoned_ts = ts.to_zoned(jiff::tz::TimeZone::UTC);
+    let zoned_ts = ts.to_zoned_datetime(jiff::tz::TimeZone::UTC);
     let raw_span = now.since(ts).unwrap_or_default();
     let total_secs = raw_span.total(jiff::Unit::Second).unwrap_or(0.0).abs();
 

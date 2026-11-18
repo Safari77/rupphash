@@ -220,6 +220,7 @@ type DbWriteTable<'txn> = Table<'txn, &'static [u8; 32], &'static [u8]>;
 ///
 /// Drop between scan chunks so MVCC does not pin old snapshots while the
 /// background writer commits.
+#[allow(dead_code)]
 pub struct ReadSession<'a> {
     ctx: &'a AppContext,
     txn: ReadTransaction,
@@ -231,6 +232,7 @@ pub struct ReadSession<'a> {
     ignored_table: Option<DbReadOnlyTable>,
 }
 
+#[allow(dead_code)]
 impl<'a> ReadSession<'a> {
     fn open_meta(&mut self) -> Result<&DbReadOnlyTable, DbError> {
         if self.meta_table.is_none() {
@@ -643,6 +645,7 @@ impl AppContext {
     ///
     /// # Errors
     /// Returns [`DbError`] if beginning the read transaction fails.
+    #[allow(dead_code)]
     pub fn read_session(&self) -> Result<ReadSession<'_>, DbError> {
         Ok(ReadSession {
             ctx: self,
@@ -830,6 +833,7 @@ impl AppContext {
 
     /// Encrypt data using AAD to bind ciphertext to `db_key`.
     /// Storage format: `[Nonce (24 bytes) || Ciphertext || Tag (16 bytes)]`.
+    #[cfg(test)]
     fn encrypt_value(
         cipher: &XChaCha20Poly1305,
         db_key: &[u8],
@@ -1112,7 +1116,6 @@ impl AppContext {
         let txn = self.env.begin_write()?;
         let mut valid_content_hashes = HashSet::new();
         let mut meta_remove_count = 0usize;
-        let mut hash_remove_count = 0usize;
         let mut total_entries = 0usize;
         let mut total_removed = 0usize;
 
@@ -1140,11 +1143,10 @@ impl AppContext {
         }
 
         // 2. Sweep HashDB
-        let (h_total, h_removed) =
+        let (h_total, hash_remove_count) =
             Self::sweep_orphaned_keys(&txn, self.hash_db, &valid_content_hashes)?;
-        hash_remove_count = h_removed;
         total_entries += h_total;
-        total_removed += h_removed;
+        total_removed += hash_remove_count;
 
         // 3. Sweep FeatureDB
         let (f_total, f_removed) =
@@ -1565,51 +1567,6 @@ impl AppContext {
                 None
             },
         }
-    }
-
-    /// Look up an existing UUID for a group within `txn`.
-    /// First checks `ignored_pdqmap_db` by `pdqhash`, then falls back to checking
-    /// `ignored_db` by `content_hash` so groups without a PDQ hash also preserve their UUID.
-    fn find_uuid_in_txn(
-        &self,
-        txn: &WriteTransaction,
-        group: &[GroupEntry],
-    ) -> Result<Option<[u8; 16]>, DbError> {
-        {
-            let pdqmap_table = txn.open_table(self.ignored_pdqmap_db)?;
-            for (_, pdqhash_opt) in group {
-                if let Some(pdqhash) = pdqhash_opt
-                    && let Some(encrypted_guard) = pdqmap_table.get(pdqhash)?
-                {
-                    if let Some(decrypted) = self.decrypt_value(pdqhash, encrypted_guard.value())
-                        && decrypted.len() == 16
-                    {
-                        let mut uuid = [0u8; 16];
-                        uuid.copy_from_slice(&decrypted);
-                        return Ok(Some(uuid));
-                    }
-                    self.log_ignored_corrupt_once("find_uuid_in_txn (pdqmap)");
-                }
-            }
-        }
-
-        // Fallback: check if any file in the group already has an entry in ignored_db
-        {
-            let ignored_table = txn.open_table(self.ignored_db)?;
-            for (content_hash, _) in group {
-                if let Some(encrypted_guard) = ignored_table.get(content_hash)? {
-                    if let Some(decrypted) =
-                        self.decrypt_value(content_hash, encrypted_guard.value())
-                        && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
-                    {
-                        return Ok(Some(entry.group_uuid));
-                    }
-                    self.log_ignored_corrupt_once("find_uuid_in_txn (ignored_db)");
-                }
-            }
-        }
-
-        Ok(None)
     }
 
     /// Store `pdqhash -> UUID` mappings for all `pdqhash`es in a group, skipping any

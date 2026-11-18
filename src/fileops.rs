@@ -6,7 +6,6 @@ use std::{
 };
 
 use file_id::FileId;
-use filetime::FileTime;
 
 // Standard filename limit for most filesystems
 const MAX_FILENAME_BYTES: usize = 255;
@@ -209,6 +208,24 @@ fn try_move(dest: &DestinationDir, src: &Path, dst_name: &OsStr) -> std::io::Res
     }
 }
 
+/// Restore access and modification timestamps via the open file handle
+/// (avoids path-based TOCTOU). Best effort: logs a warning on failure.
+fn restore_timestamps(writer: &std::fs::File, metadata: &std::fs::Metadata, dst_path: &Path) {
+    let mut times = std::fs::FileTimes::new();
+    let mut has_any = false;
+    if let Ok(atime) = metadata.accessed() {
+        times = times.set_accessed(atime);
+        has_any = true;
+    }
+    if let Ok(mtime) = metadata.modified() {
+        times = times.set_modified(mtime);
+        has_any = true;
+    }
+    if has_any && let Err(e) = writer.set_times(times) {
+        eprintln!("[WARN] Failed to restore timestamps on {dst_path:?}: {e}");
+    }
+}
+
 #[cfg(not(unix))]
 fn copy_windows_contents(
     dst_path: &Path,
@@ -217,11 +234,7 @@ fn copy_windows_contents(
 ) -> std::io::Result<()> {
     let metadata = reader.metadata()?;
     std::io::copy(&mut reader, &mut writer)?;
-    let mtime = FileTime::from_last_modification_time(&metadata);
-    let atime = FileTime::from_last_access_time(&metadata);
-    if let Err(e) = filetime::set_file_handle_times(&writer, Some(atime), Some(mtime)) {
-        eprintln!("[WARN] Failed to restore timestamps on {dst_path:?}: {e}");
-    }
+    restore_timestamps(&writer, &metadata, dst_path);
     writer.sync_all()?;
     Ok(())
 }
@@ -337,11 +350,7 @@ fn copy_contents_and_metadata(
     }
 
     // Restore timestamps via the file handle (avoids path-based TOCTOU).
-    let mtime = FileTime::from_last_modification_time(metadata);
-    let atime = FileTime::from_last_access_time(metadata);
-    if let Err(e) = filetime::set_file_handle_times(&writer, Some(atime), Some(mtime)) {
-        eprintln!("[WARN] Failed to restore timestamps on {:?}: {e}", dest.path.join(dst_name));
-    }
+    restore_timestamps(&writer, metadata, &dest.path.join(dst_name));
 
     // Fsync before unlinking the source so the new file is durable.
     writer.sync_all()?;

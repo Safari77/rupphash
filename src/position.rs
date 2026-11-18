@@ -2,7 +2,7 @@ use std::{borrow::Cow, sync::OnceLock};
 
 use chrono::Datelike;
 use geo::{Bearing, Distance, Geodesic, Point};
-use jiff::{Zoned, civil::DateTime as CivilDateTime};
+use jiff::{ZonedDateTime, civil::DateTime as CivilDateTime};
 use solar_positioning::{Location, RefractionCorrection, SolarPositions, delta_t};
 use tzf_rs::DefaultFinder;
 
@@ -84,7 +84,7 @@ pub fn sun_alt_and_azimuth(
         .map_err(|e| format!("Date Parse Error: '{final_time_str}' -> {e}"))?;
 
     // Create Zoned time. Jiff handles "UTC" correctly as a timezone name.
-    let zoned_time: Zoned =
+    let zoned_time: ZonedDateTime =
         civil_dt.in_tz(tz_name).map_err(|e| format!("Timezone Error ({tz_name}): {e}"))?;
 
     let offset_seconds = zoned_time.offset().seconds();
