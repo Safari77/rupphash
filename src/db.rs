@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
@@ -18,7 +18,8 @@ use chacha20poly1305::{
 use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
 use geo::Point;
 use redb::{
-    ConcurrencyMode, Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction,
+    CompactionMode, ConcurrencyMode, Database, ReadOnlyTable, ReadTransaction, ReadableDatabase,
+    ReadableTable, Table, TableDefinition, WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -211,6 +212,200 @@ pub enum HashAlgorithm {
     PdqHash,
 }
 
+type DbReadOnlyTable = ReadOnlyTable<&'static [u8; 32], &'static [u8]>;
+type DbWriteTable<'txn> = Table<'txn, &'static [u8; 32], &'static [u8]>;
+
+/// Short-lived batched read handle that shares a single `ReadTransaction` and
+/// reuses opened `ReadOnlyTable` handles across multiple lookups.
+///
+/// Drop between scan chunks so MVCC does not pin old snapshots while the
+/// background writer commits.
+pub struct ReadSession<'a> {
+    ctx: &'a AppContext,
+    txn: ReadTransaction,
+    meta_table: Option<DbReadOnlyTable>,
+    hash_table: Option<DbReadOnlyTable>,
+    feature_table: Option<DbReadOnlyTable>,
+    coeff_table: Option<DbReadOnlyTable>,
+    pixel_table: Option<DbReadOnlyTable>,
+    ignored_table: Option<DbReadOnlyTable>,
+}
+
+impl<'a> ReadSession<'a> {
+    fn open_meta(&mut self) -> Result<&DbReadOnlyTable, DbError> {
+        if self.meta_table.is_none() {
+            self.meta_table = Some(self.txn.open_table(self.ctx.meta_db)?);
+        }
+        Ok(self.meta_table.as_ref().expect("meta_table initialized"))
+    }
+
+    fn open_hash(&mut self) -> Result<&DbReadOnlyTable, DbError> {
+        if self.hash_table.is_none() {
+            self.hash_table = Some(self.txn.open_table(self.ctx.hash_db)?);
+        }
+        Ok(self.hash_table.as_ref().expect("hash_table initialized"))
+    }
+
+    fn open_feature(&mut self) -> Result<&DbReadOnlyTable, DbError> {
+        if self.feature_table.is_none() {
+            self.feature_table = Some(self.txn.open_table(self.ctx.feature_db)?);
+        }
+        Ok(self.feature_table.as_ref().expect("feature_table initialized"))
+    }
+
+    fn open_coeff(&mut self) -> Result<&DbReadOnlyTable, DbError> {
+        if self.coeff_table.is_none() {
+            self.coeff_table = Some(self.txn.open_table(self.ctx.coeff_db)?);
+        }
+        Ok(self.coeff_table.as_ref().expect("coeff_table initialized"))
+    }
+
+    fn open_pixel(&mut self) -> Result<&DbReadOnlyTable, DbError> {
+        if self.pixel_table.is_none() {
+            self.pixel_table = Some(self.txn.open_table(self.ctx.pixel_db)?);
+        }
+        Ok(self.pixel_table.as_ref().expect("pixel_table initialized"))
+    }
+
+    fn open_ignored(&mut self) -> Result<&DbReadOnlyTable, DbError> {
+        if self.ignored_table.is_none() {
+            self.ignored_table = Some(self.txn.open_table(self.ctx.ignored_db)?);
+        }
+        Ok(self.ignored_table.as_ref().expect("ignored_table initialized"))
+    }
+
+    pub fn get_content_hash(&mut self, meta_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, DbError> {
+        let ctx = self.ctx;
+        let table = self.open_meta()?;
+        let Some(encrypted_guard) = table.get(meta_hash)? else {
+            return Ok(None);
+        };
+        let Some(decrypted) = ctx.decrypt_value(meta_hash, encrypted_guard.value()) else {
+            return Err(DbError::DecryptionFailed { table: "file_metadata" });
+        };
+        if decrypted.len() != 40 {
+            eprintln!("[ERROR] get_content_hash Corrupted mh={:x?}", meta_hash);
+            return Err(DbError::InvalidFormat {
+                table: "file_metadata",
+                detail: "expected 40 bytes",
+            });
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&decrypted[0..32]);
+        Ok(Some(arr))
+    }
+
+    pub fn get_pdqhash(&mut self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, DbError> {
+        let ctx = self.ctx;
+        let table = self.open_hash()?;
+        let Some(encrypted_guard) = table.get(content_hash)? else {
+            return Ok(None);
+        };
+        let Some(decrypted) = ctx.decrypt_value(content_hash, encrypted_guard.value()) else {
+            eprintln!("[ERROR-DB] get_pdqhash Corrupted content_hash={:x?}", content_hash);
+            return Err(DbError::DecryptionFailed { table: "pdqhash" });
+        };
+        match decrypted.split_first() {
+            Some((&PDQ_ALGO_VERSION, rest)) if rest.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(rest);
+                Ok(Some(arr))
+            },
+            _ => Ok(None),
+        }
+    }
+
+    pub fn get_features(
+        &mut self,
+        content_hash: &[u8; 32],
+    ) -> Result<Option<ImageFeatures>, DbError> {
+        let ctx = self.ctx;
+        let table = self.open_feature()?;
+        let Some(encrypted_guard) = table.get(content_hash)? else {
+            return Ok(None);
+        };
+        let Some(decrypted) = ctx.decrypt_value(content_hash, encrypted_guard.value()) else {
+            eprintln!("[ERROR] get_features Corrupted ch={:x?}", content_hash);
+            return Err(DbError::DecryptionFailed { table: DB_FILE_NAME_FEATURES });
+        };
+        Ok(Some(ImageFeatures::from_bytes(&decrypted)?))
+    }
+
+    pub fn get_coefficients(
+        &mut self,
+        content_hash: &[u8; 32],
+    ) -> Result<Option<Vec<f32>>, DbError> {
+        let ctx = self.ctx;
+        let table = self.open_coeff()?;
+        let Some(encrypted_guard) = table.get(content_hash)? else {
+            return Ok(None);
+        };
+        let Some(decrypted) = ctx.decrypt_value(content_hash, encrypted_guard.value()) else {
+            return Err(DbError::DecryptionFailed { table: DB_FILE_NAME_COEFFICIENTS });
+        };
+        let Some((&PDQ_ALGO_VERSION, rest)) = decrypted.split_first() else {
+            return Ok(None);
+        };
+        let cached = CachedCoefficients::from_bytes(rest)?;
+        Ok(Some(cached.coefficients))
+    }
+
+    pub fn get_pixel_hash(&mut self, content_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, DbError> {
+        let ctx = self.ctx;
+        let table = self.open_pixel()?;
+        let Some(encrypted_guard) = table.get(content_hash)? else {
+            return Ok(None);
+        };
+        let Some(decrypted) = ctx.decrypt_value(content_hash, encrypted_guard.value()) else {
+            return Err(DbError::DecryptionFailed { table: DB_FILE_NAME_PIXELHASH });
+        };
+        let arr: [u8; 32] = decrypted.try_into().map_err(|_| DbError::InvalidFormat {
+            table: DB_FILE_NAME_PIXELHASH,
+            detail: "expected 32 bytes",
+        })?;
+        Ok(Some(arr))
+    }
+
+    #[must_use]
+    pub fn is_ignored(&mut self, content_hash: &[u8; 32]) -> bool {
+        let ctx = self.ctx;
+        let Ok(table) = self.open_ignored() else {
+            return false;
+        };
+        match table.get(content_hash) {
+            Ok(Some(encrypted_guard)) => {
+                let Some(decrypted) = ctx.decrypt_value(content_hash, encrypted_guard.value())
+                else {
+                    ctx.log_ignored_corrupt_once("is_ignored");
+                    return false;
+                };
+                match IgnoredEntry::from_bytes(&decrypted) {
+                    Ok(entry) => entry.ignored,
+                    Err(_) => {
+                        ctx.log_ignored_corrupt_once("is_ignored");
+                        false
+                    },
+                }
+            },
+            _ => false,
+        }
+    }
+
+    #[must_use]
+    pub fn lookup_cached_features(
+        &mut self,
+        metadata: &fs::Metadata,
+        unique_file_id: u128,
+    ) -> Option<ImageFeatures> {
+        let meta_key = compute_meta_key_from_metadata(&self.ctx.meta_key, metadata, unique_file_id);
+        let content_hash = self.get_content_hash(&meta_key).ok()??;
+        if content_hash == [0u8; 32] {
+            return None;
+        }
+        self.get_features(&content_hash).ok().flatten()
+    }
+}
+
 /// PDQ coefficients stored separately (only in duplicate finder mode).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedCoefficients {
@@ -377,21 +572,21 @@ pub fn create_feature_update(
 }
 
 struct PendingBatch {
-    meta: HashMap<[u8; 32], [u8; 32]>,
-    hash: HashMap<[u8; 32], HashValue>,
-    feature: HashMap<[u8; 32], ImageFeatures>,
-    coeff: HashMap<[u8; 32], CachedCoefficients>,
-    pixel: HashMap<[u8; 32], [u8; 32]>,
+    meta: BTreeMap<[u8; 32], [u8; 32]>,
+    hash: BTreeMap<[u8; 32], HashValue>,
+    feature: BTreeMap<[u8; 32], ImageFeatures>,
+    coeff: BTreeMap<[u8; 32], CachedCoefficients>,
+    pixel: BTreeMap<[u8; 32], [u8; 32]>,
 }
 
 impl PendingBatch {
     fn new() -> Self {
         Self {
-            meta: HashMap::new(),
-            hash: HashMap::new(),
-            feature: HashMap::new(),
-            coeff: HashMap::new(),
-            pixel: HashMap::new(),
+            meta: BTreeMap::new(),
+            hash: BTreeMap::new(),
+            feature: BTreeMap::new(),
+            coeff: BTreeMap::new(),
+            pixel: BTreeMap::new(),
         }
     }
 
@@ -444,6 +639,23 @@ impl PendingBatch {
 }
 
 impl AppContext {
+    /// Open a short-lived read session for batching lookups across tables.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if beginning the read transaction fails.
+    pub fn read_session(&self) -> Result<ReadSession<'_>, DbError> {
+        Ok(ReadSession {
+            ctx: self,
+            txn: self.env.begin_read()?,
+            meta_table: None,
+            hash_table: None,
+            feature_table: None,
+            coeff_table: None,
+            pixel_table: None,
+            ignored_table: None,
+        })
+    }
+
     fn open_database_with_retry(db_path: &Path, cache_size: usize) -> Result<Database, DbError> {
         match Database::builder()
             .set_cache_size(cache_size)
@@ -887,78 +1099,95 @@ impl AppContext {
     /// 1. Iterates `meta_db`: removes entries where `timestamp < cutoff`.
     /// 2. Collects active `content_hash`es.
     /// 3. Sweeps `hash_db`, `feature_db`, `coeff_db`, `pixel_db`: removes entries not in active set.
+    /// 4. Compacts the database if more than 20% of entries were deleted and no other handles are active.
     ///
     /// Note: `ignored_db` and `ignored_pdqmap_db` are NEVER touched by `prune`.
     ///
     /// # Errors
     /// Returns [`DbError`] on system clock, transaction, or table operation failures.
-    pub fn prune(&self, max_age_seconds: u64) -> Result<(usize, usize), DbError> {
+    pub fn prune(&mut self, max_age_seconds: u64) -> Result<(usize, usize), DbError> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let cutoff = now.saturating_sub(max_age_seconds);
 
         let txn = self.env.begin_write()?;
         let mut valid_content_hashes = HashSet::new();
-        let mut meta_remove_count = 0;
-        let mut hash_remove_count = 0;
+        let mut meta_remove_count = 0usize;
+        let mut hash_remove_count = 0usize;
+        let mut total_entries = 0usize;
+        let mut total_removed = 0usize;
 
-        // 1. Scan MetaDB
+        // 1. Scan & prune MetaDB in a single pass
         {
             let mut table = txn.open_table(self.meta_db)?;
-            let mut keys_to_delete = Vec::new();
-            for item in table.iter()? {
-                let (key_guard, val_guard) = item?;
-                let key = key_guard.value();
-                let val_bytes = val_guard.value();
-
+            table.retain_in(.., |key, val_bytes| {
+                total_entries += 1;
                 if let Some(decrypted) = self.decrypt_value(key, val_bytes)
                     && decrypted.len() == 40
                     && let Ok(ts_bytes) = <[u8; 8]>::try_from(&decrypted[32..40])
                 {
                     let last_seen = u64::from_le_bytes(ts_bytes);
-                    if last_seen < cutoff {
-                        keys_to_delete.push(*key);
-                    } else {
+                    if last_seen >= cutoff {
                         let mut ch = [0u8; 32];
                         ch.copy_from_slice(&decrypted[0..32]);
                         valid_content_hashes.insert(ch);
+                        return true;
                     }
-                } else {
-                    keys_to_delete.push(*key);
                 }
-            }
-            for key in keys_to_delete {
-                table.remove(&key)?;
                 meta_remove_count += 1;
-            }
+                false
+            })?;
+            total_removed += meta_remove_count;
         }
 
         // 2. Sweep HashDB
-        {
-            let mut table = txn.open_table(self.hash_db)?;
-            let mut keys_to_delete = Vec::new();
-            for item in table.iter()? {
-                let (key_guard, _) = item?;
-                let k = *key_guard.value();
-                if !valid_content_hashes.contains(&k) {
-                    keys_to_delete.push(k);
+        let (h_total, h_removed) =
+            Self::sweep_orphaned_keys(&txn, self.hash_db, &valid_content_hashes)?;
+        hash_remove_count = h_removed;
+        total_entries += h_total;
+        total_removed += h_removed;
+
+        // 3. Sweep FeatureDB
+        let (f_total, f_removed) =
+            Self::sweep_orphaned_keys(&txn, self.feature_db, &valid_content_hashes)?;
+        total_entries += f_total;
+        total_removed += f_removed;
+
+        // 4. Sweep CoeffDB (PDQ coefficients)
+        let (c_total, c_removed) =
+            Self::sweep_orphaned_keys(&txn, self.coeff_db, &valid_content_hashes)?;
+        total_entries += c_total;
+        total_removed += c_removed;
+
+        // 5. Sweep PixelDB
+        let (p_total, p_removed) =
+            Self::sweep_orphaned_keys(&txn, self.pixel_db, &valid_content_hashes)?;
+        total_entries += p_total;
+        total_removed += p_removed;
+
+        txn.commit()?;
+
+        // Compact if > 20% of scanned cache entries were removed
+        if total_entries > 0 && total_removed.saturating_mul(5) > total_entries {
+            if let Some(db) = Arc::get_mut(&mut self.env) {
+                match db.compact(CompactionMode::Balanced) {
+                    Ok(compacted) => {
+                        eprintln!(
+                            "[DEBUG-DB] Prune deleted {}/{} entries; compact(Balanced) = {}",
+                            total_removed, total_entries, compacted
+                        );
+                    },
+                    Err(e) => {
+                        // Expected in MultiWriter mode if another process has an active transaction
+                        eprintln!("[WARN-DB] Post-prune compaction skipped: {}", e);
+                    },
                 }
-            }
-            for k in keys_to_delete {
-                table.remove(&k)?;
-                hash_remove_count += 1;
+            } else {
+                eprintln!(
+                    "[DEBUG-DB] Post-prune compaction skipped: Database Arc is shared with another thread"
+                );
             }
         }
 
-        // 3. Sweep FeatureDB
-        Self::sweep_orphaned_keys(&txn, self.feature_db, &valid_content_hashes)?;
-
-        // 4. Sweep CoeffDB (PDQ coefficients)
-        Self::sweep_orphaned_keys(&txn, self.coeff_db, &valid_content_hashes)?;
-
-        // 5. Sweep PixelDB
-        Self::sweep_orphaned_keys(&txn, self.pixel_db, &valid_content_hashes)?;
-
-        txn.commit()?;
         Ok((meta_remove_count, hash_remove_count))
     }
 
@@ -966,20 +1195,20 @@ impl AppContext {
         txn: &WriteTransaction,
         table_def: DbTable,
         valid_content_hashes: &HashSet<[u8; 32]>,
-    ) -> Result<(), DbError> {
+    ) -> Result<(usize, usize), DbError> {
         let mut table = txn.open_table(table_def)?;
-        let mut keys_to_delete = Vec::new();
-        for item in table.iter()? {
-            let (key_guard, _) = item?;
-            let k = *key_guard.value();
-            if !valid_content_hashes.contains(&k) {
-                keys_to_delete.push(k);
+        let mut total = 0usize;
+        let mut removed = 0usize;
+        table.retain_in(.., |k, _| {
+            total += 1;
+            if valid_content_hashes.contains(k) {
+                true
+            } else {
+                removed += 1;
+                false
             }
-        }
-        for k in keys_to_delete {
-            table.remove(&k)?;
-        }
-        Ok(())
+        })?;
+        Ok((total, removed))
     }
 
     /// Spawn the background writer thread that coalesces and batches cache writes.
@@ -1001,27 +1230,41 @@ impl AppContext {
 
             let mut last_flush = Instant::now();
             let flush_interval = Duration::from_secs(1);
-            let max_buffer = 1000;
+            // Larger batch cap amortizes MultiWriter 2PC fsync + allocator reload during bulk scans,
+            // while flush_interval still commits interactive GUI updates within ~1s.
+            let max_buffer = 4096;
             // Hard cap on total buffered updates. These updates are a recomputable
             // cache, so if writes keep failing (e.g. disk full) we drop
             // the backlog past this point rather than growing memory without bound.
-            let hard_cap = max_buffer * 16;
+            let hard_cap = max_buffer * 4;
             // Tracks whether the previous write_batch failed, so retries are
             // throttled to the flush interval instead of spinning on the buffer.
             let mut last_write_failed = false;
 
             loop {
-                let was_empty = batch.is_empty();
                 let mut disconnected = false;
 
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(update) => {
-                        if was_empty {
-                            // Start batch window from the first item after an idle period
+                let recv_result = if batch.is_empty() {
+                    // Idle: block with zero wakeups until the first update arrives.
+                    match rx.recv() {
+                        Ok(update) => {
                             last_flush = Instant::now();
-                        }
-                        batch.push(update);
+                            Ok(Some(update))
+                        },
+                        Err(_) => Err(()),
+                    }
+                } else {
+                    let remaining = flush_interval.saturating_sub(last_flush.elapsed());
+                    match rx.recv_timeout(remaining) {
+                        Ok(update) => Ok(Some(update)),
+                        Err(RecvTimeoutError::Timeout) => Ok(None),
+                        Err(RecvTimeoutError::Disconnected) => Err(()),
+                    }
+                };
 
+                match recv_result {
+                    Ok(Some(update)) => {
+                        batch.push(update);
                         // Drain already-queued updates up to max_buffer to maximize batching
                         while !batch.is_full(max_buffer) {
                             match rx.try_recv() {
@@ -1034,8 +1277,8 @@ impl AppContext {
                             }
                         }
                     },
-                    Err(RecvTimeoutError::Timeout) => {},
-                    Err(RecvTimeoutError::Disconnected) => {
+                    Ok(None) => {},
+                    Err(()) => {
                         disconnected = true;
                     },
                 }
@@ -1373,21 +1616,59 @@ impl AppContext {
     /// protected hashes belonging to untouched entries with a different UUID.
     fn store_pdqmap_entries(
         cipher: &XChaCha20Poly1305,
-        txn: &WriteTransaction,
-        pdqmap_db: DbTable,
+        pdqmap_table: &mut DbWriteTable<'_>,
         pdqhashes: &[Option<[u8; 32]>],
         protected_pdqhashes: &HashSet<[u8; 32]>,
         uuid: &[u8; 16],
+        enc_buf: &mut Vec<u8>,
     ) -> Result<(), DbError> {
-        let mut table = txn.open_table(pdqmap_db)?;
         for pdqhash in pdqhashes.iter().flatten() {
             if protected_pdqhashes.contains(pdqhash) {
                 continue;
             }
-            let encrypted = Self::encrypt_value(cipher, pdqhash, uuid)?;
-            table.insert(pdqhash, encrypted.as_slice())?;
+            Self::encrypt_into(cipher, pdqhash, uuid, enc_buf)?;
+            pdqmap_table.insert(pdqhash, enc_buf.as_slice())?;
         }
         Ok(())
+    }
+
+    /// Look up an existing UUID for a group using already-opened tables.
+    /// First checks `pdqmap_table` by `pdqhash`, then falls back to checking
+    /// `ignored_table` by `content_hash` so groups without a PDQ hash also preserve their UUID.
+    fn find_uuid_in_tables(
+        &self,
+        ignored_table: &DbWriteTable<'_>,
+        pdqmap_table: &DbWriteTable<'_>,
+        group: &[GroupEntry],
+    ) -> Result<Option<[u8; 16]>, DbError> {
+        for (_, pdqhash_opt) in group {
+            if let Some(pdqhash) = pdqhash_opt
+                && let Some(encrypted_guard) = pdqmap_table.get(pdqhash)?
+            {
+                if let Some(decrypted) = self.decrypt_value(pdqhash, encrypted_guard.value())
+                    && decrypted.len() == 16
+                {
+                    let mut uuid = [0u8; 16];
+                    uuid.copy_from_slice(&decrypted);
+                    return Ok(Some(uuid));
+                }
+                self.log_ignored_corrupt_once("find_uuid_in_tables (pdqmap)");
+            }
+        }
+
+        // Fallback: check if any file in the group already has an entry in ignored_db
+        for (content_hash, _) in group {
+            if let Some(encrypted_guard) = ignored_table.get(content_hash)? {
+                if let Some(decrypted) = self.decrypt_value(content_hash, encrypted_guard.value())
+                    && let Ok(entry) = IgnoredEntry::from_bytes(&decrypted)
+                {
+                    return Ok(Some(entry.group_uuid));
+                }
+                self.log_ignored_corrupt_once("find_uuid_in_tables (ignored_db)");
+            }
+        }
+
+        Ok(None)
     }
 
     /// Register all duplicate groups in the database on scan completion.
@@ -1400,27 +1681,30 @@ impl AppContext {
     pub fn register_duplicate_groups(&self, groups: &[Vec<GroupEntry>]) -> Result<usize, DbError> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut total_registered = 0;
+        let mut enc_buf = Vec::with_capacity(128);
 
         let txn = self.env.begin_write()?;
 
-        for group in groups {
-            if group.is_empty() {
-                continue;
-            }
+        {
+            let mut ignored_table = txn.open_table(self.ignored_db)?;
+            let mut pdqmap_table = txn.open_table(self.ignored_pdqmap_db)?;
 
-            let uuid = match self.find_uuid_in_txn(&txn, group)? {
-                Some(existing_uuid) => existing_uuid,
-                None => {
-                    let mut fresh = [0u8; 16];
-                    getrandom::fill(&mut fresh)?;
-                    fresh
-                },
-            };
+            for group in groups {
+                if group.is_empty() {
+                    continue;
+                }
 
-            let mut protected_pdqhashes = HashSet::new();
+                let uuid = match self.find_uuid_in_tables(&ignored_table, &pdqmap_table, group)? {
+                    Some(existing_uuid) => existing_uuid,
+                    None => {
+                        let mut fresh = [0u8; 16];
+                        getrandom::fill(&mut fresh)?;
+                        fresh
+                    },
+                };
 
-            {
-                let mut ignored_table = txn.open_table(self.ignored_db)?;
+                let mut protected_pdqhashes = HashSet::new();
+
                 for (content_hash, pdqhash) in group {
                     // Never overwrite entries already marked ignored=true OR entries that
                     // fail decryption/deserialization (e.g. if opened with another key).
@@ -1458,21 +1742,22 @@ impl AppContext {
                         ignored: false,
                     };
                     let bytes = entry.to_bytes()?;
-                    let encrypted = Self::encrypt_value(&self.cipher, content_hash, &bytes)?;
-                    ignored_table.insert(content_hash, encrypted.as_slice())?;
+                    Self::encrypt_into(&self.cipher, content_hash, &bytes, &mut enc_buf)?;
+                    ignored_table.insert(content_hash, enc_buf.as_slice())?;
                     total_registered += 1;
                 }
-            }
 
-            let all_pdqhashes: Vec<Option<[u8; 32]>> = group.iter().map(|(_, pdq)| *pdq).collect();
-            Self::store_pdqmap_entries(
-                &self.cipher,
-                &txn,
-                self.ignored_pdqmap_db,
-                &all_pdqhashes,
-                &protected_pdqhashes,
-                &uuid,
-            )?;
+                let all_pdqhashes: Vec<Option<[u8; 32]>> =
+                    group.iter().map(|(_, pdq)| *pdq).collect();
+                Self::store_pdqmap_entries(
+                    &self.cipher,
+                    &mut pdqmap_table,
+                    &all_pdqhashes,
+                    &protected_pdqhashes,
+                    &uuid,
+                    &mut enc_buf,
+                )?;
+            }
         }
 
         txn.commit()?;
@@ -1496,6 +1781,7 @@ impl AppContext {
         let txn = self.env.begin_write()?;
         let mut entry_count = 0;
         let mut pdqmap_count = 0;
+        let mut enc_buf = Vec::with_capacity(128);
 
         {
             let mut ignored_table = txn.open_table(self.ignored_db)?;
@@ -1503,16 +1789,15 @@ impl AppContext {
 
             for (content_hash, entry) in entries {
                 let bytes = entry.to_bytes()?;
-                let encrypted = Self::encrypt_value(&self.cipher, content_hash, &bytes)?;
-                ignored_table.insert(content_hash, encrypted.as_slice())?;
+                Self::encrypt_into(&self.cipher, content_hash, &bytes, &mut enc_buf)?;
+                ignored_table.insert(content_hash, enc_buf.as_slice())?;
                 entry_count += 1;
 
                 if let Some(ref pdqhash) = entry.pdqhash
                     && entry.group_uuid != [0u8; 16]
                 {
-                    let encrypted_uuid =
-                        Self::encrypt_value(&self.cipher, pdqhash, &entry.group_uuid)?;
-                    pdqmap_table.insert(pdqhash, encrypted_uuid.as_slice())?;
+                    Self::encrypt_into(&self.cipher, pdqhash, &entry.group_uuid, &mut enc_buf)?;
+                    pdqmap_table.insert(pdqhash, enc_buf.as_slice())?;
                     pdqmap_count += 1;
                 }
             }
@@ -1534,6 +1819,7 @@ impl AppContext {
     pub fn set_files_ignored(&self, content_hashes: &[[u8; 32]]) -> Result<usize, DbError> {
         let txn = self.env.begin_write()?;
         let mut count = 0;
+        let mut enc_buf = Vec::with_capacity(128);
 
         {
             let mut table = txn.open_table(self.ignored_db)?;
@@ -1558,8 +1844,8 @@ impl AppContext {
                 if !entry.ignored {
                     entry.ignored = true;
                     let bytes = entry.to_bytes()?;
-                    let new_encrypted = Self::encrypt_value(&self.cipher, ch, &bytes)?;
-                    table.insert(ch, new_encrypted.as_slice())?;
+                    Self::encrypt_into(&self.cipher, ch, &bytes, &mut enc_buf)?;
+                    table.insert(ch, enc_buf.as_slice())?;
                     count += 1;
                 }
             }
@@ -1914,7 +2200,7 @@ mod tests {
 
     #[test]
     fn ignored_db_and_pdqmap_lifecycle_with_temp_redb() {
-        let (_dir, ctx) = temp_ctx([0x33u8; 32]);
+        let (_dir, mut ctx) = temp_ctx([0x33u8; 32]);
         let ch1 = [1u8; 32];
         let ch2 = [2u8; 32];
         let ch3 = [3u8; 32];

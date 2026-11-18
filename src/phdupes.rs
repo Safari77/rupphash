@@ -807,7 +807,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- PRUNE MODE ---
     if let Some(seconds) = args.prune {
-        let ctx = AppContext::with_algorithm(hash_algorithm)?;
+        let mut ctx = AppContext::with_algorithm(hash_algorithm)?;
 
         println!("Pruning entries older than {seconds} seconds from PDQ hash database...");
 
