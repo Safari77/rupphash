@@ -565,28 +565,6 @@ impl GpsMapState {
         self.selected_marker = path.and_then(|p| self.path_to_marker.get(&p).copied());
     }
 
-    /// Find the closest marker to a given position
-    pub fn find_closest_marker(&self, lat: f64, lon: f64) -> Option<(usize, f64)> {
-        if self.markers.is_empty() {
-            return None;
-        }
-
-        let click_point = (lat, lon);
-        let mut closest_idx = 0;
-        let mut closest_dist = f64::MAX;
-
-        for (idx, marker) in self.markers.iter().enumerate() {
-            let marker_point = (marker.lat, marker.lon);
-            let (dist, _bearing) = crate::position::distance_and_bearing(click_point, marker_point);
-            if dist < closest_dist {
-                closest_dist = dist;
-                closest_idx = idx;
-            }
-        }
-
-        Some((closest_idx, closest_dist))
-    }
-
     /// Clear all markers (e.g., when changing directory)
     pub fn clear_markers(&mut self) {
         self.markers.clear();
@@ -594,14 +572,6 @@ impl GpsMapState {
         self.selected_marker = None;
         self.last_pos = None;
         self.move_text = None;
-    }
-
-    /// Center map on a specific marker
-    pub fn center_on_marker(&mut self, marker_idx: usize) {
-        if let Some(marker) = self.markers.get(marker_idx) {
-            self.map_memory.center_at(marker.position());
-            self.selected_marker = Some(marker_idx);
-        }
     }
 
     /// Center map on the marker for a specific path
@@ -612,11 +582,6 @@ impl GpsMapState {
             self.map_memory.center_at(marker.position());
             self.selected_marker = Some(idx);
         }
-    }
-
-    /// Center map on a position
-    pub fn center_on_position(&mut self, lat: f64, lon: f64) {
-        self.map_memory.center_at(walkers::lat_lon(lat, lon));
     }
 
     /// Set initial center position for when map opens
@@ -662,11 +627,6 @@ impl GpsMapState {
         self.tile_error = None;
         // Recreate tiles with new provider
         self.init_tiles(ctx);
-    }
-
-    /// Set error message for tile loading failure
-    pub fn set_tile_error(&mut self, error: String) {
-        self.tile_error = Some(error);
     }
 }
 

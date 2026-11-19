@@ -269,14 +269,6 @@ impl SearchIndex {
         }
     }
 
-    /// Convert search index back to unique_file_id
-    pub fn index_to_file_id(&self, index: u32) -> Option<u128> {
-        if self.free_slots.contains(index) {
-            return None;
-        }
-        self.index_to_id.get(index as usize).copied()
-    }
-
     /// Get file index from unique_file_id
     pub fn file_id_to_index(&self, unique_file_id: u128) -> Option<u32> {
         self.id_to_index.get(&unique_file_id).copied()
