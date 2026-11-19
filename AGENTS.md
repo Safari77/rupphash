@@ -13,6 +13,18 @@ Key capabilities:
 
 ---
 
+## Build & Verification
+
+- **NEVER pass `--release` to `cargo` commands** (including `cargo check`, `cargo clippy`, `cargo test`, and `cargo build`) unless explicitly instructed by the user.
+- `[profile.release]` uses `lto = "fat"`, which takes ~5 minutes per build and wastes time/disk space on a separate target cache.
+- Always use debug builds for verification:
+  - Type-check: `cargo check --all-targets`
+  - Lint: `cargo clippy --all-targets -- -D warnings`
+  - Test: `cargo test`
+  - Check deny: `cargo deny check`
+
+---
+
 ## Repository Structure
 
 ### Crate Targets (`Cargo.toml`)
