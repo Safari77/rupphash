@@ -60,13 +60,13 @@ pub(super) fn handle_input(
     // Directory picker navigation
     if app.show_dir_picker {
         if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && app.dir_picker_selection > 0 {
-            app.dir_picker_selection -= 1;
+            app.dir_picker_selection = app.dir_picker_selection.saturating_sub(1);
             app.dir_picker_scroll_to_selection = true;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown))
-            && app.dir_picker_selection + 1 < app.dir_list.len()
+            && app.dir_picker_selection.saturating_add(1) < app.dir_list.len()
         {
-            app.dir_picker_selection += 1;
+            app.dir_picker_selection = app.dir_picker_selection.saturating_add(1);
             app.dir_picker_scroll_to_selection = true;
         }
         // PageUp - move up by 10 items
@@ -77,7 +77,7 @@ pub(super) fn handle_input(
         // PageDown - move down by 10 items
         if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
             let max_idx = app.dir_list.len().saturating_sub(1);
-            app.dir_picker_selection = (app.dir_picker_selection + 10).min(max_idx);
+            app.dir_picker_selection = app.dir_picker_selection.saturating_add(10).min(max_idx);
             app.dir_picker_scroll_to_selection = true;
         }
         // Home - go to first item
@@ -112,11 +112,11 @@ pub(super) fn handle_input(
             && !app.state.view_mode_flatten
             && app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
         let total_dirs = if app.state.view_mode && !app.state.view_mode_flatten {
-            (if has_parent { 1 } else { 0 }) + app.subdirs.len()
+            usize::from(has_parent).saturating_add(app.subdirs.len())
         } else {
             0
         };
-        let has_files = !app.state.groups.is_empty() && !app.state.groups[0].is_empty();
+        let has_files = app.state.groups.first().is_some_and(|g| !g.is_empty());
         let plain = ctx.input(|i| !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt);
 
         // Handle Up/Left navigation
@@ -125,13 +125,13 @@ pub(super) fn handle_input(
                 if let Some(dir_idx) = app.dir_selection_idx {
                     // Already in directory list, move up
                     if dir_idx > 0 {
-                        app.dir_selection_idx = Some(dir_idx - 1);
+                        app.dir_selection_idx = Some(dir_idx.saturating_sub(1));
                         app.dir_scroll_to_selection = true;
                     }
                     // At top of directory list, stay there
                 } else if app.state.current_file_idx == 0 {
                     // At first file, move to directory list (last directory)
-                    app.dir_selection_idx = Some(total_dirs - 1);
+                    app.dir_selection_idx = Some(total_dirs.saturating_sub(1));
                     app.dir_scroll_to_selection = true;
                 } else {
                     // Normal file navigation
@@ -155,11 +155,13 @@ pub(super) fn handle_input(
         if ctx
             .input(|i| i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowRight))
         {
-            if app.state.view_mode && app.dir_selection_idx.is_some() {
-                let dir_idx = app.dir_selection_idx.unwrap();
-                if dir_idx + 1 < total_dirs {
+            if app.state.view_mode
+                && let Some(dir_idx) = app.dir_selection_idx
+            {
+                let next_idx = dir_idx.saturating_add(1);
+                if next_idx < total_dirs {
                     // Move down in directory list
-                    app.dir_selection_idx = Some(dir_idx + 1);
+                    app.dir_selection_idx = Some(next_idx);
                     app.dir_scroll_to_selection = true;
                 } else if has_files {
                     // At bottom of directory list, move to first file
@@ -187,7 +189,7 @@ pub(super) fn handle_input(
                     app.current_dir.as_ref().and_then(|c| c.parent()).map(|p| p.to_path_buf())
                 } else {
                     // Subdirectory (index adjusted for parent)
-                    app.subdirs.get(dir_idx - 1).cloned()
+                    app.subdirs.get(dir_idx.saturating_sub(1)).cloned()
                 }
             } else {
                 // No parent, subdirs start at index 0
@@ -207,7 +209,8 @@ pub(super) fn handle_input(
                 {
                     let new_has_parent =
                         app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
-                    app.dir_selection_idx = Some(if new_has_parent { pos + 1 } else { pos });
+                    app.dir_selection_idx =
+                        Some(if new_has_parent { pos.saturating_add(1) } else { pos });
                     app.dir_scroll_to_selection = true;
                     app.state.selection_changed = false; // Prevent auto-scroll to file 0
                 }
@@ -218,20 +221,20 @@ pub(super) fn handle_input(
         if ctx.input(|i| !i.modifiers.shift && i.key_pressed(egui::Key::PageDown)) {
             if app.state.view_mode && !app.state.view_mode_flatten {
                 let has_parent = app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
-                let total_dirs = (if has_parent { 1 } else { 0 }) + app.subdirs.len();
+                let total_dirs = usize::from(has_parent).saturating_add(app.subdirs.len());
                 let total_files = app.state.groups.first().map(|g| g.len()).unwrap_or(0);
-                let page_size = 15;
+                let page_size = 15usize;
 
                 if let Some(dir_idx) = app.dir_selection_idx {
                     // Currently in directories
-                    let new_idx = dir_idx + page_size;
+                    let new_idx = dir_idx.saturating_add(page_size);
                     if new_idx < total_dirs {
                         app.dir_selection_idx = Some(new_idx);
                         app.dir_scroll_to_selection = true;
                     } else if total_files > 0 {
                         // Jump to files
                         app.dir_selection_idx = None;
-                        let file_offset = new_idx - total_dirs;
+                        let file_offset = new_idx.saturating_sub(total_dirs);
                         app.state.current_file_idx = file_offset.min(total_files.saturating_sub(1));
                         app.state.selection_changed = true;
                     } else {
@@ -255,17 +258,12 @@ pub(super) fn handle_input(
         if ctx.input(|i| !i.modifiers.shift && i.key_pressed(egui::Key::PageUp)) {
             if app.state.view_mode && !app.state.view_mode_flatten {
                 let has_parent = app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
-                let total_dirs = (if has_parent { 1 } else { 0 }) + app.subdirs.len();
-                let page_size = 15;
+                let total_dirs = usize::from(has_parent).saturating_add(app.subdirs.len());
+                let page_size = 15usize;
 
-                if app.dir_selection_idx.is_some() {
+                if let Some(dir_idx) = app.dir_selection_idx {
                     // Currently in directories
-                    let dir_idx = app.dir_selection_idx.unwrap();
-                    if dir_idx >= page_size {
-                        app.dir_selection_idx = Some(dir_idx - page_size);
-                    } else {
-                        app.dir_selection_idx = Some(0);
-                    }
+                    app.dir_selection_idx = Some(dir_idx.saturating_sub(page_size));
                     app.dir_scroll_to_selection = true;
                 } else if app.state.current_file_idx == 0 && total_dirs > 0 {
                     // At first file, jump to directories
@@ -273,7 +271,7 @@ pub(super) fn handle_input(
                     app.dir_scroll_to_selection = true;
                 } else if app.state.current_file_idx < page_size && total_dirs > 0 {
                     // Would go past first file, jump to directories
-                    let remaining = page_size - app.state.current_file_idx;
+                    let remaining = page_size.saturating_sub(app.state.current_file_idx);
                     app.dir_selection_idx = Some(total_dirs.saturating_sub(remaining));
                     app.dir_scroll_to_selection = true;
                 } else {
@@ -293,7 +291,7 @@ pub(super) fn handle_input(
         if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
             if app.state.view_mode && !app.state.view_mode_flatten {
                 let has_parent = app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
-                let total_dirs = (if has_parent { 1 } else { 0 }) + app.subdirs.len();
+                let total_dirs = usize::from(has_parent).saturating_add(app.subdirs.len());
                 if total_dirs > 0 {
                     app.dir_selection_idx = Some(0);
                     app.dir_scroll_to_selection = true;
@@ -315,7 +313,7 @@ pub(super) fn handle_input(
                     *intent.borrow_mut() = Some(InputIntent::End);
                 } else {
                     let has_parent = app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
-                    let total_dirs = (if has_parent { 1 } else { 0 }) + app.subdirs.len();
+                    let total_dirs = usize::from(has_parent).saturating_add(app.subdirs.len());
                     if total_dirs > 0 {
                         app.dir_selection_idx = Some(total_dirs.saturating_sub(1));
                         app.dir_scroll_to_selection = true;
@@ -441,7 +439,7 @@ pub(super) fn handle_input(
         }
         if plain && ctx.input(|i| i.key_pressed(egui::Key::I)) {
             // Cycle: 0 (Off) -> 1 (Standard Grid) -> 2 (Proportional Strip) -> 0 (Off)
-            app.histogram_mode = (app.histogram_mode + 1) % 3;
+            app.histogram_mode = app.histogram_mode.wrapping_add(1) % 3;
             app.histogram_enabled
                 .store(app.histogram_mode > 0, std::sync::atomic::Ordering::Relaxed);
         }
@@ -559,7 +557,8 @@ pub(super) fn handle_input(
                 {
                     let new_has_parent =
                         app.current_dir.as_ref().and_then(|c| c.parent()).is_some();
-                    app.dir_selection_idx = Some(if new_has_parent { pos + 1 } else { pos });
+                    app.dir_selection_idx =
+                        Some(if new_has_parent { pos.saturating_add(1) } else { pos });
                     app.dir_scroll_to_selection = true;
                     app.state.selection_changed = false; // Prevent auto-scroll to file 0
                 }
@@ -764,26 +763,36 @@ pub(super) fn handle_dialogs(
                                     group.retain(|f| !ignored_set.contains(&f.content_hash));
                                 }
                                 // Remove groups with < 2 members
-                                let mut gi = 0;
-                                while gi < app.state.groups.len() {
-                                    if app.state.groups[gi].len() < 2 {
-                                        app.state.groups.remove(gi);
-                                        if gi < app.state.group_infos.len() {
-                                            app.state.group_infos.remove(gi);
+                                let mut kept_groups = Vec::with_capacity(app.state.groups.len());
+                                let mut kept_infos =
+                                    Vec::with_capacity(app.state.group_infos.len());
+                                let mut info_iter = app.state.group_infos.drain(..);
+                                for group in app.state.groups.drain(..) {
+                                    let info = info_iter.next();
+                                    if group.len() >= 2 {
+                                        kept_groups.push(group);
+                                        if let Some(i) = info {
+                                            kept_infos.push(i);
                                         }
-                                    } else {
-                                        gi += 1;
                                     }
                                 }
+                                drop(info_iter);
+                                app.state.groups = kept_groups;
+                                app.state.group_infos = kept_infos;
                                 // Clamp indices
                                 if app.state.groups.is_empty() {
                                     app.state.current_group_idx = 0;
                                     app.state.current_file_idx = 0;
                                 } else {
                                     if app.state.current_group_idx >= app.state.groups.len() {
-                                        app.state.current_group_idx = app.state.groups.len() - 1;
+                                        app.state.current_group_idx =
+                                            app.state.groups.len().saturating_sub(1);
                                     }
-                                    let glen = app.state.groups[app.state.current_group_idx].len();
+                                    let glen = app
+                                        .state
+                                        .groups
+                                        .get(app.state.current_group_idx)
+                                        .map_or(0, Vec::len);
                                     if app.state.current_file_idx >= glen {
                                         app.state.current_file_idx = glen.saturating_sub(1);
                                     }
@@ -1032,15 +1041,15 @@ pub(super) fn handle_dialogs(
 
                 if let Some(parent_dir) = parent {
                     // Check if we need to refresh candidates
-                    let prev_idx = if !app.move_completion_candidates.is_empty() {
-                        (app.move_completion_index + app.move_completion_candidates.len() - 1)
-                            % app.move_completion_candidates.len()
-                    } else {
-                        0
-                    };
+                    let prev_idx = app
+                        .move_completion_index
+                        .checked_sub(1)
+                        .unwrap_or_else(|| app.move_completion_candidates.len().saturating_sub(1));
 
-                    let input_matches_candidate = !app.move_completion_candidates.is_empty()
-                        && app.move_completion_candidates[prev_idx] == app.move_input;
+                    let input_matches_candidate = app
+                        .move_completion_candidates
+                        .get(prev_idx)
+                        .is_some_and(|c| c == &app.move_input);
 
                     if app.move_completion_candidates.is_empty() || !input_matches_candidate {
                         app.move_completion_candidates.clear();
@@ -1061,11 +1070,15 @@ pub(super) fn handle_dialogs(
                         }
                     }
 
-                    if !app.move_completion_candidates.is_empty() {
-                        app.move_input =
-                            app.move_completion_candidates[app.move_completion_index].clone();
-                        app.move_completion_index =
-                            (app.move_completion_index + 1) % app.move_completion_candidates.len();
+                    if let Some(cand) =
+                        app.move_completion_candidates.get(app.move_completion_index)
+                    {
+                        app.move_input.clone_from(cand);
+                        app.move_completion_index = app
+                            .move_completion_index
+                            .saturating_add(1)
+                            .checked_rem(app.move_completion_candidates.len())
+                            .unwrap_or(0);
                     }
                 }
             }
@@ -1332,17 +1345,17 @@ pub(super) fn handle_dialogs(
 
                 if let Some(parent_dir) = parent {
                     // Calculate previous index to check if input matches what we last auto-completed
-                    let prev_idx = if !app.completion_candidates.is_empty() {
-                        (app.completion_index + app.completion_candidates.len() - 1)
-                            % app.completion_candidates.len()
-                    } else {
-                        0
-                    };
+                    let prev_idx = app
+                        .completion_index
+                        .checked_sub(1)
+                        .unwrap_or_else(|| app.completion_candidates.len().saturating_sub(1));
 
                     // Check if the current input matches the candidate we just showed.
                     // This confirms the user hasn't typed something new manually.
-                    let input_matches_candidate = !app.completion_candidates.is_empty()
-                        && app.completion_candidates[prev_idx] == app.rename_input;
+                    let input_matches_candidate = app
+                        .completion_candidates
+                        .get(prev_idx)
+                        .is_some_and(|c| c == &app.rename_input);
 
                     // If empty or user typed something new, scan for new candidates
                     if app.completion_candidates.is_empty() || !input_matches_candidate {
@@ -1361,10 +1374,13 @@ pub(super) fn handle_dialogs(
                     }
 
                     // Apply the next completion
-                    if !app.completion_candidates.is_empty() {
-                        app.rename_input = app.completion_candidates[app.completion_index].clone();
-                        app.completion_index =
-                            (app.completion_index + 1) % app.completion_candidates.len();
+                    if let Some(cand) = app.completion_candidates.get(app.completion_index) {
+                        app.rename_input.clone_from(cand);
+                        app.completion_index = app
+                            .completion_index
+                            .saturating_add(1)
+                            .checked_rem(app.completion_candidates.len())
+                            .unwrap_or(0);
                     }
                 }
             }
@@ -1570,8 +1586,9 @@ pub(super) fn handle_dialogs(
                             } else {
                                 egui::Color32::LIGHT_BLUE
                             };
+                            let name_lc = name_rect.left_center();
                             ui.painter().text(
-                                name_rect.left_center() + egui::vec2(4.0, 0.0),
+                                egui::pos2(name_lc.x + 4.0, name_lc.y),
                                 egui::Align2::LEFT_CENTER,
                                 &dir_name,
                                 egui::FontId::default(),
@@ -1580,11 +1597,12 @@ pub(super) fn handle_dialogs(
 
                             // Draw modification time (right 1/3)
                             let time_rect = egui::Rect::from_min_size(
-                                rect.min + egui::vec2(available_w * 0.67, 0.0),
+                                egui::pos2(rect.min.x + available_w * 0.67, rect.min.y),
                                 egui::vec2(available_w * 0.33, row_height),
                             );
+                            let time_rc = time_rect.right_center();
                             ui.painter().text(
-                                time_rect.right_center() - egui::vec2(4.0, 0.0),
+                                egui::pos2(time_rc.x - 4.0, time_rc.y),
                                 egui::Align2::RIGHT_CENTER,
                                 &mod_time_str,
                                 egui::FontId::new(11.0, egui::FontFamily::Monospace),
@@ -1668,9 +1686,11 @@ pub(super) fn handle_dialogs(
                 app.slideshow_last_advance = Some(std::time::Instant::now());
 
                 // Check if we are at the end of the list
-                let is_at_end = app.state.current_group_idx + 1 >= app.state.groups.len()
-                    && app.state.current_file_idx + 1
-                        >= app.state.groups[app.state.current_group_idx].len();
+                let cur_group_len =
+                    app.state.groups.get(app.state.current_group_idx).map_or(0, Vec::len);
+                let is_at_end = app.state.current_group_idx.saturating_add(1)
+                    >= app.state.groups.len()
+                    && app.state.current_file_idx.saturating_add(1) >= cur_group_len;
 
                 if is_at_end {
                     // Wrap around to the start of the slideshow list
@@ -1747,9 +1767,9 @@ fn perform_ignore_group(app: &mut GuiApp) {
 
     match app.ctx.set_files_ignored(&hashes) {
         Ok(count) => {
-            let uuid_str = app
-                .ctx
-                .get_group_uuid(&hashes[0])
+            let uuid_str = hashes
+                .first()
+                .and_then(|h| app.ctx.get_group_uuid(h))
                 .map(|u| crate::db::AppContext::format_uuid(&u))
                 .unwrap_or_else(|| "unknown".to_string());
             eprintln!(
@@ -1773,7 +1793,7 @@ fn perform_ignore_group(app: &mut GuiApp) {
                 app.state.current_file_idx = 0;
             } else {
                 if app.state.current_group_idx >= app.state.groups.len() {
-                    app.state.current_group_idx = app.state.groups.len() - 1;
+                    app.state.current_group_idx = app.state.groups.len().saturating_sub(1);
                 }
                 app.state.current_file_idx = 0;
             }
@@ -1856,10 +1876,7 @@ fn perform_advanced_search(app: &mut GuiApp) {
         if term_lc.starts_with("distancefrom:") {
             // Parse "DistanceFrom:home:20-50"
             let parts: Vec<&str> = term.split(':').collect();
-            if parts.len() >= 3 {
-                let location_name = parts[1];
-                let range_str = parts[2];
-
+            if let [_, location_name, range_str, ..] = parts.as_slice() {
                 if let Some(target) = app.get_point(location_name) {
                     if !parse_and_add_geo_filter(&mut geo_filters, target, range_str) {
                         search_errors
@@ -1876,17 +1893,13 @@ fn perform_advanced_search(app: &mut GuiApp) {
             // Parse "distancelonlat:LON:LAT:RANGE"
             let parts: Vec<&str> = term.split(':').collect();
 
-            if parts.len() < 4 {
+            let [_, lon_str, lat_str, range_str, ..] = parts.as_slice() else {
                 search_errors.push(format!(
                     "Invalid format '{}'. Expected distancelonlat:LON:LAT:RANGE",
                     term
                 ));
                 continue;
-            }
-
-            let lon_str = parts[1];
-            let lat_str = parts[2];
-            let range_str = parts[3];
+            };
 
             match (lon_str.parse::<f64>(), lat_str.parse::<f64>()) {
                 (Ok(lon), Ok(lat)) => {
@@ -2057,10 +2070,9 @@ fn perform_advanced_search(app: &mut GuiApp) {
     }
 
     // 7. Update UI
-    if !app.state.search_results.is_empty() {
+    if let Some(&(g, f, ref match_source)) = app.state.search_results.first() {
         app.state.show_search = false;
         app.state.current_search_match = 0;
-        let (g, f, ref match_source) = app.state.search_results[0];
         app.state.current_group_idx = g;
         app.state.current_file_idx = f;
         app.dir_selection_idx = None;

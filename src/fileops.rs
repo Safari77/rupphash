@@ -438,12 +438,12 @@ fn truncate_filename_to_limit(filename: &str) -> String {
         return filename.to_string();
     }
 
-    let (base, ext) = if let Some(dot_pos) = filename.rfind('.') {
-        if dot_pos > 0 && filename.len() - dot_pos <= 20 {
-            (&filename[..dot_pos], &filename[dot_pos..])
-        } else {
-            (filename, "")
-        }
+    let (base, ext) = if let Some(dot_pos) = filename.rfind('.')
+        && dot_pos > 0
+        && filename.len().saturating_sub(dot_pos) <= 20
+        && let Some(parts) = filename.split_at_checked(dot_pos)
+    {
+        parts
     } else {
         (filename, "")
     };

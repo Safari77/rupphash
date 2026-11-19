@@ -85,7 +85,7 @@ pub fn format_path_depth(path: &Path, depth: usize) -> String {
         return String::new();
     }
 
-    let skip = total.saturating_sub(depth + 1);
+    let skip = total.saturating_sub(depth.saturating_add(1));
     let out: PathBuf = path.components().skip(skip).collect();
     out.to_string_lossy().into_owned()
 }
@@ -95,7 +95,8 @@ pub fn format_path_depth(path: &Path, depth: usize) -> String {
 pub fn get_bit_identical_counts(group: &[FileMetadata]) -> HashMap<[u8; 32], usize> {
     let mut counts = HashMap::with_capacity(group.len());
     for f in group {
-        *counts.entry(f.content_hash).or_insert(0) += 1;
+        let entry = counts.entry(f.content_hash).or_insert(0usize);
+        *entry = entry.saturating_add(1);
     }
     counts
 }
@@ -104,12 +105,13 @@ pub fn get_content_subgroups(group: &[FileMetadata]) -> HashMap<[u8; 32], usize>
     let mut counts = HashMap::with_capacity(group.len());
     for f in group {
         if let Some(ph) = f.pixel_hash {
-            *counts.entry(ph).or_insert(0) += 1;
+            let entry = counts.entry(ph).or_insert(0usize);
+            *entry = entry.saturating_add(1);
         }
     }
 
     let mut ids = HashMap::new();
-    let mut next_id = 1;
+    let mut next_id = 1usize;
 
     // Assign IDs in order of appearance in the list to keep UI stable
     for f in group {
@@ -118,7 +120,7 @@ pub fn get_content_subgroups(group: &[FileMetadata]) -> HashMap<[u8; 32], usize>
             && let std::collections::hash_map::Entry::Vacant(e) = ids.entry(ph)
         {
             e.insert(next_id);
-            next_id += 1;
+            next_id = next_id.saturating_add(1);
         }
     }
     ids
@@ -428,10 +430,10 @@ impl AppState {
             InputIntent::TogglePathVisibility => {
                 if let Some(path) = self.get_current_image_path() {
                     let total_components = path.components().count();
-                    if self.path_display_depth + 1 >= total_components {
+                    if self.path_display_depth.saturating_add(1) >= total_components {
                         self.path_display_depth = 0;
                     } else {
-                        self.path_display_depth += 1;
+                        self.path_display_depth = self.path_display_depth.saturating_add(1);
                     }
                     self.selection_changed = true;
                 }
@@ -458,10 +460,10 @@ impl AppState {
                     && let Some(file) = group.get(self.current_file_idx)
                 {
                     let transform = self.file_transforms.entry(file.unique_file_id).or_default();
-                    transform.rotation = (transform.rotation + 1) % 4;
+                    transform.rotation = transform.rotation.wrapping_add(1) % 4;
                 }
                 // Also update legacy manual_rotation for compatibility
-                self.manual_rotation = (self.manual_rotation + 1) % 4;
+                self.manual_rotation = self.manual_rotation.wrapping_add(1) % 4;
             },
             InputIntent::ToggleLut => {
                 if self.has_lut {
@@ -480,10 +482,14 @@ impl AppState {
             InputIntent::CycleLut => {
                 let count = self.lut_names.len();
                 if self.has_lut && count > 0 {
-                    self.lut_index = (self.lut_index + 1) % count;
+                    self.lut_index =
+                        self.lut_index.saturating_add(1).checked_rem(count).unwrap_or(0);
                     let lut_name = self.lut_names.get(self.lut_index).map_or("", String::as_str);
                     let status = if self.lut_enabled {
-                        format!("3D LUT: [{lut_name}] ({}/{count})", self.lut_index + 1)
+                        format!(
+                            "3D LUT: [{lut_name}] ({}/{count})",
+                            self.lut_index.saturating_add(1)
+                        )
                     } else {
                         format!("3D LUT Selected: [{lut_name}] (OFF, press '3' to enable)")
                     };
@@ -526,22 +532,19 @@ impl AppState {
                 let current_dist = curr_info.max_dist;
 
                 // Find next group index with strictly greater max_dist
-                if let Some(new_idx) = self
+                if let Some((new_idx, new_dist)) = self
                     .group_infos
                     .iter()
                     .enumerate()
-                    .skip(self.current_group_idx + 1)
+                    .skip(self.current_group_idx.saturating_add(1))
                     .find(|(_, info)| info.max_dist > current_dist)
-                    .map(|(i, _)| i)
+                    .map(|(i, info)| (i, info.max_dist))
                 {
                     self.current_group_idx = new_idx;
                     self.current_file_idx = 0;
                     self.manual_rotation = 0;
                     self.selection_changed = true;
-                    self.set_status(
-                        format!("Jumped to Dist: {}", self.group_infos[new_idx].max_dist),
-                        false,
-                    );
+                    self.set_status(format!("Jumped to Dist: {new_dist}"), false);
                 } else {
                     self.set_status("No groups with higher distance found.".to_string(), false);
                 }
@@ -553,21 +556,19 @@ impl AppState {
                 let current_dist = curr_info.max_dist;
 
                 // Find the last group preceding current one that has strictly smaller max_dist
-                if let Some(new_idx) = self
+                if let Some((new_idx, new_dist)) = self
                     .group_infos
                     .iter()
                     .enumerate()
                     .take(self.current_group_idx)
-                    .rposition(|(_, info)| info.max_dist < current_dist)
+                    .rfind(|(_, info)| info.max_dist < current_dist)
+                    .map(|(i, info)| (i, info.max_dist))
                 {
                     self.current_group_idx = new_idx;
                     self.current_file_idx = 0;
                     self.manual_rotation = 0;
                     self.selection_changed = true;
-                    self.set_status(
-                        format!("Jumped to Dist: {}", self.group_infos[new_idx].max_dist),
-                        false,
-                    );
+                    self.set_status(format!("Jumped to Dist: {new_dist}"), false);
                 } else {
                     self.set_status("No groups with smaller distance found.".to_string(), false);
                 }
@@ -691,10 +692,10 @@ impl AppState {
             return;
         };
         self.manual_rotation = 0; // Reset rotation
-        if self.current_file_idx + 1 < group.len() {
-            self.current_file_idx += 1;
-        } else if self.current_group_idx + 1 < self.groups.len() {
-            self.current_group_idx += 1;
+        if self.current_file_idx.saturating_add(1) < group.len() {
+            self.current_file_idx = self.current_file_idx.saturating_add(1);
+        } else if self.current_group_idx.saturating_add(1) < self.groups.len() {
+            self.current_group_idx = self.current_group_idx.saturating_add(1);
             self.current_file_idx = 0;
         }
     }
@@ -705,10 +706,11 @@ impl AppState {
         }
         self.manual_rotation = 0; // Reset rotation
         if self.current_file_idx > 0 {
-            self.current_file_idx -= 1;
+            self.current_file_idx = self.current_file_idx.saturating_sub(1);
         } else if self.current_group_idx > 0 {
-            self.current_group_idx -= 1;
-            self.current_file_idx = self.groups[self.current_group_idx].len().saturating_sub(1);
+            self.current_group_idx = self.current_group_idx.saturating_sub(1);
+            self.current_file_idx =
+                self.groups.get(self.current_group_idx).map_or(0, |g| g.len().saturating_sub(1));
         }
     }
 
@@ -717,7 +719,8 @@ impl AppState {
             return;
         }
         self.manual_rotation = 0;
-        self.current_group_idx = (self.current_group_idx + 1) % self.groups.len();
+        self.current_group_idx =
+            self.current_group_idx.saturating_add(1).checked_rem(self.groups.len()).unwrap_or(0);
         self.current_file_idx = 0;
     }
 
@@ -727,9 +730,9 @@ impl AppState {
         }
         self.manual_rotation = 0;
         if self.current_group_idx == 0 {
-            self.current_group_idx = self.groups.len() - 1;
+            self.current_group_idx = self.groups.len().saturating_sub(1);
         } else {
-            self.current_group_idx -= 1;
+            self.current_group_idx = self.current_group_idx.saturating_sub(1);
         }
         self.current_file_idx = 0;
     }
@@ -744,7 +747,7 @@ impl AppState {
 
     fn go_end(&mut self) {
         if let Some(g) = self.groups.last() {
-            self.current_group_idx = self.groups.len() - 1;
+            self.current_group_idx = self.groups.len().saturating_sub(1);
             self.manual_rotation = 0;
             self.current_file_idx = g.len().saturating_sub(1);
         }
@@ -755,40 +758,49 @@ impl AppState {
             return;
         }
         self.manual_rotation = 0;
-        let current_abs: usize =
-            self.groups.iter().take(self.current_group_idx).map(|g| 1 + g.len()).sum::<usize>()
-                + 1
-                + self.current_file_idx;
-        let total_rows: usize = self.groups.iter().map(|g| 1 + g.len()).sum();
+        let current_abs: usize = self
+            .groups
+            .iter()
+            .take(self.current_group_idx)
+            .map(|g| g.len().saturating_add(1))
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(1)
+            .saturating_add(self.current_file_idx);
+        let total_rows: usize = self
+            .groups
+            .iter()
+            .map(|g| g.len().saturating_add(1))
+            .fold(0usize, usize::saturating_add);
         let scroll_amount = view_size.max(1);
         let target_abs = if down {
             current_abs.saturating_add(scroll_amount).min(total_rows.saturating_sub(1))
         } else {
             current_abs.saturating_sub(scroll_amount)
         };
-        let mut accum = 0;
+        let mut accum = 0usize;
         for (g_idx, group) in self.groups.iter().enumerate() {
-            let g_len = 1 + group.len();
-            if target_abs < accum + g_len {
-                let offset = target_abs - accum;
+            let g_len = group.len().saturating_add(1);
+            if target_abs < accum.saturating_add(g_len) {
+                let offset = target_abs.saturating_sub(accum);
                 if offset == 0 {
                     if down {
                         self.current_group_idx = g_idx;
                         self.current_file_idx = 0;
-                    } else if g_idx > 0 {
-                        self.current_group_idx = g_idx - 1;
-                        self.current_file_idx = self.groups[g_idx - 1].len().saturating_sub(1);
+                    } else if let Some(prev_idx) = g_idx.checked_sub(1) {
+                        self.current_group_idx = prev_idx;
+                        self.current_file_idx =
+                            self.groups.get(prev_idx).map_or(0, |g| g.len().saturating_sub(1));
                     } else {
                         self.current_group_idx = 0;
                         self.current_file_idx = 0;
                     }
                 } else {
                     self.current_group_idx = g_idx;
-                    self.current_file_idx = offset - 1;
+                    self.current_file_idx = offset.saturating_sub(1);
                 }
                 return;
             }
-            accum += g_len;
+            accum = accum.saturating_add(g_len);
         }
     }
 
@@ -804,7 +816,7 @@ impl AppState {
         if self.marked_for_deletion.is_empty() {
             return;
         }
-        let mut success_count = 0;
+        let mut success_count = 0usize;
         let mut failed_paths = HashSet::new();
         let deleted_paths: HashSet<PathBuf> = std::mem::take(&mut self.marked_for_deletion);
         let mut error_details = Vec::new();
@@ -817,7 +829,7 @@ impl AppState {
             };
             match res {
                 Ok(()) => {
-                    success_count += 1;
+                    success_count = success_count.saturating_add(1);
                     let action = if self.use_trash { "TRASHED " } else { "DELETED " };
                     eprintln!("[DELETE] {action}{}", path.display());
                 },
@@ -834,20 +846,7 @@ impl AppState {
                 group
                     .retain(|f| !deleted_paths.contains(&f.path) || failed_paths.contains(&f.path));
             }
-            let mut i = 0;
-            while i < self.groups.len() {
-                if self.groups[i].is_empty() {
-                    self.groups.remove(i);
-                    self.group_infos.remove(i);
-                    if self.current_group_idx >= i && self.current_group_idx > 0 {
-                        self.current_group_idx -= 1;
-                    }
-                } else {
-                    self.group_infos[i] =
-                        analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities);
-                    i += 1;
-                }
-            }
+            self.prune_empty_groups_and_reanalyze();
             self.clamp_selection();
             self.selection_changed = true;
         }
@@ -912,15 +911,37 @@ impl AppState {
         }
     }
 
+    fn prune_empty_groups_and_reanalyze(&mut self) {
+        let mut kept_groups = Vec::with_capacity(self.groups.len());
+        let mut kept_infos = Vec::with_capacity(self.group_infos.len());
+        let mut removed_before_current = 0usize;
+
+        for (orig_idx, mut group) in self.groups.drain(..).enumerate() {
+            if group.is_empty() {
+                if orig_idx <= self.current_group_idx {
+                    removed_before_current = removed_before_current.saturating_add(1);
+                }
+            } else {
+                let info = analyze_group(&mut group, &self.group_by, &self.ext_priorities);
+                kept_groups.push(group);
+                kept_infos.push(info);
+            }
+        }
+
+        self.groups = kept_groups;
+        self.group_infos = kept_infos;
+        self.current_group_idx = self.current_group_idx.saturating_sub(removed_before_current);
+    }
+
     fn clamp_selection(&mut self) {
         if self.groups.is_empty() {
             self.current_group_idx = 0;
             self.current_file_idx = 0;
         } else {
             if self.current_group_idx >= self.groups.len() {
-                self.current_group_idx = self.groups.len() - 1;
+                self.current_group_idx = self.groups.len().saturating_sub(1);
             }
-            let group_len = self.groups[self.current_group_idx].len();
+            let group_len = self.groups.get(self.current_group_idx).map_or(0, Vec::len);
             if self.current_file_idx >= group_len {
                 self.current_file_idx = group_len.saturating_sub(1);
             }
@@ -976,21 +997,28 @@ impl AppState {
         }
 
         if next {
-            self.current_search_match = (self.current_search_match + 1) % self.search_results.len();
+            self.current_search_match = self
+                .current_search_match
+                .saturating_add(1)
+                .checked_rem(self.search_results.len())
+                .unwrap_or(0);
         } else if self.current_search_match == 0 {
-            self.current_search_match = self.search_results.len() - 1;
+            self.current_search_match = self.search_results.len().saturating_sub(1);
         } else {
-            self.current_search_match -= 1;
+            self.current_search_match = self.current_search_match.saturating_sub(1);
         }
 
-        let (g, f, ref match_source) = self.search_results[self.current_search_match];
+        let Some(&(g, f, ref match_source)) = self.search_results.get(self.current_search_match)
+        else {
+            return;
+        };
         self.current_group_idx = g;
         self.current_file_idx = f;
         self.selection_changed = true;
         self.set_status(
             format!(
                 "Match {}/{} in [{match_source}]",
-                self.current_search_match + 1,
+                self.current_search_match.saturating_add(1),
                 self.search_results.len(),
             ),
             false,
@@ -1020,7 +1048,7 @@ impl AppState {
         if paths_to_move.is_empty() {
             return;
         }
-        let mut success_count = 0;
+        let mut success_count = 0usize;
         let mut failed_paths = HashSet::new();
         let mut error_details = Vec::new();
         // Track per-path outcomes so we can log them after the command completes.
@@ -1033,7 +1061,7 @@ impl AppState {
             let filename = result.source.file_name().unwrap_or_default().to_os_string();
             match result.outcome {
                 Ok(()) => {
-                    success_count += 1;
+                    success_count = success_count.saturating_add(1);
                     moved_ok.push((result.source, result.destination));
                 },
                 Err(e) => {
@@ -1086,20 +1114,7 @@ impl AppState {
             }
 
             // Clean up empty groups
-            let mut i = 0;
-            while i < self.groups.len() {
-                if self.groups[i].is_empty() {
-                    self.groups.remove(i);
-                    self.group_infos.remove(i);
-                    if self.current_group_idx >= i && self.current_group_idx > 0 {
-                        self.current_group_idx -= 1;
-                    }
-                } else {
-                    self.group_infos[i] =
-                        analyze_group(&mut self.groups[i], &self.group_by, &self.ext_priorities);
-                    i += 1;
-                }
-            }
+            self.prune_empty_groups_and_reanalyze();
 
             self.clamp_selection();
             self.selection_changed = true;

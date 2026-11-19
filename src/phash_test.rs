@@ -6,12 +6,12 @@ mod phash;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <image_file_path>", args[0]);
+    let [prog, file_path, ..] = args.as_slice() else {
+        let prog = args.first().map_or("phash_test", String::as_str);
+        eprintln!("Usage: {} <image_file_path>", prog);
         process::exit(1);
-    }
-
-    let file_path = &args[1];
+    };
+    let _ = prog;
     let path = Path::new(file_path);
 
     // image::open detects format automatically from file extension/magic bytes

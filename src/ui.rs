@@ -115,10 +115,10 @@ impl TuiApp {
             .groups
             .iter()
             .take(self.state.current_group_idx)
-            .map(|g| 1 + g.len())
-            .sum::<usize>()
-            + 1
-            + self.state.current_file_idx;
+            .map(|g| g.len().saturating_add(1))
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(1)
+            .saturating_add(self.state.current_file_idx);
         self.list_state.select(Some(abs_idx));
     }
 
@@ -170,14 +170,14 @@ impl TuiApp {
                     };
 
                     if let Some(parent_dir) = parent {
-                        let prev_idx = if !self.move_completion_candidates.is_empty() {
-                            (self.move_completion_index + self.move_completion_candidates.len() - 1)
-                                % self.move_completion_candidates.len()
-                        } else {
-                            0
-                        };
-                        let match_candidate = !self.move_completion_candidates.is_empty()
-                            && self.move_completion_candidates[prev_idx] == self.move_buffer;
+                        let prev_idx =
+                            self.move_completion_index.checked_sub(1).unwrap_or_else(|| {
+                                self.move_completion_candidates.len().saturating_sub(1)
+                            });
+                        let match_candidate = self
+                            .move_completion_candidates
+                            .get(prev_idx)
+                            .is_some_and(|c| c == &self.move_buffer);
 
                         if self.move_completion_candidates.is_empty() || !match_candidate {
                             self.move_completion_candidates.clear();
@@ -202,12 +202,15 @@ impl TuiApp {
                                 self.move_completion_candidates.sort();
                             }
                         }
-                        if !self.move_completion_candidates.is_empty() {
-                            self.move_buffer.clone_from(
-                                &self.move_completion_candidates[self.move_completion_index],
-                            );
-                            self.move_completion_index = (self.move_completion_index + 1)
-                                % self.move_completion_candidates.len();
+                        if let Some(cand) =
+                            self.move_completion_candidates.get(self.move_completion_index)
+                        {
+                            self.move_buffer.clone_from(cand);
+                            self.move_completion_index = self
+                                .move_completion_index
+                                .saturating_add(1)
+                                .checked_rem(self.move_completion_candidates.len())
+                                .unwrap_or(0);
                         }
                     }
                 },
@@ -243,16 +246,16 @@ impl TuiApp {
 
                     if let Some(parent_dir) = parent {
                         // Calculate previous index to check if input matches what we last auto-completed
-                        let prev_idx = if !self.completion_candidates.is_empty() {
-                            (self.completion_index + self.completion_candidates.len() - 1)
-                                % self.completion_candidates.len()
-                        } else {
-                            0
-                        };
+                        let prev_idx = self
+                            .completion_index
+                            .checked_sub(1)
+                            .unwrap_or_else(|| self.completion_candidates.len().saturating_sub(1));
 
                         // Check if the current input matches the candidate we just showed.
-                        let input_matches_candidate = !self.completion_candidates.is_empty()
-                            && self.completion_candidates[prev_idx] == self.rename_buffer;
+                        let input_matches_candidate = self
+                            .completion_candidates
+                            .get(prev_idx)
+                            .is_some_and(|c| c == &self.rename_buffer);
 
                         // If empty or user typed something new, scan for new candidates
                         if self.completion_candidates.is_empty() || !input_matches_candidate {
@@ -270,11 +273,13 @@ impl TuiApp {
                         }
 
                         // Apply the next completion
-                        if !self.completion_candidates.is_empty() {
-                            self.rename_buffer
-                                .clone_from(&self.completion_candidates[self.completion_index]);
-                            self.completion_index =
-                                (self.completion_index + 1) % self.completion_candidates.len();
+                        if let Some(cand) = self.completion_candidates.get(self.completion_index) {
+                            self.rename_buffer.clone_from(cand);
+                            self.completion_index = self
+                                .completion_index
+                                .saturating_add(1)
+                                .checked_rem(self.completion_candidates.len())
+                                .unwrap_or(0);
                         }
                     }
                 },
@@ -461,15 +466,15 @@ impl TuiApp {
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
 
-        let main_layout = Layout::default()
+        let [list_area, status_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(0),
                 Constraint::Length(1), // Status Bar
             ])
-            .split(area);
+            .areas(area);
 
-        self.view_height = (main_layout[0].height.saturating_sub(2) / 2) as usize;
+        self.view_height = (list_area.height.saturating_sub(2) / 2) as usize;
 
         // --- Status Bar ---
         let status_widget = if let Some((msg, is_error)) = &self.state.status_message {
@@ -483,26 +488,26 @@ impl TuiApp {
             )))
         };
 
-        frame.render_widget(status_widget, main_layout[1]);
+        frame.render_widget(status_widget, status_area);
 
         // --- File List ---
         let mut list_items = Vec::new();
 
-        for (g_idx, group) in self.state.groups.iter().enumerate() {
-            let info = &self.state.group_infos[g_idx];
-
+        for (g_idx, (group, info)) in
+            self.state.groups.iter().zip(self.state.group_infos.iter()).enumerate()
+        {
+            let g_num = g_idx.saturating_add(1);
             let (header_text, header_color) = match info.status {
                 GroupStatus::AllIdentical => (
-                    format!("--- Group {} - Bit-identical (hardlinks in magenta) ---", g_idx + 1),
+                    format!("--- Group {g_num} - Bit-identical (hardlinks in magenta) ---"),
                     Color::Green,
                 ),
                 GroupStatus::SomeIdentical => {
-                    (format!("--- Group {} - Some Identical ---", g_idx + 1), Color::Green)
+                    (format!("--- Group {g_num} - Some Identical ---"), Color::Green)
                 },
-                GroupStatus::None => (
-                    format!("--- Group {} (Dist: {}) ---", g_idx + 1, info.max_dist),
-                    Color::Yellow,
-                ),
+                GroupStatus::None => {
+                    (format!("--- Group {g_num} (Dist: {}) ---", info.max_dist), Color::Yellow)
+                },
             };
 
             list_items.push(ListItem::new(Line::from(vec![Span::styled(
@@ -584,7 +589,7 @@ impl TuiApp {
             .block(Block::default().borders(Borders::ALL).title("Duplicates"))
             .highlight_symbol(">> ");
 
-        frame.render_stateful_widget(list, main_layout[0], &mut self.list_state);
+        frame.render_stateful_widget(list, list_area, &mut self.list_state);
 
         // --- Modals / Popups ---
 
@@ -687,20 +692,23 @@ fn render_popup(
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
+    let margin_y = 100u16.saturating_sub(percent_y) / 2;
+    let [_, vert, _] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(margin_y),
             Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(margin_y),
         ])
-        .split(r);
-    Layout::default()
+        .areas(r);
+    let margin_x = 100u16.saturating_sub(percent_x) / 2;
+    let [_, center, _] = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(margin_x),
             Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(margin_x),
         ])
-        .split(popup_layout[1])[1]
+        .areas(vert);
+    center
 }

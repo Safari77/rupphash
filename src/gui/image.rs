@@ -155,8 +155,8 @@ impl CubeLut3d {
 
             if trimmed.starts_with("LUT_3D_SIZE") {
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let s = parts[1]
+                if let [_, size_str, ..] = parts.as_slice() {
+                    let s = size_str
                         .parse::<u32>()
                         .map_err(|e| format!("Invalid LUT_3D_SIZE: {}", e))?;
                     if !(2..=256).contains(&s) {
@@ -172,10 +172,10 @@ impl CubeLut3d {
 
             if trimmed.starts_with("DOMAIN_MIN") {
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.len() >= 4 {
-                    for i in 0..3 {
-                        if let Ok(v) = parts[i + 1].parse::<f32>() {
-                            domain_min[i] = v;
+                if let [_, s0, s1, s2, ..] = parts.as_slice() {
+                    for (dst, s) in domain_min.iter_mut().zip([s0, s1, s2]) {
+                        if let Ok(v) = s.parse::<f32>() {
+                            *dst = v;
                         }
                     }
                 }
@@ -184,10 +184,10 @@ impl CubeLut3d {
 
             if trimmed.starts_with("DOMAIN_MAX") {
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.len() >= 4 {
-                    for i in 0..3 {
-                        if let Ok(v) = parts[i + 1].parse::<f32>() {
-                            domain_max[i] = v;
+                if let [_, s0, s1, s2, ..] = parts.as_slice() {
+                    for (dst, s) in domain_max.iter_mut().zip([s0, s1, s2]) {
+                        if let Ok(v) = s.parse::<f32>() {
+                            *dst = v;
                         }
                     }
                 }
@@ -199,10 +199,10 @@ impl CubeLut3d {
             }
 
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() == 3 {
-                let r = parts[0].parse::<f32>().map_err(|e| format!("Invalid float: {}", e))?;
-                let g = parts[1].parse::<f32>().map_err(|e| format!("Invalid float: {}", e))?;
-                let b = parts[2].parse::<f32>().map_err(|e| format!("Invalid float: {}", e))?;
+            if let [rs, gs, bs] = parts.as_slice() {
+                let r = rs.parse::<f32>().map_err(|e| format!("Invalid float: {}", e))?;
+                let g = gs.parse::<f32>().map_err(|e| format!("Invalid float: {}", e))?;
+                let b = bs.parse::<f32>().map_err(|e| format!("Invalid float: {}", e))?;
                 // Keep stored output data untouched
                 data.push([r, g, b]);
             }
@@ -210,7 +210,10 @@ impl CubeLut3d {
 
         let size =
             lut_size.ok_or_else(|| "Missing LUT_3D_SIZE header in .cube file".to_string())?;
-        let expected_count = (size * size * size) as usize;
+        let expected_count = (size as usize)
+            .checked_mul(size as usize)
+            .and_then(|v| v.checked_mul(size as usize))
+            .ok_or_else(|| "LUT_3D_SIZE overflow".to_string())?;
         if data.len() != expected_count {
             return Err(format!(
                 "Malformed .cube file: expected {} points for LUT_3D_SIZE {}, found {}",
@@ -260,9 +263,9 @@ const BYTES_PER_TEXEL: u32 = (4 * std::mem::size_of::<u16>()) as u32; // 8: four
 /// cast with plain `bytemuck` (no need for half's `bytemuck` feature).
 fn pack_lut_rgba16f(lut: &CubeLut3d) -> Vec<u16> {
     let size = lut.size as usize;
-    debug_assert_eq!(lut.data.len(), size * size * size);
+    debug_assert_eq!(lut.data.len(), size.saturating_mul(size).saturating_mul(size));
     let one = f16::ONE.to_bits();
-    let mut buf = Vec::with_capacity(lut.data.len() * 4);
+    let mut buf = Vec::with_capacity(lut.data.len().saturating_mul(4));
     for &[r, g, b] in &lut.data {
         buf.extend_from_slice(&[
             f16::from_f32(r).to_bits(),
@@ -308,7 +311,7 @@ pub fn upload_lut_to_gpu(rs: &egui_wgpu::RenderState, lut: &CubeLut3d) -> Option
         bytemuck::cast_slice(&texels),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(size * BYTES_PER_TEXEL),
+            bytes_per_row: Some(size.saturating_mul(BYTES_PER_TEXEL)),
             rows_per_image: Some(size),
         },
         extent,
@@ -453,17 +456,17 @@ const BLUR_SIGMA: f32 = 1.666;
 /// colour bleeds transparent pixels' RGB into their neighbours, so this
 /// premultiplies into linear space, blurs, then divides the alpha back out.
 fn blur_backdrop(px: &[egui::Color32], w: usize, h: usize) -> egui::ColorImage {
-    let n = w * h;
-    if n == 0 || px.len() < n {
+    let n = w.saturating_mul(h);
+    let Some(px_slice) = px.get(..n).filter(|_| n > 0) else {
         return egui::ColorImage {
             size: [1, 1],
             pixels: vec![egui::Color32::TRANSPARENT],
             source_size: egui::vec2(1.0, 1.0),
         };
-    }
+    };
 
     let mut buf: Vec<[f32; 4]> = Vec::with_capacity(n);
-    for &c in &px[..n] {
+    for &c in px_slice {
         let [r, g, b, a] = c.to_srgba_unmultiplied();
         let a = a as f32 / 255.0;
         buf.push([
@@ -476,7 +479,7 @@ fn blur_backdrop(px: &[egui::Color32], w: usize, h: usize) -> egui::ColorImage {
 
     // Three sigma each side is where a Gaussian is worth truncating.
     let radius = (BLUR_SIGMA * 3.0).ceil() as isize;
-    let mut kernel: Vec<f32> = (-radius..=radius)
+    let mut kernel: Vec<f32> = (radius.saturating_neg()..=radius)
         .map(|i| {
             let x = i as f32 / BLUR_SIGMA;
             (-0.5 * x * x).exp()
@@ -490,30 +493,40 @@ fn blur_backdrop(px: &[egui::Color32], w: usize, h: usize) -> egui::ColorImage {
     // Horizontal, then vertical. Edges clamp, which stops the border fading
     // out against nothing where the kernel runs off the thumbnail.
     let mut tmp = vec![[0.0f32; 4]; n];
-    for y in 0..h {
-        for x in 0..w {
+    let w_max = (w as isize).saturating_sub(1);
+    let h_max = (h as isize).saturating_sub(1);
+    for (src_row, dst_row) in buf.chunks_exact(w).zip(tmp.chunks_exact_mut(w)) {
+        for (x, dst_px) in dst_row.iter_mut().enumerate() {
             let mut acc = [0.0f32; 4];
             for (ki, &kv) in kernel.iter().enumerate() {
-                let sx = (x as isize + ki as isize - radius).clamp(0, w as isize - 1) as usize;
-                let s = buf[y * w + sx];
-                for c in 0..4 {
-                    acc[c] += s[c] * kv;
+                let sx =
+                    (x as isize).saturating_add(ki as isize).saturating_sub(radius).clamp(0, w_max)
+                        as usize;
+                if let Some(&s) = src_row.get(sx) {
+                    for (a, &sv) in acc.iter_mut().zip(s.iter()) {
+                        *a += sv * kv;
+                    }
                 }
             }
-            tmp[y * w + x] = acc;
+            *dst_px = acc;
         }
     }
     for x in 0..w {
         for y in 0..h {
             let mut acc = [0.0f32; 4];
             for (ki, &kv) in kernel.iter().enumerate() {
-                let sy = (y as isize + ki as isize - radius).clamp(0, h as isize - 1) as usize;
-                let s = tmp[sy * w + x];
-                for c in 0..4 {
-                    acc[c] += s[c] * kv;
+                let sy =
+                    (y as isize).saturating_add(ki as isize).saturating_sub(radius).clamp(0, h_max)
+                        as usize;
+                if let Some(&s) = tmp.get(sy.saturating_mul(w).saturating_add(x)) {
+                    for (a, &sv) in acc.iter_mut().zip(s.iter()) {
+                        *a += sv * kv;
+                    }
                 }
             }
-            buf[y * w + x] = acc;
+            if let Some(dst_px) = buf.get_mut(y.saturating_mul(w).saturating_add(x)) {
+                *dst_px = acc;
+            }
         }
     }
 
@@ -1085,7 +1098,7 @@ fn deep_to_colorimage(pixels: &DeepPixels, width: u32, height: u32) -> egui::Col
                 let g = (((p >> 10) & 0x3FF) >> 2) as u8;
                 let b = (((p >> 20) & 0x3FF) >> 2) as u8;
                 // 2-bit alpha: 0..3 -> 0..255.
-                let a = (((p >> 30) & 0x3) * 85) as u8;
+                let a = ((p >> 30) & 0x3).saturating_mul(85) as u8;
                 egui::Color32::from_rgba_unmultiplied(r, g, b, a)
             })
             .collect(),
@@ -1555,9 +1568,15 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<(egui::Colo
     // Iterate through ALL fields across ALL Image File Directories (IFDs)
     for field in reader.fields() {
         if field.tag == exif::Tag::JPEGInterchangeFormatLength {
-            let length = match field.value {
-                exif::Value::Long(ref v) if !v.is_empty() => v[0] as usize,
-                exif::Value::Short(ref v) if !v.is_empty() => v[0] as usize,
+            let length = match &field.value {
+                exif::Value::Long(v) => match v.first() {
+                    Some(&l) => l as usize,
+                    None => continue,
+                },
+                exif::Value::Short(v) => match v.first() {
+                    Some(&s) => s as usize,
+                    None => continue,
+                },
                 _ => continue,
             };
 
@@ -1566,9 +1585,15 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<(egui::Colo
                 && let Some(offset_field) =
                     reader.get_field(exif::Tag::JPEGInterchangeFormat, field.ifd_num)
             {
-                let offset = match offset_field.value {
-                    exif::Value::Long(ref v) if !v.is_empty() => v[0] as usize,
-                    exif::Value::Short(ref v) if !v.is_empty() => v[0] as usize,
+                let offset = match &offset_field.value {
+                    exif::Value::Long(v) => match v.first() {
+                        Some(&l) => l as usize,
+                        None => continue,
+                    },
+                    exif::Value::Short(v) => match v.first() {
+                        Some(&s) => s as usize,
+                        None => continue,
+                    },
                     _ => continue,
                 };
 
@@ -1582,12 +1607,12 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<(egui::Colo
     }
 
     let end = best_offset.checked_add(max_length)?;
-    if max_length == 0 || end > bytes.len() {
+    if max_length == 0 {
         return None;
     }
 
     // Parse orientation directly from the embedded JPEG bytes
-    let jpeg_bytes = &bytes[best_offset..end];
+    let jpeg_bytes = bytes.get(best_offset..end)?;
     let orientation = crate::exif_extract::get_orientation(Path::new(""), Some(jpeg_bytes));
 
     let img = image::load_from_memory(jpeg_bytes).ok()?;
@@ -1609,13 +1634,15 @@ fn extract_biggest_exif_preview(path: &Path, bytes: &[u8]) -> Option<(egui::Colo
 /// Check if a WebP file contains animation by looking for the ANIM chunk in RIFF header
 fn is_animated_webp(bytes: &[u8]) -> bool {
     // WebP files start with RIFF....WEBP
-    if bytes.len() < 21 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+    if bytes.get(0..4) != Some(b"RIFF".as_slice()) || bytes.get(8..12) != Some(b"WEBP".as_slice()) {
         return false;
     }
     // VP8X extended header at offset 12, flags byte at offset 20
     // Bit 1 (0x02) of flags indicates animation
-    if &bytes[12..16] == b"VP8X" && bytes.len() > 20 {
-        return bytes[20] & 0x02 != 0;
+    if bytes.get(12..16) == Some(b"VP8X".as_slice())
+        && let Some(&flags) = bytes.get(20)
+    {
+        return flags & 0x02 != 0;
     }
     false
 }
@@ -1627,7 +1654,7 @@ fn is_animated_gif(bytes: &[u8]) -> bool {
     use image::{AnimationDecoder, codecs::gif::GifDecoder};
 
     // GIF87a / GIF89a header is 6 bytes
-    if bytes.len() < 10 || (&bytes[0..4] != b"GIF8") {
+    if bytes.len() < 10 || bytes.get(0..4) != Some(b"GIF8".as_slice()) {
         return false;
     }
 
@@ -1659,11 +1686,11 @@ fn convert_animation_frames(raw_frames: &[image::Frame]) -> (Vec<egui::ColorImag
         let (numer, denom) = delay.numer_denom_ms();
         // numer/denom is a rational number of milliseconds, so work in
         // microseconds and round instead of truncating.
-        let us = if denom == 0 {
-            UNSPECIFIED_US
-        } else {
-            (numer as u64).saturating_mul(1000).saturating_add(denom as u64 / 2) / denom as u64
-        };
+        let us = (numer as u64)
+            .saturating_mul(1000)
+            .saturating_add(denom as u64 / 2)
+            .checked_div(denom as u64)
+            .unwrap_or(UNSPECIFIED_US);
         let us = if us == 0 { UNSPECIFIED_US } else { us.max(MIN_FRAME_US) };
         durations.push(Duration::from_micros(us));
 
@@ -1806,13 +1833,14 @@ fn decode_animated_gif_frames(path: &Path, bytes: &[u8]) -> Result<DecodedAnimat
 /// The `to_vec` is a full copy (~360 MB for a 60 MP RGB decode), unavoidable
 /// unless rsraw grows a way to hand over the buffer.
 fn raw16_to_dynamic(w: usize, h: usize, samples: &[u16]) -> Result<image::DynamicImage, String> {
-    let total_pixels = w * h;
+    let total_pixels = w.saturating_mul(h);
+    let rgb_samples = total_pixels.saturating_mul(3);
     if samples.len() == total_pixels {
         // Monochrome sensor
         image::ImageBuffer::<image::Luma<u16>, _>::from_raw(w as u32, h as u32, samples.to_vec())
             .map(image::DynamicImage::ImageLuma16)
             .ok_or_else(|| "RAW: failed to build 16-bit grayscale buffer".to_string())
-    } else if samples.len() == total_pixels * 3 {
+    } else if samples.len() == rgb_samples {
         image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(w as u32, h as u32, samples.to_vec())
             .map(image::DynamicImage::ImageRgb16)
             .ok_or_else(|| "RAW: failed to build 16-bit RGB buffer".to_string())
@@ -1822,7 +1850,7 @@ fn raw16_to_dynamic(w: usize, h: usize, samples: &[u16]) -> Result<image::Dynami
              If that is exactly double, ProcessedImage<BIT_DEPTH_16> is handing back \
              bytes rather than u16 and needs a cast at the call site.",
             total_pixels,
-            total_pixels * 3,
+            rgb_samples,
             samples.len()
         ))
     }
@@ -2173,7 +2201,7 @@ fn extract_best_thumbnail(raw: &mut rsraw::RawImage) -> Option<(egui::ColorImage
     let best_thumb = thumbs
         .into_iter()
         .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
-        .max_by_key(|t| t.width * t.height)?;
+        .max_by_key(|t| (t.width as u64).saturating_mul(t.height as u64))?;
 
     // Parse orientation directly from the JPEG thumbnail's EXIF data
     let orientation = crate::exif_extract::get_orientation(Path::new(""), Some(&best_thumb.data));
@@ -2307,7 +2335,7 @@ pub(super) fn render_image_texture(
     let file_transform = app.state.get_current_file_transform();
     let manual_rot = file_transform.rotation.rem_euclid(4);
 
-    let (exif_steps, exif_flip_h, exif_flip_v) = match orientation {
+    let (exif_steps, exif_flip_h, exif_flip_v): (u8, bool, bool) = match orientation {
         2 => (0, true, false),
         3 => (2, false, false),
         4 => (0, false, true),
@@ -2321,7 +2349,7 @@ pub(super) fn render_image_texture(
     let manual_angle = manual_rot as f32 * (PI / 2.0);
     let total_angle = exif_steps as f32 * (PI / 2.0) + manual_angle;
 
-    let total_steps = (exif_steps + manual_rot).rem_euclid(4);
+    let total_steps = exif_steps.wrapping_add(manual_rot).rem_euclid(4);
     let is_rotated_90_270 = total_steps == 1 || total_steps == 3;
     // EXIF mirrors combine with the user's manual flips
     let flip_h = exif_flip_h ^ file_transform.flip_horizontal;
@@ -2363,13 +2391,13 @@ pub(super) fn render_image_texture(
     };
 
     let zoom_factor = if zoom_factor.is_finite() && zoom_factor > 0.0 { zoom_factor } else { 1.0 };
-    let virtual_visual_size = visual_size * zoom_factor;
+    let virtual_visual_size = egui::vec2(visual_size.x * zoom_factor, visual_size.y * zoom_factor);
 
     let screen_center = available_rect.center();
     // Offset from screen center to image center.
     let offset_x = (0.5 - view_state.pan_center.x) * virtual_visual_size.x;
     let offset_y = (0.5 - view_state.pan_center.y) * virtual_visual_size.y;
-    let visual_center = screen_center + egui::vec2(offset_x, offset_y);
+    let visual_center = egui::pos2(screen_center.x + offset_x, screen_center.y + offset_y);
     // If image is smaller than screen, force centering (override pan)
     let final_center = egui::pos2(
         if virtual_visual_size.x <= screen_w { screen_center.x } else { visual_center.x },
@@ -2510,9 +2538,8 @@ fn straight_rgb(px: egui::Color32) -> Option<(u8, u8, u8)> {
 
 /// `straight_rgb` for a raw premultiplied RGBA quad, carried on into Oklab.
 #[inline]
-fn oklab_from_premultiplied(px: &[u8]) -> Option<Oklab> {
-    let (r, g, b) =
-        straight_rgb(egui::Color32::from_rgba_premultiplied(px[0], px[1], px[2], px[3]))?;
+fn oklab_from_premultiplied([r, g, b, a]: [u8; 4]) -> Option<Oklab> {
+    let (r, g, b) = straight_rgb(egui::Color32::from_rgba_premultiplied(r, g, b, a))?;
     let lr = srgb_to_linear(r as f32 / 255.0);
     let lg = srgb_to_linear(g as f32 / 255.0);
     let lb = srgb_to_linear(b as f32 / 255.0);
@@ -2553,9 +2580,15 @@ fn build_histograms(oklab_pixels: &[Oklab]) -> ([u32; 256], [u32; 256], [u32; 25
         let bin_a = (((p.a + 0.3) / 0.6).clamp(0.0, 1.0) * 255.0).round() as usize;
         let bin_b = (((p.b + 0.3) / 0.6).clamp(0.0, 1.0) * 255.0).round() as usize;
 
-        hist_l[bin_l] += 1;
-        hist_a[bin_a] += 1;
-        hist_b[bin_b] += 1;
+        if let Some(slot) = hist_l.get_mut(bin_l) {
+            *slot = slot.saturating_add(1);
+        }
+        if let Some(slot) = hist_a.get_mut(bin_a) {
+            *slot = slot.saturating_add(1);
+        }
+        if let Some(slot) = hist_b.get_mut(bin_b) {
+            *slot = slot.saturating_add(1);
+        }
     }
 
     (hist_l, hist_a, hist_b)
@@ -2593,24 +2626,25 @@ fn compute_histogram_from_colorimage(
     let k = dominant_colors.clamp(1, 25);
     let low_color_palette: Option<Vec<(egui::Color32, f32)>> = if !pre_resized {
         let sample_count = total_pixels.min(4096);
-        let step = (total_pixels / sample_count).max(1);
+        let step = total_pixels.checked_div(sample_count).unwrap_or(1).max(1);
         let mut counts: std::collections::HashMap<(u8, u8, u8), u32> =
             std::collections::HashMap::new();
-        let mut idx = 0;
-        while idx < total_pixels && counts.len() <= k {
-            if let Some(rgb) = straight_rgb(img.pixels[idx]) {
-                *counts.entry(rgb).or_insert(0) += 1;
+        for &px in img.pixels.iter().take(total_pixels).step_by(step) {
+            if let Some(rgb) = straight_rgb(px) {
+                let entry = counts.entry(rgb).or_insert(0u32);
+                *entry = entry.saturating_add(1);
             }
-            idx += step;
+            if counts.len() > k {
+                break;
+            }
         }
         if counts.len() <= k && !counts.is_empty() {
             counts.clear();
-            idx = 0;
-            while idx < total_pixels {
-                if let Some(rgb) = straight_rgb(img.pixels[idx]) {
-                    *counts.entry(rgb).or_insert(0) += 1;
+            for &px in img.pixels.iter().take(total_pixels).step_by(step) {
+                if let Some(rgb) = straight_rgb(px) {
+                    let entry = counts.entry(rgb).or_insert(0u32);
+                    *entry = entry.saturating_add(1);
                 }
-                idx += step;
             }
             let total_sampled: u32 = counts.values().sum::<u32>().max(1);
             let mut colors: Vec<(Oklab, egui::Color32, f32)> = counts
@@ -2632,8 +2666,9 @@ fn compute_histogram_from_colorimage(
         None
     };
 
-    let mut oklab_pixels = Vec::with_capacity((dst_w * dst_h) as usize);
-    let mut thumb: Vec<egui::Color32> = Vec::with_capacity((dst_w * dst_h) as usize);
+    const THUMB_PIXELS: usize = 128 * 128;
+    let mut oklab_pixels = Vec::with_capacity(THUMB_PIXELS);
+    let mut thumb: Vec<egui::Color32> = Vec::with_capacity(THUMB_PIXELS);
     let pixel_type = PixelType::U8x4;
 
     let resized_successfully =
@@ -2650,7 +2685,7 @@ fn compute_histogram_from_colorimage(
         );
 
     if let Some(dst_image) = resized_successfully {
-        for chunk in dst_image.buffer().as_chunks::<4>().0 {
+        for &chunk in dst_image.buffer().as_chunks::<4>().0 {
             thumb.push(egui::Color32::from_rgba_premultiplied(
                 chunk[0], chunk[1], chunk[2], chunk[3],
             ));
@@ -2665,13 +2700,15 @@ fn compute_histogram_from_colorimage(
         let dst_h_usize = dst_h as usize;
 
         for dy in 0..dst_h_usize {
-            let sy = (dy * src_h_usize) / dst_h_usize;
+            let sy = dy.saturating_mul(src_h_usize).checked_div(dst_h_usize).unwrap_or(0);
+            let row_offset = sy.saturating_mul(src_w_usize);
             for dx in 0..dst_w_usize {
-                let sx = (dx * src_w_usize) / dst_w_usize;
-                let px = img.pixels[sy * src_w_usize + sx];
-                thumb.push(px);
-                if let Some(ok) = oklab_from_premultiplied(&px.to_array()) {
-                    oklab_pixels.push(ok);
+                let sx = dx.saturating_mul(src_w_usize).checked_div(dst_w_usize).unwrap_or(0);
+                if let Some(&px) = img.pixels.get(row_offset.saturating_add(sx)) {
+                    thumb.push(px);
+                    if let Some(ok) = oklab_from_premultiplied(px.to_array()) {
+                        oklab_pixels.push(ok);
+                    }
                 }
             }
         }
@@ -2753,16 +2790,16 @@ fn kmeans_palette(
 
     // Equalizing
     for (p, w) in working_pixels.iter().zip(weights.iter_mut()) {
-        let zone = if p.a.abs() > p.b.abs() {
-            if p.a > 0.0 { 0 } else { 1 }
+        let zw = if p.a.abs() > p.b.abs() {
+            if p.a > 0.0 { zone_weights[0] } else { zone_weights[1] }
         } else if p.b > 0.0 {
-            2
+            zone_weights[2]
         } else {
-            3
+            zone_weights[3]
         };
 
-        if zone_weights[zone] > 0.0 {
-            let equalization_factor = (avg_zone_weight / zone_weights[zone]).sqrt();
+        if zw > 0.0 {
+            let equalization_factor = (avg_zone_weight / zw).sqrt();
             *w *= equalization_factor;
         }
     }
@@ -2792,7 +2829,10 @@ fn kmeans_palette(
         })
         .collect();
 
-    let mut centroids = vec![working_pixels[0]; k];
+    let Some(&first_px) = working_pixels.first() else {
+        return vec![(egui::Color32::BLACK, 1.0 / k as f32); k];
+    };
+    let mut centroids = vec![first_px; k];
     let mut centroid_chromas = vec![0.0f32; k];
     let mut centroid_hues = vec![0.0f32; k];
     let mut min_dists = vec![f32::MAX; packed_pixels.len()];
@@ -2807,10 +2847,12 @@ fn kmeans_palette(
 
     let total_w: f32 = packed_pixels.iter().map(|p| p.weight).sum();
     let mut threshold = (xorshift() as f32 / u64::MAX as f32) * total_w;
-    for (i, p) in packed_pixels.iter().enumerate() {
+    for (p, &wp) in packed_pixels.iter().zip(working_pixels.iter()) {
         threshold -= p.weight;
         if threshold <= 0.0 {
-            centroids[0] = working_pixels[i];
+            if let Some(c0) = centroids.first_mut() {
+                *c0 = wp;
+            }
             break;
         }
     }
@@ -2823,14 +2865,16 @@ fn kmeans_palette(
         is_dark: bool,
     }
 
-    centroid_chromas[0] = (centroids[0].a.powi(2) + centroids[0].b.powi(2)).sqrt();
-    centroid_hues[0] = centroids[0].b.atan2(centroids[0].a);
-    let mut new_cd = CentroidData {
-        l: centroids[0].l,
-        c: centroid_chromas[0],
-        h: centroid_hues[0],
-        is_dark: centroids[0].l < 0.6,
-    };
+    let c0 = centroids.first().copied().unwrap_or(first_px);
+    let c0_chroma = (c0.a.powi(2) + c0.b.powi(2)).sqrt();
+    let c0_hue = c0.b.atan2(c0.a);
+    if let Some(slot) = centroid_chromas.first_mut() {
+        *slot = c0_chroma;
+    }
+    if let Some(slot) = centroid_hues.first_mut() {
+        *slot = c0_hue;
+    }
+    let mut new_cd = CentroidData { l: c0.l, c: c0_chroma, h: c0_hue, is_dark: c0.l < 0.6 };
 
     let calc_packed_dist = |p: &PackedPixel, cd: &CentroidData| -> f32 {
         let dl = (p.l - cd.l) * 2.0;
@@ -2849,40 +2893,49 @@ fn kmeans_palette(
         dl * dl + dc * dc + dh_weighted * dh_weighted
     };
 
-    for (i, p) in packed_pixels.iter().enumerate() {
-        min_dists[i] = calc_packed_dist(p, &new_cd);
+    for (md, p) in min_dists.iter_mut().zip(packed_pixels.iter()) {
+        *md = calc_packed_dist(p, &new_cd);
     }
 
     for ki in 1..k {
         let total: f32 =
             min_dists.iter().zip(packed_pixels.iter()).map(|(&d, p)| d * p.weight).sum();
 
-        if total <= 0.0 || !total.is_finite() {
-            centroids[ki] = working_pixels[(xorshift() as usize) % working_pixels.len()];
+        let chosen = if total <= 0.0 || !total.is_finite() {
+            let pick = (xorshift() as usize).checked_rem(working_pixels.len()).unwrap_or(0);
+            working_pixels.get(pick).copied().unwrap_or(first_px)
         } else {
             let mut target = (xorshift() as f32 / u64::MAX as f32) * total;
-            for i in 0..packed_pixels.len() {
-                target -= min_dists[i] * packed_pixels[i].weight;
+            let mut picked = centroids.get(ki).copied().unwrap_or(first_px);
+            for ((&d, p), &wp) in
+                min_dists.iter().zip(packed_pixels.iter()).zip(working_pixels.iter())
+            {
+                target -= d * p.weight;
                 if target <= 0.0 {
-                    centroids[ki] = working_pixels[i];
+                    picked = wp;
                     break;
                 }
             }
-        }
-
-        centroid_chromas[ki] = (centroids[ki].a.powi(2) + centroids[ki].b.powi(2)).sqrt();
-        centroid_hues[ki] = centroids[ki].b.atan2(centroids[ki].a);
-        new_cd = CentroidData {
-            l: centroids[ki].l,
-            c: centroid_chromas[ki],
-            h: centroid_hues[ki],
-            is_dark: centroids[ki].l < 0.6,
+            picked
         };
 
-        for (i, p) in packed_pixels.iter().enumerate() {
+        if let Some(slot) = centroids.get_mut(ki) {
+            *slot = chosen;
+        }
+        let chroma = (chosen.a.powi(2) + chosen.b.powi(2)).sqrt();
+        let hue = chosen.b.atan2(chosen.a);
+        if let Some(slot) = centroid_chromas.get_mut(ki) {
+            *slot = chroma;
+        }
+        if let Some(slot) = centroid_hues.get_mut(ki) {
+            *slot = hue;
+        }
+        new_cd = CentroidData { l: chosen.l, c: chroma, h: hue, is_dark: chosen.l < 0.6 };
+
+        for (md, p) in min_dists.iter_mut().zip(packed_pixels.iter()) {
             let d = calc_packed_dist(p, &new_cd);
-            if d < min_dists[i] {
-                min_dists[i] = d;
+            if d < *md {
+                *md = d;
             }
         }
     }
@@ -2960,26 +3013,30 @@ fn kmeans_palette(
                 }
             }
 
-            counts[best_idx] += p.weight;
-            sums[best_idx].0 += p.l * p.weight;
-            sums[best_idx].1 += p.a * p.weight;
-            sums[best_idx].2 += p.b * p.weight;
+            if let (Some(c_slot), Some(s_slot)) = (counts.get_mut(best_idx), sums.get_mut(best_idx))
+            {
+                *c_slot += p.weight;
+                s_slot.0 += p.l * p.weight;
+                s_slot.1 += p.a * p.weight;
+                s_slot.2 += p.b * p.weight;
+            }
         }
 
         let mut max_shift = 0.0f32;
-        for i in 0..k {
-            if counts[i] > 0.0 {
-                let new_l = sums[i].0 / counts[i];
-                let new_a = sums[i].1 / counts[i];
-                let new_b = sums[i].2 / counts[i];
+        for ((centroid, &count), &(sum_l, sum_a, sum_b)) in
+            centroids.iter_mut().zip(counts.iter()).zip(sums.iter())
+        {
+            if count > 0.0 {
+                let new_l = sum_l / count;
+                let new_a = sum_a / count;
+                let new_b = sum_b / count;
 
-                let shift =
-                    calc_dist_centroids(&centroids[i], &Oklab { l: new_l, a: new_a, b: new_b });
+                let shift = calc_dist_centroids(centroid, &Oklab { l: new_l, a: new_a, b: new_b });
 
                 max_shift = max_shift.max(shift);
-                centroids[i].l = new_l;
-                centroids[i].a = new_a;
-                centroids[i].b = new_b;
+                centroid.l = new_l;
+                centroid.a = new_a;
+                centroid.b = new_b;
             }
         }
         if max_shift < 1e-6 {
@@ -2990,7 +3047,7 @@ fn kmeans_palette(
     }
 
     let mut clusters: Vec<(f32, Oklab)> =
-        centroids.into_iter().enumerate().map(|(i, c)| (final_counts[i], c)).collect();
+        centroids.into_iter().zip(final_counts.iter().copied()).map(|(c, cnt)| (cnt, c)).collect();
 
     clusters.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -3043,7 +3100,9 @@ fn kmeans_palette(
             }
             let bucket = (((h * 8.0) / (std::f32::consts::PI * 2.0)).round() as i32).rem_euclid(8);
             chromatic_buckets.insert(bucket);
-            bucket_counts[bucket as usize] += 1;
+            if let Some(slot) = bucket_counts.get_mut(bucket as usize) {
+                *slot = slot.saturating_add(1);
+            }
         }
     }
 
@@ -3090,13 +3149,10 @@ fn kmeans_palette(
         result.push((egui::Color32::from_rgb(r, g, b), weight / total_weight));
     }
 
-    let mut indices: Vec<usize> = (0..final_k).collect();
-    indices.sort_by(|&a, &b| {
-        let cmp = sort_keys[a].0.cmp(&sort_keys[b].0);
-        if cmp == std::cmp::Ordering::Equal { sort_keys[a].1.cmp(&sort_keys[b].1) } else { cmp }
-    });
-
-    indices.iter().map(|&i| result[i]).collect()
+    let mut keyed: Vec<((i32, u32), (egui::Color32, f32))> =
+        sort_keys.into_iter().zip(result).collect();
+    keyed.sort_by_key(|&(key, _)| key);
+    keyed.into_iter().map(|(_, entry)| entry).collect()
 }
 
 /// Compute histogram and palette from a DynamicImage by thumbnailing to 128x128,
@@ -3132,49 +3188,45 @@ fn compute_histogram_from_dynamic_image(
     let k = dominant_colors.clamp(1, 25);
     let raw_pixels = rgba.as_raw();
     let sample_count = total_pixels.min(4096);
-    let step = (total_pixels / sample_count).max(1);
+    let step = total_pixels.checked_div(sample_count).unwrap_or(1).max(1);
     let mut unique_rgb: std::collections::HashMap<(u8, u8, u8), u32> =
         std::collections::HashMap::new();
-    let mut idx = 0;
-    while idx < total_pixels && unique_rgb.len() <= k {
-        let base = idx * 4;
-        if raw_pixels[base + 3] > 0 {
-            *unique_rgb
-                .entry((raw_pixels[base], raw_pixels[base + 1], raw_pixels[base + 2]))
-                .or_insert(0) += 1;
+    for &[r, g, b, a] in raw_pixels.as_chunks::<4>().0.iter().take(total_pixels).step_by(step) {
+        if a > 0 {
+            let entry = unique_rgb.entry((r, g, b)).or_insert(0u32);
+            *entry = entry.saturating_add(1);
         }
-        idx += step;
+        if unique_rgb.len() > k {
+            break;
+        }
     }
 
-    let low_color_palette: Option<Vec<(egui::Color32, f32)>> =
-        if unique_rgb.len() <= k && !unique_rgb.is_empty() {
-            unique_rgb.clear();
-            let mut full_idx = 0;
-            while full_idx < total_pixels {
-                let base = full_idx * 4;
-                if raw_pixels[base + 3] > 0 {
-                    *unique_rgb
-                        .entry((raw_pixels[base], raw_pixels[base + 1], raw_pixels[base + 2]))
-                        .or_insert(0) += 1;
-                }
-                full_idx += step;
+    let low_color_palette: Option<Vec<(egui::Color32, f32)>> = if unique_rgb.len() <= k
+        && !unique_rgb.is_empty()
+    {
+        unique_rgb.clear();
+        for &[r, g, b, a] in raw_pixels.as_chunks::<4>().0.iter().take(total_pixels).step_by(step) {
+            if a > 0 {
+                let entry = unique_rgb.entry((r, g, b)).or_insert(0u32);
+                *entry = entry.saturating_add(1);
             }
-            let total_sampled: u32 = unique_rgb.values().sum::<u32>().max(1);
-            let mut colors: Vec<(Oklab, egui::Color32, f32)> = unique_rgb
-                .iter()
-                .map(|(&(r, g, b), &count)| {
-                    let lr = srgb_to_linear(r as f32 / 255.0);
-                    let lg = srgb_to_linear(g as f32 / 255.0);
-                    let lb = srgb_to_linear(b as f32 / 255.0);
-                    let ok = linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb });
-                    (ok, egui::Color32::from_rgb(r, g, b), count as f32 / total_sampled as f32)
-                })
-                .collect();
-            colors.sort_by(|a, b| a.0.l.partial_cmp(&b.0.l).unwrap_or(std::cmp::Ordering::Equal));
-            Some(colors.into_iter().map(|(_, c, w)| (c, w)).collect())
-        } else {
-            None
-        };
+        }
+        let total_sampled: u32 = unique_rgb.values().sum::<u32>().max(1);
+        let mut colors: Vec<(Oklab, egui::Color32, f32)> = unique_rgb
+            .iter()
+            .map(|(&(r, g, b), &count)| {
+                let lr = srgb_to_linear(r as f32 / 255.0);
+                let lg = srgb_to_linear(g as f32 / 255.0);
+                let lb = srgb_to_linear(b as f32 / 255.0);
+                let ok = linear_srgb_to_oklab(LinearRgb { r: lr, g: lg, b: lb });
+                (ok, egui::Color32::from_rgb(r, g, b), count as f32 / total_sampled as f32)
+            })
+            .collect();
+        colors.sort_by(|a, b| a.0.l.partial_cmp(&b.0.l).unwrap_or(std::cmp::Ordering::Equal));
+        Some(colors.into_iter().map(|(_, c, w)| (c, w)).collect())
+    } else {
+        None
+    };
 
     let resized_successfully = FastImage::from_vec_u8(src_w, src_h, rgba.into_raw(), pixel_type)
         .ok()
@@ -3188,8 +3240,9 @@ fn compute_histogram_from_dynamic_image(
                 .map(|_| dst_image)
         });
 
-    let mut thumb: Vec<egui::Color32> = Vec::with_capacity((dst_w * dst_h) as usize);
-    let mut oklab_pixels: Vec<Oklab> = Vec::with_capacity((dst_w * dst_h) as usize);
+    const THUMB_PIXELS: usize = 128 * 128;
+    let mut thumb: Vec<egui::Color32> = Vec::with_capacity(THUMB_PIXELS);
+    let mut oklab_pixels: Vec<Oklab> = Vec::with_capacity(THUMB_PIXELS);
 
     if let Some(dst_image) = resized_successfully {
         for chunk in dst_image.buffer().as_chunks::<4>().0 {
@@ -3314,7 +3367,7 @@ fn compute_histogram_from_raw(
             if let Some(best_thumb) = thumbs
                 .into_iter()
                 .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
-                .max_by_key(|t| t.width * t.height)
+                .max_by_key(|t| (t.width as u64).saturating_mul(t.height as u64))
             {
                 match image::load_from_memory(&best_thumb.data) {
                     Ok(img) => {
@@ -3352,7 +3405,8 @@ fn compute_histogram_from_raw(
             let w = processed.width() as usize;
             let h = processed.height() as usize;
 
-            if processed.len() == w * h {
+            let mono_len = w.saturating_mul(h);
+            if processed.len() == mono_len {
                 // Monochrome: construct grayscale DynamicImage
                 if let Some(gray_buf) =
                     image::GrayImage::from_raw(w as u32, h as u32, processed.to_vec())
@@ -3364,7 +3418,7 @@ fn compute_histogram_from_raw(
                 } else {
                     eprintln!("[DEBUG-HISTOGRAM] Failed to create GrayImage buffer for {:?}", path);
                 }
-            } else if processed.len() == w * h * 3 {
+            } else if processed.len() == mono_len.saturating_mul(3) {
                 // RGB: construct DynamicImage
                 if let Some(img_buf) =
                     image::RgbImage::from_raw(w as u32, h as u32, processed.to_vec())
@@ -3560,9 +3614,9 @@ pub(super) fn render_histogram(
                 // 200ms debounce
                 if last_mut.elapsed().as_secs_f32() > 0.2 {
                     if scroll > 0.0 {
-                        app.histogram_channel = (app.histogram_channel + 1) % 3;
+                        app.histogram_channel = app.histogram_channel.wrapping_add(1) % 3;
                     } else {
-                        app.histogram_channel = (app.histogram_channel + 2) % 3;
+                        app.histogram_channel = app.histogram_channel.wrapping_add(2) % 3;
                     }
                     *last_mut = std::time::Instant::now();
                 }
@@ -3642,7 +3696,7 @@ fn draw_histogram(
         _ => "L",
     };
     ui.painter().text(
-        hist_rect.min + egui::vec2(6.0, 4.0),
+        egui::pos2(hist_rect.min.x + 6.0, hist_rect.min.y + 4.0),
         egui::Align2::LEFT_TOP,
         label,
         egui::FontId::new(14.0, egui::FontFamily::Proportional),
@@ -3702,16 +3756,13 @@ fn draw_histogram(
         );
     } else {
         // Standard grid: rows of 5 equal-width swatches
-        let colors_per_row = 5;
+        let colors_per_row = 5usize;
         let swatch_width = hist_width / colors_per_row as f32;
-        let num_rows = palette.len().div_ceil(colors_per_row);
 
-        for row in 0..num_rows {
-            let row_start = row * colors_per_row;
-            let row_end = (row_start + colors_per_row).min(palette.len());
+        for (row, row_palette) in palette.chunks(colors_per_row).enumerate() {
             let row_y = hist_rect.max.y + 4.0 + (row as f32) * (swatch_height + 4.0);
 
-            for (i, &(color, weight)) in palette[row_start..row_end].iter().enumerate() {
+            for (i, &(color, weight)) in row_palette.iter().enumerate() {
                 let x = hist_rect.min.x + (i as f32) * swatch_width;
 
                 let swatch_rect = egui::Rect::from_min_size(
@@ -3750,7 +3801,7 @@ fn draw_histogram(
             }
 
             // Draw a border encompassing this row's color strip
-            let row_color_count = row_end - row_start;
+            let row_color_count = row_palette.len();
             let row_strip_width = row_color_count as f32 * swatch_width;
             let palette_rect = egui::Rect::from_min_size(
                 egui::pos2(hist_rect.min.x, row_y),
@@ -3842,9 +3893,12 @@ pub(super) fn render_exif(
     };
 
     // Estimate width based on content
-    let max_label_width =
-        tags.iter().map(|(name, value)| name.len() + value.len() + 2).max().unwrap_or(20) as f32
-            * 7.0;
+    let max_label_width = tags
+        .iter()
+        .map(|(name, value)| name.len().saturating_add(value.len()).saturating_add(2))
+        .max()
+        .unwrap_or(20) as f32
+        * 7.0;
     let exif_width = max_label_width.clamp(150.0, 300.0);
 
     let exif_rect = egui::Rect::from_min_size(
@@ -3872,7 +3926,7 @@ pub(super) fn render_exif(
         );
 
         // Calculate offset for value (approximate)
-        let name_width = (name.len() + 2) as f32 * 6.5;
+        let name_width = name.len().saturating_add(2) as f32 * 6.5;
 
         // Draw value in white
         painter.text(

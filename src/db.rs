@@ -235,45 +235,45 @@ pub struct ReadSession<'a> {
 #[allow(dead_code)]
 impl<'a> ReadSession<'a> {
     fn open_meta(&mut self) -> Result<&DbReadOnlyTable, DbError> {
-        if self.meta_table.is_none() {
-            self.meta_table = Some(self.txn.open_table(self.ctx.meta_db)?);
+        if let Some(ref table) = self.meta_table {
+            return Ok(table);
         }
-        Ok(self.meta_table.as_ref().expect("meta_table initialized"))
+        Ok(self.meta_table.insert(self.txn.open_table(self.ctx.meta_db)?))
     }
 
     fn open_hash(&mut self) -> Result<&DbReadOnlyTable, DbError> {
-        if self.hash_table.is_none() {
-            self.hash_table = Some(self.txn.open_table(self.ctx.hash_db)?);
+        if let Some(ref table) = self.hash_table {
+            return Ok(table);
         }
-        Ok(self.hash_table.as_ref().expect("hash_table initialized"))
+        Ok(self.hash_table.insert(self.txn.open_table(self.ctx.hash_db)?))
     }
 
     fn open_feature(&mut self) -> Result<&DbReadOnlyTable, DbError> {
-        if self.feature_table.is_none() {
-            self.feature_table = Some(self.txn.open_table(self.ctx.feature_db)?);
+        if let Some(ref table) = self.feature_table {
+            return Ok(table);
         }
-        Ok(self.feature_table.as_ref().expect("feature_table initialized"))
+        Ok(self.feature_table.insert(self.txn.open_table(self.ctx.feature_db)?))
     }
 
     fn open_coeff(&mut self) -> Result<&DbReadOnlyTable, DbError> {
-        if self.coeff_table.is_none() {
-            self.coeff_table = Some(self.txn.open_table(self.ctx.coeff_db)?);
+        if let Some(ref table) = self.coeff_table {
+            return Ok(table);
         }
-        Ok(self.coeff_table.as_ref().expect("coeff_table initialized"))
+        Ok(self.coeff_table.insert(self.txn.open_table(self.ctx.coeff_db)?))
     }
 
     fn open_pixel(&mut self) -> Result<&DbReadOnlyTable, DbError> {
-        if self.pixel_table.is_none() {
-            self.pixel_table = Some(self.txn.open_table(self.ctx.pixel_db)?);
+        if let Some(ref table) = self.pixel_table {
+            return Ok(table);
         }
-        Ok(self.pixel_table.as_ref().expect("pixel_table initialized"))
+        Ok(self.pixel_table.insert(self.txn.open_table(self.ctx.pixel_db)?))
     }
 
     fn open_ignored(&mut self) -> Result<&DbReadOnlyTable, DbError> {
-        if self.ignored_table.is_none() {
-            self.ignored_table = Some(self.txn.open_table(self.ctx.ignored_db)?);
+        if let Some(ref table) = self.ignored_table {
+            return Ok(table);
         }
-        Ok(self.ignored_table.as_ref().expect("ignored_table initialized"))
+        Ok(self.ignored_table.insert(self.txn.open_table(self.ctx.ignored_db)?))
     }
 
     pub fn get_content_hash(&mut self, meta_hash: &[u8; 32]) -> Result<Option<[u8; 32]>, DbError> {
@@ -292,8 +292,12 @@ impl<'a> ReadSession<'a> {
                 detail: "expected 40 bytes",
             });
         }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&decrypted[0..32]);
+        let Some(&arr) = decrypted.first_chunk::<32>() else {
+            return Err(DbError::InvalidFormat {
+                table: "file_metadata",
+                detail: "expected 40 bytes",
+            });
+        };
         Ok(Some(arr))
     }
 
@@ -620,7 +624,12 @@ impl PendingBatch {
     }
 
     fn total_len(&self) -> usize {
-        self.meta.len() + self.hash.len() + self.feature.len() + self.coeff.len() + self.pixel.len()
+        self.meta
+            .len()
+            .saturating_add(self.hash.len())
+            .saturating_add(self.feature.len())
+            .saturating_add(self.coeff.len())
+            .saturating_add(self.pixel.len())
     }
 
     fn is_full(&self, max_buffer: usize) -> bool {
@@ -820,12 +829,13 @@ impl AppContext {
         let nonce = XNonce::from(nonce_bytes);
 
         out.clear();
-        out.reserve(ENCRYPTION_OVERHEAD + data.len());
+        out.reserve(ENCRYPTION_OVERHEAD.saturating_add(data.len()));
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(data);
 
+        let payload_slice = out.get_mut(24..).ok_or(DbError::EncryptionFailed)?;
         let tag = cipher
-            .encrypt_inout_detached(&nonce, db_key, (&mut out[24..]).into())
+            .encrypt_inout_detached(&nonce, db_key, payload_slice.into())
             .map_err(|_| DbError::EncryptionFailed)?;
         out.extend_from_slice(tag.as_slice());
         Ok(())
@@ -847,7 +857,7 @@ impl AppContext {
             .encrypt(&nonce, Payload { msg: data, aad: db_key })
             .map_err(|_| DbError::EncryptionFailed)?;
 
-        let mut out = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
+        let mut out = Vec::with_capacity(nonce_bytes.len().saturating_add(ciphertext.len()));
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
         Ok(out)
@@ -860,8 +870,8 @@ impl AppContext {
             return None;
         }
 
-        let nonce = XNonce::try_from(&data[0..24]).ok()?;
-        let ciphertext = &data[24..];
+        let (nonce_bytes, ciphertext) = data.split_first_chunk::<24>()?;
+        let nonce = XNonce::from(*nonce_bytes);
 
         self.cipher.decrypt(&nonce, Payload { msg: ciphertext, aad: db_key }).ok()
     }
@@ -972,8 +982,12 @@ impl AppContext {
             });
         }
 
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&decrypted[0..32]);
+        let Some(&arr) = decrypted.first_chunk::<32>() else {
+            return Err(DbError::InvalidFormat {
+                table: "file_metadata",
+                detail: "expected 40 bytes",
+            });
+        };
         Ok(Some(arr))
     }
 
@@ -1022,9 +1036,8 @@ impl AppContext {
         if let Ok(Some(encrypted_guard)) = meta_table.get(&meta_key)
             && let Some(decrypted) = self.decrypt_value(&meta_key, encrypted_guard.value())
             && decrypted.len() == 40
+            && let Some(&content_hash) = decrypted.first_chunk::<32>()
         {
-            let mut content_hash = [0u8; 32];
-            content_hash.copy_from_slice(&decrypted[0..32]);
             if content_hash == [0u8; 32] {
                 return None;
             }
@@ -1078,10 +1091,8 @@ impl AppContext {
             if let Ok(Some(encrypted_guard)) = meta_table.get(&meta_key)
                 && let Some(decrypted) = self.decrypt_value(&meta_key, encrypted_guard.value())
                 && decrypted.len() == 40
+                && let Some(&content_hash) = decrypted.first_chunk::<32>()
             {
-                let mut content_hash = [0u8; 32];
-                content_hash.copy_from_slice(&decrypted[0..32]);
-
                 if content_hash == [0u8; 32] {
                     continue;
                 }
@@ -1123,48 +1134,46 @@ impl AppContext {
         {
             let mut table = txn.open_table(self.meta_db)?;
             table.retain_in(.., |key, val_bytes| {
-                total_entries += 1;
+                total_entries = total_entries.saturating_add(1);
                 if let Some(decrypted) = self.decrypt_value(key, val_bytes)
-                    && decrypted.len() == 40
-                    && let Ok(ts_bytes) = <[u8; 8]>::try_from(&decrypted[32..40])
+                    && let Some((&ch, rest)) = decrypted.split_first_chunk::<32>()
+                    && let Ok(ts_bytes) = <[u8; 8]>::try_from(rest)
                 {
                     let last_seen = u64::from_le_bytes(ts_bytes);
                     if last_seen >= cutoff {
-                        let mut ch = [0u8; 32];
-                        ch.copy_from_slice(&decrypted[0..32]);
                         valid_content_hashes.insert(ch);
                         return true;
                     }
                 }
-                meta_remove_count += 1;
+                meta_remove_count = meta_remove_count.saturating_add(1);
                 false
             })?;
-            total_removed += meta_remove_count;
+            total_removed = total_removed.saturating_add(meta_remove_count);
         }
 
         // 2. Sweep HashDB
         let (h_total, hash_remove_count) =
             Self::sweep_orphaned_keys(&txn, self.hash_db, &valid_content_hashes)?;
-        total_entries += h_total;
-        total_removed += hash_remove_count;
+        total_entries = total_entries.saturating_add(h_total);
+        total_removed = total_removed.saturating_add(hash_remove_count);
 
         // 3. Sweep FeatureDB
         let (f_total, f_removed) =
             Self::sweep_orphaned_keys(&txn, self.feature_db, &valid_content_hashes)?;
-        total_entries += f_total;
-        total_removed += f_removed;
+        total_entries = total_entries.saturating_add(f_total);
+        total_removed = total_removed.saturating_add(f_removed);
 
         // 4. Sweep CoeffDB (PDQ coefficients)
         let (c_total, c_removed) =
             Self::sweep_orphaned_keys(&txn, self.coeff_db, &valid_content_hashes)?;
-        total_entries += c_total;
-        total_removed += c_removed;
+        total_entries = total_entries.saturating_add(c_total);
+        total_removed = total_removed.saturating_add(c_removed);
 
         // 5. Sweep PixelDB
         let (p_total, p_removed) =
             Self::sweep_orphaned_keys(&txn, self.pixel_db, &valid_content_hashes)?;
-        total_entries += p_total;
-        total_removed += p_removed;
+        total_entries = total_entries.saturating_add(p_total);
+        total_removed = total_removed.saturating_add(p_removed);
 
         txn.commit()?;
 
@@ -1202,11 +1211,11 @@ impl AppContext {
         let mut total = 0usize;
         let mut removed = 0usize;
         table.retain_in(.., |k, _| {
-            total += 1;
+            total = total.saturating_add(1);
             if valid_content_hashes.contains(k) {
                 true
             } else {
-                removed += 1;
+                removed = removed.saturating_add(1);
                 false
             }
         })?;
@@ -1287,7 +1296,7 @@ impl AppContext {
 
                 if disconnected {
                     if !batch.is_empty() {
-                        let mut attempts = 0;
+                        let mut attempts = 0u32;
                         loop {
                             match Self::write_batch(
                                 &cipher,
@@ -1303,7 +1312,7 @@ impl AppContext {
                             ) {
                                 Ok(()) => break,
                                 Err(e) => {
-                                    attempts += 1;
+                                    attempts = attempts.saturating_add(1);
                                     eprintln!(
                                         "[ERROR-DB] Final write_batch failed (attempt {}): {}",
                                         attempts, e
@@ -1487,7 +1496,7 @@ impl AppContext {
     {
         let txn = self.env.begin_read()?;
         let table = txn.open_table(self.feature_db)?;
-        let mut count = 0;
+        let mut count = 0usize;
         let mut corrupt_count = 0usize;
 
         for result in table.iter()? {
@@ -1496,16 +1505,16 @@ impl AppContext {
             let encrypted = encrypted_guard.value();
 
             let Some(decrypted) = self.decrypt_value(&content_hash, encrypted) else {
-                corrupt_count += 1;
+                corrupt_count = corrupt_count.saturating_add(1);
                 continue;
             };
             match ImageFeatures::from_bytes(&decrypted) {
                 Ok(features) => {
                     callback(&content_hash, &features);
-                    count += 1;
+                    count = count.saturating_add(1);
                 },
                 Err(_) => {
-                    corrupt_count += 1;
+                    corrupt_count = corrupt_count.saturating_add(1);
                 },
             }
         }
@@ -1637,7 +1646,7 @@ impl AppContext {
     /// Returns [`DbError`] on RNG, serialization, encryption, or transaction errors.
     pub fn register_duplicate_groups(&self, groups: &[Vec<GroupEntry>]) -> Result<usize, DbError> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let mut total_registered = 0;
+        let mut total_registered = 0usize;
         let mut enc_buf = Vec::with_capacity(128);
 
         let txn = self.env.begin_write()?;
@@ -1701,7 +1710,7 @@ impl AppContext {
                     let bytes = entry.to_bytes()?;
                     Self::encrypt_into(&self.cipher, content_hash, &bytes, &mut enc_buf)?;
                     ignored_table.insert(content_hash, enc_buf.as_slice())?;
-                    total_registered += 1;
+                    total_registered = total_registered.saturating_add(1);
                 }
 
                 let all_pdqhashes: Vec<Option<[u8; 32]>> =
@@ -1736,8 +1745,8 @@ impl AppContext {
         entries: &[([u8; 32], IgnoredEntry)],
     ) -> Result<(usize, usize), DbError> {
         let txn = self.env.begin_write()?;
-        let mut entry_count = 0;
-        let mut pdqmap_count = 0;
+        let mut entry_count = 0usize;
+        let mut pdqmap_count = 0usize;
         let mut enc_buf = Vec::with_capacity(128);
 
         {
@@ -1748,14 +1757,14 @@ impl AppContext {
                 let bytes = entry.to_bytes()?;
                 Self::encrypt_into(&self.cipher, content_hash, &bytes, &mut enc_buf)?;
                 ignored_table.insert(content_hash, enc_buf.as_slice())?;
-                entry_count += 1;
+                entry_count = entry_count.saturating_add(1);
 
                 if let Some(ref pdqhash) = entry.pdqhash
                     && entry.group_uuid != [0u8; 16]
                 {
                     Self::encrypt_into(&self.cipher, pdqhash, &entry.group_uuid, &mut enc_buf)?;
                     pdqmap_table.insert(pdqhash, enc_buf.as_slice())?;
-                    pdqmap_count += 1;
+                    pdqmap_count = pdqmap_count.saturating_add(1);
                 }
             }
         }
@@ -1775,7 +1784,7 @@ impl AppContext {
     /// Returns [`DbError`] on serialization, encryption, or transaction failures.
     pub fn set_files_ignored(&self, content_hashes: &[[u8; 32]]) -> Result<usize, DbError> {
         let txn = self.env.begin_write()?;
-        let mut count = 0;
+        let mut count = 0usize;
         let mut enc_buf = Vec::with_capacity(128);
 
         {
@@ -1803,7 +1812,7 @@ impl AppContext {
                     let bytes = entry.to_bytes()?;
                     Self::encrypt_into(&self.cipher, ch, &bytes, &mut enc_buf)?;
                     table.insert(ch, enc_buf.as_slice())?;
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
         }
@@ -1847,14 +1856,14 @@ impl AppContext {
             let encrypted = encrypted_guard.value();
 
             let Some(decrypted) = self.decrypt_value(&content_hash, encrypted) else {
-                corrupt_count += 1;
+                corrupt_count = corrupt_count.saturating_add(1);
                 continue;
             };
             match IgnoredEntry::from_bytes(&decrypted) {
                 Ok(entry) if entry.ignored => results.push((content_hash, entry)),
                 Ok(_) => {},
                 Err(_) => {
-                    corrupt_count += 1;
+                    corrupt_count = corrupt_count.saturating_add(1);
                 },
             }
         }
@@ -1930,7 +1939,7 @@ impl AppContext {
         let wtxn = self.env.begin_write()?;
         let mut to_remove = Vec::new();
         let mut pdqhashes_to_remove = HashSet::new();
-        let mut count = 0;
+        let mut count = 0usize;
 
         {
             let mut ignored_table = wtxn.open_table(self.ignored_db)?;
@@ -1961,7 +1970,7 @@ impl AppContext {
 
             for ch in &to_remove {
                 if ignored_table.remove(ch)?.is_some() {
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
         }
@@ -1999,7 +2008,7 @@ impl AppContext {
     pub fn remove_ignored_by_pdqhash(&self, pdqhash: &[u8; 32]) -> Result<usize, DbError> {
         let wtxn = self.env.begin_write()?;
         let mut to_remove = Vec::new();
-        let mut count = 0;
+        let mut count = 0usize;
 
         {
             let mut ignored_table = wtxn.open_table(self.ignored_db)?;
@@ -2020,7 +2029,7 @@ impl AppContext {
 
             for ch in &to_remove {
                 if ignored_table.remove(ch)?.is_some() {
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
         }
@@ -2037,36 +2046,24 @@ impl AppContext {
     /// Format a UUID as a hyphenated string.
     #[must_use]
     pub fn format_uuid(uuid: &[u8; 16]) -> String {
-        let mut hex_buf = [0u8; 32];
-        let _ = hex::encode_to_slice(uuid, &mut hex_buf);
-        let hex_str = std::str::from_utf8(&hex_buf).unwrap_or("");
-        let mut out = String::with_capacity(36);
-        out.push_str(&hex_str[0..8]);
-        out.push('-');
-        out.push_str(&hex_str[8..12]);
-        out.push('-');
-        out.push_str(&hex_str[12..16]);
-        out.push('-');
-        out.push_str(&hex_str[16..20]);
-        out.push('-');
-        out.push_str(&hex_str[20..32]);
-        out
+        let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = *uuid;
+        format!(
+            "{a:02x}{b:02x}{c:02x}{d:02x}-{e:02x}{f:02x}-{g:02x}{h:02x}-{i:02x}{j:02x}-{k:02x}{l:02x}{m:02x}{n:02x}{o:02x}{p:02x}"
+        )
     }
 
     /// Parse a hyphenated UUID string back into bytes (accepts with or without hyphens).
     #[must_use]
     pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
         let mut hex_buf = [0u8; 32];
-        let mut idx = 0;
+        let mut idx = 0usize;
         for b in s.bytes() {
             if b == b'-' {
                 continue;
             }
-            if idx >= 32 {
-                return None;
-            }
-            hex_buf[idx] = b;
-            idx += 1;
+            let slot = hex_buf.get_mut(idx)?;
+            *slot = b;
+            idx = idx.saturating_add(1);
         }
         if idx != 32 {
             return None;

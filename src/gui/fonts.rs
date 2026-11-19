@@ -116,7 +116,7 @@ fn score_face(face: &FaceInfo, role: FontRole, orthography: &[&str]) -> Option<i
         // Sarasa ships every sub-family in one .ttc, so the sub-family word is a
         // far better signal than post.isFixedPitch — which is set on faces whose
         // Latin is proportional, and unset on some that are usable as monospace.
-        score += match role {
+        score = score.saturating_add(match role {
             FontRole::Monospace => {
                 if has("term") {
                     50 // terminal line metrics, CJK exactly 2x Latin advance
@@ -137,36 +137,36 @@ fn score_face(face: &FaceInfo, role: FontRole, orthography: &[&str]) -> Option<i
                     10 // a mono face works, it just isn't the intent
                 }
             },
-        };
+        });
         if has("slab") {
-            score -= 8; // stylistic variant, only if nothing else fits
+            score = score.saturating_sub(8); // stylistic variant, only if nothing else fits
         }
         // Earlier entries in the preference list win.
         if let Some(pos) = orthography.iter().position(|o| has(&o.to_ascii_lowercase())) {
-            score += 30 - (pos as i32 * 4);
+            score = score.saturating_add(30i32.saturating_sub((pos as i32).saturating_mul(4)));
         }
     } else {
         // Generic font: trust the tables, nudge with naming conventions.
         match role {
             FontRole::Monospace => {
-                score += if face.monospace { 40 } else { -20 };
+                score = score.saturating_add(if face.monospace { 40 } else { -20 });
                 if has("mono") || has("term") || has("fixed") {
-                    score += 10;
+                    score = score.saturating_add(10);
                 }
             },
             FontRole::Proportional => {
                 if face.monospace {
-                    score -= 15;
+                    score = score.saturating_sub(15);
                 }
             },
         }
         if has("regular") || has("book") {
-            score += 5;
+            score = score.saturating_add(5);
         }
     }
 
     if face.cjk {
-        score += 15;
+        score = score.saturating_add(15);
     }
 
     Some(score)

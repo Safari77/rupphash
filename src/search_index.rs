@@ -375,6 +375,7 @@ impl SearchIndex {
     }
 
     /// Get all indexed tag IDs
+    #[cfg(debug_assertions)]
     pub fn get_indexed_tags(&self) -> Vec<u16> {
         self.indexed_tags.iter().copied().collect()
     }
@@ -406,7 +407,10 @@ impl SearchIndex {
             if self.indexed_tags.contains(tag_id) {
                 let name = tag_id_to_name(*tag_id).unwrap_or("Unknown");
                 let values = self.get_tag_values(*tag_id);
-                eprintln!("\n  {name} sample values: {:?}", &values[..values.len().min(5)]);
+                eprintln!(
+                    "\n  {name} sample values: {:?}",
+                    values.get(..values.len().min(5)).unwrap_or(&[])
+                );
 
                 if let Some(list) = self.numeric_index.get(tag_id) {
                     let sample: Vec<_> = list.iter().take(5).map(|&(v, _)| v).collect();
@@ -497,7 +501,8 @@ impl SearchIndex {
                 // Find start of potential equality range
                 let start = list.partition_point(|&(v, _)| v < value - epsilon);
                 result.extend(
-                    list[start..]
+                    list.get(start..)
+                        .unwrap_or(&[])
                         .iter()
                         .take_while(|&&(v, _)| v <= value + epsilon)
                         .map(|&(_, idx)| idx),
@@ -505,15 +510,15 @@ impl SearchIndex {
             },
             SearchOp::LessThan => {
                 let end = list.partition_point(|&(v, _)| v < value);
-                result.extend(list[..end].iter().map(|&(_, idx)| idx));
+                result.extend(list.get(..end).unwrap_or(&[]).iter().map(|&(_, idx)| idx));
             },
             SearchOp::LessOrEqual => {
                 let end = list.partition_point(|&(v, _)| v <= value + epsilon);
-                result.extend(list[..end].iter().map(|&(_, idx)| idx));
+                result.extend(list.get(..end).unwrap_or(&[]).iter().map(|&(_, idx)| idx));
             },
             SearchOp::GreaterThan => {
                 let start = list.partition_point(|&(v, _)| v <= value);
-                result.extend(list[start..].iter().map(|&(_, idx)| idx));
+                result.extend(list.get(start..).unwrap_or(&[]).iter().map(|&(_, idx)| idx));
             },
             SearchOp::GreaterOrEqual => {
                 // partition_point needs the predicate true for the prefix and
@@ -521,7 +526,7 @@ impl SearchIndex {
                 // `v < value - epsilon` (true for values below the cutoff); the
                 // returned index is the first entry with v >= value - epsilon.
                 let start = list.partition_point(|&(v, _)| v < value - epsilon);
-                result.extend(list[start..].iter().map(|&(_, idx)| idx));
+                result.extend(list.get(start..).unwrap_or(&[]).iter().map(|&(_, idx)| idx));
             },
             _ => {},
         }
@@ -553,7 +558,11 @@ impl SearchIndex {
 
         let start = list.partition_point(|&(v, _)| v < min - epsilon);
         result.extend(
-            list[start..].iter().take_while(|&&(v, _)| v <= max + epsilon).map(|&(_, idx)| idx),
+            list.get(start..)
+                .unwrap_or(&[])
+                .iter()
+                .take_while(|&&(v, _)| v <= max + epsilon)
+                .map(|&(_, idx)| idx),
         );
         result
     }
@@ -657,7 +666,7 @@ impl SearchIndex {
     pub fn all_files(&self) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
         result.insert_range(0..self.file_count);
-        result -= &self.free_slots;
+        std::ops::SubAssign::sub_assign(&mut result, &self.free_slots);
         result
     }
 }
@@ -728,48 +737,48 @@ fn is_numeric_tag(tag_id: u16) -> bool {
 fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
     let parts: Vec<&str> = query.splitn(3, ':').collect();
 
-    if parts.is_empty() || parts[0].is_empty() {
+    let [tag_name, rest @ ..] = parts.as_slice() else {
+        return Err("Empty tag name".to_string());
+    };
+    if tag_name.is_empty() {
         return Err("Empty tag name".to_string());
     }
-
-    let tag_name = parts[0];
 
     // Try to resolve tag ID, with support for aliases
     let tag_id = resolve_tag_name(tag_name)
         .ok_or_else(|| format!("Unknown tag: '{tag_name}'. Use Make, Model, ISO, FocalLength, Country, SunAzimuth, SunAltitude, etc."))?;
 
-    if parts.len() == 1 {
-        return Err(format!("Missing value for tag '{tag_name}'. Use format: {tag_name}:value"));
-    }
+    let (op_str, value) = match rest {
+        [] => {
+            return Err(format!(
+                "Missing value for tag '{tag_name}'. Use format: {tag_name}:value"
+            ));
+        },
+        [value] => {
+            // Range/numeric interpretation only applies to numeric tags. For string
+            // tags a hyphen is part of the literal value (e.g. "LensModel:24-70mm"
+            // is a lens name, not a 24..70 range), so we skip straight to the
+            // string-search fallback below to avoid returning zero results.
+            if is_numeric_tag(tag_id) {
+                // Use extract_number_from_string to handle ranges like "f/2.8-f/11"
+                if let Some((min, max)) = parse_range_value(value) {
+                    return Ok(SearchCriterion::with_range(tag_id, min, max));
+                }
 
-    if parts.len() == 2 {
-        let value = parts[1];
-
-        // Range/numeric interpretation only applies to numeric tags. For string
-        // tags a hyphen is part of the literal value (e.g. "LensModel:24-70mm"
-        // is a lens name, not a 24..70 range), so we skip straight to the
-        // string-search fallback below to avoid returning zero results.
-        if is_numeric_tag(tag_id) {
-            // Use extract_number_from_string to handle ranges like "f/2.8-f/11"
-            if let Some((min, max)) = parse_range_value(value) {
-                return Ok(SearchCriterion::with_range(tag_id, min, max));
+                // Try to parse as number first using the robust extractor.
+                // This handles "f/2.8", "1/125", "ISO 100" -> converts to numeric Equals search.
+                if let Some(num) = extract_number_from_string(value) {
+                    return Ok(SearchCriterion::new(tag_id, SearchOp::Equals, num.to_string()));
+                }
             }
 
-            // Try to parse as number first using the robust extractor.
-            // This handles "f/2.8", "1/125", "ISO 100" -> converts to numeric Equals search.
-            if let Some(num) = extract_number_from_string(value) {
-                return Ok(SearchCriterion::new(tag_id, SearchOp::Equals, num.to_string()));
-            }
-        }
-
-        // Fallback to standard parse or contains
-        let op = if value.parse::<f64>().is_ok() { SearchOp::Equals } else { SearchOp::Contains };
-        return Ok(SearchCriterion::new(tag_id, op, value.to_string()));
-    }
-
-    // parts.len() == 3: "tag:op:value"
-    let op_str = parts[1];
-    let value = parts[2];
+            // Fallback to standard parse or contains
+            let op =
+                if value.parse::<f64>().is_ok() { SearchOp::Equals } else { SearchOp::Contains };
+            return Ok(SearchCriterion::new(tag_id, op, (*value).to_string()));
+        },
+        [op_str, value, ..] => (*op_str, *value),
+    };
 
     let op = match op_str {
         "=" | "==" | "eq" => SearchOp::Equals,
@@ -803,10 +812,10 @@ fn parse_single_criterion(query: &str) -> Result<SearchCriterion, String> {
 pub fn parse_range_value(value: &str) -> Option<(String, String)> {
     // Skip the first character to avoid splitting negative numbers at the leading sign (e.g. "-5")
     for (i, c) in value.char_indices().skip(1) {
-        if c == '-' {
-            let min_str = &value[..i];
-            let max_str = &value[i + 1..];
-
+        if c == '-'
+            && let (Some(min_str), Some(max_str)) =
+                (value.get(..i), value.get(i.saturating_add(1)..))
+        {
             // Check 1: Parse Min
             let min_val = extract_number_from_string(min_str);
 

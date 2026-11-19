@@ -79,7 +79,7 @@ fn truncate_to_width(
                 let truncated = format!("{}…", &text[..cut_index]);
                 return (truncated, true);
             }
-            byte_offset += glyph.chr.len_utf8();
+            byte_offset = byte_offset.saturating_add(glyph.chr.len_utf8());
         }
     }
 
@@ -322,8 +322,8 @@ impl GuiApp {
         let start = Instant::now();
 
         self.search_index.clear();
-        let mut indexed = 0;
-        let mut missing_features = 0;
+        let mut indexed = 0usize;
+        let mut missing_features = 0usize;
 
         for group in &self.state.groups {
             for file in group {
@@ -336,10 +336,10 @@ impl GuiApp {
                 match self.ctx.get_features(&file.content_hash) {
                     Ok(Some(features)) => {
                         self.search_index.insert(file.unique_file_id, &features);
-                        indexed += 1;
+                        indexed = indexed.saturating_add(1);
                     },
                     Ok(None) => {
-                        missing_features += 1;
+                        missing_features = missing_features.saturating_add(1);
                     },
                     Err(e) => {
                         eprintln!(
@@ -533,7 +533,6 @@ impl GuiApp {
     }
 
     /// Create a new GuiApp for view mode (image browser without duplicate detection)
-    #[must_use]
     pub fn new_view_mode(
         paths: Vec<String>,
         sort_order: String,
@@ -541,7 +540,7 @@ impl GuiApp {
         use_trash: bool,
         use_raw_thumbnails: bool,
         view_flatten: bool,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let mut state = AppState::new(
             Vec::new(),
             Vec::new(),
@@ -583,7 +582,7 @@ impl GuiApp {
             calc_pixel_hash: false,
         };
 
-        let ctx = crate::db::AppContext::new().expect("Failed to create context");
+        let ctx = crate::db::AppContext::new()?;
         let mut app = Self::from_parts(ctx, state, scan_config, use_raw_thumbnails);
 
         // Start database writer for view mode
@@ -643,7 +642,7 @@ impl GuiApp {
         app.dir_total_count = dir_total_count;
         app.scan_progress_rx = scan_progress_rx;
 
-        app
+        Ok(app)
     }
 
     #[must_use]
@@ -770,14 +769,14 @@ impl GuiApp {
                     true
                 }
             });
-            total_removed += before - group.len();
+            total_removed = total_removed.saturating_add(before.saturating_sub(group.len()));
         }
 
         if total_removed > 0 {
-            let mut idx = 0;
+            let mut idx = 0usize;
             infos.retain(|_| {
                 let keep = groups.get(idx).is_none_or(|g| g.len() >= 2);
-                idx += 1;
+                idx = idx.saturating_add(1);
                 keep
             });
             groups.retain(|g| g.len() >= 2);
@@ -1019,11 +1018,12 @@ impl GuiApp {
                 .map(|f| f.path.clone());
 
             // Snapshot existing metadata by inode to preserve resolution/hashes across refreshes
-            let existing: HashMap<u128, FileMetadata> = if !self.state.groups.is_empty() {
-                self.state.groups[0].iter().map(|f| (f.unique_file_id, f.clone())).collect()
-            } else {
-                HashMap::new()
-            };
+            let existing: HashMap<u128, FileMetadata> = self
+                .state
+                .groups
+                .first()
+                .map(|g| g.iter().map(|f| (f.unique_file_id, f.clone())).collect())
+                .unwrap_or_default();
 
             self.subdirs.clear();
             let mut new_files = Vec::new();
@@ -1114,7 +1114,11 @@ impl GuiApp {
                 // Restore selection: find the previously-viewed file in the new sorted list
                 let group_len = self.state.groups.first().map_or(0, |g| g.len());
                 if let Some(ref prev) = prev_path {
-                    if let Some(new_idx) = self.state.groups[0].iter().position(|f| f.path == *prev)
+                    if let Some(new_idx) = self
+                        .state
+                        .groups
+                        .first()
+                        .and_then(|g| g.iter().position(|f| f.path == *prev))
                     {
                         self.state.current_file_idx = new_idx;
                     } else {
@@ -1318,7 +1322,7 @@ impl GuiApp {
                     self.set_status(format!("FS: {}", parts.join("; ")), false);
                 }
             } else {
-                let remaining = debounce_dur - time_since;
+                let remaining = debounce_dur.saturating_sub(time_since);
                 ctx.request_repaint_after(remaining);
             }
         }
@@ -1380,13 +1384,15 @@ impl GuiApp {
                         .group_infos
                         .push(GroupInfo { max_dist: 0, status: GroupStatus::None });
                 }
-                self.state.groups[0].extend(new_files);
+                if let Some(first_group) = self.state.groups.first_mut() {
+                    first_group.extend(new_files);
+                }
                 self.cache_dirty = true;
                 needs_repaint = true;
             }
 
             if needs_repaint {
-                self.state.last_file_count = self.state.groups[0].len();
+                self.state.last_file_count = self.state.groups.first().map_or(0, Vec::len);
             }
         }
 
@@ -1506,11 +1512,12 @@ impl GuiApp {
                 self.state.current_file_idx = 0;
             } else {
                 if self.state.current_group_idx >= self.state.groups.len() {
-                    self.state.current_group_idx = self.state.groups.len() - 1;
+                    self.state.current_group_idx = self.state.groups.len().saturating_sub(1);
                     self.state.current_file_idx = 0; // Reset file index if we jumped groups
                 }
                 // Also check file index bounds for the current group
-                let group_len = self.state.groups[self.state.current_group_idx].len();
+                let group_len =
+                    self.state.groups.get(self.state.current_group_idx).map_or(0, Vec::len);
                 if self.state.current_file_idx >= group_len {
                     self.state.current_file_idx = group_len.saturating_sub(1);
                 }
@@ -1538,8 +1545,8 @@ impl GuiApp {
 
     pub(super) fn get_title_string(&self) -> String {
         if self.state.view_mode {
-            let dir_count = self.subdirs.len()
-                + if self.current_dir.as_ref().and_then(|c| c.parent()).is_some() { 1 } else { 0 };
+            let has_parent = self.current_dir.as_ref().and_then(|c| c.parent()).is_some();
+            let dir_count = self.subdirs.len().saturating_add(usize::from(has_parent));
             if dir_count > 0 {
                 format!(
                     "{} | Dirs: {} | Files: {}",
@@ -1592,22 +1599,22 @@ impl GuiApp {
         let mut paths_to_preload: Vec<(std::path::PathBuf, bool, usize, usize)> = Vec::new(); // (path, is_current)
 
         // Single group mode (--view) or multiple groups mode (duplicate finder)
-        if self.state.groups.len() == 1 {
+        if let [group] = self.state.groups.as_slice() {
             // Original behavior: preload within the single group
-            let group = &self.state.groups[0];
             let half = preload_limit / 2;
             let start = current_f.saturating_sub(half);
-            let end = (start + preload_limit).min(group.len());
-            let start =
-                if end - start < preload_limit { end.saturating_sub(preload_limit) } else { start };
+            let end = start.saturating_add(preload_limit).min(group.len());
+            let start = if end.saturating_sub(start) < preload_limit {
+                end.saturating_sub(preload_limit)
+            } else {
+                start
+            };
 
             for (i, file) in group.iter().enumerate().take(end).skip(start) {
                 paths_to_preload.push((file.path.clone(), i == current_f, 0, i));
             }
-        } else {
+        } else if let Some(current_group) = self.state.groups.get(current_g) {
             // Multiple groups: preload current group + files from nearby groups
-            let current_group = &self.state.groups[current_g];
-
             // Add all files from current group (these are most important)
             for (i, file) in current_group.iter().enumerate() {
                 paths_to_preload.push((file.path.clone(), i == current_f, current_g, i));
@@ -1621,30 +1628,32 @@ impl GuiApp {
                 let mut extra_paths = Vec::new();
 
                 // Next group(s)
-                let mut next_g = current_g + 1;
-                let mut slots_left = remaining / 2 + remaining % 2; // Give slightly more to next
-                while next_g < self.state.groups.len() && slots_left > 0 {
-                    let group = &self.state.groups[next_g];
+                let mut next_g = current_g.saturating_add(1);
+                let mut slots_left = (remaining / 2).saturating_add(remaining % 2); // Give slightly more to next
+                while let Some(group) = self.state.groups.get(next_g)
+                    && slots_left > 0
+                {
                     for (i, file) in group.iter().enumerate().take(slots_left) {
                         extra_paths.push((file.path.clone(), false, next_g, i));
-                        slots_left -= 1;
+                        slots_left = slots_left.saturating_sub(1);
                     }
-                    next_g += 1;
+                    next_g = next_g.saturating_add(1);
                 }
 
                 // Previous group(s)
                 slots_left = remaining / 2;
                 let mut prev_g = current_g.saturating_sub(1);
                 while prev_g < current_g && slots_left > 0 {
-                    let group = &self.state.groups[prev_g];
-                    for (i, file) in group.iter().enumerate().take(slots_left) {
-                        extra_paths.push((file.path.clone(), false, prev_g, i));
-                        slots_left -= 1;
+                    if let Some(group) = self.state.groups.get(prev_g) {
+                        for (i, file) in group.iter().enumerate().take(slots_left) {
+                            extra_paths.push((file.path.clone(), false, prev_g, i));
+                            slots_left = slots_left.saturating_sub(1);
+                        }
                     }
                     if prev_g == 0 {
                         break;
                     }
-                    prev_g -= 1;
+                    prev_g = prev_g.saturating_sub(1);
                 }
 
                 paths_to_preload.extend(extra_paths);
@@ -1690,13 +1699,12 @@ impl GuiApp {
         // We preload a tight window (active_window_paths) to save CPU,
         // but we RETAIN a much wider window in RAM so going backwards doesn't thrash.
         let mut retention_paths = active_window_paths;
-        let retention_limit = preload_limit * 3; // Keep 3x as many files in RAM as we actively preload
+        let retention_limit = preload_limit.saturating_mul(3); // Keep 3x as many files in RAM as we actively preload
 
-        if self.state.groups.len() == 1 {
-            let group = &self.state.groups[0];
+        if let [group] = self.state.groups.as_slice() {
             let half_ret = retention_limit / 2;
             let start = current_f.saturating_sub(half_ret);
-            let end = (start + retention_limit).min(group.len());
+            let end = start.saturating_add(retention_limit).min(group.len());
 
             for file in group.iter().take(end).skip(start) {
                 retention_paths.insert(file.path.clone());
@@ -1704,7 +1712,7 @@ impl GuiApp {
         } else {
             // Multiple groups (Duplicate Mode): Retain current group + 2 groups adjacent
             let start_g = current_g.saturating_sub(2);
-            let end_g = (current_g + 3).min(self.state.groups.len());
+            let end_g = current_g.saturating_add(3).min(self.state.groups.len());
             for group in self.state.groups.iter().take(end_g).skip(start_g) {
                 for file in group {
                     retention_paths.insert(file.path.clone());
@@ -2193,7 +2201,9 @@ impl GuiApp {
                                 );
                                 self.retry_after.insert(
                                     path.clone(),
-                                    Instant::now() + Duration::from_millis(500),
+                                    Instant::now()
+                                        .checked_add(Duration::from_millis(500))
+                                        .unwrap_or_else(Instant::now),
                                 );
                             } else {
                                 self.failed_images.insert(path.clone(), err_msg);
@@ -2233,8 +2243,9 @@ impl GuiApp {
                         let start_idx = group.len();
                         group.extend(batch);
                         // Update file_index for new files
-                        for (i, file) in group[start_idx..].iter().enumerate() {
-                            self.file_index.insert(file.unique_file_id, start_idx + i);
+                        for (i, file) in group.iter().skip(start_idx).enumerate() {
+                            self.file_index
+                                .insert(file.unique_file_id, start_idx.saturating_add(i));
                         }
                     }
                     self.cache_dirty = true;
@@ -2265,7 +2276,7 @@ impl GuiApp {
                         let current_idx = self.state.current_file_idx;
                         files_to_enrich.sort_by_key(|(_, uid, _, _)| {
                             let f_idx = self.file_index.get(uid).copied().unwrap_or(0);
-                            (f_idx as i64 - current_idx as i64).abs()
+                            f_idx.abs_diff(current_idx)
                         });
 
                         if !files_to_enrich.is_empty() {
@@ -2468,9 +2479,8 @@ impl GuiApp {
                 // Format filename with [current_3dlut] prefix if --3dlut is enabled
                 let filename_display = if self.state.lut_enabled
                     && self.state.has_lut
-                    && !self.state.lut_names.is_empty()
+                    && let Some(current_lut_name) = self.state.lut_names.get(self.state.lut_index)
                 {
-                    let current_lut_name = &self.state.lut_names[self.state.lut_index];
                     format!("[{}] {}", current_lut_name, filename)
                 } else {
                     filename
@@ -2490,7 +2500,10 @@ impl GuiApp {
                 let del_key = if self.state.view_mode { " | [Del]ete" } else { "" };
 
                 let rot_str = if !self.state.manual_rotation.is_multiple_of(4) {
-                    format!(" | [O] Rot: {}°", (self.state.manual_rotation % 4) * 90)
+                    format!(
+                        " | [O] Rot: {}°",
+                        u16::from(self.state.manual_rotation % 4).saturating_mul(90)
+                    )
                 } else {
                     String::new()
                 };
@@ -2507,9 +2520,9 @@ impl GuiApp {
                         .iter()
                         .take(self.state.current_group_idx)
                         .map(Vec::len)
-                        .sum::<usize>()
-                        + self.state.current_file_idx
-                        + 1;
+                        .fold(0usize, usize::saturating_add)
+                        .saturating_add(self.state.current_file_idx)
+                        .saturating_add(1);
                     format!(" [{}/{}]", current, total)
                 } else {
                     String::new()
@@ -2700,15 +2713,17 @@ impl GuiApp {
                 ui.painter().rect_filled(rect, 2.0, ui.visuals().widgets.hovered.bg_fill);
             }
 
+            let lc = rect.left_center();
             ui.painter().text(
-                rect.left_center() + egui::vec2(4.0, 0.0),
+                egui::pos2(lc.x + 4.0, lc.y),
                 egui::Align2::LEFT_CENTER,
                 "\u{1f4c1} ..",
                 egui::FontId::default(),
                 egui::Color32::YELLOW,
             );
+            let rc = rect.right_center();
             ui.painter().text(
-                rect.right_center() - egui::vec2(4.0, 0.0),
+                egui::pos2(rc.x - 4.0, rc.y),
                 egui::Align2::RIGHT_CENTER,
                 mod_time_str,
                 egui::FontId::new(10.0, egui::FontFamily::Monospace),
@@ -2721,7 +2736,7 @@ impl GuiApp {
             if is_selected && scroll_to_dir {
                 resp.scroll_to_me(Some(egui::Align::Center));
             }
-            dir_idx += 1;
+            dir_idx = dir_idx.saturating_add(1);
         }
 
         // --- 2. Render Subdirectories ---
@@ -2777,8 +2792,9 @@ impl GuiApp {
                     font_id.clone(),
                     egui::Color32::LIGHT_BLUE,
                 );
+                let lc = rect.left_center();
                 ui.painter().galley(
-                    rect.left_center() + egui::vec2(4.0, -main_galley.rect.height() / 2.0),
+                    egui::pos2(lc.x + 4.0, lc.y - main_galley.rect.height() / 2.0),
                     main_galley,
                     egui::Color32::LIGHT_BLUE,
                 );
@@ -2801,8 +2817,9 @@ impl GuiApp {
                     egui::Color32::GRAY,
                 );
             } else {
+                let lc = rect.left_center();
                 ui.painter().text(
-                    rect.left_center() + egui::vec2(4.0, 0.0),
+                    egui::pos2(lc.x + 4.0, lc.y),
                     egui::Align2::LEFT_CENTER,
                     format!("{}{}", folder_prefix, display_dir_name),
                     font_id,
@@ -2810,8 +2827,9 @@ impl GuiApp {
                 );
             }
 
+            let rc = rect.right_center();
             ui.painter().text(
-                rect.right_center() - egui::vec2(4.0, 0.0),
+                egui::pos2(rc.x - 4.0, rc.y),
                 egui::Align2::RIGHT_CENTER,
                 mod_time_str,
                 time_font,
@@ -2824,7 +2842,7 @@ impl GuiApp {
             if is_selected && scroll_to_dir {
                 resp.scroll_to_me(Some(egui::Align::Center));
             }
-            dir_idx += 1;
+            dir_idx = dir_idx.saturating_add(1);
         }
 
         if !self.subdirs_cache.is_empty() || self.parent_cache.is_some() {
@@ -3125,7 +3143,9 @@ impl GuiApp {
         let start_y = files_start_pos.y;
 
         for (g_idx, group) in self.state.groups.iter().enumerate().skip(start_idx) {
-            let group_y = self.group_y_offsets[g_idx];
+            let Some(&group_y) = self.group_y_offsets.get(g_idx) else {
+                break;
+            };
             let mut current_y = start_y + group_y;
 
             if current_y > clip_rect.max.y {
@@ -3133,24 +3153,23 @@ impl GuiApp {
             }
 
             // Render Header
-            if show_headers {
-                let info = &self.state.group_infos[g_idx];
+            if show_headers && let Some(info) = self.state.group_infos.get(g_idx) {
                 let header_rect = egui::Rect::from_min_size(
                     egui::pos2(files_start_pos.x, current_y),
                     egui::vec2(list_width, header_height),
                 );
 
                 if ui.is_rect_visible(header_rect) {
+                    let g_num = g_idx.saturating_add(1);
                     let (mut txt, col) = match info.status {
                         GroupStatus::AllIdentical => {
-                            (format!("Group {} - Bit-identical", g_idx + 1), egui::Color32::GREEN)
+                            (format!("Group {g_num} - Bit-identical"), egui::Color32::GREEN)
                         },
-                        GroupStatus::SomeIdentical => (
-                            format!("Group {} - Some Identical", g_idx + 1),
-                            egui::Color32::LIGHT_GREEN,
-                        ),
+                        GroupStatus::SomeIdentical => {
+                            (format!("Group {g_num} - Some Identical"), egui::Color32::LIGHT_GREEN)
+                        },
                         GroupStatus::None => (
-                            format!("Group {} (Dist: {})", g_idx + 1, info.max_dist),
+                            format!("Group {g_num} (Dist: {})", info.max_dist),
                             egui::Color32::YELLOW,
                         ),
                     };
@@ -3694,23 +3713,40 @@ impl GuiApp {
                 } else {
                     // 0b. Check Animation Cache (animated WebP etc.)
                     // Extract animation frame data first to avoid borrow conflicts
-                    let anim_frame_info = if let Some(anim) = self.animation_cache.get_mut(&path) {
+                    let anim_frame_info = if let Some(anim) = self.animation_cache.get_mut(&path)
+                        && !anim.frames.is_empty()
+                    {
                         // Advance frame based on elapsed time
                         let now = Instant::now();
                         let elapsed = now.duration_since(anim.last_frame_time);
-                        let current_duration = anim.frame_durations[anim.current_frame];
+                        let current_duration = anim
+                            .frame_durations
+                            .get(anim.current_frame)
+                            .copied()
+                            .unwrap_or_else(|| Duration::from_millis(100));
 
                         if elapsed >= current_duration {
-                            anim.current_frame = (anim.current_frame + 1) % anim.frames.len();
+                            anim.current_frame = anim
+                                .current_frame
+                                .saturating_add(1)
+                                .checked_rem(anim.frames.len())
+                                .unwrap_or(0);
                             anim.last_frame_time = now;
                         }
 
-                        let texture_id = anim.frames[anim.current_frame].id();
-                        let texture_size = anim.frames[anim.current_frame].size_vec2();
-                        let next_duration = anim.frame_durations[anim.current_frame];
-                        let last_frame_time = anim.last_frame_time;
-
-                        Some((texture_id, texture_size, next_duration, last_frame_time))
+                        if let Some(frame) = anim.frames.get(anim.current_frame) {
+                            let texture_id = frame.id();
+                            let texture_size = frame.size_vec2();
+                            let next_duration = anim
+                                .frame_durations
+                                .get(anim.current_frame)
+                                .copied()
+                                .unwrap_or(current_duration);
+                            let last_frame_time = anim.last_frame_time;
+                            Some((texture_id, texture_size, next_duration, last_frame_time))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     };

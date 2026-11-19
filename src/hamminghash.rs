@@ -27,7 +27,7 @@ impl HammingHash for u64 {
 
     #[inline(always)]
     fn get_chunk(&self, chunk_idx: usize) -> u16 {
-        ((self >> (chunk_idx * 8)) & 0xFF) as u16
+        self.to_le_bytes().get(chunk_idx).copied().unwrap_or(0) as u16
     }
 
     #[inline(always)]
@@ -48,8 +48,8 @@ impl HammingHash for [u8; 32] {
 
     #[inline(always)]
     fn get_chunk(&self, chunk_idx: usize) -> u16 {
-        let offset = chunk_idx * 2;
-        u16::from_le_bytes([self[offset], self[offset + 1]])
+        let (chunks, _) = self.as_chunks::<2>();
+        chunks.get(chunk_idx).map_or(0, |&c| u16::from_le_bytes(c))
     }
 
     #[inline(always)]
@@ -93,21 +93,25 @@ pub struct MIHIndex<H: HammingHash> {
 
 impl<H: HammingHash> MIHIndex<H> {
     pub fn new(hashes: Vec<H>) -> Self {
-        let num_buckets = H::NUM_CHUNKS * H::NUM_BUCKETS;
-        let mut offsets = vec![0u32; num_buckets + 1];
+        let num_buckets = H::NUM_CHUNKS.saturating_mul(H::NUM_BUCKETS);
+        let mut offsets = vec![0u32; num_buckets.saturating_add(1)];
 
         // Count phase
         for h in &hashes {
             for k in 0..H::NUM_CHUNKS {
                 let bucket = h.get_chunk(k) as usize;
-                let flat = k * H::NUM_BUCKETS + bucket;
-                offsets[flat + 1] += 1;
+                let flat = k.saturating_mul(H::NUM_BUCKETS).saturating_add(bucket);
+                if let Some(slot) = offsets.get_mut(flat.saturating_add(1)) {
+                    *slot = slot.saturating_add(1);
+                }
             }
         }
 
         // Prefix sum
-        for i in 1..offsets.len() {
-            offsets[i] += offsets[i - 1];
+        let mut running = 0u32;
+        for slot in &mut offsets {
+            running = running.saturating_add(*slot);
+            *slot = running;
         }
 
         let total_entries = offsets.last().copied().unwrap_or(0) as usize;
@@ -119,10 +123,14 @@ impl<H: HammingHash> MIHIndex<H> {
             let dense = DenseId(i as u32);
             for k in 0..H::NUM_CHUNKS {
                 let bucket = h.get_chunk(k) as usize;
-                let flat = k * H::NUM_BUCKETS + bucket;
-                let pos = cursor[flat] as usize;
-                values[pos] = dense;
-                cursor[flat] += 1;
+                let flat = k.saturating_mul(H::NUM_BUCKETS).saturating_add(bucket);
+                if let Some(cursor_slot) = cursor.get_mut(flat) {
+                    let pos = *cursor_slot as usize;
+                    if let Some(val_slot) = values.get_mut(pos) {
+                        *val_slot = dense;
+                    }
+                    *cursor_slot = cursor_slot.saturating_add(1);
+                }
             }
         }
 
@@ -135,15 +143,18 @@ impl<H: HammingHash> MIHIndex<H> {
 
     #[inline(always)]
     pub fn bucket(&self, chunk: usize, value: u16) -> &[DenseId] {
-        let flat = chunk * H::NUM_BUCKETS + value as usize;
-        let start = self.offsets[flat] as usize;
-        let end = self.offsets[flat + 1] as usize;
-        &self.values[start..end]
+        let flat = chunk.saturating_mul(H::NUM_BUCKETS).saturating_add(value as usize);
+        let Some((&start, &end)) =
+            self.offsets.get(flat).zip(self.offsets.get(flat.saturating_add(1)))
+        else {
+            return &[];
+        };
+        self.values.get(start as usize..end as usize).unwrap_or(&[])
     }
 
     #[inline(always)]
-    pub fn hash(&self, id: DenseId) -> &H {
-        &self.db_hashes[id.index()]
+    pub fn hash(&self, id: DenseId) -> Option<&H> {
+        self.db_hashes.get(id.index())
     }
 
     #[inline(always)]
@@ -175,7 +186,9 @@ impl SparseBitSet {
         let bit = idx % 64;
         let mask = 1u64 << bit;
 
-        let word = &mut self.data[word_idx];
+        let Some(word) = self.data.get_mut(word_idx) else {
+            return true;
+        };
         let was_set = (*word & mask) != 0;
 
         if !was_set {
@@ -191,7 +204,9 @@ impl SparseBitSet {
     #[inline(always)]
     pub fn clear(&mut self) {
         for &idx in &self.dirty {
-            self.data[idx] = 0;
+            if let Some(word) = self.data.get_mut(idx) {
+                *word = 0;
+            }
         }
         self.dirty.clear();
     }
@@ -199,7 +214,7 @@ impl SparseBitSet {
 
 pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Vec<u32>> {
     let n = index.len();
-    let chunk_tolerance = max_dist / H::NUM_CHUNKS as u32;
+    let chunk_tolerance = max_dist.checked_div(H::NUM_CHUNKS as u32).unwrap_or(0);
     let bits_per_chunk = H::bit_width_per_chunk();
 
     let adjacency: Vec<Vec<u32>> = (0..n)
@@ -209,7 +224,9 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
             |visited, i| {
                 visited.clear();
                 let mut results = Vec::new();
-                let query_hash = index.hash(DenseId(i as u32));
+                let Some(query_hash) = index.hash(DenseId(i as u32)) else {
+                    return results;
+                };
 
                 for k in 0..H::NUM_CHUNKS {
                     let q_chunk = query_hash.get_chunk(k);
@@ -222,8 +239,9 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
                                 continue;
                             }
 
-                            let cand_hash = index.hash(dense);
-                            if query_hash.hamming_distance(cand_hash) <= max_dist {
+                            if let Some(cand_hash) = index.hash(dense)
+                                && query_hash.hamming_distance(cand_hash) <= max_dist
+                            {
                                 results.push(dense_idx as u32);
                             }
                         }
@@ -248,17 +266,21 @@ pub fn find_groups<H: HammingHash>(index: &MIHIndex<H>, max_dist: u32) -> Vec<Ve
     let mut groups = Vec::new();
 
     for (i, neighbors) in adjacency.iter().enumerate() {
-        if visited[i] || neighbors.is_empty() {
+        if neighbors.is_empty() || visited.get(i).copied().unwrap_or(true) {
             continue;
         }
 
         let mut group = vec![i as u32];
-        visited[i] = true;
+        if let Some(v) = visited.get_mut(i) {
+            *v = true;
+        }
 
         for &neighbor in neighbors {
             let idx = neighbor as usize;
-            if !visited[idx] {
-                visited[idx] = true;
+            if let Some(v) = visited.get_mut(idx)
+                && !*v
+            {
+                *v = true;
                 group.push(neighbor);
             }
         }

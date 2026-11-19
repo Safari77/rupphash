@@ -31,7 +31,13 @@ fn main() {
     let args = Args::parse();
     let filename = &args.filename;
 
-    let file = File::open(filename).expect("Cannot open file");
+    let file = match File::open(filename) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Cannot open file '{}': {}", filename, e);
+            std::process::exit(1);
+        },
+    };
     let mut bufreader = BufReader::new(file);
     let exif_reader = Reader::new();
 

@@ -67,16 +67,18 @@ impl DctPhash {
         //    because it represents flat luminance. We exclude it here for better robustness.
         let mut sorted = low_freqs.clone();
         // Remove DC term (0) for median calc
-        sorted.remove(0);
+        if !sorted.is_empty() {
+            sorted.remove(0);
+        }
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = sorted[sorted.len() / 2];
+        let median = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
 
         // 6. Generate Hash bits
         let mut hash: u64 = 0;
-        for (i, &val) in low_freqs.iter().enumerate() {
+        for (i, &val) in low_freqs.iter().take(64).enumerate() {
             if val > median {
                 // Set bit i (Big Endian style mapping: bit 63 is (0,0), bit 0 is (7,7))
-                hash |= 1 << (63 - i);
+                hash |= 1u64 << 63usize.saturating_sub(i);
             }
         }
 
@@ -121,9 +123,10 @@ impl DctPhash {
     /// Helper: Extract 8x8 crop from 32x32 buffer
     fn crop_8x8(&self, full_dct: &[f32]) -> Vec<f32> {
         let mut crop = Vec::with_capacity(HASH_SIZE * HASH_SIZE);
-        for y in 0..HASH_SIZE {
-            let start = y * DCT_SIZE;
-            crop.extend_from_slice(&full_dct[start..start + HASH_SIZE]);
+        for row in full_dct.as_chunks::<DCT_SIZE>().0.iter().take(HASH_SIZE) {
+            if let Some(slice) = row.get(..HASH_SIZE) {
+                crop.extend_from_slice(slice);
+            }
         }
         crop
     }
@@ -150,22 +153,22 @@ pub fn calculate_rotation_invariant_hash(hash: u64) -> u64 {
 /// In pHash, sign reversal flips the bit relative to the median (assuming median approx 0).
 pub fn rotate_hash_90(hash: u64) -> u64 {
     let mut result = 0u64;
-    for y in 0..8 {
-        for x in 0..8 {
-            let src_idx = 8 * y + x;
+    for y in 0u32..8 {
+        for x in 0u32..8 {
+            let src_idx = 8u32.wrapping_mul(y).wrapping_add(x);
 
             // Transpose indices: (x, y) -> (y, x)
             let dst_x = y;
             let dst_y = x;
-            let dst_idx = 8 * dst_y + dst_x;
+            let dst_idx = 8u32.wrapping_mul(dst_y).wrapping_add(dst_x);
 
-            let bit = (hash >> (63 - src_idx)) & 1;
+            let bit = (hash >> 63u32.wrapping_sub(src_idx)) & 1;
 
             // Logic: Rot90 implies sign change on odd horizontal frequencies.
             let flip = dst_x % 2 != 0;
 
             let final_bit = if flip { bit ^ 1 } else { bit };
-            result |= final_bit << (63 - dst_idx);
+            result |= final_bit << 63u32.wrapping_sub(dst_idx);
         }
     }
     result
@@ -175,15 +178,16 @@ pub fn rotate_hash_90(hash: u64) -> u64 {
 /// Logic: Sign change on (x+y) odd. No transpose.
 pub fn rotate_hash_180(hash: u64) -> u64 {
     let mut result = 0u64;
-    for i in 0..64 {
+    for i in 0u32..64 {
         let x = i % 8;
         let y = i / 8;
 
-        let flip = (x + y) % 2 != 0;
-        let bit = (hash >> (63 - i)) & 1;
+        let flip = x.wrapping_add(y) % 2 != 0;
+        let shift = 63u32.wrapping_sub(i);
+        let bit = (hash >> shift) & 1;
 
         let final_bit = if flip { bit ^ 1 } else { bit };
-        result |= final_bit << (63 - i);
+        result |= final_bit << shift;
     }
     result
 }
@@ -191,22 +195,22 @@ pub fn rotate_hash_180(hash: u64) -> u64 {
 /// Rotates a DCT pHash by 270 degrees clockwise (90 CCW).
 pub fn rotate_hash_270(hash: u64) -> u64 {
     let mut result = 0u64;
-    for y in 0..8 {
-        for x in 0..8 {
-            let src_idx = 8 * y + x;
+    for y in 0u32..8 {
+        for x in 0u32..8 {
+            let src_idx = 8u32.wrapping_mul(y).wrapping_add(x);
 
             // Transpose
             let dst_x = y;
             let dst_y = x;
-            let dst_idx = 8 * dst_y + dst_x;
+            let dst_idx = 8u32.wrapping_mul(dst_y).wrapping_add(dst_x);
 
-            let bit = (hash >> (63 - src_idx)) & 1;
+            let bit = (hash >> 63u32.wrapping_sub(src_idx)) & 1;
 
             // Logic: Sign change on odd vertical frequencies
             let flip = dst_y % 2 != 0;
 
             let final_bit = if flip { bit ^ 1 } else { bit };
-            result |= final_bit << (63 - dst_idx);
+            result |= final_bit << 63u32.wrapping_sub(dst_idx);
         }
     }
     result
@@ -218,14 +222,16 @@ pub fn rotate_hash_270(hash: u64) -> u64 {
 
 /// Flips a DCT pHash horizontally.
 /// Logic: Horizontal flip changes sign of odd horizontal frequencies.
+#[allow(dead_code)]
 pub fn flip_hash_horizontal(hash: u64) -> u64 {
     let mut result = 0u64;
-    for i in 0..64 {
+    for i in 0u32..64 {
         let x = i % 8;
         let flip = x % 2 != 0;
-        let bit = (hash >> (63 - i)) & 1;
+        let shift = 63u32.wrapping_sub(i);
+        let bit = (hash >> shift) & 1;
         let final_bit = if flip { bit ^ 1 } else { bit };
-        result |= final_bit << (63 - i);
+        result |= final_bit << shift;
     }
     result
 }
@@ -240,6 +246,7 @@ pub fn flip_hash_horizontal(hash: u64) -> u64 {
 /// This is used for the "Store 1 / Query 8" strategy:
 /// - Store: Only the original pHash (Rotation 0°)
 /// - Query: Generate all 8 variants and check if any match stored hashes
+#[allow(dead_code)]
 pub fn generate_dihedral_hashes(hash: u64) -> Vec<u64> {
     let h0 = hash;
     let h90 = rotate_hash_90(hash);

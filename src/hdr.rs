@@ -74,17 +74,19 @@ impl Cicp {
 fn detect_cicp_isobmff(bytes: &[u8]) -> Option<Cicp> {
     // Restrict the scan to the first 256 KiB
     let search_limit = bytes.len().min(1024 * 256);
-    let haystack = &bytes[..search_limit];
+    let haystack = bytes.get(..search_limit)?;
 
     // 1. Fast-scan for NCLX (cICP metadata)
     // Layout: [size: 4] c o l r n c l x [prim: 2] [trans: 2] [matrix: 2] [flags: 1]
     if let Some(pos) = haystack.windows(8).position(|w| w == b"colrnclx")
-        && pos + 15 <= haystack.len()
+        && let Some(payload) = haystack
+            .get(pos.saturating_add(8)..pos.saturating_add(15))
+            .and_then(|s| s.first_chunk::<7>())
     {
-        let primaries = u16::from_be_bytes([haystack[pos + 8], haystack[pos + 9]]);
-        let transfer = u16::from_be_bytes([haystack[pos + 10], haystack[pos + 11]]);
-        let matrix = u16::from_be_bytes([haystack[pos + 12], haystack[pos + 13]]);
-        let flags = haystack[pos + 14];
+        let primaries = u16::from_be_bytes([payload[0], payload[1]]);
+        let transfer = u16::from_be_bytes([payload[2], payload[3]]);
+        let matrix = u16::from_be_bytes([payload[4], payload[5]]);
+        let flags = payload[6];
         let full_range = (flags & 0x80) != 0;
 
         if let (Ok(cp), Ok(tc), Ok(mc)) =
@@ -109,32 +111,26 @@ fn detect_cicp_isobmff(bytes: &[u8]) -> Option<Cicp> {
     // 2. Fast-scan for embedded ICC profiles ('prof' or 'rICC')
     // Layout: [size: 4] c o l r p r o f [ICC bytes...]
     for icc_magic in [b"colrprof", b"colrrICC"] {
-        if let Some(pos) = haystack.windows(8).position(|w| w == icc_magic) {
-            // Ensure we can safely read the 4-byte box size preceding 'colr'
-            if pos >= 4 {
-                let box_size = u32::from_be_bytes([
-                    haystack[pos - 4],
-                    haystack[pos - 3],
-                    haystack[pos - 2],
-                    haystack[pos - 1],
-                ]) as usize;
+        if let Some(pos) = haystack.windows(8).position(|w| w == icc_magic)
+            && let Some(box_start) = pos.checked_sub(4)
+            && let Some(&size_bytes) =
+                haystack.get(box_start..pos).and_then(|s| s.first_chunk::<4>())
+        {
+            let box_size = u32::from_be_bytes(size_bytes) as usize;
 
-                // Normal box sizes include the 12-byte header.
-                // A size of 1 indicates a 64-bit extended size, which we skip.
-                if box_size > 12
-                    && let Some(icc_end) = (pos - 4).checked_add(box_size)
-                    && icc_end <= bytes.len()
-                {
-                    let icc_start = pos + 8;
-                    let icc_bytes = &bytes[icc_start..icc_end];
-
-                    img_debug!(
-                        "[DEBUG-CICP] Fast-scan extracted ICC profile ({} bytes)",
-                        icc_bytes.len()
-                    );
-                    if let Some(cicp) = detect_cicp_icc(icc_bytes) {
-                        return Some(cicp);
-                    }
+            // Normal box sizes include the 12-byte header.
+            // A size of 1 indicates a 64-bit extended size, which we skip.
+            if box_size > 12
+                && let Some(icc_end) = box_start.checked_add(box_size)
+                && let Some(icc_start) = pos.checked_add(8)
+                && let Some(icc_bytes) = bytes.get(icc_start..icc_end)
+            {
+                img_debug!(
+                    "[DEBUG-CICP] Fast-scan extracted ICC profile ({} bytes)",
+                    icc_bytes.len()
+                );
+                if let Some(cicp) = detect_cicp_icc(icc_bytes) {
+                    return Some(cicp);
                 }
             }
         }
@@ -164,11 +160,12 @@ pub fn detect_cicp(bytes: &[u8]) -> Option<Cicp> {
         return None;
     }
 
-    let _brand = std::str::from_utf8(&bytes[4..8]).unwrap_or("????");
+    let sig = bytes.get(4..8)?;
+    let _brand = std::str::from_utf8(sig).unwrap_or("????");
     img_debug!("[DEBUG-CICP] File signature: {}", _brand);
 
     // 1. Check for ISOBMFF (AVIF / HEIC).
-    if &bytes[4..8] == b"ftyp" {
+    if sig == b"ftyp" {
         img_debug!("[DEBUG-CICP] Routing to ISOBMFF parser...");
         if let Some(c) = detect_cicp_isobmff(bytes) {
             return Some(c);
@@ -177,7 +174,7 @@ pub fn detect_cicp(bytes: &[u8]) -> Option<Cicp> {
     }
 
     // 2. PNG signature: 89 50 4E 47
-    if bytes[0..4] == [0x89, 0x50, 0x4E, 0x47]
+    if bytes.get(0..4) == Some([0x89, 0x50, 0x4E, 0x47].as_slice())
         && let Some(c) = detect_cicp_png(bytes)
     {
         return Some(c);
@@ -197,15 +194,15 @@ pub fn detect_cicp(bytes: &[u8]) -> Option<Cicp> {
 pub fn detect_cicp_png(bytes: &[u8]) -> Option<Cicp> {
     // PNG signature: 8 bytes.
     const PNG_SIG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
-    if bytes.len() < 8 || bytes[..8] != PNG_SIG {
+    if bytes.get(..8) != Some(PNG_SIG.as_slice()) {
         return None;
     }
 
     let mut i: usize = 8;
-    while i + 8 <= bytes.len() {
-        let len = u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
-        let chunk_type = &bytes[i + 4..i + 8];
-        let data_start = i + 8;
+    while let Some(header) = bytes.get(i..i.saturating_add(8)).and_then(|s| s.first_chunk::<8>()) {
+        let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let chunk_type = [header[4], header[5], header[6], header[7]];
+        let data_start = i.checked_add(8)?;
         let data_end = data_start.checked_add(len)?;
         // +4 for the CRC that follows.
         let next = data_end.checked_add(4)?;
@@ -213,13 +210,15 @@ pub fn detect_cicp_png(bytes: &[u8]) -> Option<Cicp> {
             return None;
         }
 
-        match chunk_type {
+        match &chunk_type {
             b"cICP" if len == 4 => {
+                let &[cp, tc, mc, fr] =
+                    bytes.get(data_start..data_end).and_then(|s| s.first_chunk::<4>())?;
                 return Some(Cicp {
-                    color_primaries: bytes[data_start],
-                    transfer_characteristics: bytes[data_start + 1],
-                    matrix_coefficients: bytes[data_start + 2],
-                    full_range: bytes[data_start + 3] != 0,
+                    color_primaries: cp,
+                    transfer_characteristics: tc,
+                    matrix_coefficients: mc,
+                    full_range: fr != 0,
                 });
             },
             // IDAT marks start of image data; cICP is always before it.
@@ -273,33 +272,25 @@ fn detect_cicp_from_icc_profile(bytes: &[u8]) -> Option<Cicp> {
 fn detect_cicp_icc(icc: &[u8]) -> Option<Cicp> {
     // ICC layout: 128-byte header, then u32 tag count, then (tag_count * 12)
     // bytes of tag table entries.
-    if icc.len() < 132 {
-        return None;
-    }
-    let tag_count = u32::from_be_bytes([icc[128], icc[129], icc[130], icc[131]]) as usize;
+    let &count_bytes = icc.get(128..132).and_then(|s| s.first_chunk::<4>())?;
+    let tag_count = u32::from_be_bytes(count_bytes) as usize;
     let tag_table_start = 132usize;
     let tag_table_end = tag_table_start.checked_add(tag_count.checked_mul(12)?)?;
-    if tag_table_end > icc.len() {
-        return None;
-    }
+    let tag_table = icc.get(tag_table_start..tag_table_end)?;
 
-    for idx in 0..tag_count {
-        let entry = tag_table_start + idx * 12;
-        if &icc[entry..entry + 4] != b"cicp" {
+    for entry in tag_table.as_chunks::<12>().0 {
+        let [s0, s1, s2, s3, o0, o1, o2, o3, sz0, sz1, sz2, sz3] = *entry;
+        if &[s0, s1, s2, s3] != b"cicp" {
             continue;
         }
-        let offset =
-            u32::from_be_bytes([icc[entry + 4], icc[entry + 5], icc[entry + 6], icc[entry + 7]])
-                as usize;
-        let size =
-            u32::from_be_bytes([icc[entry + 8], icc[entry + 9], icc[entry + 10], icc[entry + 11]])
-                as usize;
+        let offset = u32::from_be_bytes([o0, o1, o2, o3]) as usize;
+        let size = u32::from_be_bytes([sz0, sz1, sz2, sz3]) as usize;
         let end = offset.checked_add(size)?;
-        if end > icc.len() || size < 12 {
+        if size < 12 {
             return None;
         }
-        let data = &icc[offset..end];
-        if &data[0..4] != b"cicp" {
+        let data = icc.get(offset..end)?.first_chunk::<12>()?;
+        if &[data[0], data[1], data[2], data[3]] != b"cicp" {
             return None;
         }
         return Some(Cicp {
@@ -636,12 +627,12 @@ fn to_rgba16_flat(img: &DynamicImage) -> (u32, u32, Vec<u16>) {
 /// Quantization (step 7) is left to the caller so the same math can feed
 /// both the 8-bit and the 10-bit output paths.
 #[inline]
-fn tonemap_px(src: &[u16], p: TonemapParams) -> (f32, f32, f32, f32) {
+fn tonemap_px([sr, sg, sb, sa]: [u16; 4], p: TonemapParams) -> (f32, f32, f32, f32) {
     // Normalize to [0,1].
-    let mut r = src[0] as f32 / 65535.0;
-    let mut g = src[1] as f32 / 65535.0;
-    let mut b = src[2] as f32 / 65535.0;
-    let a = src[3] as f32 / 65535.0;
+    let mut r = sr as f32 / 65535.0;
+    let mut g = sg as f32 / 65535.0;
+    let mut b = sb as f32 / 65535.0;
+    let a = sa as f32 / 65535.0;
 
     // Limited (video) range → full range. 16-bit narrow range puts black at
     // 16 << 8 = 4096 and white at 235 << 8 = 60160.
@@ -727,9 +718,9 @@ const NOISE_DATA_WIDTH_AND_HEIGHT: usize = 256;
 /// they will wrap around. Means we don't need a noise texture as large as the image.
 #[inline]
 fn get_noise(x: u32, y: u32) -> u8 {
-    let wrap_x = (x as usize) % NOISE_DATA_WIDTH_AND_HEIGHT;
-    let wrap_y = (y as usize) % NOISE_DATA_WIDTH_AND_HEIGHT;
-    NOISE_DATA[wrap_y * NOISE_DATA_WIDTH_AND_HEIGHT + wrap_x]
+    let wrap_x = (x as usize) & (NOISE_DATA_WIDTH_AND_HEIGHT - 1);
+    let wrap_y = (y as usize) & (NOISE_DATA_WIDTH_AND_HEIGHT - 1);
+    NOISE_DATA.get((wrap_y << 8) | wrap_x).copied().unwrap_or(0)
 }
 
 const _: () =
@@ -770,17 +761,21 @@ pub fn process_hdr_to_sdr(img: &DynamicImage, cicp: Cicp, sdr_peak_nits: f32) ->
     let pixel_count = (width as usize).saturating_mul(height as usize);
     let mut out: Vec<u8> = vec![0u8; pixel_count.saturating_mul(4)];
     let w = (width as usize).max(1);
-    raw_rgba_u16.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).enumerate().for_each(
-        |(i, (src, dst))| {
-            let (r, g, b, a) = tonemap_px(src, params);
-            let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
-            let q = |v: f32| (v * 255.0 + d).round().clamp(0.0, 255.0) as u8;
-            dst[0] = q(r);
-            dst[1] = q(g);
-            dst[2] = q(b);
-            dst[3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
-        },
-    );
+    raw_rgba_u16
+        .as_chunks::<4>()
+        .0
+        .par_chunks_exact(w)
+        .zip(out.as_chunks_mut::<4>().0.par_chunks_exact_mut(w))
+        .enumerate()
+        .for_each(|(y, (src_row, dst_row))| {
+            let y_u32 = y as u32;
+            for (x, (&src, dst)) in src_row.iter().zip(dst_row.iter_mut()).enumerate() {
+                let (r, g, b, a) = tonemap_px(src, params);
+                let d = blue_noise_dither(x as u32, y_u32);
+                let q = |v: f32| (v * 255.0 + d).round().clamp(0.0, 255.0) as u8;
+                *dst = [q(r), q(g), q(b), (a * 255.0).round().clamp(0.0, 255.0) as u8];
+            }
+        });
 
     ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, out).unwrap_or_else(|| {
         // Extremely defensive: should never happen since length is exact.
@@ -808,17 +803,24 @@ pub fn process_hdr_to_rgb10a2(
 
     let mut out: Vec<u32> = vec![0u32; (width as usize).saturating_mul(height as usize)];
     let w = (width as usize).max(1);
-    raw_rgba_u16.par_chunks_exact(4).zip(out.par_iter_mut()).enumerate().for_each(
-        |(i, (src, dst))| {
-            let (r, g, b, a) = tonemap_px(src, params);
-            // 1023 codes is close to the visible threshold, but the BT.2390
-            // curve is steep in the shadows, so dither still earns its keep.
-            let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
-            let q = |v: f32| (v * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
-            let qa = (a * 3.0).round().clamp(0.0, 3.0) as u32;
-            *dst = (qa << 30) | (q(b) << 20) | (q(g) << 10) | q(r);
-        },
-    );
+    raw_rgba_u16
+        .as_chunks::<4>()
+        .0
+        .par_chunks_exact(w)
+        .zip(out.par_chunks_exact_mut(w))
+        .enumerate()
+        .for_each(|(y, (src_row, dst_row))| {
+            let y_u32 = y as u32;
+            for (x, (&src, dst)) in src_row.iter().zip(dst_row.iter_mut()).enumerate() {
+                let (r, g, b, a) = tonemap_px(src, params);
+                // 1023 codes is close to the visible threshold, but the BT.2390
+                // curve is steep in the shadows, so dither still earns its keep.
+                let d = blue_noise_dither(x as u32, y_u32);
+                let q = |v: f32| (v * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
+                let qa = (a * 3.0).round().clamp(0.0, 3.0) as u32;
+                *dst = (qa << 30) | (q(b) << 20) | (q(g) << 10) | q(r);
+            }
+        });
 
     (width, height, out)
 }
@@ -859,11 +861,11 @@ impl SdrParams {
 /// because the source is already display-referred: SDR white in, SDR white
 /// out. Only the shape of the curve between black and white changes.
 #[inline]
-fn sdr_px(src: &[u16], p: SdrParams) -> (f32, f32, f32, f32) {
-    let mut r = src[0] as f32 / 65535.0;
-    let mut g = src[1] as f32 / 65535.0;
-    let mut b = src[2] as f32 / 65535.0;
-    let a = src[3] as f32 / 65535.0;
+fn sdr_px([sr, sg, sb, sa]: [u16; 4], p: SdrParams) -> (f32, f32, f32, f32) {
+    let mut r = sr as f32 / 65535.0;
+    let mut g = sg as f32 / 65535.0;
+    let mut b = sb as f32 / 65535.0;
+    let a = sa as f32 / 65535.0;
 
     if p.limited_range_rgb {
         const BLACK: f32 = 4096.0 / 65535.0;
@@ -917,13 +919,21 @@ pub fn convert_sdr_to_srgb_rgb10a2(img: &DynamicImage, cicp: Cicp) -> (u32, u32,
 
     let mut out: Vec<u32> = vec![0u32; (width as usize).saturating_mul(height as usize)];
     let w = (width as usize).max(1);
-    raw.par_chunks_exact(4).zip(out.par_iter_mut()).enumerate().for_each(|(i, (src, dst))| {
-        let (r, g, b, a) = sdr_px(src, params);
-        let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
-        let q = |v: f32| (v * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
-        let qa = (a * 3.0).round().clamp(0.0, 3.0) as u32;
-        *dst = (qa << 30) | (q(b) << 20) | (q(g) << 10) | q(r);
-    });
+    raw.as_chunks::<4>()
+        .0
+        .par_chunks_exact(w)
+        .zip(out.par_chunks_exact_mut(w))
+        .enumerate()
+        .for_each(|(y, (src_row, dst_row))| {
+            let y_u32 = y as u32;
+            for (x, (&src, dst)) in src_row.iter().zip(dst_row.iter_mut()).enumerate() {
+                let (r, g, b, a) = sdr_px(src, params);
+                let d = blue_noise_dither(x as u32, y_u32);
+                let q = |v: f32| (v * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
+                let qa = (a * 3.0).round().clamp(0.0, 3.0) as u32;
+                *dst = (qa << 30) | (q(b) << 20) | (q(g) << 10) | q(r);
+            }
+        });
 
     (width, height, out)
 }
@@ -939,15 +949,14 @@ pub fn convert_sdr_to_srgb_rgba16(img: &DynamicImage, cicp: Cicp) -> (u32, u32, 
 
     let mut out: Vec<u16> =
         vec![0u16; (width as usize).saturating_mul(height as usize).saturating_mul(4)];
-    raw.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).for_each(|(src, dst)| {
-        let (r, g, b, a) = sdr_px(src, params);
-        // 65536 codes is far below the visible threshold, so no dither here.
-        let q = |v: f32| (v * 65535.0).round().clamp(0.0, 65535.0) as u16;
-        dst[0] = q(r);
-        dst[1] = q(g);
-        dst[2] = q(b);
-        dst[3] = q(a);
-    });
+    raw.as_chunks::<4>().0.par_iter().zip(out.as_chunks_mut::<4>().0.par_iter_mut()).for_each(
+        |(&src, dst)| {
+            let (r, g, b, a) = sdr_px(src, params);
+            // 65536 codes is far below the visible threshold, so no dither here.
+            let q = |v: f32| (v * 65535.0).round().clamp(0.0, 65535.0) as u16;
+            *dst = [q(r), q(g), q(b), q(a)];
+        },
+    );
 
     (width, height, out)
 }
@@ -961,17 +970,20 @@ pub fn convert_sdr_to_srgb8(img: &DynamicImage, cicp: Cicp) -> RgbaImage {
     let pixel_count = (width as usize).saturating_mul(height as usize);
     let mut out: Vec<u8> = vec![0u8; pixel_count.saturating_mul(4)];
     let w = (width as usize).max(1);
-    raw.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).enumerate().for_each(
-        |(i, (src, dst))| {
-            let (r, g, b, a) = sdr_px(src, params);
-            let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
-            let q = |v: f32| (v * 255.0 + d).round().clamp(0.0, 255.0) as u8;
-            dst[0] = q(r);
-            dst[1] = q(g);
-            dst[2] = q(b);
-            dst[3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
-        },
-    );
+    raw.as_chunks::<4>()
+        .0
+        .par_chunks_exact(w)
+        .zip(out.as_chunks_mut::<4>().0.par_chunks_exact_mut(w))
+        .enumerate()
+        .for_each(|(y, (src_row, dst_row))| {
+            let y_u32 = y as u32;
+            for (x, (&src, dst)) in src_row.iter().zip(dst_row.iter_mut()).enumerate() {
+                let (r, g, b, a) = sdr_px(src, params);
+                let d = blue_noise_dither(x as u32, y_u32);
+                let q = |v: f32| (v * 255.0 + d).round().clamp(0.0, 255.0) as u8;
+                *dst = [q(r), q(g), q(b), (a * 255.0).round().clamp(0.0, 255.0) as u8];
+            }
+        });
 
     ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, out)
         .unwrap_or_else(|| ImageBuffer::new(width, height))
@@ -986,12 +998,21 @@ pub fn requantize_srgb16_to_rgb10a2(img: &DynamicImage) -> (u32, u32, Vec<u32>) 
     let w = (width as usize).max(1);
     let mut out: Vec<u32> = vec![0u32; (width as usize).saturating_mul(height as usize)];
 
-    raw.par_chunks_exact(4).zip(out.par_iter_mut()).enumerate().for_each(|(i, (src, dst))| {
-        let d = blue_noise_dither((i % w) as u32, (i / w) as u32);
-        let q = |v: u16| ((v as f32 / 65535.0) * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
-        let a = (src[3] as f32 / 65535.0 * 3.0).round().clamp(0.0, 3.0) as u32;
-        *dst = (a << 30) | (q(src[2]) << 20) | (q(src[1]) << 10) | q(src[0]);
-    });
+    raw.as_chunks::<4>()
+        .0
+        .par_chunks_exact(w)
+        .zip(out.par_chunks_exact_mut(w))
+        .enumerate()
+        .for_each(|(y, (src_row, dst_row))| {
+            let y_u32 = y as u32;
+            for (x, (&[r, g, b, a], dst)) in src_row.iter().zip(dst_row.iter_mut()).enumerate() {
+                let d = blue_noise_dither(x as u32, y_u32);
+                let q =
+                    |v: u16| ((v as f32 / 65535.0) * 1023.0 + d).round().clamp(0.0, 1023.0) as u32;
+                let qa = (a as f32 / 65535.0 * 3.0).round().clamp(0.0, 3.0) as u32;
+                *dst = (qa << 30) | (q(b) << 20) | (q(g) << 10) | q(r);
+            }
+        });
 
     (width, height, out)
 }
@@ -1021,15 +1042,17 @@ pub fn process_hdr_to_rgba16(
     let mut out: Vec<u16> =
         vec![0u16; (width as usize).saturating_mul(height as usize).saturating_mul(4)];
 
-    raw_rgba_u16.par_chunks_exact(4).zip(out.par_chunks_exact_mut(4)).for_each(|(src, dst)| {
-        let (r, g, b, a) = tonemap_px(src, params);
-        // 65536 codes is far below the visible threshold, so no dither here.
-        let q = |v: f32| (v * 65535.0).round().clamp(0.0, 65535.0) as u16;
-        dst[0] = q(r);
-        dst[1] = q(g);
-        dst[2] = q(b);
-        dst[3] = q(a);
-    });
+    raw_rgba_u16
+        .as_chunks::<4>()
+        .0
+        .par_iter()
+        .zip(out.as_chunks_mut::<4>().0.par_iter_mut())
+        .for_each(|(&src, dst)| {
+            let (r, g, b, a) = tonemap_px(src, params);
+            // 65536 codes is far below the visible threshold, so no dither here.
+            let q = |v: f32| (v * 65535.0).round().clamp(0.0, 65535.0) as u16;
+            *dst = [q(r), q(g), q(b), q(a)];
+        });
 
     (width, height, out)
 }
@@ -1080,15 +1103,15 @@ mod tests {
 
         // Mid-grey: decoded with 2.4, re-encoded with ~2.2, so it has to
         // come out darker than it went in.
-        let (r, g, b, a) = sdr_px(&[32768, 32768, 32768, 65535], p);
+        let (r, g, b, a) = sdr_px([32768, 32768, 32768, 65535], p);
         assert!((r - g).abs() < 1e-6 && (g - b).abs() < 1e-6);
         assert!((r - 0.4725).abs() < 0.01, "unexpected mid-grey {}", r);
         assert!((a - 1.0).abs() < 1e-6);
 
         // Black and white are fixed points; only the curve between them moves.
-        let (w, ..) = sdr_px(&[65535, 65535, 65535, 65535], p);
+        let (w, ..) = sdr_px([65535, 65535, 65535, 65535], p);
         assert!((w - 1.0).abs() < 1e-5);
-        let (k, ..) = sdr_px(&[0, 0, 0, 65535], p);
+        let (k, ..) = sdr_px([0, 0, 0, 65535], p);
         assert!(k.abs() < 1e-6);
     }
 
@@ -1104,7 +1127,7 @@ mod tests {
 
         let p = SdrParams::new(cicp);
         assert!(p.is_noop());
-        let (r, ..) = sdr_px(&[20000, 20000, 20000, 65535], p);
+        let (r, ..) = sdr_px([20000, 20000, 20000, 65535], p);
         assert!((r - 20000.0 / 65535.0).abs() < 1e-4, "round-trip drifted: {}", r);
     }
 

@@ -234,22 +234,28 @@ fn filter_and_register_groups(
     sort_order: &str,
     ext_priorities: &HashMap<String, usize>,
 ) {
-    let mut i = 0;
-    while i < groups.len() {
-        let before = groups[i].len();
-        groups[i].retain(|f| f.content_hash == [0u8; 32] || !ctx.is_ignored(&f.content_hash));
-        if groups[i].len() < 2 {
-            groups.remove(i);
-            if i < infos.len() {
-                infos.remove(i);
+    let mut kept_groups = Vec::with_capacity(groups.len());
+    let mut kept_infos = Vec::with_capacity(infos.len());
+    let mut info_iter = infos.drain(..);
+    for mut group in groups.drain(..) {
+        let info = info_iter.next();
+        let before = group.len();
+        group.retain(|f| f.content_hash == [0u8; 32] || !ctx.is_ignored(&f.content_hash));
+        if group.len() >= 2 {
+            if let Some(existing_info) = info {
+                let updated = if group.len() != before {
+                    analyze_group(&mut group, sort_order, ext_priorities)
+                } else {
+                    existing_info
+                };
+                kept_infos.push(updated);
             }
-        } else {
-            if groups[i].len() != before && i < infos.len() {
-                infos[i] = analyze_group(&mut groups[i], sort_order, ext_priorities);
-            }
-            i += 1;
+            kept_groups.push(group);
         }
     }
+    drop(info_iter);
+    *groups = kept_groups;
+    *infos = kept_infos;
 
     let group_data: Vec<Vec<_>> = groups
         .iter()
@@ -508,11 +514,12 @@ fn parse_show_ignored_output(input: &str) -> Result<Vec<([u8; 32], db::IgnoredEn
             continue;
         }
 
+        let line_no = line_num.saturating_add(1);
+
         if let Some(uuid_part) = line.strip_prefix("Group UUID:") {
             let uuid_str = uuid_part.trim();
-            current_uuid = AppContext::parse_uuid(uuid_str).ok_or_else(|| {
-                format!("Line {}: invalid Group UUID '{}'", line_num + 1, uuid_str)
-            })?;
+            current_uuid = AppContext::parse_uuid(uuid_str)
+                .ok_or_else(|| format!("Line {line_no}: invalid Group UUID '{uuid_str}'"))?;
             continue;
         }
 
@@ -523,34 +530,34 @@ fn parse_show_ignored_output(input: &str) -> Result<Vec<([u8; 32], db::IgnoredEn
             let (blake3_str, after_blake3) = rest
                 .trim_start()
                 .split_once("pdqhash:")
-                .ok_or_else(|| format!("Line {}: missing 'pdqhash:'", line_num + 1))?;
+                .ok_or_else(|| format!("Line {line_no}: missing 'pdqhash:'"))?;
 
             let content_hash_vec = hex::decode(blake3_str.trim())
-                .map_err(|e| format!("Line {}: invalid blake3 hex: {}", line_num + 1, e))?;
+                .map_err(|e| format!("Line {line_no}: invalid blake3 hex: {e}"))?;
             let content_hash: [u8; 32] = content_hash_vec
                 .try_into()
-                .map_err(|_| format!("Line {}: blake3 hash must be 32 bytes", line_num + 1))?;
+                .map_err(|_| format!("Line {line_no}: blake3 hash must be 32 bytes"))?;
 
             let (pdq_str, after_pdq) = after_blake3
                 .trim_start()
                 .split_once("quality:")
-                .ok_or_else(|| format!("Line {}: missing 'quality:'", line_num + 1))?;
+                .ok_or_else(|| format!("Line {line_no}: missing 'quality:'"))?;
 
             let pdq_str = pdq_str.trim();
             let pdqhash = if pdq_str.eq_ignore_ascii_case("none") {
                 None
             } else {
                 let pdq_vec = hex::decode(pdq_str)
-                    .map_err(|e| format!("Line {}: invalid pdqhash hex: {}", line_num + 1, e))?;
+                    .map_err(|e| format!("Line {line_no}: invalid pdqhash hex: {e}"))?;
                 let arr: [u8; 32] = pdq_vec
                     .try_into()
-                    .map_err(|_| format!("Line {}: pdqhash must be 32 bytes", line_num + 1))?;
+                    .map_err(|_| format!("Line {line_no}: pdqhash must be 32 bytes"))?;
                 Some(arr)
             };
 
             let (_, after_quality) = after_pdq
                 .split_once("added:")
-                .ok_or_else(|| format!("Line {}: missing 'added:'", line_num + 1))?;
+                .ok_or_else(|| format!("Line {line_no}: missing 'added:'"))?;
 
             let ts_str = after_quality.trim().trim_end_matches("(no group)").trim();
 
@@ -558,15 +565,9 @@ fn parse_show_ignored_output(input: &str) -> Result<Vec<([u8; 32], db::IgnoredEn
                 secs
             } else {
                 let ndt = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S UTC")
-                    .map_err(|e| {
-                        format!("Line {}: invalid timestamp '{}': {}", line_num + 1, ts_str, e)
-                    })?;
+                    .map_err(|e| format!("Line {line_no}: invalid timestamp '{ts_str}': {e}"))?;
                 u64::try_from(ndt.and_utc().timestamp()).map_err(|_| {
-                    format!(
-                        "Line {}: timestamp '{}' cannot be before Unix epoch",
-                        line_num + 1,
-                        ts_str
-                    )
+                    format!("Line {line_no}: timestamp '{ts_str}' cannot be before Unix epoch")
                 })?
             };
 
@@ -577,7 +578,7 @@ fn parse_show_ignored_output(input: &str) -> Result<Vec<([u8; 32], db::IgnoredEn
             continue;
         }
 
-        return Err(format!("Line {}: unrecognized line '{}'", line_num + 1, line));
+        return Err(format!("Line {line_no}: unrecognized line '{line}'"));
     }
 
     Ok(entries)
@@ -593,24 +594,24 @@ fn run_interactive_cli_delete(
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
-    for (g_idx, group) in groups.iter().enumerate() {
+    for (g_idx, (group, info)) in groups.iter().zip(group_infos.iter()).enumerate() {
         if group.len() < 2 {
             continue;
         }
-        let info = &group_infos[g_idx];
+        let g_num = g_idx.saturating_add(1);
         let green = "\x1b[32m";
         let reset = "\x1b[0m";
 
         println!("\n========================================================");
         match info.status {
             GroupStatus::AllIdentical => {
-                println!("Group {} - {}Bit-identical{}", g_idx + 1, green, reset);
+                println!("Group {g_num} - {green}Bit-identical{reset}");
             },
             GroupStatus::SomeIdentical => {
-                println!("Group {} - {}Some files Bit-identical{}", g_idx + 1, green, reset);
+                println!("Group {g_num} - {green}Some files Bit-identical{reset}");
             },
             GroupStatus::None => {
-                println!("Group {}/{} (Max Dist: {})", g_idx + 1, groups.len(), info.max_dist);
+                println!("Group {g_num}/{} (Max Dist: {})", groups.len(), info.max_dist);
             },
         }
         println!("========================================================");
@@ -632,7 +633,7 @@ fn run_interactive_cli_delete(
             println!(
                 "{}[{}] {} {} | {} | {} | {}{}",
                 color_start,
-                i + 1,
+                i.saturating_add(1),
                 marker,
                 time_str,
                 format_size(file.size),
@@ -658,7 +659,9 @@ fn run_interactive_cli_delete(
                 let mut invalid_token = None;
                 for token in line.split_whitespace() {
                     match token.parse::<usize>() {
-                        Ok(idx) if (1..=group.len()).contains(&idx) => indices.push(idx - 1),
+                        Ok(idx) if (1..=group.len()).contains(&idx) => {
+                            indices.push(idx.saturating_sub(1));
+                        },
                         _ => {
                             invalid_token = Some(token);
                             break;
@@ -682,7 +685,9 @@ fn run_interactive_cli_delete(
                 }
 
                 for &idx in &indices {
-                    let file = &group[idx];
+                    let Some(file) = group.get(idx) else {
+                        continue;
+                    };
                     print!(
                         "{} {:?} ... ",
                         if use_trash { "Trashing" } else { "Deleting" },
@@ -1077,7 +1082,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.use_trash,
             args.raw_thumbnails,
             args.view_flatten,
-        )
+        )?
         .with_move_target(args.move_marked.clone())
         .with_slideshow_interval(args.slideshow)
         .with_slideshow_effect(args.slideshow_effect)
@@ -1205,22 +1210,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let green = "\x1b[32m";
         let reset = "\x1b[0m";
-        for (i, group) in final_groups.iter().enumerate() {
-            let info = &final_infos[i];
+        for (i, (group, info)) in final_groups.iter().zip(final_infos.iter()).enumerate() {
+            let g_num = i.saturating_add(1);
             match info.status {
                 GroupStatus::AllIdentical => {
-                    println!("\n--- Group {} - {}Bit-identical{} ---", i + 1, green, reset);
+                    println!("\n--- Group {g_num} - {green}Bit-identical{reset} ---");
                 },
                 GroupStatus::SomeIdentical => {
-                    println!(
-                        "\n--- Group {} - {}Some files Bit-identical{} ---",
-                        i + 1,
-                        green,
-                        reset
-                    );
+                    println!("\n--- Group {g_num} - {green}Some files Bit-identical{reset} ---");
                 },
                 GroupStatus::None => {
-                    println!("\n--- Group {} (Max Dist: {}) ---", i + 1, info.max_dist);
+                    println!("\n--- Group {g_num} (Max Dist: {}) ---", info.max_dist);
                 },
             }
 

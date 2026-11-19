@@ -36,7 +36,7 @@ fn bench_hamming_distance(c: &mut Criterion) {
             b.iter(|| {
                 let mut sum = 0u64;
                 for h in hashes {
-                    sum += std::hint::black_box(h1_64).hamming_distance(h) as u64;
+                    sum = sum.wrapping_add(std::hint::black_box(h1_64).hamming_distance(h) as u64);
                 }
                 std::hint::black_box(sum)
             })
@@ -58,7 +58,7 @@ fn bench_hamming_distance(c: &mut Criterion) {
             b.iter(|| {
                 let mut sum = 0u64;
                 for h in hashes {
-                    sum += std::hint::black_box(h1_256).hamming_distance(h) as u64;
+                    sum = sum.wrapping_add(std::hint::black_box(h1_256).hamming_distance(h) as u64);
                 }
                 std::hint::black_box(sum)
             })
@@ -73,13 +73,11 @@ fn bench_generate_pdq(c: &mut Criterion) {
 
     // Load benchmark image if present; fallback to a synthetic 1024x768 RGB image
     let path = Path::new("./tests/bench.jpg");
-    let img = if path.exists() {
-        image::open(path).expect("Failed to open './tests/bench.jpg'")
-    } else {
+    let img = image::open(path).unwrap_or_else(|_| {
         DynamicImage::ImageRgb8(RgbImage::from_fn(1024, 768, |x, y| {
-            Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+            Rgb([(x % 256) as u8, (y % 256) as u8, (x.wrapping_add(y) % 256) as u8])
         }))
-    };
+    });
 
     // Full pipeline from DynamicImage (RGB -> Luma601 -> Downsample -> Filter -> DCT -> Hash)
     group.bench_function("rgb_image", |b| {

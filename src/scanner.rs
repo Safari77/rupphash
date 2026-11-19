@@ -90,7 +90,7 @@ pub fn init_smart_limits() -> usize {
             },
         };
 
-        let max_allowed_ram = (total_ram_bytes / 4) * 3; // 75% global limit
+        let max_allowed_ram = (total_ram_bytes / 4).saturating_mul(3); // 75% global limit
 
         // How many 1.5GB decodes can fit in 75% of RAM?
         let mut target_threads = (max_allowed_ram / BUDGET_PER_THREAD_BYTES) as usize;
@@ -102,8 +102,10 @@ pub fn init_smart_limits() -> usize {
         target_threads = target_threads.clamp(1, cpu_cores);
 
         // Calculate the new, highly accurate per-thread limit (fallback to default if RAM query returned 0)
-        let limit_per_thread =
-            (max_allowed_ram / (target_threads as u64)).max(BUDGET_PER_THREAD_BYTES);
+        let limit_per_thread = max_allowed_ram
+            .checked_div(target_threads as u64)
+            .unwrap_or(0)
+            .max(BUDGET_PER_THREAD_BYTES);
 
         eprintln!(
             "[SYSTEM] Smart Limits: Limiting to {}/{} cores. {} MB limit per thread.",
@@ -453,7 +455,7 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
     let has_alpha = handle.has_alpha_channel();
     let channels = if has_alpha { 4usize } else { 3usize };
 
-    let bytes_per_pixel = if bit_depth > 8 { channels * 2 } else { channels } as u64;
+    let bytes_per_pixel = if bit_depth > 8 { channels.saturating_mul(2) } else { channels } as u64;
     let est_bytes = (handle.width() as u64)
         .saturating_mul(handle.height() as u64)
         .saturating_mul(bytes_per_pixel);
@@ -509,9 +511,10 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
 
         match bit_depth {
             10 => {
-                for y in 0..height {
-                    let row_start = y * stride;
-                    let row_bytes = &data[row_start..row_start + row_bytes_len];
+                for row in data.chunks(stride).take(height) {
+                    let Some(row_bytes) = row.get(..row_bytes_len) else {
+                        return Err("HEIC: Truncated plane row".to_string());
+                    };
                     // 10-bit: (v << 6) | (v >> 4) maps 1023 -> 65535 exactly
                     out.extend(row_bytes.as_chunks::<2>().0.iter().map(|&c| {
                         let v = u16::from_le_bytes(c);
@@ -520,9 +523,10 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
                 }
             },
             12 => {
-                for y in 0..height {
-                    let row_start = y * stride;
-                    let row_bytes = &data[row_start..row_start + row_bytes_len];
+                for row in data.chunks(stride).take(height) {
+                    let Some(row_bytes) = row.get(..row_bytes_len) else {
+                        return Err("HEIC: Truncated plane row".to_string());
+                    };
                     // 12-bit: (v << 4) | (v >> 8) maps 4095 -> 65535 exactly
                     out.extend(row_bytes.as_chunks::<2>().0.iter().map(|&c| {
                         let v = u16::from_le_bytes(c);
@@ -531,21 +535,28 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
                 }
             },
             16 => {
-                for y in 0..height {
-                    let row_start = y * stride;
-                    let row_bytes = &data[row_start..row_start + row_bytes_len];
+                for row in data.chunks(stride).take(height) {
+                    let Some(row_bytes) = row.get(..row_bytes_len) else {
+                        return Err("HEIC: Truncated plane row".to_string());
+                    };
                     out.extend(row_bytes.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)));
                 }
             },
             _ => {
                 // Bit-replication scaling: scales an arbitrary N-bit value to standard 16-bit unorm (0..65535)
-                let max_val = ((1u32 << u32::from(bit_depth)) - 1).max(1);
-                for y in 0..height {
-                    let row_start = y * stride;
-                    let row_bytes = &data[row_start..row_start + row_bytes_len];
+                let max_val = (1u32 << u32::from(bit_depth)).saturating_sub(1).max(1);
+                let half_max = max_val / 2;
+                for row in data.chunks(stride).take(height) {
+                    let Some(row_bytes) = row.get(..row_bytes_len) else {
+                        return Err("HEIC: Truncated plane row".to_string());
+                    };
                     out.extend(row_bytes.as_chunks::<2>().0.iter().map(|&c| {
-                        let v = u16::from_le_bytes(c) as u32;
-                        ((v * 65535 + (max_val / 2)) / max_val).min(65535) as u16
+                        let v = u32::from(u16::from_le_bytes(c));
+                        v.saturating_mul(65535)
+                            .saturating_add(half_max)
+                            .checked_div(max_val)
+                            .unwrap_or(0)
+                            .min(65535) as u16
                     }));
                 }
             },
@@ -572,12 +583,16 @@ pub fn decode_heic(bytes: &[u8]) -> Result<DynamicImage, String> {
         }
 
         let out = if stride == samples_per_row {
-            data[..total_samples].to_vec()
+            data.get(..total_samples)
+                .ok_or_else(|| "HEIC: Plane buffer smaller than expected dimensions".to_string())?
+                .to_vec()
         } else {
             let mut out = Vec::with_capacity(total_samples);
-            for y in 0..height {
-                let row_start = y * stride;
-                out.extend_from_slice(&data[row_start..row_start + samples_per_row]);
+            for row in data.chunks(stride).take(height) {
+                let Some(row_bytes) = row.get(..samples_per_row) else {
+                    return Err("HEIC: Truncated plane row".to_string());
+                };
+                out.extend_from_slice(row_bytes);
             }
             out
         };
@@ -1172,7 +1187,7 @@ pub fn scan_and_group(
             .par_iter()
             .filter_map(|path| {
                 if let Some(prog_tx) = &progress_tx {
-                    let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    let current = processed_count.fetch_add(1, Ordering::Relaxed).saturating_add(1);
                     if current.is_multiple_of(10) || current == total_files {
                         let _ = prog_tx.send((current, total_files));
                     }
@@ -1310,7 +1325,7 @@ pub fn scan_and_group(
                             && let Some(thumb) = thumbs // Find largest JPEG thumbnail
                                 .into_iter()
                                 .filter(|t| matches!(t.format, rsraw::ThumbFormat::Jpeg))
-                                .max_by_key(|t| (t.width as u64) * (t.height as u64))
+                                .max_by_key(|t| (t.width as u64).saturating_mul(t.height as u64))
                         {
                             img_for_hashing =
                                 load_image_fast(Path::new("raw_thumb.jpg"), &thumb.data).ok();
@@ -1598,18 +1613,22 @@ where
             },
             |(visited, matched, local_edges, variants_buf), (chunk_idx, chunk)| {
                 local_edges.clear();
-                let chunk_base_idx = chunk_idx * CHUNK_SIZE;
+                let chunk_base_idx = chunk_idx.saturating_mul(CHUNK_SIZE);
 
                 for (offset, file) in chunk.iter().enumerate() {
-                    let i = chunk_base_idx + offset;
+                    let i = chunk_base_idx.saturating_add(offset);
 
                     let Some(hash) = strategy.extract_hash(file) else { continue };
 
                     let count = strategy.generate_variants(file, hash, variants_buf);
-                    let variants = &variants_buf[..count];
+                    let variants = variants_buf.get(..count).unwrap_or(&[]);
                     let is_single_variant = count == 1;
 
-                    let base_limit = if low_conf[i] { 0 } else { effective_similarity };
+                    let base_limit = if low_conf.get(i).copied().unwrap_or(false) {
+                        0
+                    } else {
+                        effective_similarity
+                    };
 
                     matched.clear();
 
@@ -1628,7 +1647,9 @@ where
                                     let bucket = mih.bucket(k, val);
                                     for dense in bucket {
                                         let dense_id = dense.index();
-                                        let cand_idx = dense_to_sparse[dense_id];
+                                        let Some(&cand_idx) = dense_to_sparse.get(dense_id) else {
+                                            continue;
+                                        };
 
                                         // Skip self. For cand_idx < i, skip if both sides are symmetric
                                         // or if cand_idx already expanded its own dihedral variants
@@ -1637,16 +1658,23 @@ where
                                         if cand_idx == i
                                             || (cand_idx < i
                                                 && (is_single_variant
-                                                    || valid_files[cand_idx]
-                                                        .pdq_features
-                                                        .is_some()))
+                                                    || valid_files
+                                                        .get(cand_idx)
+                                                        .is_some_and(|f| f.pdq_features.is_some())))
                                             || v.set(cand_idx)
                                         {
                                             continue;
                                         }
 
-                                        let cand_hash = mih.hash(*dense);
-                                        let limit = if low_conf[cand_idx] { 0 } else { base_limit };
+                                        let Some(cand_hash) = mih.hash(*dense) else {
+                                            continue;
+                                        };
+                                        let limit =
+                                            if low_conf.get(cand_idx).copied().unwrap_or(false) {
+                                                0
+                                            } else {
+                                                base_limit
+                                            };
                                         if variant.hamming_distance(cand_hash) <= limit
                                             && !m.set(cand_idx)
                                         {
@@ -1674,9 +1702,9 @@ where
                             }
 
                             // R=2: 2-bit flips
-                            if base_limit >= (H::NUM_CHUNKS * 2) as u32 {
+                            if base_limit >= H::NUM_CHUNKS.saturating_mul(2) as u32 {
                                 for i_bit in 0..bits {
-                                    for j_bit in (i_bit + 1)..bits {
+                                    for j_bit in i_bit.saturating_add(1)..bits {
                                         check_bucket(
                                             q_chunk ^ (1 << i_bit) ^ (1 << j_bit),
                                             visited,
@@ -1688,10 +1716,10 @@ where
                             }
 
                             // R=3: 3-bit flips
-                            if base_limit >= (H::NUM_CHUNKS * 3) as u32 {
+                            if base_limit >= H::NUM_CHUNKS.saturating_mul(3) as u32 {
                                 for i_bit in 0..bits {
-                                    for j_bit in (i_bit + 1)..bits {
-                                        for m_bit in (j_bit + 1)..bits {
+                                    for j_bit in i_bit.saturating_add(1)..bits {
+                                        for m_bit in j_bit.saturating_add(1)..bits {
                                             check_bucket(
                                                 q_chunk
                                                     ^ (1 << i_bit)
@@ -1784,14 +1812,16 @@ fn analyze_group_with_features(
     // 1. Count Bit-Identical (Content Hash)
     let mut bit_counts = HashMap::new();
     for f in files.iter() {
-        *bit_counts.entry(f.content_hash).or_insert(0) += 1;
+        let entry = bit_counts.entry(f.content_hash).or_insert(0usize);
+        *entry = entry.saturating_add(1);
     }
 
     // 2. Count Pixel-Identical (Pixel Hash)
     let mut pixel_counts = HashMap::new();
     for f in files.iter() {
         if let Some(ph) = f.pixel_hash {
-            *pixel_counts.entry(ph).or_insert(0) += 1;
+            let entry = pixel_counts.entry(ph).or_insert(0usize);
+            *entry = entry.saturating_add(1);
         }
     }
 
@@ -1871,13 +1901,18 @@ fn analyze_group_with_features(
 #[inline]
 fn uf_find(parent: &mut [usize], i: usize) -> usize {
     let mut root = i;
-    while root != parent[root] {
-        root = parent[root];
+    while let Some(&p) = parent.get(root)
+        && p != root
+    {
+        root = p;
     }
     let mut curr = i;
     while curr != root {
-        let next = parent[curr];
-        parent[curr] = root;
+        let Some(slot) = parent.get_mut(curr) else {
+            break;
+        };
+        let next = *slot;
+        *slot = root;
         curr = next;
     }
     root
@@ -1888,8 +1923,10 @@ fn uf_find(parent: &mut [usize], i: usize) -> usize {
 fn uf_union(parent: &mut [usize], i: usize, j: usize) {
     let ri = uf_find(parent, i);
     let rj = uf_find(parent, j);
-    if ri != rj {
-        parent[ri] = rj;
+    if ri != rj
+        && let Some(slot) = parent.get_mut(ri)
+    {
+        *slot = rj;
     }
 }
 
@@ -1905,8 +1942,9 @@ fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> V
 
     for (g_idx, group) in groups.iter().enumerate() {
         for &f_idx in group {
-            // Safety: Indices are guaranteed valid by upstream logic
-            let f = &valid_files[f_idx as usize];
+            let Some(f) = valid_files.get(f_idx as usize) else {
+                continue;
+            };
             if let (Some(parent), Some(stem)) = (f.path.parent(), f.path.file_stem()) {
                 entries.push((parent, stem, g_idx));
             }
@@ -1920,9 +1958,9 @@ fn merge_groups_by_stem(groups: Vec<Vec<u32>>, valid_files: &[ScannedFile]) -> V
     let mut parent: Vec<usize> = (0..groups.len()).collect();
 
     // Iterate linearly and merge adjacent identical stems
-    for w in entries.windows(2) {
-        if w[0].0 == w[1].0 && w[0].1 == w[1].1 {
-            uf_union(&mut parent, w[0].2, w[1].2);
+    for (first, second) in entries.iter().zip(entries.iter().skip(1)) {
+        if first.0 == second.0 && first.1 == second.1 {
+            uf_union(&mut parent, first.2, second.2);
         }
     }
 
@@ -1972,7 +2010,7 @@ fn process_raw_groups(
         .map(|group_indices| {
             let mut group_data: Vec<FileMetadata> = group_indices
                 .iter()
-                .map(|&idx| valid_files[idx as usize].to_file_metadata())
+                .filter_map(|&idx| valid_files.get(idx as usize).map(ScannedFile::to_file_metadata))
                 .collect();
 
             let info = analyze_group_with_features(
@@ -2201,7 +2239,8 @@ pub fn scan_for_view(
                 .par_iter()
                 .filter_map(|path| {
                     if let Some(prog_tx) = &progress_tx {
-                        let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        let current =
+                            processed_count.fetch_add(1, Ordering::Relaxed).saturating_add(1);
                         if current.is_multiple_of(50) || current == total_files {
                             let _ = prog_tx.send((current, total_files));
                         }
@@ -2555,7 +2594,7 @@ fn process_and_stream_dir_entries(
 
     std::thread::spawn(move || {
         const BATCH_SIZE: usize = 500;
-        let mut processed = 0;
+        let mut processed = 0usize;
 
         let mut files: Vec<FileMetadata> = entries
             .into_iter()
@@ -2598,7 +2637,7 @@ fn process_and_stream_dir_entries(
             if batch.is_empty() {
                 break;
             }
-            processed += batch.len();
+            processed = processed.saturating_add(batch.len());
             if let Some(ref tx) = progress_tx {
                 let _ = tx.send((processed, file_count));
             }

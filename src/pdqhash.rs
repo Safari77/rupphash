@@ -43,11 +43,11 @@ struct PdqScratch {
 
 impl PdqScratch {
     fn new() -> Self {
-        let cap = (DOWNSAMPLE_DIMS as usize) * (DOWNSAMPLE_DIMS as usize);
+        const CAP: usize = (DOWNSAMPLE_DIMS as usize) * (DOWNSAMPLE_DIMS as usize);
         Self {
             resizer: fr::Resizer::new(),
-            luma_buf: Vec::with_capacity(cap),
-            tmp_buf: Vec::with_capacity(cap),
+            luma_buf: Vec::with_capacity(CAP),
+            tmp_buf: Vec::with_capacity(CAP),
         }
     }
 }
@@ -108,12 +108,13 @@ impl PdqFeatures {
     fn bit_rows(&self, neg_rows: bool, neg_cols: bool) -> [u16; DCT_OUTPUT_W_H] {
         let median = self.coefficient_median(neg_rows, neg_cols);
         let mut rows = [0u16; DCT_OUTPUT_W_H];
-        for (r, row) in rows.iter_mut().enumerate() {
-            let base = r * DCT_OUTPUT_W_H;
+        for ((r, row), coeffs_row) in
+            rows.iter_mut().enumerate().zip(self.coefficients.as_chunks::<DCT_OUTPUT_W_H>().0)
+        {
             let mut bits = 0u16;
-            for c in 0..DCT_OUTPUT_W_H {
+            for (c, &coeff) in coeffs_row.iter().enumerate() {
                 // Compare all coeffs (including DC) against the median
-                if apply_sign(self.coefficients[base + c], r, c, neg_rows, neg_cols) > median {
+                if apply_sign(coeff, r, c, neg_rows, neg_cols) > median {
                     bits |= 1 << c;
                 }
             }
@@ -132,12 +133,12 @@ impl PdqFeatures {
     /// for a sort, and total_cmp is a real total order (unlike partial_cmp).
     fn coefficient_median(&self, neg_rows: bool, neg_cols: bool) -> f32 {
         let mut buffer = [0.0f32; DCT_OUTPUT_MATRIX_SIZE];
-        for (idx, slot) in buffer.iter_mut().enumerate() {
+        for ((idx, slot), &coeff) in buffer.iter_mut().enumerate().zip(self.coefficients.iter()) {
             let (r, c) = (idx / DCT_OUTPUT_W_H, idx % DCT_OUTPUT_W_H);
-            *slot = apply_sign(self.coefficients[idx], r, c, neg_rows, neg_cols);
+            *slot = apply_sign(coeff, r, c, neg_rows, neg_cols);
         }
-        let mid = (buffer.len() - 1) / 2;
-        *buffer.select_nth_unstable_by(mid, f32::total_cmp).1
+        const MID: usize = (DCT_OUTPUT_MATRIX_SIZE - 1) / 2;
+        *buffer.select_nth_unstable_by(MID, f32::total_cmp).1
     }
 }
 
@@ -148,8 +149,8 @@ fn apply_sign(v: f32, r: usize, c: usize, neg_rows: bool, neg_cols: bool) -> f32
     // DCT_FREQ_OFFSET = 1 the DC term is dropped, so the parity is inverted
     // relative to the index; getting this wrong complements the hash of every
     // variant built from an odd number of mirrors.
-    let flip_r = neg_rows && !(r + DCT_FREQ_OFFSET).is_multiple_of(2);
-    let flip_c = neg_cols && !(c + DCT_FREQ_OFFSET).is_multiple_of(2);
+    let flip_r = neg_rows && !r.wrapping_add(DCT_FREQ_OFFSET).is_multiple_of(2);
+    let flip_c = neg_cols && !c.wrapping_add(DCT_FREQ_OFFSET).is_multiple_of(2);
     if flip_r ^ flip_c { -v } else { v }
 }
 
@@ -160,8 +161,10 @@ fn transpose_bit_rows(rows: &[u16; DCT_OUTPUT_W_H]) -> [u16; DCT_OUTPUT_W_H] {
         let mut bits = row;
         while bits != 0 {
             let c = bits.trailing_zeros() as usize;
-            out[c] |= 1 << r;
-            bits &= bits - 1;
+            if let Some(slot) = out.get_mut(c) {
+                *slot |= 1 << r;
+            }
+            bits &= bits.wrapping_sub(1);
         }
     }
     out
@@ -171,10 +174,8 @@ fn transpose_bit_rows(rows: &[u16; DCT_OUTPUT_W_H]) -> [u16; DCT_OUTPUT_W_H] {
 /// of matrix row r goes to hash[31 - 2r] and the high byte to hash[30 - 2r].
 fn pack_bit_rows(rows: &[u16; DCT_OUTPUT_W_H]) -> [u8; HASH_LENGTH] {
     let mut hash = [0u8; HASH_LENGTH];
-    for (r, &row) in rows.iter().enumerate() {
-        let [lo, hi] = row.to_le_bytes();
-        hash[HASH_LENGTH - 2 * r - 1] = lo;
-        hash[HASH_LENGTH - 2 * r - 2] = hi;
+    for (&row, dst) in rows.iter().zip(hash.as_chunks_mut::<2>().0.iter_mut().rev()) {
+        *dst = row.to_be_bytes();
     }
     hash
 }
@@ -189,7 +190,7 @@ pub fn generate_pdq_features(image: &image::DynamicImage) -> Option<(PdqFeatures
     // Resizing 1 channel is 3x faster than resizing 3 channels (RGB).
     let luma_image: Cow<image::GrayImage> = match image {
         image::DynamicImage::ImageLuma8(x) => Cow::Borrowed(x),
-        other => Cow::Owned(to_luma601(other)),
+        other => Cow::Owned(to_luma601(other)?),
     };
 
     let w = luma_image.width();
@@ -244,10 +245,18 @@ fn calculate_target_dimensions(w: u32, h: u32, max_dim: u32) -> (u32, u32) {
         return (w.max(1), h.max(1));
     }
     if w > h {
-        let new_h = (u64::from(h) * u64::from(max_dim) / u64::from(w)).max(1) as u32;
+        let new_h = u64::from(h)
+            .saturating_mul(u64::from(max_dim))
+            .checked_div(u64::from(w))
+            .unwrap_or(1)
+            .max(1) as u32;
         (max_dim, new_h)
     } else {
-        let new_w = (u64::from(w) * u64::from(max_dim) / u64::from(h)).max(1) as u32;
+        let new_w = u64::from(w)
+            .saturating_mul(u64::from(max_dim))
+            .checked_div(u64::from(h))
+            .unwrap_or(1)
+            .max(1) as u32;
         (new_w, max_dim)
     }
 }
@@ -293,23 +302,29 @@ fn generate_pdq_from_luma(img: &image::GrayImage) -> (PdqFeatures, f32) {
 
 /// Rec.601 luma (0.299/0.587/0.114), as used by reference PDQ. The `image`
 /// crate's to_luma8() is hardcoded to Rec.709, so this has to be done by hand.
-fn to_luma601(img: &image::DynamicImage) -> image::GrayImage {
+fn to_luma601(img: &image::DynamicImage) -> Option<image::GrayImage> {
     #[inline(always)]
-    fn luma601(px: &[u8]) -> u8 {
+    fn luma601([r, g, b]: [u8; 3]) -> u8 {
         // (299r + 587g + 114b + 500) / 1000, rounded, integer only
-        ((299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2]) + 500) / 1000)
-            as u8
+        let sum = 299u32
+            .wrapping_mul(u32::from(r))
+            .wrapping_add(587u32.wrapping_mul(u32::from(g)))
+            .wrapping_add(114u32.wrapping_mul(u32::from(b)))
+            .wrapping_add(500);
+        (sum / 1000) as u8
     }
 
     let (w, h) = (img.width(), img.height());
-    let mut buf = Vec::with_capacity(w as usize * h as usize);
+    let mut buf = Vec::with_capacity((w as usize).saturating_mul(h as usize));
     match img {
-        image::DynamicImage::ImageRgb8(src) => buf.extend(src.pixels().map(|p| luma601(&p.0))),
-        image::DynamicImage::ImageRgba8(src) => buf.extend(src.pixels().map(|p| luma601(&p.0))),
+        image::DynamicImage::ImageRgb8(src) => buf.extend(src.pixels().map(|p| luma601(p.0))),
+        image::DynamicImage::ImageRgba8(src) => {
+            buf.extend(src.pixels().map(|p| luma601([p.0[0], p.0[1], p.0[2]])))
+        },
         image::DynamicImage::ImageLuma8(src) => buf.extend_from_slice(src.as_raw()),
-        other => buf.extend(other.to_rgb8().pixels().map(|p| luma601(&p.0))),
+        other => buf.extend(other.to_rgb8().pixels().map(|p| luma601(p.0))),
     }
-    image::GrayImage::from_raw(w, h, buf).expect("buffer is exactly w*h bytes")
+    image::GrayImage::from_raw(w, h, buf)
 }
 
 // Computed once and cached in DCT_MATRIX.
@@ -321,7 +336,7 @@ fn compute_dct_matrix() -> [[f32; BUFFER_W_H]; DCT_OUTPUT_W_H] {
 
     for (i, row) in matrix.iter_mut().enumerate() {
         // Rows (Frequency)
-        let freq_idx = i + DCT_FREQ_OFFSET;
+        let freq_idx = i.saturating_add(DCT_FREQ_OFFSET);
         let freq = freq_idx as f32;
         let normalization = if freq_idx == 0 { inv_sqrt_cols } else { inv_sqrt_cols * sqrt_2 };
         for (j, cell) in row.iter_mut().enumerate() {
@@ -341,9 +356,8 @@ fn dct64_to_16(input: &[[f32; BUFFER_W_H]; BUFFER_W_H]) -> [f32; DCT_OUTPUT_MATR
     // Pass 1: Rows. k is the outer loop so both operands are walked
     // row-major; the accumulation order over k is unchanged, so the result is
     // bit identical to the naive triple loop.
-    for (i, inter_row) in intermediate.iter_mut().enumerate() {
-        for (k, in_row) in input.iter().enumerate() {
-            let coeff = dct_mat[i][k];
+    for (inter_row, dct_row) in intermediate.iter_mut().zip(dct_mat.iter()) {
+        for (in_row, &coeff) in input.iter().zip(dct_row.iter()) {
             for (inter_val, &in_val) in inter_row.iter_mut().zip(in_row.iter()) {
                 *inter_val += coeff * in_val;
             }
@@ -353,13 +367,15 @@ fn dct64_to_16(input: &[[f32; BUFFER_W_H]; BUFFER_W_H]) -> [f32; DCT_OUTPUT_MATR
     let mut output = [0.0; DCT_OUTPUT_MATRIX_SIZE];
 
     // Pass 2: Columns (Using same matrix, effectively Transposed * Matrix)
-    for (i, inter_row) in intermediate.iter().enumerate() {
-        for (j, dct_row) in dct_mat.iter().enumerate() {
+    for (inter_row, out_row) in
+        intermediate.iter().zip(output.as_chunks_mut::<DCT_OUTPUT_W_H>().0.iter_mut())
+    {
+        for (out_val, dct_row) in out_row.iter_mut().zip(dct_mat.iter()) {
             let mut sum = 0.0;
             for (&inter_val, &dct_val) in inter_row.iter().zip(dct_row.iter()) {
                 sum += inter_val * dct_val;
             }
-            output[i * DCT_OUTPUT_W_H + j] = sum;
+            *out_val = sum;
         }
     }
     output
@@ -377,57 +393,59 @@ fn box_one_d_float(
     stride: usize,
     win_size: usize,
 ) {
+    if stride == 0 || vec_len == 0 {
+        return;
+    }
     // A window wider than the vector would read past the end of the line.
     let win_size = win_size.clamp(1, vec_len.max(1));
-    let half_win = (win_size + 2) / 2;
+    let half_win = win_size.saturating_add(2) / 2;
 
-    let phase_1 = half_win - 1;
-    let phase_2 = win_size - half_win + 1;
+    let phase_1 = half_win.saturating_sub(1);
+    let phase_2 = win_size.saturating_sub(half_win).saturating_add(1);
     let phase_3 = vec_len.saturating_sub(win_size);
-    let phase_4 = half_win - 1;
+    let phase_4 = half_win.saturating_sub(1);
 
-    let mut li = in_start;
-    let mut ri = in_start;
-    let mut oi = out_start;
+    let in_slice = invec.get(in_start..).unwrap_or(&[]);
+    let out_slice = outvec.get_mut(out_start..).unwrap_or(&mut []);
+    let mut r_iter = in_slice.iter().step_by(stride);
+    let mut l_iter = in_slice.iter().step_by(stride);
+    let mut o_iter = out_slice.iter_mut().step_by(stride);
     let mut sum = 0.0;
     let mut curr_win = 0.0;
 
     // Accumulate the leading half window without emitting anything.
-    for _ in 0..phase_1 {
-        sum += invec[ri];
+    for &v in r_iter.by_ref().take(phase_1) {
+        sum += v;
         curr_win += 1.0;
-        ri += stride;
     }
     // Grow the window up to full size.
-    for _ in 0..phase_2 {
-        sum += invec[ri];
+    for (&v, out) in r_iter.by_ref().zip(o_iter.by_ref()).take(phase_2) {
+        sum += v;
         curr_win += 1.0;
-        outvec[oi] = sum / curr_win;
-        ri += stride;
-        oi += stride;
+        *out = sum / curr_win;
     }
     // Slide the full window.
-    for _ in 0..phase_3 {
-        sum += invec[ri];
-        sum -= invec[li];
-        outvec[oi] = sum / curr_win;
-        li += stride;
-        ri += stride;
-        oi += stride;
+    for ((&rv, &lv), out) in r_iter.by_ref().zip(l_iter.by_ref()).zip(o_iter.by_ref()).take(phase_3)
+    {
+        sum += rv;
+        sum -= lv;
+        *out = sum / curr_win;
     }
     // Shrink the trailing half window.
-    for _ in 0..phase_4 {
-        sum -= invec[li];
+    for (&lv, out) in l_iter.by_ref().zip(o_iter.by_ref()).take(phase_4) {
+        sum -= lv;
         curr_win -= 1.0;
-        outvec[oi] = sum / curr_win;
-        li += stride;
-        oi += stride;
+        *out = sum / curr_win;
     }
 }
 
 fn box_along_rows_float(input: &[f32], output: &mut [f32], rows: usize, cols: usize, win: usize) {
-    for i in 0..rows {
-        box_one_d_float(input, i * cols, output, i * cols, cols, 1, win);
+    if cols == 0 {
+        return;
+    }
+    for (in_row, out_row) in input.chunks_exact(cols).zip(output.chunks_exact_mut(cols)).take(rows)
+    {
+        box_one_d_float(in_row, 0, out_row, 0, cols, 1, win);
     }
 }
 
@@ -461,12 +479,32 @@ fn decimate_float<const R: usize, const C: usize>(
     in_c: usize,
 ) -> [[f32; C]; R] {
     let mut out = [[0.0; C]; R];
+    if R == 0 || C == 0 || in_r == 0 || in_c == 0 {
+        return out;
+    }
+    let r_den = R.saturating_mul(2);
+    let c_den = C.saturating_mul(2);
     for (i, out_row) in out.iter_mut().enumerate() {
-        let ini = ((i * 2 + 1) * in_r) / (R * 2);
-        // Slice the source row once so the inner loop indexes within it.
-        let in_row = &input[ini * in_c..][..in_c];
+        let ini = i
+            .saturating_mul(2)
+            .saturating_add(1)
+            .saturating_mul(in_r)
+            .checked_div(r_den)
+            .unwrap_or(0);
+        let row_start = ini.saturating_mul(in_c);
+        let Some(in_row) = input.get(row_start..row_start.saturating_add(in_c)) else {
+            continue;
+        };
         for (j, out_px) in out_row.iter_mut().enumerate() {
-            *out_px = in_row[((j * 2 + 1) * in_c) / (C * 2)];
+            let inj = j
+                .saturating_mul(2)
+                .saturating_add(1)
+                .saturating_mul(in_c)
+                .checked_div(c_den)
+                .unwrap_or(0);
+            if let Some(&px) = in_row.get(inj) {
+                *out_px = px;
+            }
         }
     }
     out
@@ -479,8 +517,8 @@ fn pdq_image_domain_quality_metric<const R: usize, const C: usize>(buf: &[[f32; 
     // Vertical gradients (each row against the next) come first, then the
     // horizontal ones; f32 addition is not associative, so the order of the
     // chain has to stay as it is to keep the sum bit-identical to reference.
-    let vertical = buf.windows(2).flat_map(|pair| pair[0].iter().zip(&pair[1]));
-    let horizontal = buf.iter().flat_map(|row| row.iter().zip(&row[1..]));
+    let vertical = buf.iter().zip(buf.iter().skip(1)).flat_map(|(r0, r1)| r0.iter().zip(r1.iter()));
+    let horizontal = buf.iter().flat_map(|row| row.iter().zip(row.iter().skip(1)));
 
     let sum: f32 =
         vertical.chain(horizontal).map(|(a, b)| (((a - b) * 100.0) / 255.0).abs().trunc()).sum();
@@ -499,17 +537,18 @@ mod tests {
     fn naive_to_hash(f: &PdqFeatures) -> [u8; HASH_LENGTH] {
         let mut buffer = f.coefficients;
         buffer.sort_unstable_by(f32::total_cmp);
-        let median = buffer[(buffer.len() - 1) / 2];
+        const MID: usize = (DCT_OUTPUT_MATRIX_SIZE - 1) / 2;
+        let median = buffer[MID];
 
         let mut hash = [0; HASH_LENGTH];
-        for i in 0..HASH_LENGTH {
+        for (i, chunk) in f.coefficients.as_chunks::<8>().0.iter().enumerate() {
             let mut byte = 0;
-            for j in 0..8 {
-                if f.coefficients[i * 8 + j] > median {
+            for (j, &coeff) in chunk.iter().enumerate() {
+                if coeff > median {
                     byte |= 1 << j;
                 }
             }
-            hash[HASH_LENGTH - i - 1] = byte;
+            hash[HASH_LENGTH.saturating_sub(i).saturating_sub(1)] = byte;
         }
         hash
     }
@@ -518,7 +557,9 @@ mod tests {
         let mut new_coeffs = [0.0; DCT_OUTPUT_MATRIX_SIZE];
         for r in 0..DCT_OUTPUT_W_H {
             for c in 0..DCT_OUTPUT_W_H {
-                new_coeffs[c * DCT_OUTPUT_W_H + r] = f.coefficients[r * DCT_OUTPUT_W_H + c];
+                let dst = c.saturating_mul(DCT_OUTPUT_W_H).saturating_add(r);
+                let src = r.saturating_mul(DCT_OUTPUT_W_H).saturating_add(c);
+                new_coeffs[dst] = f.coefficients[src];
             }
         }
         PdqFeatures { coefficients: new_coeffs }
@@ -526,11 +567,10 @@ mod tests {
 
     fn naive_flip_x(f: &PdqFeatures) -> PdqFeatures {
         let mut new_coeffs = f.coefficients;
-        for r in 0..DCT_OUTPUT_W_H {
-            for c in 0..DCT_OUTPUT_W_H {
-                if (c + DCT_FREQ_OFFSET) % 2 != 0 {
-                    let idx = r * DCT_OUTPUT_W_H + c;
-                    new_coeffs[idx] = -new_coeffs[idx];
+        for row in new_coeffs.as_chunks_mut::<DCT_OUTPUT_W_H>().0 {
+            for (c, val) in row.iter_mut().enumerate() {
+                if !c.wrapping_add(DCT_FREQ_OFFSET).is_multiple_of(2) {
+                    *val = -*val;
                 }
             }
         }
@@ -539,11 +579,10 @@ mod tests {
 
     fn naive_flip_y(f: &PdqFeatures) -> PdqFeatures {
         let mut new_coeffs = f.coefficients;
-        for r in 0..DCT_OUTPUT_W_H {
-            if (r + DCT_FREQ_OFFSET) % 2 != 0 {
-                for c in 0..DCT_OUTPUT_W_H {
-                    let idx = r * DCT_OUTPUT_W_H + c;
-                    new_coeffs[idx] = -new_coeffs[idx];
+        for (r, row) in new_coeffs.as_chunks_mut::<DCT_OUTPUT_W_H>().0.iter_mut().enumerate() {
+            if !r.wrapping_add(DCT_FREQ_OFFSET).is_multiple_of(2) {
+                for val in row.iter_mut() {
+                    *val = -*val;
                 }
             }
         }

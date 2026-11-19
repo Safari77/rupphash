@@ -458,8 +458,8 @@ impl GeoSpatialIndex {
         if self.entries.is_empty() || filters.is_empty() {
             return Vec::new();
         }
-        if filters.len() == 1 {
-            return self.search(&filters[0]);
+        if let [single] = filters {
+            return self.search(single);
         }
         debug_assert!(
             self.is_finalized,
@@ -537,8 +537,9 @@ impl GeoSpatialIndex {
     #[inline]
     fn lat_slice(&self, min_lat: f64, max_lat: f64) -> &[GeoPointEntry] {
         let start = self.entries.partition_point(|e| e.lat < min_lat);
-        let end = start + self.entries[start..].partition_point(|e| e.lat <= max_lat);
-        &self.entries[start..end]
+        let tail = self.entries.get(start..).unwrap_or(&[]);
+        let len = tail.partition_point(|e| e.lat <= max_lat);
+        tail.get(..len).unwrap_or(&[])
     }
 }
 

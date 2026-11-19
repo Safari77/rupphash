@@ -69,11 +69,15 @@ pub fn sort_nearest_neighbor(markers: &mut [GpsMarker]) {
     let len = markers.len();
 
     for i in 0..len.saturating_sub(1) {
-        let current = (markers[i].lat, markers[i].lon);
+        let Some(cur) = markers.get(i) else {
+            break;
+        };
+        let current = (cur.lat, cur.lon);
+        let next = i.saturating_add(1);
         let mut best_dist = f64::INFINITY;
-        let mut best_idx = i + 1;
+        let mut best_idx = next;
 
-        for (j, marker) in markers.iter().enumerate().take(len).skip(i + 1) {
+        for (j, marker) in markers.iter().enumerate().take(len).skip(next) {
             let d2 = dist_sq_approx(current, (marker.lat, marker.lon));
             if d2 < best_dist {
                 best_dist = d2;
@@ -81,7 +85,9 @@ pub fn sort_nearest_neighbor(markers: &mut [GpsMarker]) {
             }
         }
 
-        markers.swap(i + 1, best_idx);
+        if next < len && best_idx < len {
+            markers.swap(next, best_idx);
+        }
     }
 }
 
@@ -98,23 +104,30 @@ fn optimize_2opt(markers: &mut [GpsMarker], deadline: std::time::Instant) {
     } // Need at least 4 points to have crossing lines
 
     let mut improved = true;
-    let mut passes = 0;
+    let mut passes = 0u8;
 
     // Run up to 5 passes (usually converges in 1 or 2 for simple maps)
     while improved && passes < 5 {
         improved = false;
-        passes += 1;
+        passes = passes.saturating_add(1);
 
-        for i in 0..(len - 2) {
+        for i in 0..len.saturating_sub(2) {
             if std::time::Instant::now() >= deadline {
                 return;
             }
-            for j in (i + 2)..(len - 1) {
+            let i_next = i.saturating_add(1);
+            for j in i.saturating_add(2)..len.saturating_sub(1) {
+                let j_next = j.saturating_add(1);
                 // -1 because we are looking at segments
-                let p1 = (markers[i].lat, markers[i].lon);
-                let p2 = (markers[i + 1].lat, markers[i + 1].lon);
-                let p3 = (markers[j].lat, markers[j].lon);
-                let p4 = (markers[j + 1].lat, markers[j + 1].lon);
+                let (Some(m1), Some(m2), Some(m3), Some(m4)) =
+                    (markers.get(i), markers.get(i_next), markers.get(j), markers.get(j_next))
+                else {
+                    continue;
+                };
+                let p1 = (m1.lat, m1.lon);
+                let p2 = (m2.lat, m2.lon);
+                let p3 = (m3.lat, m3.lon);
+                let p4 = (m4.lat, m4.lon);
 
                 // Current edge lengths: p1->p2 and p3->p4.
                 // NOTE: 2-opt compares the SUM of two edge lengths, so the metric
@@ -127,9 +140,11 @@ fn optimize_2opt(markers: &mut [GpsMarker], deadline: std::time::Instant) {
                 // Swapped edge lengths: p1->p3 and p2->p4 (uncrossing)
                 let d_swap = dist_sq_approx(p1, p3).sqrt() + dist_sq_approx(p2, p4).sqrt();
 
-                if d_swap < d_current {
+                if d_swap < d_current
+                    && let Some(segment) = markers.get_mut(i_next..=j)
+                {
                     // Reverse the segment between i+1 and j to uncross
-                    markers[i + 1..=j].reverse();
+                    segment.reverse();
                     improved = true;
                 }
             }
@@ -412,8 +427,8 @@ impl GpsMapState {
                 // 2. If we didn't just remove the very last element,
                 // an element has moved from the end to 'idx'.
                 // We must update the lookup map for that moved element.
-                if idx < self.markers.len() {
-                    let moved_path = self.markers[idx].path.clone();
+                if let Some(moved) = self.markers.get(idx) {
+                    let moved_path = moved.path.clone();
                     self.path_to_marker.insert(moved_path, idx);
                 }
             }
@@ -489,8 +504,9 @@ impl GpsMapState {
 
             let total_dist: f64 = self
                 .markers
-                .windows(2)
-                .map(|w| crate::position::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
+                .iter()
+                .zip(self.markers.iter().skip(1))
+                .map(|(a, b)| crate::position::distance((a.lat, a.lon), (b.lat, b.lon)))
                 .sum();
 
             let with_ts = self.markers.iter().filter(|m| m.exif_timestamp.is_some()).count();
@@ -514,7 +530,9 @@ impl GpsMapState {
             // Fixes the ugly cross-country jumps the greedy sort left behind.
             // Capped so a large set can't stall the frame; whatever passes fit
             // in the budget still improve the path.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(50))
+                .unwrap_or_else(std::time::Instant::now);
             optimize_2opt(&mut self.markers, deadline);
         } else {
             // For massive datasets, stick to the instant spatial sort
@@ -531,8 +549,9 @@ impl GpsMapState {
         // Calculate and log Total Distance using exact geodesic formula
         let total_dist: f64 = self
             .markers
-            .windows(2)
-            .map(|w| crate::position::distance((w[0].lat, w[0].lon), (w[1].lat, w[1].lon)))
+            .iter()
+            .zip(self.markers.iter().skip(1))
+            .map(|(a, b)| crate::position::distance((a.lat, a.lon), (b.lat, b.lon)))
             .sum();
         eprintln!("[GPS] Spatial Sort Complete. Path Length: {}", format_distance(total_dist));
         self.markers_needs_sort = false;
@@ -669,9 +688,9 @@ impl Plugin for GpsMarkersPlugin {
         if self.draw_lines && self.markers.len() > 1 {
             let line_stroke = egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 60, 0));
 
-            for pair in self.markers.windows(2) {
-                let pos1 = pair[0].0;
-                let pos2 = pair[1].0;
+            for (first, second) in self.markers.iter().zip(self.markers.iter().skip(1)) {
+                let pos1 = first.0;
+                let pos2 = second.0;
 
                 // Optimization: Skip lines that are completely off-screen (Latitude only for speed)
                 // If both points are too far North or too far South, don't draw.
@@ -936,16 +955,16 @@ pub fn render_gps_map(
         let idx = clicked_idx.load(std::sync::atomic::Ordering::Relaxed);
         if idx >= 0 {
             let idx = idx as usize;
-            if idx < state.markers.len() {
+            if let Some(marker) = state.markers.get(idx) {
                 state.selected_marker = Some(idx);
-                clicked_path = Some(state.markers[idx].path.clone());
+                clicked_path = Some(marker.path.clone());
             }
         }
 
         // Draw attribution at bottom right of the map area
         let attribution_text = format!("© {}", state.provider_name);
         ui.painter().text(
-            map_rect.max - egui::vec2(5.0, 5.0),
+            egui::pos2(map_rect.max.x - 5.0, map_rect.max.y - 5.0),
             egui::Align2::RIGHT_BOTTOM,
             attribution_text,
             egui::FontId::proportional(10.0),
@@ -1079,7 +1098,7 @@ pub fn format_bearing(degrees: f64) -> String {
     let directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
     let norm = if degrees.is_finite() { degrees.rem_euclid(360.0) } else { 0.0 };
     let idx = ((norm + 22.5) / 45.0) as usize % 8;
-    format!("{:.2}° {}", degrees, directions[idx])
+    format!("{:.2}° {}", degrees, directions.get(idx).copied().unwrap_or("N"))
 }
 
 /// Get distance and bearing string between two points

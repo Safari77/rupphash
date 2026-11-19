@@ -99,10 +99,11 @@ impl SlideshowEffectChoice {
             SlideshowEffectChoice::Vacuum => SlideshowEffect::Vacuum,
             SlideshowEffectChoice::Random => {
                 let available = SlideshowEffect::ALL;
-                let idx = (random_u64() as usize) % available.len();
-                let chosen = available[idx];
+                let idx = (random_u64() as usize).checked_rem(available.len()).unwrap_or(0);
+                let chosen = available.get(idx).copied().unwrap_or(SlideshowEffect::None);
                 if Some(chosen) == last_effect && available.len() > 1 {
-                    available[(idx + 1) % available.len()]
+                    let next = idx.saturating_add(1).checked_rem(available.len()).unwrap_or(0);
+                    available.get(next).copied().unwrap_or(chosen)
                 } else {
                     chosen
                 }
@@ -114,11 +115,10 @@ impl SlideshowEffectChoice {
         choices: &[SlideshowEffectChoice],
         last_effect: Option<SlideshowEffect>,
     ) -> SlideshowEffect {
-        if choices.is_empty() {
-            return SlideshowEffectChoice::Random.pick_effective(last_effect);
-        }
-        if choices.len() == 1 {
-            return choices[0].pick_effective(last_effect);
+        match choices {
+            [] => return SlideshowEffectChoice::Random.pick_effective(last_effect),
+            [single] => return single.pick_effective(last_effect),
+            _ => {},
         }
 
         let mut effects = Vec::new();
@@ -138,17 +138,17 @@ impl SlideshowEffectChoice {
             }
         }
         effects.dedup();
-        if effects.is_empty() {
-            return SlideshowEffect::None;
-        }
-        if effects.len() == 1 {
-            return effects[0];
+        match effects.as_slice() {
+            [] => return SlideshowEffect::None,
+            [single] => return *single,
+            _ => {},
         }
 
-        let idx = (random_u64() as usize) % effects.len();
-        let chosen = effects[idx];
+        let idx = (random_u64() as usize).checked_rem(effects.len()).unwrap_or(0);
+        let chosen = effects.get(idx).copied().unwrap_or(SlideshowEffect::None);
         if Some(chosen) == last_effect && effects.len() > 1 {
-            effects[(idx + 1) % effects.len()]
+            let next = idx.saturating_add(1).checked_rem(effects.len()).unwrap_or(0);
+            effects.get(next).copied().unwrap_or(chosen)
         } else {
             chosen
         }
@@ -1207,7 +1207,7 @@ impl SlideshowManager {
             image.as_raw(),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * width.max(1)),
+                bytes_per_row: Some(4u32.saturating_mul(width.max(1))),
                 rows_per_image: Some(height.max(1)),
             },
             size,
@@ -1233,12 +1233,14 @@ impl SlideshowManager {
         let (raw_bytes, bpp, format) = match pixels {
             super::image::DeepPixels::Rgb10a2(v) => (
                 bytemuck::cast_slice::<u32, u8>(v.as_slice()),
-                4,
+                4u32,
                 wgpu::TextureFormat::Rgb10a2Unorm,
             ),
-            super::image::DeepPixels::Rgba16(v) => {
-                (bytemuck::cast_slice::<u16, u8>(v.as_slice()), 8, wgpu::TextureFormat::Rgba16Unorm)
-            },
+            super::image::DeepPixels::Rgba16(v) => (
+                bytemuck::cast_slice::<u16, u8>(v.as_slice()),
+                8u32,
+                wgpu::TextureFormat::Rgba16Unorm,
+            ),
         };
 
         let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
@@ -1259,7 +1261,7 @@ impl SlideshowManager {
             raw_bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(bpp * width),
+                bytes_per_row: Some(bpp.saturating_mul(width)),
                 rows_per_image: Some(height),
             },
             size,

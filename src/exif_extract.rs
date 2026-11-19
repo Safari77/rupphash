@@ -80,15 +80,12 @@ pub fn extract_gps_lat_lon(exif_data: &exif::Exif) -> Option<(f64, f64)> {
 /// Returns positive value; caller must apply sign from ref tag.
 pub fn parse_gps_coordinate(value: &Value) -> Option<f64> {
     if let Value::Rational(rats) = value
-        && rats.len() >= 3
+        && let [deg, min, sec, ..] = rats.as_slice()
     {
-        if rats[0].denom == 0 || rats[1].denom == 0 || rats[2].denom == 0 {
+        if deg.denom == 0 || min.denom == 0 || sec.denom == 0 {
             return None;
         }
-        let degrees = rats[0].to_f64();
-        let minutes = rats[1].to_f64();
-        let seconds = rats[2].to_f64();
-        return Some(degrees + minutes / 60.0 + seconds / 3600.0);
+        return Some(deg.to_f64() + min.to_f64() / 60.0 + sec.to_f64() / 3600.0);
     }
     None
 }
@@ -96,53 +93,43 @@ pub fn parse_gps_coordinate(value: &Value) -> Option<f64> {
 /// Parses date string. If `use_gps` is true, attempts GPS time (UTC).
 pub fn get_date_str(exif: &exif::Exif, use_gps: bool) -> Option<String> {
     if use_gps {
-        let date_field = exif.get_field(Tag::GPSDateStamp, In::PRIMARY);
-        let time_field = exif.get_field(Tag::GPSTimeStamp, In::PRIMARY);
+        let d_field = exif.get_field(Tag::GPSDateStamp, In::PRIMARY)?;
+        let t_field = exif.get_field(Tag::GPSTimeStamp, In::PRIMARY)?;
 
-        if let (Some(d_field), Some(t_field)) = (date_field, time_field) {
-            // Parse Date: "YYYY:MM:DD"
-            let date_part = if let Value::Ascii(ref vec) = d_field.value {
-                if !vec.is_empty() {
-                    std::str::from_utf8(&vec[0]).ok()?.trim().replace(':', "-")
-                } else {
-                    return None;
-                }
-            } else {
-                return None;
-            };
+        // Parse Date: "YYYY:MM:DD"
+        let Value::Ascii(vec) = &d_field.value else {
+            return None;
+        };
+        let date_part = std::str::from_utf8(vec.first()?).ok()?.trim().replace(':', "-");
 
-            // Parse Time: 3 Rationals [Hr, Min, Sec]
-            let time_part = if let Value::Rational(ref rats) = t_field.value {
-                if rats.len() >= 3 && rats[0].denom != 0 && rats[1].denom != 0 && rats[2].denom != 0
-                {
-                    let h = rats[0].num as f64 / rats[0].denom as f64;
-                    let m = rats[1].num as f64 / rats[1].denom as f64;
-                    let s = rats[2].num as f64 / rats[2].denom as f64;
-                    format!("{:02}:{:02}:{:06.3}", h as u32, m as u32, s)
-                } else {
-                    return None;
-                }
-            } else {
-                return None;
-            };
-
-            return Some(format!("{} {}", date_part, time_part));
+        // Parse Time: 3 Rationals [Hr, Min, Sec]
+        let Value::Rational(rats) = &t_field.value else {
+            return None;
+        };
+        let [hr, min, sec, ..] = rats.as_slice() else {
+            return None;
+        };
+        if hr.denom == 0 || min.denom == 0 || sec.denom == 0 {
+            return None;
         }
-        return None;
+        let h = hr.num as f64 / hr.denom as f64;
+        let m = min.num as f64 / min.denom as f64;
+        let s = sec.num as f64 / sec.denom as f64;
+        let time_part = format!("{:02}:{:02}:{:06.3}", h as u32, m as u32, s);
+
+        return Some(format!("{} {}", date_part, time_part));
     }
 
     // Default: Use DateTimeOriginal
     let field = exif.get_field(Tag::DateTimeOriginal, In::PRIMARY)?;
-    match field.value {
-        Value::Ascii(ref vec) if !vec.is_empty() => {
-            if let Ok(dt) = exif::DateTime::from_ascii(&vec[0]) {
-                return Some(format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                    dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
-                ));
-            }
-        },
-        _ => {},
+    if let Value::Ascii(vec) = &field.value
+        && let Some(first) = vec.first()
+        && let Ok(dt) = exif::DateTime::from_ascii(first)
+    {
+        return Some(format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
+        ));
     }
     None
 }
@@ -158,16 +145,14 @@ pub fn get_exif_timestamp(exif: &exif::Exif) -> Option<i64> {
 /// Parse an EXIF DateTime tag to Unix timestamp.
 fn parse_exif_datetime_tag(exif: &exif::Exif, tag: Tag) -> Option<i64> {
     let field = exif.get_field(tag, In::PRIMARY)?;
-    if let Value::Ascii(ref vec) = field.value {
-        if vec.is_empty() {
-            return None;
-        }
-        if let Ok(dt) = exif::DateTime::from_ascii(&vec[0]) {
-            let date = NaiveDate::from_ymd_opt(dt.year as i32, dt.month as u32, dt.day as u32)?;
-            let time = NaiveTime::from_hms_opt(dt.hour as u32, dt.minute as u32, dt.second as u32)?;
-            let naive_dt = NaiveDateTime::new(date, time);
-            return Some(naive_dt.and_utc().timestamp());
-        }
+    if let Value::Ascii(vec) = &field.value
+        && let Some(first) = vec.first()
+        && let Ok(dt) = exif::DateTime::from_ascii(first)
+    {
+        let date = NaiveDate::from_ymd_opt(dt.year as i32, dt.month as u32, dt.day as u32)?;
+        let time = NaiveTime::from_hms_opt(dt.hour as u32, dt.minute as u32, dt.second as u32)?;
+        let naive_dt = NaiveDateTime::new(date, time);
+        return Some(naive_dt.and_utc().timestamp());
     }
     None
 }
@@ -177,17 +162,18 @@ pub fn get_altitude(exif: &exif::Exif) -> Option<f64> {
     let val_field = exif.get_field(Tag::GPSAltitude, In::PRIMARY)?;
     let ref_field = exif.get_field(Tag::GPSAltitudeRef, In::PRIMARY);
 
-    if let Value::Rational(ref rats) = val_field.value {
-        if rats.is_empty() || rats[0].denom == 0 {
+    if let Value::Rational(rats) = &val_field.value
+        && let Some(first) = rats.first()
+    {
+        if first.denom == 0 {
             return None;
         }
 
-        let mut alt = rats[0].num as f64 / rats[0].denom as f64;
+        let mut alt = first.num as f64 / first.denom as f64;
 
         if let Some(rf) = ref_field
-            && let Value::Byte(ref bytes) = rf.value
-            && !bytes.is_empty()
-            && bytes[0] == 1
+            && let Value::Byte(bytes) = &rf.value
+            && bytes.first() == Some(&1)
         {
             alt = -alt;
         }
@@ -228,53 +214,38 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
 
         // Convert value to our format
         let value = match &field.value {
-            Value::Byte(v) => {
-                if v.len() == 1 {
-                    ExifValue::Byte(v[0])
-                } else if v.len() <= MAX_TAG_SIZE {
-                    ExifValue::Bytes(v.clone())
-                } else {
-                    continue;
-                }
+            Value::Byte(v) => match v.as_slice() {
+                [b] => ExifValue::Byte(*b),
+                slice if slice.len() <= MAX_TAG_SIZE => ExifValue::Bytes(v.clone()),
+                _ => continue,
             },
 
-            Value::Short(v) => {
-                if v.len() == 1 {
-                    ExifValue::Short(v[0])
-                } else if v.len() <= MAX_TAG_SIZE / 2 {
-                    ExifValue::Shorts(v.clone())
-                } else {
-                    continue;
-                }
+            Value::Short(v) => match v.as_slice() {
+                [s] => ExifValue::Short(*s),
+                slice if slice.len() <= MAX_TAG_SIZE / 2 => ExifValue::Shorts(v.clone()),
+                _ => continue,
             },
 
-            Value::Long(v) => {
-                if v.len() == 1 {
-                    ExifValue::Long(v[0])
-                } else {
-                    continue;
-                }
+            Value::Long(v) => match v.as_slice() {
+                [l] => ExifValue::Long(*l),
+                _ => continue,
             },
 
-            Value::SLong(v) => {
-                if v.len() == 1 {
-                    ExifValue::Signed(v[0])
-                } else {
-                    continue;
-                }
+            Value::SLong(v) => match v.as_slice() {
+                [l] => ExifValue::Signed(*l),
+                _ => continue,
             },
 
-            Value::Rational(v) => {
-                if v.is_empty() {
-                    continue;
-                }
-                if v.len() == 1 {
-                    if v[0].denom != 0 {
-                        ExifValue::Float(v[0].num as f64 / v[0].denom as f64)
+            Value::Rational(v) => match v.as_slice() {
+                [] => continue,
+                [r] => {
+                    if r.denom != 0 {
+                        ExifValue::Float(r.num as f64 / r.denom as f64)
                     } else {
                         continue;
                     }
-                } else {
+                },
+                _ => {
                     // Multiple rationals (e.g., GPS coordinates)
                     let floats: Vec<f64> = v
                         .iter()
@@ -285,20 +256,19 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                         continue;
                     }
                     ExifValue::Floats(floats)
-                }
+                },
             },
 
-            Value::SRational(v) => {
-                if v.is_empty() {
-                    continue;
-                }
-                if v.len() == 1 {
-                    if v[0].denom != 0 {
-                        ExifValue::Float(v[0].num as f64 / v[0].denom as f64)
+            Value::SRational(v) => match v.as_slice() {
+                [] => continue,
+                [r] => {
+                    if r.denom != 0 {
+                        ExifValue::Float(r.num as f64 / r.denom as f64)
                     } else {
                         continue;
                     }
-                } else {
+                },
+                _ => {
                     let floats: Vec<f64> = v
                         .iter()
                         .filter(|r| r.denom != 0)
@@ -308,7 +278,7 @@ pub fn extract_all_exif(exif_data: &exif::Exif) -> BTreeMap<u16, ExifValue> {
                         continue;
                     }
                     ExifValue::Floats(floats)
-                }
+                },
             },
 
             Value::Ascii(v) => {
@@ -567,7 +537,7 @@ pub fn format_dms_from_decimal(decimal_deg: f64, is_latitude: bool) -> String {
     let mut s_rounded = (s * 10.0).round() / 10.0;
     if s_rounded >= 60.0 {
         s_rounded = 0.0;
-        m += 1;
+        m = m.saturating_add(1);
         if m >= 60 {
             m = 0;
             d = d.saturating_add(1);
@@ -620,19 +590,20 @@ pub fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bo
             // ExposureTime is stored as Rational; check that first because
             // Value::get_uint() returns None for Rational values.
             if let exif::Value::Rational(rats) = value
-                && !rats.is_empty()
-                && rats[0].num > 0
-                && rats[0].denom > 0
+                && let Some(first) = rats.first()
+                && first.num > 0
+                && first.denom > 0
             {
-                let g = gcd(rats[0].num, rats[0].denom);
-                let (n, d) = (rats[0].num / g, rats[0].denom / g);
-                if d == 1 {
-                    // Whole seconds, e.g. "2s"
-                    return format_seconds(n as f64);
+                let g = gcd(first.num, first.denom);
+                if let (Some(n), Some(d)) = (first.num.checked_div(g), first.denom.checked_div(g)) {
+                    if d == 1 {
+                        // Whole seconds, e.g. "2s"
+                        return format_seconds(n as f64);
+                    }
+                    // Exact reduced fraction plus human-readable time, always
+                    let secs = n as f64 / d as f64;
+                    return format!("{n}/{d}s ({})", format_seconds(secs));
                 }
-                // Exact reduced fraction plus human-readable time, always
-                let secs = n as f64 / d as f64;
-                return format!("{n}/{d}s ({})", format_seconds(secs));
             }
             // Integer-typed fallback (some writers store plain integers)
             if let Some(r) = value.get_uint(0) {
@@ -644,42 +615,43 @@ pub fn format_exif_value(value: &exif::Value, tag: exif::Tag, decimal_coords: bo
             // ExposureBias is stored as SRational; widen to i64 first so that
             // negating i32::MIN (-2147483648) never overflows or panics in gcd().
             if let exif::Value::SRational(rats) = value
-                && !rats.is_empty()
-                && rats[0].denom != 0
+                && let Some(first) = rats.first()
+                && first.denom != 0
             {
-                let (mut n, mut d) = (rats[0].num as i64, rats[0].denom as i64);
+                let (mut n, mut d) = (first.num as i64, first.denom as i64);
                 if d < 0 {
                     // Normalize sign into the numerator safely in i64
-                    n = -n;
-                    d = -d;
+                    n = n.saturating_neg();
+                    d = d.saturating_neg();
                 }
                 let g = gcd(n, d);
-                let (n, d) = (n / g, d / g);
-                return if n == 0 {
-                    "0 EV".to_string()
-                } else if d == 1 {
-                    format!("{n:+} EV")
-                } else {
-                    format!("{n:+}/{d} EV")
-                };
+                if let (Some(n), Some(d)) = (n.checked_div(g), d.checked_div(g)) {
+                    return if n == 0 {
+                        "0 EV".to_string()
+                    } else if d == 1 {
+                        format!("{n:+} EV")
+                    } else {
+                        format!("{n:+}/{d} EV")
+                    };
+                }
             }
             clean_exif_string(&value.display_as(tag).to_string())
         },
         exif::Tag::FNumber => {
             if let exif::Value::Rational(rats) = value
-                && !rats.is_empty()
-                && rats[0].denom > 0
+                && let Some(first) = rats.first()
+                && first.denom > 0
             {
-                return format!("f/{:.1}", rats[0].num as f64 / rats[0].denom as f64);
+                return format!("f/{:.1}", first.num as f64 / first.denom as f64);
             }
             clean_exif_string(&value.display_as(tag).to_string())
         },
         exif::Tag::FocalLength => {
             if let exif::Value::Rational(rats) = value
-                && !rats.is_empty()
-                && rats[0].denom > 0
+                && let Some(first) = rats.first()
+                && first.denom > 0
             {
-                return format!("{}mm", rats[0].num as f64 / rats[0].denom as f64);
+                return format!("{}mm", first.num as f64 / first.denom as f64);
             }
             clean_exif_string(&value.display_as(tag).to_string())
         },
