@@ -6,16 +6,12 @@ use regex::RegexBuilder;
 
 use super::{app::GuiApp, image::ViewMode};
 use crate::{
-    format_relative_time, scanner,
+    format_relative_time,
+    position::GeoDistanceFilter,
+    scanner,
     search_index::{SearchCriterion, parse_search_query},
     state::InputIntent,
 };
-
-struct GeoDistanceFilter {
-    target_point: geo::Point<f64>,
-    min_km: f64,
-    max_km: f64,
-}
 
 /// Handle keyboard input
 pub(super) fn handle_input(
@@ -1967,89 +1963,95 @@ fn perform_advanced_search(app: &mut GuiApp) {
         app.state.search_index_stats = Some(app.search_index.stats());
     }
 
-    let mut exif_matching_ids: Option<std::collections::HashSet<u128>> = None;
-    if use_search_index {
+    let exif_matching_bitmap = if use_search_index {
         let bitmap = if app.search_or_mode {
             app.search_index.search_or(&exif_criteria)
         } else {
             app.search_index.search_and(&exif_criteria)
         };
-        let matching_ids: std::collections::HashSet<u128> =
-            bitmap.iter().filter_map(|idx| app.search_index.index_to_file_id(idx)).collect();
-        exif_matching_ids = Some(matching_ids);
-    }
+        Some(bitmap)
+    } else {
+        None
+    };
 
-    // 6. Search
-    for (g_idx, group) in app.state.groups.iter().enumerate() {
-        for (f_idx, file) in group.iter().enumerate() {
-            if !file.path.exists() {
-                app.exif_search_cache.remove(&file.path);
-                continue;
-            }
+    let has_exif = !exif_criteria.is_empty();
+    let has_geo = !geo_filters.is_empty();
 
-            let filename_matches = if let Some(ref re) = filename_regex {
-                let filename = file.path.file_name().unwrap_or_default().to_string_lossy();
-                re.is_match(&filename)
-            } else {
-                true
-            };
+    // 6. Search (skip full scan when AND-mode EXIF index returned zero matches)
+    let skip_scan =
+        !app.search_or_mode && exif_matching_bitmap.as_ref().is_some_and(|b| b.is_empty());
 
-            if !filename_matches {
-                continue;
-            }
+    if !skip_scan {
+        let match_source_template = if !exif_query_raw.is_empty() && filename_regex.is_some() {
+            format!("Filename + {}", exif_query_raw)
+        } else if !exif_query_raw.is_empty() {
+            exif_query_raw.clone()
+        } else {
+            "Filename".to_string()
+        };
 
-            let exif_matches = if exif_criteria.is_empty() {
-                true
-            } else if let Some(ref matching_ids) = exif_matching_ids {
-                matching_ids.contains(&file.unique_file_id)
-            } else {
-                super::dialogs::check_exif_criteria_fallback(
-                    &mut app.exif_search_cache,
-                    file,
-                    &exif_criteria,
-                    app.search_or_mode,
-                )
-            };
-
-            let matches_geo = if geo_filters.is_empty() {
-                true
-            } else if let Some(gps_pos) = file.gps_pos {
-                let mut check = |filter: &GeoDistanceFilter| {
-                    let dist_km = crate::position::distance(
-                        (gps_pos.y(), gps_pos.x()),
-                        (filter.target_point.y(), filter.target_point.x()),
-                    ) / 1000.0;
-                    dist_km >= filter.min_km && dist_km <= filter.max_km
-                };
-                if app.search_or_mode {
-                    geo_filters.iter().any(&mut check)
-                } else {
-                    geo_filters.iter().all(&mut check)
+        for (g_idx, group) in app.state.groups.iter().enumerate() {
+            for (f_idx, file) in group.iter().enumerate() {
+                if let Some(ref re) = filename_regex {
+                    let filename = file.path.file_name().unwrap_or_default().to_string_lossy();
+                    if !re.is_match(&filename) {
+                        continue;
+                    }
                 }
-            } else {
-                false
-            };
 
-            let query_matches = if app.search_or_mode {
-                match (!exif_criteria.is_empty(), !geo_filters.is_empty()) {
-                    (true, true) => exif_matches || matches_geo,
-                    (true, false) => exif_matches,
-                    (false, true) => matches_geo,
-                    (false, false) => true,
-                }
-            } else {
-                exif_matches && matches_geo
-            };
-
-            if query_matches {
-                let match_source = if !exif_query_raw.is_empty() && filename_regex.is_some() {
-                    format!("Filename + {}", exif_query_raw)
-                } else if !exif_query_raw.is_empty() {
-                    exif_query_raw.clone()
-                } else {
-                    "Filename".to_string()
+                let check_exif = |cache: &mut std::collections::HashMap<
+                    std::path::PathBuf,
+                    Vec<(String, String)>,
+                >| {
+                    if let Some(ref bitmap) = exif_matching_bitmap {
+                        app.search_index
+                            .file_id_to_index(file.unique_file_id)
+                            .is_some_and(|idx| bitmap.contains(idx))
+                    } else {
+                        super::dialogs::check_exif_criteria_fallback(
+                            cache,
+                            file,
+                            &exif_criteria,
+                            app.search_or_mode,
+                        )
+                    }
                 };
-                app.state.search_results.push((g_idx, f_idx, match_source));
+
+                let check_geo = || {
+                    if let Some(gps_pos) = file.gps_pos {
+                        if app.search_or_mode {
+                            geo_filters.iter().any(|filter| filter.matches_point(gps_pos))
+                        } else {
+                            geo_filters.iter().all(|filter| filter.matches_point(gps_pos))
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                let query_matches = if app.search_or_mode {
+                    match (has_exif, has_geo) {
+                        (true, true) => check_exif(&mut app.exif_search_cache) || check_geo(),
+                        (true, false) => check_exif(&mut app.exif_search_cache),
+                        (false, true) => check_geo(),
+                        (false, false) => true,
+                    }
+                } else {
+                    // Short-circuit exif_matches before evaluating geo_filters in AND mode
+                    (!has_exif || check_exif(&mut app.exif_search_cache))
+                        && (!has_geo || check_geo())
+                };
+
+                if !query_matches {
+                    continue;
+                }
+
+                if !file.path.exists() {
+                    app.exif_search_cache.remove(&file.path);
+                    continue;
+                }
+
+                app.state.search_results.push((g_idx, f_idx, match_source_template.clone()));
             }
         }
     }
@@ -2097,10 +2099,10 @@ fn parse_and_add_geo_filter(
         let min_km = min_s.parse::<f64>().unwrap_or(0.0);
         let max_km = max_s.parse::<f64>().unwrap_or(f64::MAX);
 
-        geo_filters.push(GeoDistanceFilter { target_point: target, min_km, max_km });
+        geo_filters.push(GeoDistanceFilter::from_point(target, min_km, max_km));
         true
     } else if let Some(val) = crate::search_index::extract_number_from_string(range_str) {
-        geo_filters.push(GeoDistanceFilter { target_point: target, min_km: 0.0, max_km: val });
+        geo_filters.push(GeoDistanceFilter::from_point(target, 0.0, val));
         true
     } else {
         false
