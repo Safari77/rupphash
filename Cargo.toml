@@ -99,8 +99,9 @@ strip = true
 lto = "fat"
 
 [profile.dev]
-opt-level = 3
+opt-level = 1
 debug = true
+strip = false
 lto = false
 
 [[bench]]
