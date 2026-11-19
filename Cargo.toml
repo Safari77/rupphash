@@ -96,7 +96,7 @@ criterion = "0.8"
 opt-level = 3
 debug = false
 strip = true
-lto = false
+lto = "fat"
 
 [profile.dev]
 opt-level = 3
