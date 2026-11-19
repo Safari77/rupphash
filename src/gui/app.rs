@@ -354,11 +354,13 @@ impl GuiApp {
         self.search_index.finalize();
         self.search_index_dirty = false;
 
+        let stats = self.search_index.stats();
         let elapsed = start.elapsed();
         eprintln!(
-            "[SEARCH] Index built: {} files indexed, {} missing features, took {:?}",
-            indexed, missing_features, elapsed
+            "[SEARCH] Index built: {} files indexed, {} missing features, took {:?} ({})",
+            indexed, missing_features, elapsed, stats
         );
+        self.state.search_index_stats = Some(stats);
 
         // Debug: show what tags were indexed
         #[cfg(debug_assertions)]
@@ -1364,6 +1366,7 @@ impl GuiApp {
                         && let Ok(Some(features)) = self.ctx.get_features(&file.content_hash)
                     {
                         self.search_index.insert(file.unique_file_id, &features);
+                        self.state.search_index_stats = None;
                     }
                 }
 
@@ -2304,6 +2307,9 @@ impl GuiApp {
                             // Re-sort numeric indices only if search is open
                             if self.state.show_search {
                                 self.search_index.finalize();
+                                self.state.search_index_stats = Some(self.search_index.stats());
+                            } else {
+                                self.state.search_index_stats = None;
                             }
                         } else if let Ok(Some(features)) =
                             self.ctx.get_features(&result.content_hash)
@@ -2314,6 +2320,9 @@ impl GuiApp {
 
                             if self.state.show_search {
                                 self.search_index.finalize();
+                                self.state.search_index_stats = Some(self.search_index.stats());
+                            } else {
+                                self.state.search_index_stats = None;
                             }
                         }
 
@@ -2413,10 +2422,21 @@ impl GuiApp {
     ) {
         egui::Panel::bottom("status").show(ui, |ui| {
             if let Some((msg, is_error)) = &self.state.status_message {
-                ui.colored_label(
-                    if *is_error { egui::Color32::RED } else { egui::Color32::GREEN },
-                    msg,
-                );
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        if *is_error { egui::Color32::RED } else { egui::Color32::GREEN },
+                        msg,
+                    );
+                    if !*is_error
+                        && !self.state.search_results.is_empty()
+                        && self.state.search_index_stats.is_some()
+                    {
+                        super::dialogs::render_index_stats_badge(
+                            ui,
+                            self.state.search_index_stats.as_ref(),
+                        );
+                    }
+                });
             } else {
                 let mode_str = match current_view_mode.mode {
                     ViewMode::FitWindow => "Fit Window",
@@ -2527,6 +2547,14 @@ impl GuiApp {
                     ));
                     ui.separator();
                     ui.label(pos_str);
+                    if !self.state.search_results.is_empty()
+                        && self.state.search_index_stats.is_some()
+                    {
+                        super::dialogs::render_index_stats_badge(
+                            ui,
+                            self.state.search_index_stats.as_ref(),
+                        );
+                    }
                     if !filename_display.is_empty() {
                         ui.separator();
                         ui.label(

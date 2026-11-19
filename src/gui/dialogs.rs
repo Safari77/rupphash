@@ -1159,7 +1159,15 @@ pub(super) fn handle_dialogs(
 
                 // --- EXIF Tag Search Input ---
                 ui.group(|ui| {
-                    ui.label(egui::RichText::new("🏷️ EXIF Tag Search").strong());
+                    if app.state.search_index_stats.is_none() && !app.search_index.is_empty() {
+                        app.state.search_index_stats = Some(app.search_index.stats());
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("🏷️ EXIF Tag Search").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            render_index_stats_badge(ui, app.state.search_index_stats.as_ref());
+                        });
+                    });
 
                     let exif_res = ui.add(
                         egui::TextEdit::singleline(&mut app.search_exif_input)
@@ -1779,6 +1787,50 @@ fn perform_ignore_group(app: &mut GuiApp) {
     }
 }
 
+/// Render a discreet `(i)` icon whose hover tooltip displays `SearchIndex` statistics.
+pub(super) fn render_index_stats_badge(
+    ui: &mut egui::Ui,
+    stats: Option<&crate::search_index::IndexStats>,
+) {
+    let text_color = ui.visuals().weak_text_color();
+    let response = ui.add(
+        egui::Label::new(egui::RichText::new("ℹ️").small().color(text_color))
+            .sense(egui::Sense::hover()),
+    );
+    response.on_hover_ui(|ui| {
+        if let Some(stats) = stats {
+            ui.label(egui::RichText::new("Search Index Stats").strong());
+            ui.separator();
+            egui::Grid::new("search_index_stats_grid").num_columns(2).spacing([12.0, 2.0]).show(
+                ui,
+                |ui| {
+                    ui.label("Files:");
+                    ui.monospace(stats.file_count.to_string());
+                    ui.end_row();
+
+                    ui.label("Tags:");
+                    ui.monospace(stats.tag_count.to_string());
+                    ui.end_row();
+
+                    ui.label("String values:");
+                    ui.monospace(stats.string_table_size.to_string());
+                    ui.end_row();
+
+                    ui.label("Exact entries:");
+                    ui.monospace(stats.exact_entries.to_string());
+                    ui.end_row();
+
+                    ui.label("Numeric entries:");
+                    ui.monospace(stats.numeric_entries.to_string());
+                    ui.end_row();
+                },
+            );
+        } else {
+            ui.label("Search index not built yet (builds on first EXIF search).");
+        }
+    });
+}
+
 /// Perform advanced search with filename regex + EXIF tag filtering using SearchIndex
 fn perform_advanced_search(app: &mut GuiApp) {
     app.state.search_results.clear();
@@ -1904,6 +1956,9 @@ fn perform_advanced_search(app: &mut GuiApp) {
 
     if use_search_index {
         app.search_index.finalize();
+        app.state.search_index_stats = Some(app.search_index.stats());
+    } else if !app.search_index.is_empty() && app.state.search_index_stats.is_none() {
+        app.state.search_index_stats = Some(app.search_index.stats());
     }
 
     let mut exif_matching_ids: Option<std::collections::HashSet<u128>> = None;

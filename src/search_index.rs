@@ -1088,4 +1088,40 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result.contains(1)); // Only the -5.0 one
     }
+
+    #[test]
+    fn test_index_stats() {
+        use crate::exif_types::TAG_ISO;
+
+        let mut index = SearchIndex::new();
+        let empty = index.stats();
+        assert_eq!(empty.file_count, 0);
+        assert_eq!(empty.tag_count, 0);
+        assert_eq!(empty.exact_entries, 0);
+        assert_eq!(empty.numeric_entries, 0);
+
+        let mut f1 = ImageFeatures::new(1920, 1080);
+        f1.insert_tag(TAG_MAKE, ExifValue::String("Canon".to_string()));
+        f1.insert_tag(TAG_ISO, ExifValue::Short(400));
+
+        let mut f2 = ImageFeatures::new(1920, 1080);
+        f2.insert_tag(TAG_MAKE, ExifValue::String("Nikon".to_string()));
+        f2.insert_tag(TAG_ISO, ExifValue::Short(800));
+
+        index.insert(1, &f1);
+        index.insert(2, &f2);
+        index.finalize();
+
+        let stats = index.stats();
+        assert_eq!(stats.file_count, 2);
+        assert!(stats.tag_count >= 2);
+        assert!(stats.string_table_size >= 2);
+        assert!(stats.exact_entries >= 2);
+        assert!(stats.numeric_entries >= 2);
+        assert!(stats.to_string().contains("2 files"));
+
+        index.remove(1);
+        let after_remove = index.stats();
+        assert_eq!(after_remove.file_count, 1);
+    }
 }

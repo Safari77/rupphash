@@ -170,6 +170,7 @@ pub struct AppState {
     pub show_search: bool,
     pub search_results: Vec<(usize, usize, String)>, // (group_idx, file_idx, match_source)
     pub current_search_match: usize,
+    pub search_index_stats: Option<crate::search_index::IndexStats>,
     pub use_gps_utc: bool, // Solar position
     // Per-file transform state (rotation and flips)
     pub file_transforms: HashMap<u128, FileTransform>,
@@ -227,6 +228,7 @@ impl AppState {
             show_search: false,
             search_results: Vec::new(),
             current_search_match: 0,
+            search_index_stats: None,
             use_gps_utc: false,
             file_transforms: HashMap::new(),
             last_title: String::new(),
@@ -926,8 +928,8 @@ impl AppState {
     }
 
     fn perform_search(&mut self, query: &str) {
-        // Note: EXIF-aware search with caching is handled by GuiApp::perform_search_with_cache
-        // This is a simple filename-only fallback
+        // EXIF-aware search (using SearchIndex and IndexStats) is handled by
+        // gui::dialogs::perform_advanced_search; this is the filename-only fallback.
         self.search_results.clear();
         if query.is_empty() {
             self.show_search = false;
