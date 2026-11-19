@@ -55,11 +55,10 @@ pub enum InputIntent {
     PrevSearchResult,
     CancelSearch,
     FindInMap,
-    IgnoreCurrent,      // Q key: ignore marked files or current file (duplicate mode)
-    IgnoreGroup,        // Ctrl+Q: ignore all files in current group (duplicate mode)
-    ConfirmIgnoreGroup, // Y on ignore group confirmation dialog
-    ToggleLut,          // Key '3' logic for 3D LUT
-    CycleLut,           // Key '4' to switch to next LUT
+    IgnoreCurrent, // Q key: ignore marked files or current file (duplicate mode)
+    IgnoreGroup,   // Ctrl+Q: ignore all files in current group (duplicate mode)
+    ToggleLut,     // Key '3' logic for 3D LUT
+    CycleLut,      // Key '4' to switch to next LUT
 }
 
 #[derive(Debug, Clone)]
@@ -307,17 +306,10 @@ impl AppState {
             return;
         }
 
-        // Handle ignore-group confirmation modal
+        // Handle ignore-group confirmation modal (confirm handled in dialogs.rs)
         if self.show_ignore_group_confirmation {
-            match intent {
-                InputIntent::ConfirmIgnoreGroup => {
-                    self.show_ignore_group_confirmation = false;
-                    // Actual DB work is done in dialogs.rs handle_dialogs
-                },
-                InputIntent::Cancel | InputIntent::Quit => {
-                    self.show_ignore_group_confirmation = false;
-                },
-                _ => {},
+            if matches!(intent, InputIntent::Cancel | InputIntent::Quit) {
+                self.show_ignore_group_confirmation = false;
             }
             return;
         }
@@ -603,7 +595,6 @@ impl AppState {
                     self.show_ignore_group_confirmation = true;
                 }
             },
-            InputIntent::ConfirmIgnoreGroup => {}, // handled in dialogs.rs
         }
     }
 
