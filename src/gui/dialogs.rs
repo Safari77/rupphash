@@ -1193,6 +1193,12 @@ pub(super) fn handle_dialogs(
                         }
                     }
 
+                    ui.horizontal(|ui| {
+                        ui.label("Combine criteria:");
+                        ui.radio_value(&mut app.search_or_mode, false, "All (AND)");
+                        ui.radio_value(&mut app.search_or_mode, true, "Any (OR)");
+                    });
+
                     // Show syntax help
                     ui.collapsing("📖 Search Syntax Help", |ui| {
                         ui.spacing_mut().item_spacing.y = 4.0;
@@ -1963,7 +1969,11 @@ fn perform_advanced_search(app: &mut GuiApp) {
 
     let mut exif_matching_ids: Option<std::collections::HashSet<u128>> = None;
     if use_search_index {
-        let bitmap = app.search_index.search_and(&exif_criteria);
+        let bitmap = if app.search_or_mode {
+            app.search_index.search_or(&exif_criteria)
+        } else {
+            app.search_index.search_and(&exif_criteria)
+        };
         let matching_ids: std::collections::HashSet<u128> =
             bitmap.iter().filter_map(|idx| app.search_index.index_to_file_id(idx)).collect();
         exif_matching_ids = Some(matching_ids);
@@ -1997,24 +2007,41 @@ fn perform_advanced_search(app: &mut GuiApp) {
                     &mut app.exif_search_cache,
                     file,
                     &exif_criteria,
+                    app.search_or_mode,
                 )
             };
 
             let matches_geo = if geo_filters.is_empty() {
                 true
             } else if let Some(gps_pos) = file.gps_pos {
-                geo_filters.iter().all(|filter| {
+                let mut check = |filter: &GeoDistanceFilter| {
                     let dist_km = crate::position::distance(
                         (gps_pos.y(), gps_pos.x()),
                         (filter.target_point.y(), filter.target_point.x()),
                     ) / 1000.0;
                     dist_km >= filter.min_km && dist_km <= filter.max_km
-                })
+                };
+                if app.search_or_mode {
+                    geo_filters.iter().any(&mut check)
+                } else {
+                    geo_filters.iter().all(&mut check)
+                }
             } else {
                 false
             };
 
-            if exif_matches && matches_geo {
+            let query_matches = if app.search_or_mode {
+                match (!exif_criteria.is_empty(), !geo_filters.is_empty()) {
+                    (true, true) => exif_matches || matches_geo,
+                    (true, false) => exif_matches,
+                    (false, true) => matches_geo,
+                    (false, false) => true,
+                }
+            } else {
+                exif_matches && matches_geo
+            };
+
+            if query_matches {
                 let match_source = if !exif_query_raw.is_empty() && filename_regex.is_some() {
                     format!("Filename + {}", exif_query_raw)
                 } else if !exif_query_raw.is_empty() {
@@ -2085,6 +2112,7 @@ fn check_exif_criteria_fallback(
     exif_cache: &mut std::collections::HashMap<std::path::PathBuf, Vec<(String, String)>>,
     file: &crate::FileMetadata,
     criteria: &[crate::search_index::SearchCriterion],
+    match_any: bool,
 ) -> bool {
     use crate::{exif_types::*, search_index::SearchOp};
 
@@ -2184,6 +2212,9 @@ fn check_exif_criteria_fallback(
             .map(|(_, v)| v.as_str());
 
         let Some(value_str) = tag_value else {
+            if match_any {
+                continue;
+            }
             return false; // Tag not found, criterion not met
         };
 
@@ -2270,10 +2301,14 @@ fn check_exif_criteria_fallback(
             },
         };
 
-        if !matches {
+        if match_any {
+            if matches {
+                return true;
+            }
+        } else if !matches {
             return false; // AND logic - all criteria must match
         }
     }
 
-    true // All criteria matched
+    !match_any
 }

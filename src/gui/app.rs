@@ -222,6 +222,7 @@ pub struct GuiApp {
     // Search index for EXIF-based filtering
     pub(super) search_filename_input: String,
     pub(super) search_exif_input: String,
+    pub(super) search_or_mode: bool,
     pub(super) search_index: crate::search_index::SearchIndex,
     pub(super) search_index_dirty: bool,
     // View mode: Map of paths to Instant when retry is allowed
@@ -489,6 +490,7 @@ impl GuiApp {
             last_failed_images_len: 0,
             search_filename_input: String::new(),
             search_exif_input: String::new(),
+            search_or_mode: false,
             search_index: crate::search_index::SearchIndex::new(),
             search_index_dirty: true,
             retry_after: HashMap::new(),
