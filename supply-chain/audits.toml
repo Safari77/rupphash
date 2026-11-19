@@ -3,6 +3,12 @@
 
 [audits]
 
+[[trusted.flate2]]
+criteria = "safe-to-deploy"
+user-id = 980
+start = "2023-08-15"
+end = "2027-11-19"
+
 [[trusted.globset]]
 criteria = "safe-to-deploy"
 user-id = 189 # Andrew Gallant (BurntSushi)
@@ -15,11 +21,41 @@ user-id = 189 # Andrew Gallant (BurntSushi)
 start = "2019-04-15"
 end = "2027-10-31"
 
+[[trusted.jiff]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:BurntSushi/jiff"
+start = "2026-11-02"
+end = "2027-11-19"
+
+[[trusted.jiff-core]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:BurntSushi/jiff"
+start = "2026-11-02"
+end = "2027-11-19"
+
+[[trusted.jiff-static]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:BurntSushi/jiff"
+start = "2026-11-02"
+end = "2027-11-19"
+
+[[trusted.jiff-tzdb]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:BurntSushi/jiff"
+start = "2026-11-14"
+end = "2027-11-19"
+
 [[trusted.js-sys]]
 criteria = "safe-to-deploy"
 user-id = 1 # Alex Crichton (alexcrichton)
 start = "2019-03-04"
 end = "2027-10-31"
+
+[[trusted.notify]]
+criteria = "safe-to-deploy"
+user-id = 51017 # Yuki Okushi (JohnTitor)
+start = "2020-01-07"
+end = "2027-11-19"
 
 [[trusted.notify-types]]
 criteria = "safe-to-deploy"
@@ -33,11 +69,35 @@ user-id = 4556 # Dirkjan Ochtman (djc)
 start = "2025-12-29"
 end = "2027-10-26"
 
+[[trusted.regex]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-02-27"
+end = "2027-11-19"
+
+[[trusted.regex-automata]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-02-25"
+end = "2027-11-19"
+
 [[trusted.rustix]]
 criteria = "safe-to-deploy"
 user-id = 6825 # Dan Gohman (sunfishcode)
 start = "2021-10-29"
 end = "2027-10-31"
+
+[[trusted.rustls-webpki]]
+criteria = "safe-to-deploy"
+user-id = 2751 # Joe Birr-Pixton (ctz)
+start = "2023-01-09"
+end = "2027-11-19"
+
+[[trusted.ucd-trie]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-07-21"
+end = "2027-11-19"
 
 [[trusted.unicode-width]]
 criteria = "safe-to-deploy"
@@ -80,3 +140,9 @@ criteria = "safe-to-deploy"
 user-id = 1 # Alex Crichton (alexcrichton)
 start = "2019-03-04"
 end = "2027-10-31"
+
+[[trusted.webpki-roots]]
+criteria = "safe-to-deploy"
+user-id = 2751 # Joe Birr-Pixton (ctz)
+start = "2019-07-21"
+end = "2027-11-19"
