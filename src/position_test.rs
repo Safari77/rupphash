@@ -1,13 +1,8 @@
-mod exif_extract;
-mod exif_types;
-mod helper_exif;
-mod image_features;
-mod position;
-
 use std::{fs::File, io::BufReader};
 
 use clap::Parser;
 use exif::Reader;
+use rupphash::{exif_extract, helper_exif, position};
 
 /// Simple program to calculate sun position from EXIF data
 #[derive(Parser, Debug)]

@@ -37,21 +37,18 @@ struct DepInfo {
 
 mod configs;
 mod db;
-mod exif_extract;
-mod exif_types;
 mod fileops;
 mod gui;
 mod hdr;
-#[allow(unused)] mod helper_exif;
-mod image_features;
-mod position;
 mod raw_exif;
 mod scanner;
 mod search_index;
 mod state;
 mod ui;
 
-use rupphash::{hamminghash, pdqhash};
+use rupphash::{
+    exif_extract, exif_types, hamminghash, helper_exif, image_features, pdqhash, position,
+};
 
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
