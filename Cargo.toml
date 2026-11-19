@@ -19,7 +19,7 @@ codes-iso-3166 = { version = "0.1", features = ["part_2"] }
 country-boundaries = "1.2"
 crossbeam-channel = "0.5"
 crossterm = "0.29"
-dirs = "6"
+dirs = "7"
 fast_image_resize = "6"
 file-id = "0.2"
 flate2 = { version = "1.1", features = [
@@ -47,8 +47,8 @@ once_cell = "1.21"
 postcard = { version = "1.1", features = ["use-std"] }
 rand = "0.10"
 ratatui = { version = "0.30", default-features = false, features = ["underline-color", "layout-cache", "std", "crossterm_0_29"] }
-rayon = "1.11"
-regex = "1.12"
+rayon = "1.12"
+regex = "1.13"
 rsraw = { git = "https://github.com/Safari77/rsraw" }
 rustc-hash = "2.1"
 rustdct = "0.7"
@@ -59,12 +59,12 @@ solar-positioning = "0.7"
 sysinfo = "0.40"
 toml = "1"
 transpose = "0.2"
-trash = "5.2"
+trash = "5.4"
 tzf-rs = "2"
 unicode-width = "0.2"
 walkdir = "2.5"
 zerocopy = "0.8"
-zeroize = "1.8"
+zeroize = "1.9"
 zune-jpeg = "0.5"
 oklab = "1"
 mp4parse = "0.17"
@@ -134,7 +134,7 @@ path = "src/position_test.rs"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 jemallocator = "0.5"
-xattr = "1.6"
+xattr = "1.7"
 
 [features]
 default = []
@@ -142,3 +142,13 @@ default = []
 # and run cargo build --release --features embed-fonts
 embed-fonts = []
 staticbuild = []
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+arithmetic_side_effects = "warn"

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::{env, fs, path::Path, process::Command};
 
 use cargo_lock::Lockfile;
