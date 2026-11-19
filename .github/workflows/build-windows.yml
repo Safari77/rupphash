@@ -332,8 +332,8 @@ jobs:
         Add-Content -Path $env:GITHUB_ENV -Value "EXT_HEIF_HASH=Managed by vcpkg.json (x64-windows-static)" -Encoding utf8
         Add-Content -Path $env:GITHUB_ENV -Value "EXT_AOM_HASH=Managed by vcpkg.json (x64-windows-static)" -Encoding utf8
 
-    - name: Install Rust 1.99.1
-      uses: dtolnay/rust-toolchain@1.99.1
+    - name: Install Rust 1.100.0
+      uses: dtolnay/rust-toolchain@1.100.0
       with:
         targets: "x86_64-pc-windows-msvc"
 
