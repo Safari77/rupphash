@@ -1137,7 +1137,7 @@ impl AppState {
     }
 }
 
-/// Returns a map of (dev, ino) -> Vec<usize> for files that are hardlinked
+/// Returns a map of `(dev, ino)` -> `Vec<usize>` for files that are hardlinked
 pub fn get_hardlink_groups(group: &[FileMetadata]) -> HashMap<u128, Vec<usize>> {
     let mut groups: HashMap<u128, Vec<usize>> = HashMap::with_capacity(group.len());
 

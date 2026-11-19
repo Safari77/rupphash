@@ -314,7 +314,7 @@ const PQ_C1: f32 = 3424.0 / 4096.0;
 const PQ_C2: f32 = 2413.0 / 4096.0 * 32.0;
 const PQ_C3: f32 = 2392.0 / 4096.0 * 32.0;
 
-/// Inverse PQ EOTF: non-linear PQ code value in [0,1] → linear light in nits
+/// Inverse PQ EOTF: non-linear PQ code value in `[0, 1]` → linear light in nits
 /// (0 to 10000 nits).
 #[inline]
 fn pq_eotf(e: f32) -> f32 {
@@ -327,7 +327,7 @@ fn pq_eotf(e: f32) -> f32 {
     y * 10000.0
 }
 
-/// HLG inverse OETF → scene-linear in [0,1], then apply system OOTF to get
+/// HLG inverse OETF → scene-linear in `[0, 1]`, then apply system OOTF to get
 /// display-referred linear light in nits. This is the "system gamma" path
 /// from ITU-R BT.2100.
 #[inline]
@@ -402,7 +402,7 @@ impl Trc {
     }
 }
 
-/// SDR EOTF: display-encoded code value in [0,1] → display-linear light,
+/// SDR EOTF: display-encoded code value in `[0, 1]` → display-linear light,
 /// normalised so 1.0 is display white.
 #[inline]
 fn sdr_eotf(v: f32, trc: Trc) -> f32 {
@@ -465,8 +465,8 @@ fn p3_to_bt709_linear(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
 
 /// ITU-R BT.2390 tone-mapping EETF applied to PQ-encoded luma.
 ///
-/// Input `e` is already PQ-encoded in [0,1]. `src_peak_pq` and `dst_peak_pq`
-/// are the source and destination peaks expressed as PQ code values in [0,1]
+/// Input `e` is already PQ-encoded in `[0, 1]`. `src_peak_pq` and `dst_peak_pq`
+/// are the source and destination peaks expressed as PQ code values in `[0, 1]`
 /// (i.e. the PQ of the peak nits). This operator is applied to the MaxRGB
 /// component of each pixel, and then the three channels are scaled by the
 /// resulting ratio — this preserves hue better than per-channel tone mapping.
@@ -500,7 +500,7 @@ fn bt2390_eetf(e: f32, src_peak_pq: f32, dst_peak_pq: f32) -> f32 {
     (e2 * src_peak_pq).clamp(0.0, 1.0)
 }
 
-/// Inverse of the PQ EOTF for a value in nits. Returns PQ code value in [0,1].
+/// Inverse of the PQ EOTF for a value in nits. Returns PQ code value in `[0, 1]`.
 #[inline]
 fn pq_inverse_eotf_nits(nits: f32) -> f32 {
     let y = (nits / 10000.0).clamp(0.0, 1.0);

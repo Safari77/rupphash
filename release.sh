@@ -14,9 +14,5 @@ cargo test --release
 ./target/release/phdupes --version
 cargo release patch --no-publish --no-push --no-tag --execute
 
-# Eventually:
-# RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-# cargo clippy --all-targets --all-features -- -D warnings
-
 # vetting if feeling lazy:
 # cargo vet regenerate exemptions
