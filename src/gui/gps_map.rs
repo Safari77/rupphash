@@ -742,6 +742,9 @@ impl Plugin for GpsMarkersPlugin {
         let mut closest_dist = f32::MAX;
         let mut closest_idx = -1;
         let mut hovered_marker: Option<(Position, String)> = None;
+        let mut yellow_markers: Vec<(egui::Pos2, f32, egui::Color32)> = Vec::new();
+        let mut current_marker: Option<(egui::Pos2, f32, egui::Color32)> = None;
+        let marker_stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
 
         for (pos, color, radius, idx, name) in &self.markers {
             let p_lat = pos.y();
@@ -763,16 +766,18 @@ impl Plugin for GpsMarkersPlugin {
                 continue;
             }
 
-            // Project & Draw
+            // Project & Draw (defer highlighted markers so they render above grey markers)
             let screen_vec = projector.project(*pos);
             let screen_pos = egui::pos2(screen_vec.x, screen_vec.y);
 
-            painter.circle_filled(screen_pos, *radius, *color);
-            painter.circle_stroke(
-                screen_pos,
-                *radius,
-                egui::Stroke::new(1.5, egui::Color32::WHITE),
-            );
+            if *color == egui::Color32::GREEN {
+                current_marker = Some((screen_pos, *radius, *color));
+            } else if *color == egui::Color32::YELLOW {
+                yellow_markers.push((screen_pos, *radius, *color));
+            } else {
+                painter.circle_filled(screen_pos, *radius, *color);
+                painter.circle_stroke(screen_pos, *radius, marker_stroke);
+            }
 
             // Tooltip Detection
             if let Some(h_pos) = hover_pos
@@ -789,6 +794,16 @@ impl Plugin for GpsMarkersPlugin {
                     closest_idx = *idx as i32;
                 }
             }
+        }
+
+        // Draw search-match (yellow) markers above grey markers, and current (green) on top
+        for (screen_pos, radius, color) in yellow_markers {
+            painter.circle_filled(screen_pos, radius, color);
+            painter.circle_stroke(screen_pos, radius, marker_stroke);
+        }
+        if let Some((screen_pos, radius, color)) = current_marker {
+            painter.circle_filled(screen_pos, radius, color);
+            painter.circle_stroke(screen_pos, radius, marker_stroke);
         }
 
         // Apply Selection
@@ -832,13 +847,15 @@ impl Plugin for GpsMarkersPlugin {
 }
 
 /// Render the GPS map panel
-/// current_path is used for highlighting the current file's marker (works in both view mode and duplicate mode)
-/// Returns the path of a clicked marker if any
+/// current_path is used for highlighting the current file's marker (works in both view mode and duplicate mode).
+/// When search_match_paths is `Some`, matching markers are highlighted in yellow (unless they are current_path, which stays green).
+/// Returns the path of a clicked marker if any.
 pub fn render_gps_map(
     state: &mut GpsMapState,
     ui: &mut egui::Ui,
     _available_rect: egui::Rect,
     current_path: Option<&Path>,
+    search_match_paths: Option<&rustc_hash::FxHashSet<&Path>>,
 ) -> Option<PathBuf> {
     state.ensure_tiles(ui.ctx());
 
@@ -908,8 +925,16 @@ pub fn render_gps_map(
         .enumerate()
         .map(|(idx, marker)| {
             let is_current = current_path.map(|p| p == marker.path).unwrap_or(false);
-            let color = if is_current { egui::Color32::GREEN } else { egui::Color32::GRAY };
-            let radius = if is_current { 8.0 } else { 5.0 };
+            let is_search_match = !is_current
+                && search_match_paths
+                    .is_some_and(|matches| matches.contains(marker.path.as_path()));
+            let (color, radius) = if is_current {
+                (egui::Color32::GREEN, 8.0)
+            } else if is_search_match {
+                (egui::Color32::YELLOW, 6.5)
+            } else {
+                (egui::Color32::GRAY, 5.0)
+            };
 
             let name = marker.path.file_name().unwrap_or_default().to_string_lossy().to_string();
 

@@ -3610,12 +3610,33 @@ impl GuiApp {
                     .and_then(|g| g.get(self.state.current_file_idx))
                     .map(|f| f.path.clone());
 
+                // Collect search match paths when search mode is active
+                let search_match_paths: Option<rustc_hash::FxHashSet<&std::path::Path>> =
+                    if self.state.search_results.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            self.state
+                                .search_results
+                                .iter()
+                                .filter_map(|(g_idx, f_idx, _)| {
+                                    self.state
+                                        .groups
+                                        .get(*g_idx)
+                                        .and_then(|g| g.get(*f_idx))
+                                        .map(|f| f.path.as_path())
+                                })
+                                .collect(),
+                        )
+                    };
+
                 // Render the map
                 map_clicked_path = super::gps_map::render_gps_map(
                     &mut self.gps_map,
                     ui,
                     map_rect,
                     current_path.as_deref(),
+                    search_match_paths.as_ref(),
                 );
 
                 // Statistics
