@@ -189,6 +189,7 @@ pub fn pick_face(data: &[u8], role: FontRole, orthography: &[&str]) -> Option<Fa
         .map(|(_, f)| f)
 }
 
+#[cfg(feature = "embed-fonts")]
 pub fn install_font_file(
     fonts: &mut egui::FontDefinitions,
     label: &str,
